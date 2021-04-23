@@ -6,11 +6,12 @@ DocMeta.setdocmeta!(Avro, :DocTestSetup, :(using Avro); recursive=true)
 makedocs(;
     modules=[Avro],
     authors="Jacob Quinn <quinn.jacobd@gmail.com> and contributors",
-    repo="https://github.com/quinnj/Avro.jl/blob/{commit}{path}#{line}",
+    repo="https://github.com/JuliaData/Avro.jl/blob/{commit}{path}#{line}",
     sitename="Avro.jl",
     format=Documenter.HTML(;
+        edit_link="main",
         prettyurls=get(ENV, "CI", "false") == "true",
-        canonical="https://quinnj.github.io/Avro.jl",
+        canonical="https://JuliaData.github.io/Avro.jl",
         assets=String[],
     ),
     pages=[
@@ -19,5 +20,6 @@ makedocs(;
 )
 
 deploydocs(;
-    repo="github.com/quinnj/Avro.jl",
+    repo="github.com/JuliaData/Avro.jl",
+    devbranch = "main",
 )
