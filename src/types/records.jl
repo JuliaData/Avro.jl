@@ -48,7 +48,7 @@ Base.NamedTuple(x::Record{names, types, N}) where {names, types, N} =
 juliatype(x::RecordType) = Record{symtup(map(f->f.name, x.fields)), Tuple{map(f->juliatype(f.type), x.fields)...}, length(x.fields)}
 
 autoname(T::Type{Record{names, types, N}}) where {names, types, N} =
-    Base.string("Record_", abs(T.hash))
+    Base.string("Record_", hash(T))
 
 schematype(::StructTypes.CustomStruct, ::Type{Record{names, types, N}}, name=autoname(Record{names, types, N})) where {names, types, N} =
     schematype(Record{names, types})
