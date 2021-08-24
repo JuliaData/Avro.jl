@@ -73,14 +73,18 @@ end
 
 function skipvalue(B::Binary, MT::MapType, ::Type{A}, buf, pos, buflen, opts) where {A <: AbstractDict{K, V}} where {K, V}
     while true
+        # read the count of elements in the block
         len, pos = readvalue(B, long, Int, buf, pos, buflen, opts)
         if len == 0
+            # no more elements
             break
         elseif len < 0
+            # the block includes its size in bytes: read it and skip that much data
             sz, pos = readvalue(B, long, Int, buf, pos, buflen, opts)
             pos += sz
         else
-            for i = 1:-len
+            # skip each element individually
+            for i = 1:len
                 pos = skipvalue(B, string, K, buf, pos, buflen, opts)
                 pos = skipvalue(B, MT.values, V, buf, pos, buflen, opts)
             end

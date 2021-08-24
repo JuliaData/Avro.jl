@@ -5,7 +5,7 @@ mutable struct ArrayType <: SchemaType
 end
 
 ==(x::ArrayType, y::ArrayType) = x.items == y.items
-ArrayType(items::Schema, default=nothing) = ArrayType("array", items, default)
+ArrayType(items::Schema, default = nothing) = ArrayType("array", items, default)
 ArrayType() = ArrayType("array", "", nothing)
 StructTypes.StructType(::Type{ArrayType}) = StructTypes.Mutable()
 
@@ -47,12 +47,20 @@ function writevalue(B::Binary, A::ArrayType, x, buf, pos, len, opts)
     return pos
 end
 
-function nbytes(A::ArrayType, x, self=false)
+function nbytes(A::ArrayType, x, self = false)
     nb = isempty(x) ? 0 : sum(y -> nbytes(A.items, y), x)
     return self ? nb : nbytes(length(x)) + nbytes(nb) + nb + 1
 end
 
-function readvalue(B::Binary, AT::ArrayType, ::Type{A}, buf, pos, buflen, opts) where {A <: AbstractVector{T}} where {T}
+function readvalue(
+    B::Binary,
+    AT::ArrayType,
+    ::Type{A},
+    buf,
+    pos,
+    buflen,
+    opts,
+) where {A<:AbstractVector{T}} where {T}
     sz = startpos = 0
     len, pos = readvalue(B, long, Int, buf, pos, buflen, opts)
     if len == 0
@@ -95,16 +103,28 @@ function readvalue(B::Binary, AT::ArrayType, ::Type{A}, buf, pos, buflen, opts) 
     end
 end
 
-function skipvalue(B::Binary, AT::ArrayType, ::Type{A}, buf, pos, buflen, opts) where {A <: AbstractVector{T}} where {T}
+function skipvalue(
+    B::Binary,
+    AT::ArrayType,
+    ::Type{A},
+    buf,
+    pos,
+    buflen,
+    opts,
+) where {A<:AbstractVector{T}} where {T}
     while true
+        # read the count of elements in the block
         len, pos = readvalue(B, long, Int, buf, pos, buflen, opts)
         if len == 0
+            # no more elements
             break
         elseif len < 0
+            # the block includes its size in bytes: read it and skip that much data
             sz, pos = readvalue(B, long, Int, buf, pos, buflen, opts)
             pos += sz
         else
-            for i = 1:-len
+            # skip each element individually
+            for i = 1:len
                 pos = skipvalue(B, AT.items, T, buf, pos, buflen, opts)
             end
         end
