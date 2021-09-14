@@ -52,7 +52,7 @@ function nbytes(A::ArrayType, x, self=false)
         return self ? 0 : 1
     else
         nb = sum(y -> nbytes(A.items, y), x)
-        return self ? nb : nbytes(length(x)) + nbytes(nb) + nb + 1
+        return self ? nb : nbytes(-length(x)) + nbytes(nb) + nb + 1
     end
 end
 

@@ -44,7 +44,7 @@ function nbytes(MT::MapType, x, self=false)
         nb += nbytes(MT.values, v)
         next = iterate(pairs, state)
     end
-    return nb == 0 ? 1 : self ? nb : nbytes(length(x)) + nbytes(nb) + nb + 1
+    return nb == 0 ? 1 : self ? nb : nbytes(-length(x)) + nbytes(nb) + nb + 1
 end
 
 function readvalue(B::Binary, MT::MapType, ::Type{A}, buf, pos, buflen, opts) where {A <: AbstractDict{K, V}} where {K, V}
