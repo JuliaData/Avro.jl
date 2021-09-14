@@ -48,8 +48,12 @@ function writevalue(B::Binary, A::ArrayType, x, buf, pos, len, opts)
 end
 
 function nbytes(A::ArrayType, x, self=false)
-    nb = isempty(x) ? 0 : sum(y -> nbytes(A.items, y), x)
-    return self ? nb : nbytes(length(x)) + nbytes(nb) + nb + 1
+    if isempty(x)
+        return self ? 0 : 1
+    else
+        nb = sum(y -> nbytes(A.items, y), x)
+        return self ? nb : nbytes(length(x)) + nbytes(nb) + nb + 1
+    end
 end
 
 function readvalue(B::Binary, AT::ArrayType, ::Type{A}, buf, pos, buflen, opts) where {A <: AbstractVector{T}} where {T}
