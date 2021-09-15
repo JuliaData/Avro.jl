@@ -106,6 +106,11 @@ TimeMillisType() = TimeMillisType("int", "time-millis")
 
 juliatype(::TimeMillisType) = Time
 
+writevalue(B::Binary, ::TimeMillisType, x::Time, buf, pos, len, opts) =
+    writevalue(B, long, div(Dates.value(x), 1000_000), buf, pos, len, opts)
+
+nbytes(::TimeMillisType, x::Time) = nbytes(div(Dates.value(x), 1000_000))
+
 function readvalue(B::Binary, ::TimeMillisType, ::Type{Time}, buf, pos, len, opts)
     x, pos = readvalue(B, int, Int32, buf, pos, len, opts)
     return Time(Nanosecond(Millisecond(x))), pos
@@ -148,6 +153,11 @@ const UNIX_EPOCH_DATETIME = Dates.value(Dates.DateTime(1970))
 unix(x::DateTime) = Int64(Dates.value(x) - UNIX_EPOCH_DATETIME)
 datetime(x::Int64) = Dates.DateTime(Dates.UTM(Int64(x + UNIX_EPOCH_DATETIME)))
 
+writevalue(B::Binary, ::TimestampMillisType, x::DateTime, buf, pos, len, opts) =
+    writevalue(B, long, unix(x), buf, pos, len, opts)
+
+nbytes(::TimestampMillisType, x::DateTime) = nbytes(unix(x))
+
 function readvalue(B::Binary, ::TimestampMillisType, ::Type{DateTime}, buf, pos, len, opts)
     x, pos = readvalue(B, long, Int64, buf, pos, len, opts)
     return datetime(x), pos
@@ -164,6 +174,11 @@ TimestampMicrosType() = TimestampMicrosType("long", "timestamp-micros")
 
 juliatype(::TimestampMicrosType) = DateTime
 
+writevalue(B::Binary, ::TimestampMicrosType, x::DateTime, buf, pos, len, opts) =
+    writevalue(B, long, unix(x) * 1000, buf, pos, len, opts)
+
+nbytes(::TimestampMicrosType, x::DateTime) = nbytes(unix(x) * 1000)
+
 function readvalue(B::Binary, ::TimestampMicrosType, ::Type{DateTime}, buf, pos, len, opts)
     x, pos = readvalue(B, long, Int64, buf, pos, len, opts)
     return datetime(div(x, 1000)), pos
@@ -179,6 +194,12 @@ end
 LocalTimestampMillisType() = LocalTimestampMillisType("long", "local-timestamp-millis")
 
 juliatype(::LocalTimestampMillisType) = DateTime
+schematype(::Type{DateTime}) = LocalTimestampMillisType()
+
+writevalue(B::Binary, ::LocalTimestampMillisType, x::DateTime, buf, pos, len, opts) =
+    writevalue(B, long, unix(x), buf, pos, len, opts)
+
+nbytes(::LocalTimestampMillisType, x::DateTime) = nbytes(unix(x))
 
 function readvalue(B::Binary, ::LocalTimestampMillisType, ::Type{DateTime}, buf, pos, len, opts)
     x, pos = readvalue(B, long, Int64, buf, pos, len, opts)
@@ -195,7 +216,6 @@ end
 LocalTimestampMicrosType() = LocalTimestampMicrosType("long", "local-timestamp-micros")
 
 juliatype(::LocalTimestampMicrosType) = DateTime
-schematype(::Type{DateTime}) = LocalTimestampMicrosType()
 
 writevalue(B::Binary, ::LocalTimestampMicrosType, x::DateTime, buf, pos, len, opts) =
     writevalue(B, long, unix(x) * 1000, buf, pos, len, opts)
