@@ -40,7 +40,6 @@ function writetable(file::String, tbl; kw...)
 end
 
 function writetable(io::IO, source; compress::Union{Nothing, Symbol}=nothing, kw...)
-    comp = get(COMPRESSORS, compress, nothing)
     parts = Tables.partitions(source)
     state = iterate(parts)
     state === nothing && error("no data in input; unable to write avro file")
@@ -53,13 +52,18 @@ function writetable(io::IO, source; compress::Union{Nothing, Symbol}=nothing, kw
         sch = Tables.schema(rows)
         dictrow = true
     end
-    writewithschema(io, parts, rows, st, sch, dictrow, comp, kw)
+    writewithschema(io, parts, rows, st, sch, dictrow, compress, kw)
     return io
 end
 
-function writewithschema(io, parts, rows, st, sch, dictrow, comp, kw)
+function writewithschema(io, parts, rows, st, sch, dictrow, compress, kw)
+    comp = get(COMPRESSORS, compress, nothing)
+
     schtyp = schematype(sch)
     meta = Dict("avro.schema" => JSON3.write(schtyp))
+    if comp !== nothing
+        meta["avro.codec"] = String(compress)
+    end
     sync = _cast(NTuple{16, UInt8}, rand(UInt128))
     buf = write((magic=MAGIC, meta=meta, sync=sync); schema=FileHeaderRecordType)
     Base.write(io, buf)
@@ -103,7 +107,7 @@ function writewithschema(io, parts, rows, st, sch, dictrow, comp, kw)
         else
             finalbytes = bytes
         end
-        block = Block(nrow, view(bytes, 1:(pos - 1)), sync)
+        block = Block(nrow, view(finalbytes, 1:length(finalbytes)), sync)
         buf = write(block; schema=BlockType)
         Base.write(io, buf)
         state = iterate(parts, st)
@@ -177,7 +181,7 @@ function readwithschema(::Type{T}, sch, buf, pos, comp) where {T}
         bytes = block.bytes
         # uncompress
         if comp !== nothing
-            bytes = transcode(comp, bytes)
+            bytes = transcode(comp, Vector{UInt8}(bytes))
         end
         bpos = 1
         blen = length(bytes)
