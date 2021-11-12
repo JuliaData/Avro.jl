@@ -260,6 +260,14 @@ end
         tbl = Avro.readtable(pth)
         @test length(tbl) == 3
         @test tbl.sch == sch
+
+        pth = joinpath(p,"tmp.avro")
+        Avro.recordwriter(sch, pth; compress=:bzip2) do rw
+            Avro.writerecord(rw, rows[1])
+        end
+        tbl = Avro.readtable(pth)
+        f = first(tbl)
+        @test f.b == 2.
     end
 end
 

@@ -2,6 +2,7 @@ mutable struct recordwriter
     io :: IO
     schtyp :: SchemaType
     sync :: NTuple{16, UInt8}
+    comp
 end
 
 
@@ -25,12 +26,19 @@ close(rw)
 end
 ```
 """
-function recordwriter(schema::Tables.Schema, pth:: String)
+function recordwriter(schema::Tables.Schema, pth:: String; compress::Union{Nothing, Symbol}=nothing)
     io = open(pth,"w")
     schtyp = schematype(schema)
-    writeheader(io, schtyp)
     sync = _cast(NTuple{16, UInt8}, rand(UInt128))
-    return recordwriter(io, schtyp, sync)
+    comp = get(COMPRESSORS, compress, nothing)
+    meta = Dict("avro.schema" => JSON3.write(schtyp))
+    if comp !== nothing
+        meta["avro.codec"] = String(compress)
+    end
+    sync = _cast(NTuple{16, UInt8}, rand(UInt128))
+    buf = write((magic=MAGIC, meta=meta, sync=sync); schema=FileHeaderRecordType)
+    Base.write(io, buf)
+    return recordwriter(io, schtyp, sync, comp)
 end
 
 """
@@ -52,8 +60,8 @@ mktempdir() do p
 end
 ```
 """
-function recordwriter(f::Function, schema::Tables.Schema, pth:: String)
-    writer = recordwriter(schema, pth)
+function recordwriter(f::Function, schema::Tables.Schema, pth:: String; kw...)
+    writer = recordwriter(schema, pth; kw...)
     try
         f(writer)
     finally
@@ -61,17 +69,13 @@ function recordwriter(f::Function, schema::Tables.Schema, pth:: String)
     end
 end
 
-function writeheader(io::IO, schtyp::SchemaType)
-    meta = Dict("avro.schema" => JSON3.write(schtyp))
-    sync = _cast(NTuple{16, UInt8}, rand(UInt128))
-    buf = write((magic=MAGIC, meta=meta, sync=sync); schema=FileHeaderRecordType)
-    Base.write(io, buf)
-end
-
 function writerecord(arr::recordwriter, record)
     nb = nbytes(arr.schtyp, record)
     bytes = Vector{UInt8}(undef, nb)
-    writevalue(Binary(), arr.schtyp, record, bytes, 1, nb, Dict())
+    posrecord = writevalue(Binary(), arr.schtyp, record, bytes, 1, nb, Dict())
+    if arr.comp !== nothing
+        bytes = transcode(arr.comp[Threads.threadid()], unsafe_wrap(Base.Array, pointer(bytes), posrecord - 1))
+    end
     block = Block(1, view(bytes, 1:length(bytes)), arr.sync)
     Base.write(arr.io, write(block; schema=BlockType))
 end
