@@ -7,11 +7,14 @@ end
 
 
 """
-recordwriter(schema::Tables.Schema, pth:: String)
+recordwriter(schema::Tables.Schema, pth:: String; compress::Union{Nothing, Symbol}=nothing)
 
 Opens file handle at `pth` and writes `schema` as header. 
 To write records as separate partitions use `writerecord(arr::recordwriter, record)` 
 and call close(arr::recordwriter) to close file handle.
+
+Compression is supported via the `compress` keyword argument, and can
+currently be one of `:zstd`, `:deflate`, `:bzip2`, or `:xz`.
 
 ```julia
 mktempdir() do p
@@ -42,10 +45,13 @@ function recordwriter(schema::Tables.Schema, pth:: String; compress::Union{Nothi
 end
 
 """
-recordwriter(f::Function, schema::Tables.Schema, pth:: String)
+recordwriter(f::Function, schema::Tables.Schema, pth:: String; compress::Union{Nothing, Symbol}=nothing)
 
 Writes `schema` as header to `pth` and ensures file handle is closed.
 To write records as separate partitions use `writerecord(arr::recordwriter, record)`.
+
+Compression is supported via the `compress` keyword argument, and can
+currently be one of `:zstd`, `:deflate`, `:bzip2`, or `:xz`.
 
 ```julia
 mktempdir() do p
@@ -101,6 +107,8 @@ recordreader(pth:: String)
 Open avro file and read header. Use `iterate` to access one partition at a time.
 Close filehandle with `close(arr::recordreader)`
 
+Any compression will be detected and decompressed automatically when reading.
+
 ```julia
 mktempdir() do p
     pth = joinpath(p,"tmp.avro")
@@ -132,6 +140,8 @@ end
     recordreader(f::Function, pth:: String)
 
 Open avro file and read header. Use `iterate` to access one partition at a time.
+
+Any compression will be detected and decompressed automatically when reading.
 
 ```julia
 mktempdir() do p
