@@ -232,6 +232,37 @@ tbl = Avro.readtable(io)
 
 end
 
+@testset "rowwise" begin
+    rows = [
+        (a=missing, b=2., c=3, d=4),
+        (a=1, b=4.0, c=missing, d=5),
+        (a=1, b=4.0, c=missing, d="5"),
+    ]
+    sch = Tables.Schema([:a, :b, :c, :d], [Union{Missing, Int64}, Float64, Union{Missing, Int64}, Union{Int64, String}])
+
+    mktempdir() do p
+        pth = joinpath(p,"tmp.avro")
+        Avro.recordwriter(sch, pth) do rw
+            Avro.writerecord(rw, rows[1])
+            Avro.writerecord(rw, rows[2])
+            Avro.writerecord(rw, rows[3])
+        end
+        
+        Avro.recordreader(pth) do rr
+            @test all(collect(skipmissing(first(rr))) .== collect(skipmissing(rows[1])))
+            @test all(collect(skipmissing(first(rr))) .== collect(skipmissing(rows[1])))
+            res= []
+            for r in rr
+                push!(res, NamedTuple(r))
+            end
+            @test all(collect.(skipmissing.(res)).==collect.(skipmissing.(rows)))
+        end
+        tbl = Avro.readtable(pth)
+        @test length(tbl) == 3
+        @test tbl.sch == sch
+    end
+end
+
 
 # using CSV, Dates, Tables, Test
 # const dir = joinpath(dirname(pathof(CSV)), "..", "test", "testfiles")
