@@ -86,6 +86,9 @@ using Mmap, UUIDs, Dates
 using StructTypes, JSON3, Tables, SentinelArrays
 using CodecBzip2, CodecXz, CodecZlib, CodecZstd#, CodecSnappy
 
+import Base.open
+import Base.close
+import Base.iterate
 import Base: ==
 
 const DEBUG_LEVEL = Ref(0)
@@ -116,6 +119,7 @@ end
 include("utils.jl")
 include("types.jl")
 include("tables.jl")
+include("rowwise.jl")
 
 const COMPRESSORS = Dict{Symbol, Any}(
     :bzip2 => Bzip2Compressor[],
