@@ -80,23 +80,29 @@ function writewithschema(io, parts, rows, st, sch, dictrow, compress, kw)
             pos = 0
         else
             row, rowst = rowsstate
-            # calc nbytes on first row, then allocate bytes
+            # calc nbytes on all rows to find max, then allocate bytes
             bytesperrow = nbytes(schtyp, row)
+            while true 
+                rowsstate = iterate(rows, rowst)
+                rowsstate === nothing && break
+                row, rowst = rowsstate
+                nb = nbytes(schtyp, row)
+                if nb > bytesperrow
+                    bytesperrow = nb
+                end
+            end
+            rowsstate = iterate(rows)
+            row, rowst = rowsstate
             blen = trunc(Int, nrow * bytesperrow * 1.05) # add 5% cushion
             bytes = Vector{UInt8}(undef, blen)
             n = 1
+            nb = nbytes(schtyp, row)
             while true
                 pos = writevalue(Binary(), schtyp, row, bytes, pos, blen, kw)
                 rowsstate = iterate(rows, rowst)
                 rowsstate === nothing && break
                 row, rowst = rowsstate
                 nb = nbytes(schtyp, row)
-                if (pos + nb - 1) > blen
-                    # unlikely, but need to resize our buffer
-                    rowslefttowrite = nrow - n
-                    avgbytesperrowwritten = div(bytesperrow, n)
-                    resize!(bytes, pos + (rowslefttowrite * avgbytesperrowwritten))
-                end
                 bytesperrow += nb
                 n += 1
             end
