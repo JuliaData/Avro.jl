@@ -189,13 +189,33 @@ end
 
 Best-effort estimate of the memory this process may still use: the minimum of the host's free memory,
 the (cgroup-constrained) total memory and the cgroup's remaining memory, minus the package's pending
-reservations. `Sys.free_memory()` is host-wide on Julia ≤ 1.12 (documented).
+reservations. `Sys.free_memory()` is host-wide on Julia ≤ 1.12 (documented); on macOS it counts only
+truly free pages, so the reclaimable inactive page cache is added (`host_free_memory`).
 """
 function available_memory()
-    free = Int(min(Sys.free_memory(), typemax(Int) % UInt64))
+    free = host_free_memory()
     total = Int(min(Sys.total_memory(), typemax(Int) % UInt64))
     avail = min(free, total, cgroup_remaining())
     return max(clamped_add(avail, -(@atomic GUARD.pending)), 0)
+end
+
+# `Sys.free_memory()`, except on macOS where free + inactive pages (the `vm_stat` convention) is the
+# reclaimable figure: free pages alone routinely fall to a few hundred MB on a busy host.
+function host_free_memory()
+    free = Int(min(Sys.free_memory(), typemax(Int) % UInt64))
+    Sys.isapple() || return free
+    return max(free, something(darwin_available_memory(), 0))
+end
+
+function darwin_available_memory()
+    stats = zeros(UInt32, 38)   # vm_statistics64_data_t as HOST_VM_INFO64_COUNT integer_t
+    count = Ref{UInt32}(length(stats))
+    host = ccall(:mach_host_self, UInt32, ())
+    kr = ccall(:host_statistics64, Cint, (UInt32, Cint, Ptr{UInt32}, Ptr{UInt32}), host, 4, stats, count)
+    ccall(:mach_port_deallocate, Cint, (UInt32, UInt32), unsafe_load(cglobal(:mach_task_self_, UInt32)), host)
+    (kr == 0 && count[] >= 3) || return nothing
+    pagesize = Int(ccall(:getpagesize, Cint, ()))
+    return clamped_add(Int(stats[1]), Int(stats[3])) * pagesize   # free + inactive pages
 end
 
 """
