@@ -63,6 +63,12 @@ function fuzzcorpus(fixtures::AbstractString)
     for s in schemas
         push!(entries, FuzzEntry(:schema, s, 0, nextseed()))
     end
+    for f in ("generated/roots/int-null.avro", "generated/roots/string-null.avro", "generated/roots/union-null.avro",
+              "generated/roots/map-snappy.avro", "generated/roots/array-deflate.avro", "generated/roots/enum-zstandard.avro",
+              "generated/data/everything-null.avro", "generated/data/bench-deflate.avro", "generated/data/logical-null.avro",
+              "apache/weather.avro", "apache/weather-deflate.avro", "apache/weather-snappy.avro")
+        push!(entries, FuzzEntry(:container, f, 0, nextseed()))
+    end
     push!(entries, FuzzEntry(:single, "generated/singleobject/weather.avsc|generated/singleobject/weather1.bin", 0, nextseed()))
     push!(entries, FuzzEntry(:single, "apache/messageV1/test_schema.avsc|apache/messageV1/test_message.bin", 0, nextseed()))
     return entries
@@ -89,6 +95,7 @@ end
 
 function loadentry(fixtures, e::FuzzEntry)
     e.kind === :schema && return (text=read(joinpath(fixtures, e.source), String),)
+    e.kind === :container && return (bytes=read(joinpath(fixtures, e.source)),)
     schemapath, src = split(e.source, '|')
     s = Avro.parseschema(read(joinpath(fixtures, schemapath), String))
     if e.kind === :single
@@ -228,10 +235,18 @@ function singlecase(ctx, m::Vector{UInt8}, limits)
     return nothing
 end
 
+"A mutated container file: any AvroError or a valid read (the §4.13 whole-file guarantee)."
+function containercase(m::Vector{UInt8}, limits)
+    r = attempt(() -> Avro.Reader(rr -> (foreach(identity, Avro.eachdatum(rr)); nothing), m; limits=limits))
+    r[1] === :other && return "guarantee: container read raised $(r[1]) — $(r[2])"
+    return nothing
+end
+
 function runcase(ctx, kind::Symbol, m::Vector{UInt8}, limits)
     kind === :datum && return datumcase(ctx, m, limits)
     kind === :schema && return schemacase(m, limits)
     kind === :json && return jsoncase(ctx, m, limits)
+    kind === :container && return containercase(m, limits)
     return singlecase(ctx, m, limits)
 end
 

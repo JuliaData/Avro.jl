@@ -16,9 +16,9 @@ json	generated/sortorder/case39.avsc|generated/sortorder/case39.a.json	1	1084
 json	generated/schemas/everything.avsc|generated/data/everything.jsonl	46	712
 json	generated/roots/boolean.avsc|generated/roots/boolean.jsonl	8	56
 json	generated/sortorder/case07.avsc|generated/sortorder/case07.b.json	1	958
-datum	generated/schemas/wide.avsc|generated/data/wide.jsonl	9	843
+container	generated/roots/map-snappy.avro	0	1230
 schema	generated/sortorder/case45.avsc	0	1208
-datum	generated/singleobject/weather.avsc|generated/singleobject/weather1.json	1	1133
+container	generated/roots/union-null.avro	0	1229
 json	generated/schemas/interop.avsc|generated/data/interop.jsonl	42	804
 datum	generated/schemas/everything.avsc|generated/data/everything.jsonl	38	695
 datum	generated/roots/double.avsc|generated/roots/double.jsonl	8	135
@@ -38,7 +38,7 @@ datum	generated/schemas/wide.avsc|generated/data/wide.jsonl	5	835
 json	generated/roots/null.avsc|generated/roots/null.jsonl	9	418
 schema	generated/roots/array.avsc	0	1144
 json	generated/sortorder/case17.avsc|generated/sortorder/case17.a.json	1	996
-single	generated/singleobject/weather.avsc|generated/singleobject/weather1.bin	0	1227
+container	generated/roots/int-null.avro	0	1227
 json	generated/schemas/wide.avsc|generated/data/wide.jsonl	37	900
 datum	generated/schemas/everything.avsc|generated/data/everything.jsonl	29	677
 datum	generated/sortorder/case18.avsc|generated/sortorder/case18.a.json	1	999
@@ -88,7 +88,7 @@ datum	generated/schemas/bench.avsc|generated/data/bench.jsonl	14	547
 datum	generated/roots/enum.avsc|generated/roots/enum.jsonl	9	177
 json	generated/sortorder/case21.avsc|generated/sortorder/case21.a.json	1	1012
 json	generated/schemas/interop.avsc|generated/data/interop.jsonl	33	786
-datum	generated/sortorder/case32.avsc|generated/sortorder/case32.a.json	1	1055
+single	generated/singleobject/weather.avsc|generated/singleobject/weather1.bin	0	1239
 datum	generated/schemas/wide.avsc|generated/data/wide.jsonl	16	857
 datum	generated/roots/enum.avsc|generated/roots/enum.jsonl	2	163
 json	generated/roots/map.avsc|generated/roots/map.jsonl	16	392
@@ -135,7 +135,7 @@ json	generated/roots/bytes.avsc|generated/roots/bytes.jsonl	8	96
 json	generated/roots/enum.avsc|generated/roots/enum.jsonl	2	164
 datum	generated/roots/boolean.avsc|generated/roots/boolean.jsonl	17	73
 json	generated/roots/array.avsc|generated/roots/array.jsonl	3	6
-json	generated/roots/array.avsc|generated/roots/array.jsonl	17	34
+container	apache/weather-deflate.avro	0	1237
 datum	generated/schemas/everything.avsc|generated/data/everything.jsonl	27	673
 json	generated/sortorder/case13.avsc|generated/sortorder/case13.b.json	1	982
 datum	generated/sortorder/case46.avsc|generated/sortorder/case46.b.json	1	1113
