@@ -1,6 +1,6 @@
 # Avro.jl 2.0 — Audit and Rewrite Plan
 
-Status: DRAFT v8 (revised after Codex review rounds 1–7; see §14 review log and `reviews/response-N.md`).
+Status: DRAFT v9 (revised after Codex review rounds 1–8; see §14 review log and `reviews/response-N.md`).
 Date: 2026-08-21/22. Repository: `JuliaData/Avro.jl`, local checkout `/Users/jacob.quinn/.julia/dev/Avro`,
 branch `jq/v2-rewrite` forked from `main` @ `0c7be10db6d83fd20806a8eceec9276a7aa8e21d` (v1.1.2, registered).
 Specification source pinned for this plan: `apache/avro` `main` @ `326950f40c1172f7564c757b0e51c39883721083`
@@ -272,9 +272,11 @@ struct FullName; name::String; namespace::String; end       # fullname(x) = isem
   `big-decimal` is carried this way in 2.0). A recognised logical type is **evaluated in context**: when
   its underlying type is wrong, or its attributes are malformed (`precision`/`scale` not JSON integers
   within `Int`, `precision ≤ 0`, `scale < 0`, `scale > precision`, precision exceeding
-  `floor(log10(2^(8n−1) − 1))` for fixed size n, duration size ≠ 12, uuid fixed size ≠ 16), the
-  annotation is dropped to the underlying type per spec with the raw attributes preserved in `props`
-  (matching Java, which warns and reduces such schemas to their underlying type).
+  `floor(log10(2^(8n−1) − 1))` for fixed size n ≥ 1 — for `fixed(0)` no positive precision is valid, so
+  the annotation is always dropped and the formula is never evaluated at n = 0 (parsing never leaks a
+  `DomainError`; tested) —, duration size ≠ 12, uuid fixed size ≠ 16), the annotation is dropped to the
+  underlying type per spec with the raw attributes preserved in `props` (matching Java, which warns and
+  reduces such schemas to their underlying type).
 * `Default` (record fields **and enum defaults**) is `nothing` (absent) or
   `Some(DefaultValue(json::FrozenJSON, branch, span, index, valid::Bool))`: the frozen JSON tree of the
   default, the selected union branch (first branch that accepts the bare default, in declaration order),
@@ -390,7 +392,7 @@ Base.@kwdef struct Limits
     max_block_count::Int      = 1 << 24       # declared datums per block (16M)
     max_block_output_bytes::Int = 64 << 20    # decoded output of one block (hard cap, charged incrementally — not a reservation)
     max_blocks::Int           = 1 << 28       # blocks per container operation
-    max_codec_memory::Int     = 32 << 20      # codec DECODER requirement cap: xz `memlimit`; zstd window; emitted frames must satisfy it too (§4.9)
+    max_codec_memory::Int     = 32 << 20      # ONE meaning: cap on the COMPLETE decoder memory requirement of one frame as reported by the library (xz `memlimit`; zstd `ZSTD_estimateDStreamSize_fromFrame`); enforced on every frame read and written (§4.9)
     # ONE per-operation ceiling for package-owned memory (committed output + in-flight reservations + internal tables + owned input copies + codec workspaces)
     max_total_bytes::Int      = 256 << 20     # FIXED, portable default (256 MiB); raise explicitly on every side that processes the data
     max_total_values::Int     = 1 << 28       # values decoded or encoded, including zero-size ones (provisional; set by the latency gate below)
@@ -433,7 +435,10 @@ processes the data.
 
 **Constructor validation** (once, at `Limits(...)`): every field ≥ 0; `max_codec_memory ≥ 16 MiB` (the
 smallest value under which bzip2 — ≤ 3.7 MiB —, xz preset 6 — 8.06 MiB as reported by liblzma — and
-zstd's default 8 MiB window plus its ≈ 128 KiB context all decode); `max_datum_bytes ≤ max_bytes +
+zstandard frames with the default window of every level up to 19 (window log ≤ 23:
+`ZSTD_estimateDStreamSize(8 MiB)` = 8,877,872 bytes with zstd 1.5.7, whose fixed per-stream overhead is
+489,264 bytes above the window for windows ≥ 1 MiB — reported by the library, never hard-coded) all
+decode); `max_datum_bytes ≤ max_bytes +
 1 MiB`; `max_block_bytes ≤ max_total_bytes ÷ 4`; `max_codec_memory + 4 MiB ≤ max_total_bytes ÷ 4`;
 `max_block_output_bytes ≤ max_total_bytes ÷ 2`; `max_metadata_bytes + max_schema_bytes ≤
 max_total_bytes ÷ 2`. These relations guarantee that the first unit of progress of any operation —
@@ -694,23 +699,29 @@ resolving-plan node is charged; exceeding it is a `LimitError`):
   `UnsupportedCodecError`), and iterates blocks **strictly**: `0 ≤ count ≤ max_block_count`;
   `0 ≤ size ≤ max_block_bytes` and `size ≤` remaining input — all checked before any arithmetic (tests
   use −1 and `typemin(Int64)` for both); block index ≤ `max_blocks`; data; sync (mismatch → `DataError`
-  with block index); framing bytes credited to the work rule. **Codec contract — `max_codec_memory` is a
-  decode-side decoder window/dictionary cap, not a process-memory cap, and not applied to compression:**
-  xz passes it as `XzDecompressor(; memlimit)` — liblzma counts the dictionary **plus its decoder state**
-  against `memlimit`, so a frame whose dictionary equals the cap is rejected and the documented
-  threshold is "the cap must be at least liblzma's reported memory requirement for the frame
-  (dictionary + ≈ 64 KiB)"; zstandard passes `ZstdDecompressor(; windowLogMax = clamp(Int32(63 -
-  leading_zeros(UInt64(max_codec_memory))), windowLogMax_bounds()...))` (integer log, clamped to the
-  library's supported range 10…31, so a cap of 2 GiB or more permits every supported frame; zstd's fixed
-  per-context overhead of ≈ 128 KiB is reserved in addition to the cap); deflate's window is fixed at
-  32 KiB; bzip2's decoder needs ≤ 3.7 MiB for its fixed 900 KiB block format (hence the ≥ 8 MiB
-  constructor floor); snappy is bounded by the capped output. Both enforcements were verified in the
-  authoring session to reject over-limit frames. Every adapter must report a clean end-of-stream **and**
-  full consumption of the compressed payload (a valid stream followed by extra bytes, or a truncated
-  stream, is a `CodecError`; tests cover both cases for all five codecs plus the high-window fixtures:
-  the 1 GiB-dictionary xz block fails under the default cap and under any cap below liblzma's reported
-  requirement (1 GiB + ≈ 64 KiB) and succeeds above it; the window-log-30 zstd frame fails under any cap
-  below 1 GiB and succeeds at ≥ 1 GiB, and a cap ≥ 2 GiB maps to window log 31 — run under an
+  with block index); framing bytes credited to the work rule. **Codec contract — `max_codec_memory` has exactly one meaning: the cap on the complete decoder memory
+  requirement of one frame, as reported by the codec library, enforced on every frame read and on every
+  frame written (decision 6 = decision 28); it is not a process-memory cap:** xz passes it as
+  `XzDecompressor(; memlimit)` — liblzma counts the dictionary **plus its decoder state** (the complete
+  requirement) against `memlimit`, so a frame whose requirement exceeds the cap fails with `CodecError`;
+  the frame's reservation (§4.9 parallel rules) is computed in-house from the block header's filter
+  chain before any decoder is created (LZMA2 dictionary-size property + 64 KiB; 64 KiB per BCJ/delta
+  filter), and the fixtures verify that this estimate equals `lzma_easy_decoder_memusage(preset)` for
+  presets 0–9 and the 1 GiB fixture (liblzma's own `memlimit` enforcement remains the hard check).
+  Zstandard calls `ZSTD_estimateDStreamSize_fromFrame` on the block's first 18 bytes (the frame header)
+  before any decompressor is created and rejects a frame whose estimate exceeds the cap with a
+  `CodecError` naming both numbers; the reservation is that estimate; additionally
+  `ZstdDecompressor(; windowLogMax = L)` is passed with `L` the largest supported log (10…31) for which
+  `ZSTD_estimateDStreamSize(2^L) ≤ cap` (belt and braces, never the primary check; caps at or above the
+  estimate for 2^31 permit every supported frame). Deflate's window is fixed at 32 KiB; bzip2's decoder
+  needs ≤ 3.7 MiB for its fixed 900 KiB block format (within the 16 MiB constructor floor); snappy is
+  bounded by the capped output. Both enforcements were verified in the authoring session to reject
+  over-limit frames. Every adapter must report a clean end-of-stream **and** full consumption of the
+  compressed payload (a valid stream followed by extra bytes, or a truncated stream, is a `CodecError`;
+  tests cover both cases for all five codecs plus the high-window fixtures: the 1 GiB-dictionary xz block
+  fails under the default cap and under any cap below liblzma's reported requirement (1 GiB + ≈ 64 KiB)
+  and succeeds above it; the window-log-30 zstd frame fails under any cap below its reported estimate
+  (1,074,231,088 bytes = 1 GiB + 489,264 with zstd 1.5.7) and succeeds at or above it — run under an
   RSS-limited subprocess); decompressed size is capped at `max_block_bytes` (streamed with a cap); the
   exact work rule is applied to the decompressed size plus framing; exactly `count` datums must consume
   exactly the decompressed block (`DataError` otherwise); a partial trailing block → `DataError("truncated
@@ -739,11 +750,20 @@ resolving-plan node is charged; exceeding it is a `LimitError`):
   level (SIGBUS); `mmap=false` (streamed) is the safe option for files that may change and is documented
   as such.
 * **Parallel decoding** (`Avro.Table` only, memory-mapped or byte sources, `ntasks > 1`, actual tasks
-  capped at the number of blocks; `IO`/streamed sources decode sequentially). Stage 1 pre-scans block
+  capped at the number of blocks; `IO`/streamed sources decode sequentially, growing columns geometrically and reserving each new
+  capacity — the same exact storage formula as below — before every `sizehint!`/`resize!`). Actual tasks
+  are `min(ntasks, nblocks)`; the in-flight block count is `max_inflight_blocks == 0 ? tasks :
+  min(max_inflight_blocks, tasks)`, further bounded by the ceiling. Stage 1 pre-scans block
   headers (no decompression) into a block table with checked prefix sums under `max_rows`/`max_blocks`
   (the table itself charged to the ceiling) and **preallocates every final column once, at its exact
-  final capacity** (`rows × sizeof(e)` for isbits element types, `rows × 8` bytes for reference element
-  types), charging that capacity — not the logical length — to the ceiling up front, so final columns are
+  final capacity**, charging the **exact Julia storage** of `Vector{e}(undef, rows)` — `rows ×
+  Base.elsize(Vector{e})`, plus one type-tag byte per element for isbits-`Union` element types
+  (`Union{Missing,Float64}` is 9 bytes per row, `Union{Missing,Bool}` 2, `Union{Missing,UUID}` 17;
+  verified on Julia 1.12 with `Base.summarysize`, which is the test oracle for the empty shell), plus the
+  40-byte array header, with checked arithmetic — not the logical length — to the ceiling up front;
+  reference element types charge 8 bytes per row for the slot, and their referenced payload (strings and
+  bytes `length + 32`, nested values per §4.4) is charged separately as committed output when the value
+  is produced, so **storage and payload are never double-charged**; so final columns are
   never reallocated and a table whose column shells alone exceed the ceiling fails deterministically
   before decoding. Stage 2 runs under **one accumulator — the effective ceiling — shared by committed
   output, final-column capacity and in-flight reservations**, with these rules:
@@ -763,9 +783,21 @@ resolving-plan node is charged; exceeding it is a `LimitError`):
      block remains; only then does block *i* itself fail with a `LimitError` — which is exactly the
      condition under which sequential decoding fails at block *i*. Hence **acceptance is identical for
      every `ntasks`**: a file is accepted iff the sequential rule accepts it; parallelism only costs
-     wasted work under memory pressure, never acceptance.
+     wasted work under memory pressure, never acceptance. **Eviction is cooperative and acknowledged:**
+     a worker observes its eviction flag between decompression steps (streamed decompression advances in
+     bounded steps of at most 64 KiB of output) and between datums, frees its buffers, and acknowledges;
+     the coordinator counts the reservation as released only after the acknowledgement, so "released"
+     means physically freed, and the wait for it is bounded by one step. **Each block is attempted at
+     most twice:** the first attempt is speculative (evictable); an evicted block is marked serial-only
+     and retried only when it is the lowest uncommitted block, where by rule 3 it is never evicted again.
+     The value and work counters of a discarded attempt are **rolled back** — cumulative rules are
+     checked only at commit — so acceptance stays identical to sequential decoding, and the total CPU
+     work is bounded by **twice the sequential work bound** (every block decompressed and walked at most
+     twice), stated in the manual and gated under forced eviction schedules (attempts ≤ 2 per block,
+     CPU time ≤ 2 × sequential plus scheduling overhead).
   3. **Liveness.** The lowest-index in-flight block never waits on any other block (its reservations are
-     admitted by evicting higher blocks) and the coordinator waits only on it; every commit releases that
+     admitted by evicting higher blocks, waiting only for their bounded acknowledgement) and the
+     coordinator waits only on it; every commit releases that
      block's reservations; evicted blocks are retried after the next commit. No task ever waits while
      holding memory that a lower-index block needs.
   4. **Streaming ordered assembly.** The coordinator commits the lowest uncommitted block in index order:
@@ -784,10 +816,12 @@ resolving-plan node is charged; exceeding it is a `LimitError`):
   The parallel gates: identical results and identical acceptance for `ntasks ∈ {1,2,8}` under default
   limits (incl. files whose total exceeds the ceiling, which fail at the same block index); forced
   eviction schedules; and the peak-RSS gate, whose method is fixed now: a fresh process is warmed
-  (`using Avro` plus one small decode), its RSS recorded as the baseline, the input is streamed (no
-  mapping), and `peak_rss − baseline_rss ≤ effective_ceiling + 128 MiB` with both numbers recorded —
-  run on highly compressible 16 MiB blocks with eight workers and on a table whose final columns exceed
-  half the ceiling. The eight-thread performance gate (§10.2) runs with an explicit
+  (`using Avro` plus one small decode), the input file is read into a caller-owned byte buffer and
+  faulted **before** the baseline RSS is recorded (so the parallel byte-source path is exercised, not
+  the sequential streamed path), the table is decoded with `ntasks = 8`, a test-only `@atomic`
+  high-water counter asserts that at least two blocks were in flight concurrently, and `peak_rss −
+  baseline_rss ≤ effective_ceiling + 128 MiB` with both numbers recorded — run on highly compressible
+  16 MiB blocks and on a table whose final columns exceed half the ceiling. The eight-thread performance gate (§10.2) runs with an explicit
   `Limits(max_total_bytes = 4 GiB)` stated in the benchmark protocol, because default limits allow only
   as much parallelism as fits under 256 MiB.
 * `Avro.Writer(io_or_path, schema; codec=:null, level=nothing, metadata=Dict{String,Vector{UInt8}}(),
@@ -807,12 +841,17 @@ resolving-plan node is charged; exceeding it is a `LimitError`):
   `ZSTD_estimateCStreamSize(level)` — 3.5 MiB at level 3, 834 MiB at level 22; bzip2 ≤ 7.6 MiB; deflate
   ≤ 320 KiB; snappy ≈ the block size) and charges it to the writer's ceiling, and (b) the **decoder
   requirement of the frames it will emit** (xz: `lzma_easy_decoder_memusage(preset)`; zstandard: the
-  writer sets the frame window explicitly to `min(default window for the level,
-  max_codec_memory − 128 KiB)` so the frame's `ZSTD_estimateDStreamSize(window)` is within the cap by
-  construction; bzip2/deflate/snappy always fit the 16 MiB floor); if either exceeds the configured
+  writer sets the frame's `windowLog` explicitly to the largest `L` in `10 … default windowLog of the
+  level` (`ZSTD_getCParams`: 19 at level 1, 21 at level 3, 23 at level 19, 27 at level 22) with
+  `ZSTD_estimateDStreamSize(2^L) ≤ max_codec_memory` — no arithmetic on a hard-coded overhead — and
+  **verifies every emitted frame** with `ZSTD_estimateDStreamSize_fromFrame` on its header before the
+  block is written (a violation is a `CodecError`; unreachable by construction and gated);
+  bzip2/deflate/snappy always fit the 16 MiB floor); if either exceeds the configured
   limits the constructor raises `LimitError` naming the level and the keyword to raise — so a writer
   never emits a frame that a reader with identical limits cannot decode (gated at minimum, default,
-  high and raised limits for every codec). **Atomic path
+  high and raised limits for every codec, and for zstandard at caps one byte below, at, and one byte
+  above `ZSTD_estimateDStreamSize(2^L)` for every supported `L`, asserting the selected `windowLog` and
+  the `fromFrame` estimate of the emitted frame). **Atomic path
   contract** (`atomic=true`): the temp file is created with `mktemp` in the destination's directory
   (same filesystem by construction; default permissions from the umask), data is written and closed,
   then `Base.Filesystem.rename` replaces the destination (an existing destination file is replaced; if
@@ -948,7 +987,8 @@ whole-file, schema, and JSON mutations must yield any `AvroError` or a valid res
 * `Avro.Table` columns are plain vectors (concurrent reads safe). `Avro.Rows` is a single-consumer iterator.
 * Parallel decode memory (final-column capacity plus committed payload plus actual-size in-flight
   reservations plus internal tables) is bounded by the effective operation ceiling; reservations have
-  lowest-block priority with eviction of higher blocks; commits are ordered; the symbol-admission table
+  lowest-block priority with cooperative, acknowledged eviction of higher blocks (each block attempted
+  at most twice); commits are ordered; the symbol-admission table
   is lock-protected. Concurrent operations each own a ceiling (documented; caller-side governor advised).
 * Writer-side parallel compression is deferred to 2.x.
 
@@ -1100,6 +1140,17 @@ container writer, and `Avro.write(io, x)` where `x` is not a table raises a clea
     `select=()` yields a zero-column table with the correct row count.
   * **Filter**: per block, pass 1 decodes only `b.filtercols` and records each datum's byte offset;
     `Tables.filtermask(b, subset_table)`; pass 2 decodes the selected columns for qualifying rows only.
+  * **Filter in the parallel path** (`ntasks > 1`): header counts describe source rows, so a
+    row-dependent filter runs as a **global filter pass** first — every block's filter columns are
+    decoded (in parallel, under the §4.9 reservation rules; in `:strict` mode the remaining fields are
+    walked, so validation is complete after this pass), per-block masks (`Vector{Bool}`, `rows` bytes,
+    charged) and qualifying counts are retained — then `offset`/`limit` are applied to the qualifying
+    prefix sums, the exact final capacity is preallocated, and a **selection pass** decodes the selected
+    columns of qualifying rows only (blocks with no qualifying rows inside the window are skipped in both
+    modes, having been validated in the first pass; every block is decompressed at most twice, covered by
+    the ≤ 2 × work statement of §4.9). The sequential path keeps the per-block two-pass rule with
+    explicitly reserved geometric column growth. Gate: identical results for `ntasks ∈ {1,2,8}` over
+    low-selectivity filters, `offset`/`limit` across block boundaries, and near-ceiling files.
   * **offset / limit**: Tables' pipeline is filter → offset/limit → projection, so header counts
     describe *source* rows. **Without a filter** (or with a constant-true filter), whole blocks outside
     the row window are skipped by header `count`; **with a row-dependent filter**, qualifying rows are
@@ -1116,8 +1167,8 @@ container writer, and `Avro.write(io, x)` where `x` is not a table raises a clea
   * Gate: names, order, eltypes, `Tables.schema`, row count, and values identical to
     `Tables.scan(Avro.Table(src), scan)` for a generated matrix of scans (selection × filter × limit/
     offset × validate × overrides incl. supertypes and no-op subtype overrides), including multi-block
-    files, empty records, `select=()`, missing-only filters, and filters combined with offset/limit
-    across block boundaries, in both validation modes; malformed data inside projected-away fields and
+  files, empty records, `select=()`, missing-only filters, low-selectivity filters, and filters combined
+  with offset/limit across block boundaries, for `ntasks ∈ {1,2,8}`, in both validation modes; malformed data inside projected-away fields and
     skipped blocks is tested under each mode's documented policy.
 * **Cross-package smoke** (Phase 5): CSV → Avro → Arrow round trip with the registered Arrow 2.x and a
   `DataFrames` round trip with a stored schema (required); the same pipeline against the local Arrow 3
@@ -1150,9 +1201,11 @@ container writer, and `Avro.write(io, x)` where `x` is not a table raises a clea
 * Behavioural guarantees stated in docs: the error guarantee (§4.13); **oracle readability** — every
   file Avro.jl writes from a schema that the Java 1.12.2 and fastavro 1.12.2 oracles accept is read by
   both (CI-enforced over the §8 matrix); the recorded exceptions, where Avro.jl follows the spec and an
-  oracle does not, are unions with colliding JSON branch labels (Java rejects the schema) and files
-  carrying invalid-but-repaired legacy schemas (accepted only with the repair options) — listed in
-  `manual/limits-and-security.md`; the writer/reader invariant under identical limits (§4.4);
+  oracle does not, are unions with colliding JSON branch labels (Java rejects the schema), files
+  carrying invalid-but-repaired legacy schemas (accepted only with the repair options), and user
+  metadata values that are not valid UTF-8 (the spec's header is `map<string,bytes>` and Java accepts
+  them; fastavro 1.12.2 decodes every metadata value as UTF-8 and raises `UnicodeDecodeError` — verified)
+  — listed in `manual/limits-and-security.md`; the writer/reader invariant under identical limits (§4.4);
   thread-safety contract (§4.14), ownership contract (§4.9), the validation modes (§4.3), the
   symbol-admission boundary (§6). The package documents itself as an implementation of the Avro data
   format (schemas, encodings, container files), not of Avro RPC.
@@ -1192,13 +1245,15 @@ the encoded comparator says `-1` and the object comparator `1`); Java decimal ed
 Avro.jl 1.1.2 files (padding, `zstd`, decimals; five codecs); **high-window codec blocks** with a
 three-datum payload: an xz block with a 1 GiB LZMA2 dictionary (fastavro reads it without a limit; the
 documented success threshold is liblzma's reported requirement, 1 GiB + ≈ 64 KiB) and a zstd frame
-advertising window log 30 (rejected by Python's own zstd module: "Frame requires too much memory"),
-both of which must fail under `max_codec_memory` defaults and succeed above their thresholds; a
+advertising window log 30 (rejected by Python's own zstd module: "Frame requires too much memory"; its
+reported decoder estimate is 1,074,231,088 bytes), both of which must fail under `max_codec_memory`
+defaults and succeed at or above their library-reported thresholds; a
 **one-million-empty-string single block** (134 bytes under zstandard, 1,071 under deflate, ≈ 1 MiB
 decompressed) that must be accepted under defaults (no compressed-size work pre-check).
 
 Additional matrix rows (Phase 4): empty file (header only), zero-datum blocks, many small blocks (1-datum
-blocks), user metadata, unknown codec, user `avro.*` keys (rejected), named-branch collisions in unions,
+blocks), user metadata (including a non-UTF-8 value `x => ff ff` that Julia and Java accept and
+fastavro is expected to reject), unknown codec, user `avro.*` keys (rejected), named-branch collisions in unions,
 negative collection blocks, negative block count/size headers, work-rule blocks (huge count, tiny
 decompressed size; the 32,768-empty-block file), default-writer files for every zero-size and
 all-null-field root, multi-block files near the ceiling, maximal metadata and maximal schema (all must
@@ -1230,8 +1285,9 @@ inside skipped regions (for both validation modes).
 | sort order of bytes/fixed | object-level signed (bug), encoded unsigned | n/a | n/a | unsigned |
 | unions with colliding JSON labels | schema rejected | accepted | — | schema valid |
 | self-alias (`name:"foo", aliases:["foo"]`) | accepted | accepted | accepted | silent |
+| non-UTF-8 user metadata values | accepted (bytes) | **rejected** (`UnicodeDecodeError`; every value decoded as UTF-8) | accepted | `map<string,bytes>` |
 
-### 8.5 Live differential tests (`test/interop/`, run when `java`/`AVRO_TOOLS_JAR` and the pinned Python venv are available; a CI job on ubuntu installs Temurin 21, the checksummed jar, `avro==1.12.2`, `fastavro==1.12.2`, `cramjam==2.11.0`)
+### 8.5 Live differential tests (`test/interop/`, run when `java`/`AVRO_TOOLS_JAR` and the pinned Python venv are available; a CI job on ubuntu installs Temurin 21, the checksummed jar, and CPython 3.14 (3.14.2 in the authoring venv) with `avro==1.12.2`, `fastavro==1.12.2`, `cramjam==2.11.0`)
 
 For the schema matrix (every schema both oracles accept; the §7 exceptions are tested separately as
 spec-over-oracle cases): (1) Julia-written container files for every codec read by Java `tojson` and
@@ -1324,7 +1380,9 @@ in the fixture).
     allocation; `Writer` construction rejects xz preset 9 and zstd level 22 under default limits and
     accepts them with raised limits, and every frame a default writer emits decodes under default
     `max_codec_memory` for every codec; the constructor relations are checked at equality and one byte
-    beyond.
+    beyond; the zstd `windowLog` selection and `fromFrame` verification at caps one byte below, at, and
+    above every power-of-two estimate; `fixed(0)` with a decimal annotation parses to plain `fixed(0)`
+    without a `DomainError`; a non-UTF-8 metadata value round-trips through Julia and Java.
 11. **Concurrency**: multi-block files decoded with `ntasks ∈ {1,2,8}` produce identical tables **and
     identical acceptance** (files that exceed the ceiling fail at the same block index for every
     `ntasks`); forced eviction schedules (a higher block holding memory the lowest block needs) complete
@@ -1332,9 +1390,12 @@ in the fixture).
     blocks failing concurrently (a higher index failing first) surface the lowest block index
     deterministically across 100 scheduled repetitions, for content/content, budget/content and
     content/budget pairs; a ceiling that admits exactly one of two blocks fails deterministically at the
-    higher index under forced opposite schedules; measured peak RSS with eight workers on 64 MiB highly
-    compressible blocks, and on a table whose final columns exceed half the ceiling, stays within the
-    ceiling plus documented runtime overhead and the run completes (liveness); GC-stress runs on the
+    higher index under forced opposite schedules; measured peak RSS with eight workers on 16 MiB highly
+    compressible blocks decoded from a caller-owned byte buffer faulted before the baseline (in-flight
+    high-water counter ≥ 2), and on a table whose final columns exceed half the ceiling, stays within the
+    ceiling plus documented runtime overhead and the run completes (liveness); forced eviction schedules
+    show ≤ 2 attempts per block and CPU time ≤ 2 × sequential; nullable `Int64`/`Float64`/`Date`/`UUID`
+    columns near the ceiling are charged exactly (`Base.summarysize` oracle); GC-stress runs on the
     parallel path; writer flush/close/abort/poison ordering; caller-owned IO never closed.
 12. **Allocation budgets**: measured with a per-Julia-version script (`@allocated` bytes after warm-up;
     allocation counts from `Base.gc_num` deltas / `@allocations`) on prepared readers/writers for
@@ -1402,9 +1463,15 @@ expose are reported as "unavailable" and never silently pass. Scripts live in `b
 
 * **Package metadata**: `Project.toml` version `2.0.0-DEV`; deps `JSON` (1.7), `StructUtils` (2.8),
   `Tables` (1.13; `[sources]` pin to the Scan SHA on the development branch only), `DataAPI` (1),
-  `CodecZlib` (0.7), `CodecZstd` (0.8.7), `Snappy` (0.4), `TranscodingStreams` (0.11), `MD5` (0.2),
-  stdlibs `Dates`, `UUIDs`, `Mmap`, `SHA`, `Random`; `PrecompileTools` (1); weak deps `CodecBzip2`
-  (0.8), `CodecXz` (0.7), `TimeZones` (1); `[compat]` bounds for everything incl. `julia = "1.10"`;
+  `CodecZlib` (0.7), `CodecZstd` (0.8.7), `Zstd_jll` (1.5 — a direct dependency for the `ccall`s to
+  the stable public estimators `ZSTD_estimateDStreamSize`, `ZSTD_estimateDStreamSize_fromFrame`,
+  `ZSTD_estimateCStreamSize`, `ZSTD_getCParams`; `__init__` checks the symbols with `Libdl.dlsym(…;
+  throw_error=false)` and, if any is absent, `Avro.codecs()` omits `zstandard` and its use raises
+  `UnsupportedCodecError` naming the symbol), `Snappy` (0.4), `TranscodingStreams` (0.11), `MD5` (0.2),
+  stdlibs `Dates`, `UUIDs`, `Mmap`, `SHA`, `Random`, `Libdl`; `PrecompileTools` (1); weak deps
+  `CodecBzip2` (0.8), `CodecXz` (0.7) together with `XZ_jll` (5.8; the xz extension triggers on
+  `[CodecXz, XZ_jll]` and `ccall`s `lzma_easy_encoder_memusage`/`lzma_easy_decoder_memusage`, with the
+  same symbol check at extension load), `TimeZones` (1); `[compat]` bounds for everything incl. `julia = "1.10"`;
   `test/Project.toml` with `Aqua`, `JET`, `Test`, `Tables`, `CodecBzip2`, `CodecXz`, `TimeZones`, `CSV`,
   `Arrow`, `DataFrames` (exact compatible versions recorded in the test Manifest). `SentinelArrays`,
   `JSON3`, `StructTypes` dropped. `public` names are declared through a version-gated
@@ -1425,7 +1492,7 @@ expose are reported as "unavailable" and never silently pass. Scripts live in `b
 * **CHANGELOG.md** (Keep-a-Changelog style) with the 2.0.0 entry.
 * **CI** (`.github/workflows/ci.yml`): required jobs — Julia `1.10`, `1.11`, `1` on ubuntu/macos/windows
   with `JULIA_NUM_THREADS ∈ {1, 4}`; docs build; Aqua+JET; interop (ubuntu: Temurin 21 + checksummed jar
-  + pinned Python packages). Informational jobs — coverage (processcoverage + Codecov, no threshold);
+  + CPython 3.14 with pinned Python packages). Informational jobs — coverage (processcoverage + Codecov, no threshold);
   `pre` and `nightly` on ubuntu only; `juliac --trim` smoke compile of a reader program; Arrow 3
   candidate smoke. `TagBot`, `CompatHelper`. Trigger on `push: branches: ['**']` plus `pull_request`
   with a same-repo duplicate guard.
@@ -1446,14 +1513,14 @@ on Julia 1.10 and 1.12 at the end of every phase (and nothing more is implied by
 
 | Phase | Scope | Acceptance gate |
 |---|---|---|
-| **0 — Foundation** | branch; legacy code removed; `Project.toml` 2.0.0-DEV + pinned deps (Tables SHA + 1.10 bootstrap, jar checksum, Python pins incl. cramjam, CodecZstd ≥ 0.8.7); `test/Project.toml` incl. CodecBzip2/CodecXz; CI skeleton incl. informational coverage; vendored + generated fixtures with licence and generator script (every root kind, fastavro all codecs, real 1.x files, time/decimal/sort vectors normalised, cross-form arrays, high-window codec blocks with liblzma's reported threshold and the window-log-30 description, the million-empty-string block); Java harness; `errors.jl`, `limits.jl` (validated; fixed defaults; ceiling accounting; available-memory guard), `frozen.jl`, `values.jl` skeleton, `admission.jl`; benchmark harness with raw-logged 1.1.2/fastavro/Java baselines and the measurement protocol; Julia 1.10 load test; `public` gating; codec-window feasibility (verified) with the clamped integer `windowLogMax` conversion | `Pkg.test` skeleton green on 1.10 and 1.12; fixtures licensed and regenerable; baseline logs committed |
+| **0 — Foundation** | branch; legacy code removed; `Project.toml` 2.0.0-DEV + pinned deps (Tables SHA + 1.10 bootstrap, jar checksum, Python pins incl. cramjam, CodecZstd ≥ 0.8.7); `test/Project.toml` incl. CodecBzip2/CodecXz; CI skeleton incl. informational coverage; vendored + generated fixtures with licence and generator script (every root kind, fastavro all codecs, real 1.x files, time/decimal/sort vectors normalised, cross-form arrays, high-window codec blocks with liblzma's reported threshold and the window-log-30 description, the million-empty-string block); Java harness; `errors.jl`, `limits.jl` (validated; fixed defaults; ceiling accounting; available-memory guard), `frozen.jl`, `values.jl` skeleton, `admission.jl`; benchmark harness with raw-logged 1.1.2/fastavro/Java baselines and the measurement protocol; Julia 1.10 load test; `public` gating; codec-cap feasibility (verified) through the library estimators (`Zstd_jll` direct, `XZ_jll` weak, symbol capability checks) with the one recorded cap meaning | `Pkg.test` skeleton green on 1.10 and 1.12; fixtures licensed and regenerable; baseline logs committed |
 | **1 — Schema model** | JSON pre-scan + lazy traversal, fullname algorithm before validation, parser/validator (all §3 rules incl. self-alias idempotence and union branch identity, `fixed.size` syntax, contextual logical attributes with `Int` precision/scale, §4.4 schema limits, repair options incl. enum defaults), defaults as frozen JSON, transitive freezing with freeze-time hashes, normalised structural `==`, printer, canonical form, fingerprints, the complete Julia-derived name policy with `avroname`/`avrosymbol` hooks and collision errors, `minsize`, `inspect`'s permissive diagnostic parse | `schema-tests.txt` **100%** (incl. 023/024); every constraint and limit tested positive/negative; duplicate-key, depth, recursion, equality-on-cycles and transitive-immutability gates; repair options round-trip invalid legacy schemas incl. enum defaults; Java-accepted metadata/invalid-logical/ignored-namespace/self-alias cases accepted identically; `canonical`/`fingerprint` equal to Java for all fixture schemas; Aqua+JET clean |
 | **2 — Binary core** | Decoder/Encoder with checked arithmetic, both validation modes, the shared work rule and every cumulative limit on encode and decode, generic dynamic plans with `PlanRef`, the enumerated value set `E`, typed plans with `AvroStyle` eligibility and Symbol admission on every typed path, prepared `DatumReader`/`DatumWriter`, column builders in schema-independent containers, logical values with decode-side checks and `Int` scale, bounded JSON datum encoding in both directions with the common `max_json_depth`, single-object + `SchemaCache` ambiguity rules, value-level `Avro.schema(x)`, `ConversionError`, **the latency gate measurement that fixes the work constants** | spec-example tests; round-trip properties with independent assertions; 1.x round-trip cases ported; Java `fragtojson`/`jsontofrag` differential on deterministic datums + semantic comparison on collections; blocking-encoder fixtures; fuzz 100k mutations clean in sandboxed batches under the split gate; acceptance-equivalence tests in both modes; limit/budget/work-rule/encode-work tests; latency gate ≤ 10 s on every supported Julia version with constants recorded; allocation budgets on prepared objects; messageV1; numeric compile-cost gate with `E` warm-up over random widths/orders |
 | **3 — Resolution and order** | `resolve` with both union policies, reader-directed output and the resolution work budget, resolving plans (memoised pairs), aliases, defaults (incl. invalid-default repair), enum defaults by symbol, decimal rule and all other logical pairings, `Avro.compare`/`comparebytes` (budgeted, exact consumption, canonical-encoding contract, cross-form arrays) | resolution matrix with direct expectations (both policies, every output direction, every logical pairing, work-limit case) plus Java/fastavro where observable; sort-order vectors from both Java comparators incl. NaN/−0.0/ignore/maps/signed-bytes deviation/logical types/non-minimal decimal/mixed-case UUID/cross-form arrays; `compare`/`comparebytes` agreement property |
-| **4a — Strict containers and codecs** | Reader/Writer/`Avro.write` with strict validation (lower bounds, framing-credited work rule evaluated after decompression with no compressed-size pre-check, codec decoder caps with liblzma/zstd thresholds, EOS/consumption contract), streamed `mmap=false`, atomic path contract, full writer failure contract, option/header/schema validation against reader limits, **writer-side codec workspace charging and emitted-frame decoder-requirement checks**, work-rule-driven block flushing, reserved-metadata rejection, codecs (+ extensions), legacy mode, `decimal_byteorder`, repair options, `Avro.inspect`, any-root `eachdatum`/`eachblock` (owned decompressed bytes), explicit-schema requirement for schema-less sources | Apache corpus reads; Java **and** fastavro read Julia files — checked after each codec lands; Julia reads Java and fastavro files for every codec and every root kind; the million-empty-string block reads under defaults; 1.x fixtures read under legacy options and rejected under strict; truncation/corruption/bomb/high-window/EOS/suffix/negative-header/work-rule/empty-file/zero-datum/metadata tests; **writer/reader invariant tests** (every zero-size and all-null-field root, near-ceiling multi-block files, maximal metadata and schema) pass under the fixed defaults; writer failure-injection and atomic-replacement tests on every OS; `mmap=false` streams a file larger than the ceiling |
-| **4b — Tables basics and ownership** | `Avro.Table` (sequential), `Avro.Rows` (record and non-record roots, lazy admission), partitions, DataAPI metadata interface, stored schemas, symbol admission objects (names and typed values, binary and JSON), zero-column/zero-row behaviour, close semantics | `Table == columntable(Rows)` property; ownership/close tests (caller IO untouched); Tables and DataAPI interface tests; symbol-admission tests incl. caller-owned objects and repeated files |
-| **4c — Parallel decode** | block pre-scan with exact final-column preallocation, actual-size reservations before every allocation with lowest-block priority and eviction of higher blocks, per-block local budgets, streaming ordered assembly with ordered cumulative commits, lower-blocks-never-abandoned cancellation, lowest-index error selection across failure kinds | identical results **and acceptance** for `ntasks ∈ {1,2,8}` under default limits; deterministic failure selection over forced schedules for every failure-kind pairing incl. evictions; GC-stress; peak RSS under the fixed §4.9 method (`peak − baseline ≤ effective ceiling + 128 MiB`) on highly compressible 16 MiB blocks with eight workers and on half-ceiling tables, with liveness |
-| **4d — Scan and performance** | `src/scan.jl` against the pin (`Tables.resolve`, residual with retained overrides, both validation modes, filter-aware offset/limit), projection skipping, performance work | Scan equivalence matrix in both modes incl. filters across block boundaries and malformed data in projected-away fields and skipped blocks; §10.2 ratio gates on the named host under the measurement protocol |
+| **4a — Strict containers and codecs** | Reader/Writer/`Avro.write` with strict validation (lower bounds, framing-credited work rule evaluated after decompression with no compressed-size pre-check, codec decoder caps with liblzma/zstd thresholds, EOS/consumption contract), streamed `mmap=false`, atomic path contract, full writer failure contract, option/header/schema validation against reader limits, **writer-side codec workspace charging and emitted-frame decoder-requirement checks (zstd `windowLog` selection + per-frame `fromFrame` verification)**, work-rule-driven block flushing, reserved-metadata rejection, codecs (+ extensions), legacy mode, `decimal_byteorder`, repair options, `Avro.inspect`, any-root `eachdatum`/`eachblock` (owned decompressed bytes), explicit-schema requirement for schema-less sources | Apache corpus reads; Java **and** fastavro read Julia files — checked after each codec lands; Julia reads Java and fastavro files for every codec and every root kind; the million-empty-string block reads under defaults; 1.x fixtures read under legacy options and rejected under strict; truncation/corruption/bomb/high-window/EOS/suffix/negative-header/work-rule/empty-file/zero-datum/metadata tests; **writer/reader invariant tests** (every zero-size and all-null-field root, near-ceiling multi-block files, maximal metadata and schema) pass under the fixed defaults; writer failure-injection and atomic-replacement tests on every OS; `mmap=false` streams a file larger than the ceiling; the non-UTF-8 metadata fixture (Julia/Java accept, fastavro rejects) |
+| **4b — Tables basics and ownership** | `Avro.Table` (sequential), `Avro.Rows` (record and non-record roots, lazy admission), partitions, DataAPI metadata interface, stored schemas, exact column-storage charging (isbits-union tag bytes) with reserved geometric growth on streamed sources, symbol admission objects (names and typed values, binary and JSON), zero-column/zero-row behaviour, close semantics | `Table == columntable(Rows)` property; ownership/close tests (caller IO untouched); Tables and DataAPI interface tests; symbol-admission tests incl. caller-owned objects and repeated files |
+| **4c — Parallel decode** | block pre-scan with exact final-column preallocation (exact Julia storage incl. tag bytes), actual-size reservations before every allocation with lowest-block priority and cooperative, acknowledged eviction of higher blocks (at most two attempts per block; discarded counters rolled back), per-block local budgets, streaming ordered assembly with ordered cumulative commits, lower-blocks-never-abandoned cancellation, lowest-index error selection across failure kinds | identical results **and acceptance** for `ntasks ∈ {1,2,8}` under default limits; deterministic failure selection over forced schedules for every failure-kind pairing incl. evictions; GC-stress; peak RSS under the fixed §4.9 method (`peak − baseline ≤ effective ceiling + 128 MiB`, caller-owned faulted byte buffer, in-flight high-water ≥ 2) on highly compressible 16 MiB blocks with eight workers and on half-ceiling tables, with liveness; attempts ≤ 2 per block and CPU ≤ 2 × sequential under forced evictions |
+| **4d — Scan and performance** | `src/scan.jl` against the pin (`Tables.resolve`, residual with retained overrides, both validation modes, filter-aware offset/limit, the global filter pass before exact preallocation in the parallel path), projection skipping, performance work | Scan equivalence matrix in both modes incl. filters across block boundaries and malformed data in projected-away fields and skipped blocks; §10.2 ratio gates on the named host under the measurement protocol |
 | **5 — Release engineering** | shims, docs (incl. limits guidance and the oracle-readability exceptions), examples, changelog, precompile workload, trim smoke, benchmarks doc, README, CI matrix live, coverage report, cross-package smoke | docs build without warnings; load-time budget; full local matrix green on 1.10/1.11/1.12 (+1.13-rc if installed); Aqua/JET; interop job green locally |
 
 Readiness levels (this task stops at **PR-ready**; nothing is pushed):
@@ -1481,8 +1548,9 @@ Readiness levels (this task stops at **PR-ready**; nothing is pushed):
   and sort order (incl. logical types, canonical-encoding contract).
 * Security: checked arithmetic, no `@inbounds` without a proven bound, no allocation sized by untrusted
   counts, one fixed-default per-operation ceiling covering final-column capacity, committed payload and
-  actual-size in-flight reservations (lowest-block priority with eviction, streaming assembly into
-  preallocated columns, a liveness argument, acceptance identical to sequential), an available-memory
+  actual-size in-flight reservations (lowest-block priority with cooperative eviction, at most two attempts per block, exact column
+  storage incl. isbits-union tag bytes, streaming assembly into preallocated columns, a liveness
+  argument, acceptance identical to sequential, CPU work ≤ 2 × sequential), an available-memory
   guard, writer-side codec workspace and decoder-requirement checks, an input-proportional work rule with latency-gated constants enforced identically
   on encode and decode, decode-side codec window caps, a resolution work budget, bounded
   recursion/schema/metadata/JSON/symbol admission (names and typed values, binary and JSON), streamed
@@ -1512,10 +1580,10 @@ Decisions (each with rationale; reviewers may challenge any):
 5. Decimals carry runtime `Int` scale (`Avro.Decimal` Int128 ≤ 38 digits, `Avro.WideDecimal` beyond);
    digit counts are validated on both encode and decode (stricter than Java on decode); encode requires
    exact scale equality.
-6. Codec dependency split: `deflate`/`snappy`/`zstandard` hard, `bzip2`/`xz` extensions; decoder
-   windows/dictionaries are capped by `max_codec_memory` (decode only; a window cap, not a
-   process-memory cap; liblzma's reported requirement and zstd's clamped window log define the
-   thresholds).
+6. Codec dependency split: `deflate`/`snappy`/`zstandard` hard, `bzip2`/`xz` extensions;
+   `max_codec_memory` has one meaning — the cap on the complete decoder memory requirement of one frame
+   as reported by the library (liblzma `memlimit`; `ZSTD_estimateDStreamSize_fromFrame`) — enforced on
+   every frame read and written (decision 28); it is not a process-memory cap.
 7. Strict container validation is the default; `legacy=:avrojl1` covers only the two unambiguous 1.x
    tolerances; decimal byte-order reinterpretation is explicit-only.
 8. `Avro.write(dst, table)` is the container writer; datum writing is `encode`/`encode!`/`DatumWriter`;
@@ -1554,9 +1622,11 @@ Decisions (each with rationale; reviewers may challenge any):
 21. JSON union-label collisions are accepted at the schema level and rejected at JSON conversion time
     (Java rejects the schema; fastavro accepts silently); excluded from the oracle-readability promise.
 22. Parallel decoding runs under the single operation ceiling with actual-size reservations before every
-    allocation, lowest-block priority with eviction of higher blocks, exact final-column preallocation
-    and streaming ordered assembly; acceptance is identical to sequential decoding; the lowest failing
-    block index wins regardless of failure kind.
+    allocation, lowest-block priority with cooperative, acknowledged eviction of higher blocks (each
+    block attempted at most twice; discarded attempts roll back their counters), exact final-column
+    preallocation and streaming ordered assembly; acceptance is identical to sequential decoding, CPU
+    work is at most twice the sequential bound, and the lowest failing block index wins regardless of
+    failure kind.
 23. Only `fixed.size` among the optional numeric attributes is schema syntax; logical-type attributes are
     evaluated in context and malformed ones drop the annotation (Java-compatible); unknown attributes
     are never validated.
@@ -1573,6 +1643,13 @@ Decisions (each with rationale; reviewers may challenge any):
     liblzma's reported decoder requirement), so identical limits guarantee readability.
 29. Type aliases are normalised to fullnames at parse time; the empty union is a valid schema with no
     datum; `Nothing` maps to `null` at the type level.
+30. Column storage is charged at its exact Julia size (element size plus the isbits-union tag byte plus
+    the array header); referenced payload is charged separately as committed output.
+31. Filtered scans in the parallel path run a global filter pass before exact preallocation; sequential
+    paths keep per-block two-pass decoding with reserved geometric growth.
+32. Non-UTF-8 user metadata is written as the spec allows and recorded as a fastavro readability
+    exception; `Zstd_jll` is a direct dependency and `XZ_jll` a weak one so the codec estimators are
+    reached through pinned, symbol-checked `ccall`s rather than package internals.
 
 Intentionally unresolved risks:
 
@@ -1587,8 +1664,12 @@ Intentionally unresolved risks:
   explicitly on both sides; the error message and manual make this a one-line change. The ceiling is an
   estimate of package-owned memory, not a hard OS limit; `Sys.free_memory()` is host-wide on Julia ≤
   1.12, so the guard is weaker inside cgroups than `Sys.total_memory()` alone suggests.
-* Eviction under memory pressure wastes work; the design trades throughput for identical acceptance and
-  bounded memory, and the measured parallel speedups are reported with the explicit limits used.
+* Eviction under memory pressure wastes work (bounded: at most one discarded attempt per block, so CPU
+  work ≤ 2 × sequential); the design trades throughput for identical acceptance and bounded memory, and
+  the measured parallel speedups are reported with the explicit limits used.
+* The codec estimators are library-reported numbers for the pinned `Zstd_jll`/`XZ_jll` versions; a
+  future library release may change them, which the symbol checks cannot detect — the threshold tests
+  pin the behaviour and fail loudly on a change.
 * The provisional work constants may change at the Phase 2 latency gate; the defaults in this plan are
   the starting point, not the commitment.
 
@@ -1632,6 +1713,19 @@ Review log:
   constructor relations that guarantee the first unit of progress (§4.4); empty-union semantics and
   alias normalisation (§4.2); `Nothing → null` and the exact sanitisation algorithm (§4.8); streamed
   compressed buffers reserved (§4.9).
+* **Round 8** (`reviews/codex-review-8.md`: 8 new findings — 6 majors, 2 minors — plus follow-ups;
+  `VERDICT: REVISE`). All adopted; dispositions in `reviews/response-8.md`. Changes: exact Julia column
+  storage incl. isbits-union tag bytes, storage vs payload separation (§4.9, decision 30);
+  `max_codec_memory` given one meaning — the library-reported complete decoder requirement — with
+  `ZSTD_estimateDStreamSize_fromFrame` on read and on every emitted frame, writer `windowLog` selection
+  by the estimate, and in-house xz header estimates cross-checked against liblzma (§4.4, §4.9, decision
+  6); cooperative, acknowledged eviction with at most two attempts per block, rolled-back counters and a
+  ≤ 2 × work bound (§4.9, decision 22); the peak-RSS gate run from a caller-owned faulted byte buffer
+  with an in-flight high-water assertion (§4.9, §9, §12); the non-UTF-8 metadata fastavro exception and
+  fixture (§7, §8, decision 32); the global filter pass for filtered parallel scans (§6, decision 31);
+  `fixed(0)` decimal handling (§4.2); `Zstd_jll`/`XZ_jll` pinned estimator access with symbol checks
+  (§11); task cap and streamed column growth stated (§4.9); stale 8 MiB/64 MiB wordings fixed; CPython
+  3.14 pinned for the interop job.
 
 ---
 
@@ -1641,7 +1735,7 @@ Review log:
   network used only for specs, dependencies, and interop tools.
 * Commands and results: recorded in `STATUS.md` in the worktree as phases complete (exact commands,
   Julia versions, pass/fail counts, benchmark numbers).
-* Current state: **plan under review (round 8); no production code changed yet.**
+* Current state: **plan under review (round 9); no production code changed yet.**
 
 ---
 
