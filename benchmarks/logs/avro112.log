@@ -1,0 +1,10 @@
+impl=Avro.jl version=1.1.2 julia=1.12.6 threads=1 cpu=Apple M3 Max rows=1000000
+metric=write codec=null best_s=0.969899458 all_s=[0.996716792, 1.093888583, 0.969899458] bytes=23100364
+metric=write codec=zstd best_s=1.066863625 all_s=[1.30495025, 1.066863625, 1.184511708] bytes=13964340
+metric=write codec=deflate best_s=1.679749375 all_s=[1.766511125, 1.679749375, 1.684411375] bytes=13943344
+metric=read_index codec=null best_s=1.455399917 all_s=[1.455399917, 1.456310875, 1.572371583]
+metric=materialize_columns codec=null best_s=3.548123666 all_s=[3.807323792, 3.548123666, 3.551897875]
+metric=read_to_columns codec=null best_s=5.035989208 all_s=[5.087610167, 5.035989208, 5.042858459]
+metric=read_to_columns codec=zstd best_s=5.251227792 all_s=[5.714624875, 5.251227792, 5.435315458]
+metric=single_record_read bytes=1376 allocs=187
+metric=single_record_write bytes=944 allocs=200

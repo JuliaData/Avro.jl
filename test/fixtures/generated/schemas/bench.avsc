@@ -1,0 +1,23 @@
+{
+ "type": "record",
+ "name": "Bench",
+ "namespace": "avro.jl.test",
+ "fields": [
+  {
+   "name": "id",
+   "type": "long"
+  },
+  {
+   "name": "x",
+   "type": "double"
+  },
+  {
+   "name": "name",
+   "type": "string"
+  },
+  {
+   "name": "flag",
+   "type": "boolean"
+  }
+ ]
+}

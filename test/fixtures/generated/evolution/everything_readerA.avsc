@@ -1,0 +1,149 @@
+{
+ "type": "record",
+ "name": "Everything",
+ "namespace": "avro.jl.test",
+ "fields": [
+  {
+   "name": "s",
+   "type": "bytes"
+  },
+  {
+   "name": "i",
+   "type": "long"
+  },
+  {
+   "name": "f",
+   "type": "double"
+  },
+  {
+   "name": "l",
+   "type": "double"
+  },
+  {
+   "name": "e",
+   "type": {
+    "type": "enum",
+    "name": "Color",
+    "symbols": [
+     "BLUE",
+     "RED",
+     "YELLOW"
+    ],
+    "default": "YELLOW"
+   }
+  },
+  {
+   "name": "opt",
+   "type": [
+    "string",
+    "null"
+   ],
+   "default": "x"
+  },
+  {
+   "name": "added",
+   "type": "int",
+   "default": 5
+  },
+  {
+   "name": "addedrec",
+   "type": {
+    "type": "record",
+    "name": "Added",
+    "fields": [
+     {
+      "name": "q",
+      "type": "string"
+     },
+     {
+      "name": "r",
+      "type": [
+       "null",
+       "int"
+      ],
+      "default": null
+     }
+    ]
+   },
+   "default": {
+    "q": "z",
+    "r": null
+   }
+  },
+  {
+   "name": "arr",
+   "type": {
+    "type": "array",
+    "items": "double"
+   }
+  },
+  {
+   "name": "map",
+   "type": {
+    "type": "map",
+    "values": "bytes"
+   }
+  },
+  {
+   "name": "fx",
+   "type": {
+    "type": "fixed",
+    "name": "F4",
+    "size": 4
+   }
+  },
+  {
+   "name": "u",
+   "type": [
+    "null",
+    "double",
+    "long",
+    "string",
+    "bytes",
+    "boolean",
+    {
+     "type": "array",
+     "items": "boolean"
+    },
+    {
+     "type": "map",
+     "values": "long"
+    },
+    {
+     "type": "record",
+     "name": "Point",
+     "fields": [
+      {
+       "name": "x",
+       "type": "double"
+      },
+      {
+       "name": "y",
+       "type": "double"
+      }
+     ]
+    },
+    "Color",
+    "F4"
+   ]
+  },
+  {
+   "name": "withdefaults",
+   "type": {
+    "type": "record",
+    "name": "Defaults",
+    "fields": [
+     {
+      "name": "a",
+      "type": "long"
+     },
+     {
+      "name": "zz",
+      "type": "string",
+      "default": "new"
+     }
+    ]
+   }
+  }
+ ]
+}
