@@ -27,6 +27,7 @@ include("valuegen.jl")
     include("legacy.jl")
     include("gates.jl")
     include("latency.jl")
+    include("fuzz.jl")
     if get(ENV, "AVRO_QUALITY_GATES", "false") == "true"
         include("quality.jl")
     end
