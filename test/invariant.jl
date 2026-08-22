@@ -1,0 +1,122 @@
+@testset "Writer/Reader invariant: consumers and source modes (plan §4.4)" begin
+    P = Avro.parseschema
+    dir = mktempdir()
+    @testset "the writer preflight equals a stream reader's construction retention" begin
+        s = P("{\"type\":\"record\",\"name\":\"R\",\"namespace\":\"inv\",\"fields\":[{\"name\":\"a\",\"type\":\"long\"},{\"name\":\"b\",\"type\":\"string\"},{\"name\":\"c\",\"type\":[\"null\",{\"type\":\"array\",\"items\":\"double\"}]}]}")
+        path = joinpath(dir, "pf.avro")
+        w = Avro.Writer(path, s; metadata=Dict("k" => Vector{UInt8}("v"), "blob" => zeros(UInt8, 1000)))
+        @test w.preflightbase > 0
+        push!(w, (a=Int64(1), b="x", c=[1.0, 2.0]))
+        close(w)
+        r = Avro.Reader(path; mmap=false)
+        @test r.budget.reserved == w.preflightbase              # the same graph, metadata and read plan
+        close(r)
+    end
+    @testset "a near-ceiling record file through every source mode and guaranteed consumer" begin
+        lim = Avro.Limits(max_total_bytes=96 << 20, max_block_bytes=8 << 20, max_codec_memory=16 << 20,
+                          max_block_output_bytes=32 << 20, max_bytes=8 << 20, max_datum_bytes=8 << 20)
+        s = P("{\"type\":\"record\",\"name\":\"N\",\"fields\":[{\"name\":\"a\",\"type\":\"long\"},{\"name\":\"b\",\"type\":\"string\"},{\"name\":\"c\",\"type\":[\"null\",\"double\"]}]}")
+        n = 260_000
+        rows = [(a=Int64(i), b="value-$(i)-payloadpayloadpayloadpayloadpayload", c=iseven(i) ? i / 3 : missing) for i in 1:n]
+        path = joinpath(dir, "near.avro")
+        Avro.write(path, rows; schema=s, limits=lim, codec=:deflate)
+        bytes = read(path)
+        for mode in (:bytes, :mapped, :streampath, :io)
+            src() = mode === :bytes ? IOBuffer(bytes) : mode === :io ? open(path) : path
+            kw = mode === :streampath ? (; mmap=false) : (;)
+            cnt = Avro.Reader(rr -> sum(first(b) for b in Avro.eachblock(rr); init=0), src(); limits=lim, kw...)
+            @test cnt == n
+            rl = Avro.Rows(src(); limits=lim, kw...)
+            total = 0
+            last = nothing
+            for row in rl
+                total += 1
+                last = row
+            end
+            close(rl)
+            @test total == n && last.a === Int64(n)
+            t = Avro.Table(src(); limits=lim, kw...)
+            @test length(t) == n && Tables.getcolumn(t, :a)[end] == n && Tables.getcolumn(t, :b)[1] == rows[1].b
+            @test ismissing(Tables.getcolumn(t, :c)[1]) && Tables.getcolumn(t, :c)[2] == 2 / 3
+        end
+    end
+    @testset "root shapes through the guaranteed consumers" begin
+        shapes = [
+            ("\"null\"", fill(nothing, 1000), false),
+            ("{\"type\":\"record\",\"name\":\"E\",\"fields\":[]}", fill((;), 1000), true),
+            ("{\"type\":\"record\",\"name\":\"AN\",\"fields\":[{\"name\":\"x\",\"type\":\"null\"},{\"name\":\"y\",\"type\":\"null\"}]}",
+             fill((x=nothing, y=nothing), 1000), true),
+            ("{\"type\":\"fixed\",\"name\":\"F0\",\"size\":0}", fill(UInt8[], 1000), false),
+            ("{\"type\":\"array\",\"items\":{\"type\":\"array\",\"items\":\"long\"}}", fill(Vector{Int64}[], 1000), false),
+            ("{\"type\":\"record\",\"name\":\"NR\",\"fields\":[{\"name\":\"inner\",\"type\":{\"type\":\"record\",\"name\":\"NI\",\"fields\":[{\"name\":\"x\",\"type\":\"null\"}]}}]}",
+             fill((inner=(x=nothing,),), 1000), true),
+        ]
+        for (json, vals, isrecord) in shapes
+            s = P(json)
+            io = IOBuffer()
+            w = Avro.Writer(io, s; block_bytes=256)
+            for v in vals
+                push!(w, v)
+            end
+            close(w)
+            bytes = take!(io)
+            cnt = Avro.Reader(rr -> sum(first(b) for b in Avro.eachblock(rr); init=0), IOBuffer(bytes))
+            @test cnt == 1000
+            rl = Avro.Rows(IOBuffer(bytes))
+            @test count(Returns(true), rl) == 1000
+            close(rl)
+            if isrecord
+                t = Avro.Table(IOBuffer(bytes))
+                @test length(t) == 1000
+            else
+                @test_throws ArgumentError Avro.Table(IOBuffer(bytes))
+            end
+        end
+    end
+    @testset "wide mostly-null records over one-row blocks: chunk shells dominate" begin
+        fields = join(("{\"name\":\"f$i\",\"type\":[\"null\",\"long\"]}" for i in 1:1001), ",")
+        ws = P("{\"type\":\"record\",\"name\":\"W\",\"fields\":[$fields]}")
+        row = Dict{String,Any}("f$i" => nothing for i in 1:1001)
+        w = Avro.Writer(IOBuffer(), ws; block_bytes=1)          # every datum flushes: one-row blocks
+        e = try
+            for _ in 1:10_000
+                push!(w, row)
+            end
+            close(w)
+            nothing
+        catch err
+            err
+        end
+        @test e isa Avro.LimitError && e.limit === :max_total_bytes && e.direction === :encode
+        raised = Avro.Limits(max_total_bytes=4 << 30, max_block_bytes=64 << 20, max_block_output_bytes=2 << 30,
+                             max_codec_memory=512 << 20, max_bytes=256 << 20, max_datum_bytes=256 << 20)
+        wide = joinpath(dir, "wide.avro")
+        w2 = Avro.Writer(wide, ws; block_bytes=1, limits=raised)
+        for _ in 1:10_000
+            push!(w2, row)
+        end
+        close(w2)
+        e2 = try
+            Avro.Table(wide)
+            nothing
+        catch err
+            err
+        end
+        @test e2 isa Avro.LimitError && e2.limit === :max_total_bytes && e2.direction === :decode   # the chunk shells cross the default ceiling
+        rl = Avro.Rows(wide)                                     # streaming stays bounded and accepts
+        @test count(Returns(true), rl) == 10_000
+        close(rl)
+        cnt = Avro.Reader(rr -> sum(first(b) for b in Avro.eachblock(rr); init=0), wide)
+        @test cnt == 10_000
+    end
+    @testset "admission across repeated files; exhausted admission" begin
+        s = P("{\"type\":\"record\",\"name\":\"A\",\"fields\":[{\"name\":\"p\",\"type\":\"long\"},{\"name\":\"q\",\"type\":\"long\"}]}")
+        buf() = Avro.tobuffer([(p=Int64(1), q=Int64(2))]; schema=s)
+        adm = Avro.SymbolAdmission(max_names=2, max_bytes=64)
+        @test Tables.columnnames(Avro.Table(buf(); names=adm)) == [:p, :q]
+        @test Tables.columnnames(Avro.Table(buf(); names=adm)) == [:p, :q]     # already-admitted names do not count twice
+        s2 = P("{\"type\":\"record\",\"name\":\"A2\",\"fields\":[{\"name\":\"r\",\"type\":\"long\"}]}")
+        buf2 = Avro.tobuffer([(r=Int64(1),)]; schema=s2)
+        @test_throws Avro.LimitError Avro.Table(buf2; names=adm)               # exhausted for new names
+    end
+end

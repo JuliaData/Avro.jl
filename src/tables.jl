@@ -117,7 +117,9 @@ function Table(src; reader_schema::Union{Nothing,Schema}=nothing, union_resoluti
         outschema = sel === nothing ? effective : projectschema(effective, sel, limits)
         counts = Int[]
         chunkcols = Vector{Vector{AbstractVector}}()
+        reserve!(r.budget, blocktablecharge(0))
         while (blk = nextblock!(r)) !== nothing
+            reserve!(r.budget, 32)                     # this block's block-table entry (plan §4.4)
             count, bytes = blk
             addrows!(r.budget, count)
             reserve!(r.budget, bytesbytes(length(bytes)))
@@ -139,18 +141,24 @@ function Table(src; reader_schema::Union{Nothing,Schema}=nothing, union_resoluti
         nrows = sum(counts; init=0)
         ncols = length(outschema.fields)
         finals = AbstractVector[]
-        for k in 1:ncols
+        for k in 1:ncols                               # both sets of reference slots coexist during assembly (plan §4.4)
             E = juliatype(outschema.fields[k].schema)
             reserve!(r.budget, vectorbytes(E, nrows))
-            col = Vector{E}(undef, nrows)
+            push!(finals, Vector{E}(undef, nrows))
+        end
+        for k in 1:ncols
+            col = finals[k]
             off = 0
             for chunk in chunkcols
                 c = chunk[k]
                 copyto!(col, off + 1, c, 1, length(c))
                 off += length(c)
-                release!(r.budget, vectorbytes(E, length(c)))       # payload charges transfer without re-charging
             end
-            push!(finals, col)
+        end
+        for chunk in chunkcols
+            for c in chunk
+                release!(r.budget, vectorbytes(eltype(c), length(c)))   # referenced payload transfers, counted once
+            end
         end
         ranges = UnitRange{Int}[]
         off = 0

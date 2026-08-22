@@ -133,7 +133,7 @@ function readheader(s::BlockSource, limits::Limits, budget::Budget; legacy, allo
     schemabytes = get(metadata, "avro.schema", nothing)
     schemabytes === nothing && throw(DataError("the container has no avro.schema", position(s)))
     schema = parseschema(schemabytes; allow_invalid_names=allow_invalid_names, allow_invalid_defaults=allow_invalid_defaults, limits=limits,
-                         legacy_fixed_names=legacy === :avrojl1)
+                         legacy_fixed_names=legacy === :avrojl1, budget=budget)
     codecbytes = get(metadata, "avro.codec", nothing)
     codecname = "null"
     if codecbytes !== nothing
@@ -482,6 +482,73 @@ function recordfieldvalue(p::WRecord, x, i::Int)
     return getfield(x, j)
 end
 
+# ---- the writer's reader preflight (plan §4.4) -------------------------------------------------------
+
+"The reader-retained charge of the block table: one entry per block (offset, size, count, cumulative rows)."
+blocktablecharge(nblocks::Int) = checked_add(STORAGE[].vector, checked_mul(32, nblocks))
+
+"""
+One block's transient reader-side peak (plan §4.4): the compressed and decompressed buffers, the codec's
+decoder requirement, and the block's decoded output. One function for the writer preflight, sequential
+reading, and the Phase 4c parallel admission arithmetic.
+"""
+function readerblockpeak(compressedbytes::Int, decompressedbytes::Int, outputbytes::Int, codecmemory::Int, samebuffer::Bool)
+    peak = checked_add(checked_add(bytesbytes(decompressedbytes), outputbytes), codecmemory)
+    samebuffer || (peak = checked_add(peak, bytesbytes(compressedbytes)))
+    return peak
+end
+
+"""
+The per-field slot allowance of the column consumer: the part of a field's §4.9 output estimate that an
+`Avro.Table` chunk's reference slots already cover. The remainder of the estimate is the referenced
+payload the chunk holds beyond its slots (0 for inline cells).
+"""
+function cellslack(p::WritePlan)
+    p isa Union{WBool,WInt,WDate,WTimeMillis,WFloat} && return 4
+    p isa Union{WLong,WTimeMicros,WTimestamp,WLocalTimestamp,WDouble} && return 8
+    p isa WDuration && return 12
+    p isa WUUIDFixed && return 16
+    p isa WUUIDString && return STORAGE[].slot + 16
+    p isa WEnum && return enumvaluebytes()
+    p isa Union{WString,WBytes,WFixed} && return STORAGE[].slot
+    return 0
+end
+
+"The streamed `Avro.Table` consumer projection of a record-root writer (plan §4.4)."
+mutable struct TablePreflight
+    const cols::Vector{Type}
+    const slack::Vector{Int}
+    chunkbytes::Int      # chunk shells and capacities of the flushed blocks
+    payload::Int         # referenced payload of the flushed blocks, counted once
+    rows::Int
+    nblocks::Int
+    pendingpayload::Int  # referenced payload of the pending block
+end
+
+function TablePreflight(readerschema::RecordSchema, p::WRecord)
+    cols = Type[juliatype(f.schema) for f in readerschema.fields]
+    slack = Int[cellslack(f) for f in p.fields]
+    return TablePreflight(cols, slack, 0, 0, 0, 0, 0)
+end
+
+"The §4.9 estimate of one record-root datum plus its column-consumer payload beyond the chunk slots."
+function estimaterootrecord(p::WRecord, pf::TablePreflight, x)
+    b, v = recordbytes(length(p.fields)), 1
+    payload = 0
+    for (i, f) in enumerate(p.fields)
+        fv = try
+            recordfieldvalue(p, x, i)
+        catch
+            continue
+        end
+        eb, ev = estimatevalue(f, fv)
+        b = checked_add(b, eb)
+        v += ev
+        payload = checked_add(payload, max(eb - pf.slack[i], 0))
+    end
+    return (b, v, payload)
+end
+
 # ---- Writer -----------------------------------------------------------------------------------------
 
 function writevarint(io::IO, n::Integer)
@@ -525,6 +592,8 @@ mutable struct Writer
     const fsync::Bool
     const ownsink::Bool
     const encoder::Encoder
+    const preflightbase::Int
+    const preflight::Union{Nothing,TablePreflight}
     pendingcount::Int
     pendingbytes::Int
     pendingvalues::Int
@@ -565,6 +634,26 @@ function Writer(dst::Union{AbstractString,IO}, schema::Schema; codec::Symbol=:nu
     w = try
         reserve!(budget, wcodec.workspace)
         plan = writeplan(schema; budget=budget)
+        # The reader's construction retention, preflighted under the writer's budget (plan §4.4): the
+        # parsed schema graph a reader builds from the same JSON, the materialised metadata of a stream
+        # reader (key and value buffers plus the retained entries and map), and the generic read plan.
+        base0 = budget.reserved
+        pfschema = parseschema(schemajson; allow_invalid_names=allow_invalid_names, allow_invalid_defaults=allow_invalid_defaults,
+                               limits=limits, budget=budget)
+        pfkeys = String[]
+        pfvals = Vector{UInt8}[]
+        for (k, v) in entries
+            reserve!(budget, checked_add(bytesbytes(sizeof(k)), bytesbytes(length(v))))   # a stream reader's key and value buffers
+            reserve!(budget, checked_add(stringbytes(sizeof(k)), bytesbytes(length(v))))  # the retained metadata entry
+            push!(pfkeys, k)
+            push!(pfvals, v)
+        end
+        buildmap(Vector{UInt8}, pfkeys, pfvals, budget)
+        withplanbudget(budget) do
+            readplan(pfschema; budget=budget)
+        end
+        preflightbase = budget.reserved - base0
+        preflight = pfschema isa RecordSchema ? TablePreflight(pfschema, plan::WRecord) : nothing
         path = dst isa AbstractString ? String(dst) : nothing
         sink, temppath, ownsink = if path === nothing
             (dst, nothing, false)
@@ -576,7 +665,7 @@ function Writer(dst::Union{AbstractString,IO}, schema::Schema; codec::Symbol=:nu
         end
         encoder = Encoder(budget)
         w = Writer(sink, path, atomic ? temppath : nothing, schema, plan, wcodec, syncmarker, limits, budget,
-                   Int(block_bytes), atomic, fsync, ownsink, encoder, 0, 0, 0, false, nothing)
+                   Int(block_bytes), atomic, fsync, ownsink, encoder, preflightbase, preflight, 0, 0, 0, false, nothing)
         try
             for m in MAGIC
                 Base.write(sink, m)
@@ -639,7 +728,13 @@ end
 
 function Base.push!(w::Writer, datum)
     checkwritable(w)
-    eb, ev = estimatevalue(w.plan, datum)
+    pf = w.preflight
+    if pf === nothing
+        eb, ev = estimatevalue(w.plan, datum)
+        pp = 0
+    else
+        eb, ev, pp = estimaterootrecord(w.plan::WRecord, pf, datum)
+    end
     eb > w.limits.max_block_output_bytes &&
         throw(LimitError(:max_block_output_bytes, eb, w.limits.max_block_output_bytes, :max_block_output_bytes, :encode))
     if w.pendingcount > 0 && (checked_add(w.pendingbytes, eb) > w.limits.max_block_output_bytes ||
@@ -657,6 +752,7 @@ function Base.push!(w::Writer, datum)
     w.pendingcount += 1
     w.pendingbytes = checked_add(w.pendingbytes, eb)
     w.pendingvalues += ev
+    pf === nothing || (pf.pendingpayload = checked_add(pf.pendingpayload, pp))
     w.encoder.pos >= w.blockbytes && flushblock!(w)
     return w
 end
@@ -671,11 +767,42 @@ end
 function flushblock!(w::Writer)
     w.pendingcount == 0 && return nothing
     try
+        pf = w.preflight
+        chunk = payload = rows = 0
+        if pf !== nothing
+            # The streamed Table consumer's peak with this block included (plan §4.4): chunk shells and
+            # capacities, referenced payload once, both sets of reference slots (finals fully reserved
+            # before the chunks release), the block table, and the reader's construction retention.
+            n = w.pendingcount
+            chunk = pf.chunkbytes
+            finals = 0
+            rows = pf.rows + n
+            for E in pf.cols
+                chunk = checked_add(chunk, vectorbytes(E, n))
+                finals = checked_add(finals, vectorbytes(E, rows))
+            end
+            payload = checked_add(pf.payload, pf.pendingpayload)
+            projected = checked_add(checked_add(w.preflightbase, blocktablecharge(pf.nblocks + 1)),
+                                    checked_add(checked_add(chunk, payload), finals))
+            projected <= w.budget.ceiling ||
+                throw(LimitError(:max_total_bytes, projected, w.budget.ceiling, :max_total_bytes, :encode))
+        end
         blockbytes = take!(w.encoder)
         compressed = compressblock(w.wcodec, blockbytes)
         length(compressed) <= w.limits.max_block_bytes ||
             throw(LimitError(:max_block_bytes, length(compressed), w.limits.max_block_bytes, :max_block_bytes, :encode))
         verifyframe(w.wcodec, compressed, w.limits)
+        peak = readerblockpeak(length(compressed), length(blockbytes), w.pendingbytes,
+                               w.wcodec.name === :null ? 0 : w.limits.max_codec_memory, w.wcodec.name === :null)
+        reserve!(w.budget, peak)                       # one block's transient reader peak fits the ceiling
+        release!(w.budget, peak)
+        if pf !== nothing
+            pf.chunkbytes = chunk
+            pf.payload = payload
+            pf.rows = rows
+            pf.nblocks += 1
+            pf.pendingpayload = 0
+        end
         writevarint(w.sink, w.pendingcount)
         writevarint(w.sink, length(compressed))
         Base.write(w.sink, compressed)

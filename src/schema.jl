@@ -274,18 +274,19 @@ marked `repaired_names`); with `allow_invalid_defaults=true` invalid defaults ar
 `valid=false`.
 """
 function parseschema(src; allow_invalid_names::Bool=false, allow_invalid_defaults::Bool=false, limits::Limits=Limits(),
-                     legacy_fixed_names::Bool=false)
-    return withbudget(limits) do budget
-        buf = sourcebytes(src, limits.max_schema_bytes, budget, SchemaError)
-        errfn = (msg, pos) -> throw(SchemaError(string(msg, " (byte ", pos, ")"), "\$"))
-        limitfn = (limit, observed, value) -> throw(LimitError(limit, observed, value, limit, :decode))
-        tree = parsejson(buf; maxbytes=limits.max_schema_bytes, maxdepth=limits.max_schema_depth, errfn=errfn, budget=budget,
-            limitfn=limitfn, bytelimit=:max_schema_bytes, depthlimit=:max_schema_depth)
-        ctx = ParseContext(limits, budget, allow_invalid_names, allow_invalid_defaults, legacy_fixed_names)
-        s = parsenode(ctx, tree, "", "\$", buf)
-        isempty(ctx.pending) || schemaerror("internal error: unfilled record", "\$")
-        return finalize!(ctx, s)
-    end
+                     legacy_fixed_names::Bool=false, budget::Union{Nothing,Budget}=nothing)
+    budget === nothing &&
+        return withbudget(b -> parseschema(src; allow_invalid_names=allow_invalid_names, allow_invalid_defaults=allow_invalid_defaults,
+                                           limits=limits, legacy_fixed_names=legacy_fixed_names, budget=b), limits)
+    buf = sourcebytes(src, limits.max_schema_bytes, budget, SchemaError)
+    errfn = (msg, pos) -> throw(SchemaError(string(msg, " (byte ", pos, ")"), "\$"))
+    limitfn = (limit, observed, value) -> throw(LimitError(limit, observed, value, limit, :decode))
+    tree = parsejson(buf; maxbytes=limits.max_schema_bytes, maxdepth=limits.max_schema_depth, errfn=errfn, budget=budget,
+        limitfn=limitfn, bytelimit=:max_schema_bytes, depthlimit=:max_schema_depth)
+    ctx = ParseContext(limits, budget, allow_invalid_names, allow_invalid_defaults, legacy_fixed_names)
+    s = parsenode(ctx, tree, "", "\$", buf)
+    isempty(ctx.pending) || schemaerror("internal error: unfilled record", "\$")
+    return finalize!(ctx, s)
 end
 
 """
