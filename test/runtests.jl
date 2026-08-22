@@ -31,4 +31,7 @@ include("valuegen.jl")
     if get(ENV, "AVRO_QUALITY_GATES", "false") == "true"
         include("quality.jl")
     end
+    if get(ENV, "AVRO_INTEROP", "false") == "true"
+        include("interop.jl")
+    end
 end
