@@ -193,6 +193,16 @@ Big-endian two's complement of `n` bytes at `start` into `Decimal` (≤ 38 digit
 validating `digits(unscaled) ≤ precision` (spec's "maximum precision"; Java checks only on encode).
 """
 function decimalfrombytes(d::Decoder, p::DecimalPlan, start::Int, n::Int)
+    big = p.wide || n > 16
+    big && reserve!(d.budget, widedecimalbytes(n))        # the BigInt path allocates before the value is known
+    v = decimalunscaled(d, p, start, n)
+    v isa Int128 || return WideDecimal(v, p.scale)
+    big && release!(d.budget, widedecimalbytes(n))        # a narrow result computed through a transient BigInt
+    return Decimal(v, p.scale)                            # isbits: charged where it is boxed or stored
+end
+
+"The validated unscaled value of the `n` bytes at `start`: an `Int128` for the narrow representation, a `BigInt` for the wide one."
+function decimalunscaled(d::Decoder, p::DecimalPlan, start::Int, n::Int)
     buf = d.buf
     if !p.wide && n <= 16
         v = Int128(0)
@@ -202,9 +212,8 @@ function decimalfrombytes(d::Decoder, p::DecimalPlan, start::Int, n::Int)
         shift = 8 * (16 - n)
         v = (v << shift) >> shift   # sign-extend
         ndigits128(v) <= p.precision || dataerror(d, "decimal exceeds precision $(p.precision)")
-        return Decimal(v, p.scale)             # isbits: charged where it is boxed or stored
+        return v
     end
-    reserve!(d.budget, widedecimalbytes(n))
     big = BigInt(0)
     @inbounds for i in 0:n - 1
         big = (big << 8) | BigInt(buf[start + i])
@@ -213,9 +222,9 @@ function decimalfrombytes(d::Decoder, p::DecimalPlan, start::Int, n::Int)
         big -= BigInt(1) << (8 * n)
     end
     ndigits(abs(big)) <= p.precision || dataerror(d, "decimal exceeds precision $(p.precision)")
-    p.wide && return WideDecimal(big, p.scale)
+    p.wide && return big
     typemin(Int128) <= big <= typemax(Int128) || dataerror(d, "decimal exceeds precision $(p.precision)")
-    return Decimal(Int128(big), p.scale)
+    return Int128(big)
 end
 
 function ndigits128(v::Int128)
@@ -231,10 +240,36 @@ function ndigits128(v::Int128)
 end
 
 function decodevalue(::UUIDStringPlan, d::Decoder)
-    s = readstring(d)
-    u = tryparseuuid(s)
-    u === nothing && dataerror(d, "invalid uuid string \"$(escapename(s))\"")
-    return u
+    n = readlen(d, d.budget.limits.max_bytes, :max_bytes)
+    p = d.pos
+    validuuid(d.buf, p, n) || dataerror(d, "invalid uuid string \"$(escapename(unsafe_substring(d.buf, p, n)))\"")
+    d.pos = p + n
+    return uuidfrombuffer(d.buf, p)
+end
+
+"RFC 4122 text `8-4-4-4-12` (hex digits in either case) at `buf[from:from + n - 1]`."
+function validuuid(buf::AbstractVector{UInt8}, from::Int, n::Int)
+    n == 36 || return false
+    for i in 1:36
+        b = buf[from + i - 1]
+        if i in (9, 14, 19, 24)
+            b == UInt8('-') || return false
+        else
+            ishex8(b) || return false
+        end
+    end
+    return true
+end
+
+hexnibble(b::UInt8) = b <= UInt8('9') ? b - UInt8('0') : (b | 0x20) - UInt8('a') + 0x0a
+
+function uuidfrombuffer(buf::AbstractVector{UInt8}, from::Int)
+    v = UInt128(0)
+    for i in 1:36
+        i in (9, 14, 19, 24) && continue
+        v = (v << 4) | UInt128(hexnibble(buf[from + i - 1]))
+    end
+    return UUID(v)
 end
 
 """
@@ -430,14 +465,31 @@ end
 
 skipvalue(::NullPlan, d::Decoder) = nothing
 skipvalue(::BoolPlan, d::Decoder) = (readbool(d); nothing)
-skipvalue(::Union{IntPlan,DatePlan,TimeMillisPlan}, d::Decoder) = (readint(d); nothing)
-skipvalue(::Union{LongPlan,TimeMicrosPlan,TimestampPlan,LocalTimestampPlan}, d::Decoder) = (readlong(d); nothing)
+# Logical values are domain-checked when skipped exactly as when decoded (plan §4.3: only skipped
+# strings are not UTF-8-validated).
+skipvalue(::Union{IntPlan,DatePlan}, d::Decoder) = (readint(d); nothing)
+skipvalue(p::TimeMillisPlan, d::Decoder) = (decodevalue(p, d); nothing)
+skipvalue(::Union{LongPlan,TimestampPlan,LocalTimestampPlan}, d::Decoder) = (readlong(d); nothing)
+skipvalue(p::TimeMicrosPlan, d::Decoder) = (decodevalue(p, d); nothing)
 skipvalue(::FloatPlan, d::Decoder) = (readfloat(d); nothing)
 skipvalue(::DoublePlan, d::Decoder) = (readdouble(d); nothing)
-skipvalue(::Union{BytesPlan,StringPlan,UUIDStringPlan}, d::Decoder) = skiplen(d)
+skipvalue(::Union{BytesPlan,StringPlan}, d::Decoder) = skiplen(d)
+function skipvalue(::UUIDStringPlan, d::Decoder)
+    n = readlen(d, d.budget.limits.max_bytes, :max_bytes)
+    validuuid(d.buf, d.pos, n) || dataerror(d, "invalid uuid string \"$(escapename(unsafe_substring(d.buf, d.pos, n)))\"")
+    d.pos += n
+    return nothing
+end
 function skipvalue(p::DecimalPlan, d::Decoder)
-    p.fixedsize == 0 && return skiplen(d)
-    return skipfixed(d, p.fixedsize)
+    n = p.fixedsize == 0 ? readlen(d, d.budget.limits.max_bytes, :max_bytes) : p.fixedsize
+    n == 0 && dataerror(d, "empty decimal payload")
+    n <= remaining(d) || dataerror(d, "fixed of $n bytes exceeds the remaining $(remaining(d)) bytes")
+    big = p.wide || n > 16
+    big && reserve!(d.budget, widedecimalbytes(n))        # the transient BigInt of the check
+    decimalunscaled(d, p, d.pos, n)
+    big && release!(d.budget, widedecimalbytes(n))
+    d.pos += n
+    return nothing
 end
 skipvalue(p::FixedPlan, d::Decoder) = skipfixed(d, p.schema.size)
 skipvalue(::UUIDFixedPlan, d::Decoder) = skipfixed(d, 16)

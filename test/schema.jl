@@ -170,6 +170,10 @@
     end
 
     @testset "names, reserved names, aliases" begin
+        # an invalid name ending in a multi-byte character is reported with the escaped text (fuzz finding: byte-indexed slicing)
+        e = try; Avro.parseschema("{\"type\":\"enum\",\"name\":\"r\",\"symbols\":[\"\u0380\",\"\"]}"); nothing; catch err; err; end
+        @test e isa Avro.SchemaError && occursin("invalid enum symbol \"\u0380\"", sprint(showerror, e))
+        @test Avro.escapename("a\u0380") == "a\u0380" && Avro.escapename("") == "" && Avro.escapename("x\"y") == "x\\\"y" && Avro.escapename("t\tb") == "t\\tb"
         @test_throws Avro.SchemaError P("""{"type":"record","name":"9R","fields":[]}""")
         @test_throws Avro.SchemaError P("""{"type":"record","name":"a-b","fields":[]}""")
         @test_throws Avro.SchemaError P("""{"type":"record","name":"int","fields":[]}""")            # reserved in the null namespace

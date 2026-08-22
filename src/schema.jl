@@ -259,7 +259,7 @@ function checknamespace(ctx::ParseContext, s::AbstractString, path::AbstractStri
     return nothing
 end
 
-escapename(s::AbstractString) = sprint(escapejson, s)[2:end - 1]
+escapename(s::AbstractString) = String(chop(sprint(escapejson, s); head=1, tail=1))   # character-wise: the quoted text may end in a multi-byte character
 
 # ---- parsing ------------------------------------------------------------------------------------
 

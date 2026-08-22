@@ -324,6 +324,44 @@
         d = Avro.Decoder(badstr, b)
         @test Avro.skip(Avro.readplan(bs), d) === nothing && d.pos == length(badstr) + 1
         @test_throws Avro.DataError Avro.decode(bs, badstr)
+        # skipped logical values are domain-checked like decoded ones (fuzz findings): uuid text, time ranges, decimals
+        function skipverdict(s, bytes)
+            b = Avro.Budget(Avro.Limits(); available=1 << 40); Avro.addinput!(b, length(bytes))
+            d = Avro.Decoder(bytes, b)
+            try
+                Avro.skip(Avro.readplan(s), d)
+                return d.pos == length(bytes) + 1 ? :ok : :trailing
+            catch e
+                e isa Avro.DataError || rethrow()
+                return :data
+            end
+        end
+        decodeverdict(s, bytes) = try; Avro.decode(s, bytes); :ok; catch e; e isa Avro.DataError ? :data : rethrow(); end
+        us = P("{\"type\":\"string\",\"logicalType\":\"uuid\"}")
+        for txt in ("00000000-0000-0000-0000-000000000001", "0z000000-0000-0000-0000-000000000001", "00000000-0000-0000-0000-000000&00001", "123e4567-e89b-12d3-a456-26614174000\x12", "ABCDEF01-2345-6789-abcd-ef0123456789", "")
+            bytes = enc("\"string\"", txt)
+            @test skipverdict(us, bytes) == decodeverdict(us, bytes)
+        end
+        @test decodeverdict(us, enc("\"string\"", "ABCDEF01-2345-6789-abcd-ef0123456789")) == :ok
+        tm = P("{\"type\":\"long\",\"logicalType\":\"time-micros\"}")
+        tms = P("{\"type\":\"int\",\"logicalType\":\"time-millis\"}")
+        for v in (0, 86_399_999_999, 86_400_000_000, -1, 274877915135)
+            bytes = enc("\"long\"", v)
+            @test skipverdict(tm, bytes) == decodeverdict(tm, bytes) == (0 <= v < 86_400_000_000 ? :ok : :data)
+        end
+        for v in (0, 86_399_999, 86_400_000, -1)
+            bytes = enc("\"int\"", v)
+            @test skipverdict(tms, bytes) == decodeverdict(tms, bytes) == (0 <= v < 86_400_000 ? :ok : :data)
+        end
+        dec18 = P("{\"type\":\"bytes\",\"logicalType\":\"decimal\",\"precision\":18,\"scale\":2}")
+        dec60 = P("{\"type\":\"bytes\",\"logicalType\":\"decimal\",\"precision\":60,\"scale\":2}")
+        fdec = P("{\"type\":\"fixed\",\"name\":\"FD\",\"size\":4,\"logicalType\":\"decimal\",\"precision\":5,\"scale\":0}")
+        for (s, payload) in ((dec18, UInt8[]), (dec18, UInt8[0x01]), (dec18, fill(0x7f, 9)), (dec18, fill(0x7f, 17)), (dec60, fill(0x7f, 17)), (dec60, fill(0x7f, 30)))
+            bytes = enc("\"bytes\"", payload)
+            @test skipverdict(s, bytes) == decodeverdict(s, bytes)
+        end
+        @test skipverdict(fdec, UInt8[0x00, 0x01, 0x86, 0xa0]) == decodeverdict(fdec, UInt8[0x00, 0x01, 0x86, 0xa0]) == :data    # 100000: six digits exceed precision 5
+        @test skipverdict(fdec, UInt8[0x00, 0x00, 0x27, 0x0f]) == decodeverdict(fdec, UInt8[0x00, 0x00, 0x27, 0x0f]) == :ok      # 9999
     end
 
     @testset "round-trip property (generated schemas and values)" begin
