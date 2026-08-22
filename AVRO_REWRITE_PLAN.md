@@ -1,6 +1,6 @@
 # Avro.jl 2.0 — Audit and Rewrite Plan
 
-Status: DRAFT v14 (revised after Codex review rounds 1–13; see §14 review log and `reviews/response-N.md`).
+Status: DRAFT v15 (revised after Codex review rounds 1–14; see §14 review log and `reviews/response-N.md`).
 Date: 2026-08-21/22. Repository: `JuliaData/Avro.jl`, local checkout `/Users/jacob.quinn/.julia/dev/Avro`,
 branch `jq/v2-rewrite` forked from `main` @ `0c7be10db6d83fd20806a8eceec9276a7aa8e21d` (v1.1.2, registered).
 Specification source pinned for this plan: `apache/avro` `main` @ `326950f40c1172f7564c757b0e51c39883721083`
@@ -190,7 +190,7 @@ requirements for later inclusion recorded.
    per-operation ceiling** bounds package-owned memory through **actual-size reservations made before
    every allocation** for the generic value set and the column path, input/codec/output buffers and
    internal tables, and through input-bounded per-node charges for schema and plan graphs (§4.4
-   categories (a)–(e)); work is bounded as a function of input bytes (values, probes and resolution
+   categories (a)–(e)); work is bounded as a function of input bytes (values, comparisons and resolution
    effort); the one documented boundary is the typed conversion of §4.8, which runs after ownership
    transfer in caller space; an **available-memory guard** lowers the
    effective ceiling in constrained processes so the package fails with a `LimitError` rather than being
@@ -208,7 +208,7 @@ requirements for later inclusion recorded.
    admission table (§6), because `Tables.columnnames` must return `Symbol`s, and the write-once storage
    constants measured in `__init__` (§4.4), frozen before any public operation runs; callers may supply their own admission
    object instead, and every typed decoding path that interns (`DatumReader`, `decode`, `decodesingle`,
-   `fromjson`, `Rows`, `Table`) goes through the same boundary. Codec instances, buffers, budgets, and
+   `fromjson`, `Rows`; `Table` for column names) goes through the same boundary. Codec instances, buffers, budgets, and
    plans are owned by reader/writer objects or operations; hashes are computed at freeze time and stored
    in the immutable nodes. The logical-type set is closed in 2.0.
 6. **Strict by default, fast by choice.** `validate=:strict` walks every byte it skips (the single
@@ -261,9 +261,12 @@ struct FullName; name::String; namespace::String; end       # fullname(x) = isem
   default *value* and selected branch — not the JSON spelling — `order`, normalised aliases, doc),
   symbols, enum default, size, logical type and attributes, and `props` compared as unordered maps of
   JSON values;
-    recursion uses a visited set of `(a,b)` pairs (an `Avro.Map`-style deterministic structure bounded
-  by the node counts of the two admitted graphs; `==`, `hash` and `show` operate on graphs the limits
-  already admitted and use `Limits()` for their scratch space) so cyclic graphs terminate. `hash` is the stored digest
+    recursion uses a visited set of `(a,b)` pairs keyed by the **dense node IDs** every schema node
+  receives at parse time (§4.4 category (e): a per-`a` small vector of visited `b` IDs, scanned
+  linearly; every visit is charged to `max_resolution_work`, so `==` on two adversarially shared
+  graphs fails with `LimitError` rather than running unbounded — documented; the limits used are the
+  larger of the two schemas' recorded parse limits, which every root node stores) so cyclic graphs
+  terminate. `hash` is the stored digest
   of the same normalised content, so `==` and `hash` agree. `Avro.parsingequivalent(a, b)` compares
   Parsing Canonical Forms.
 * **Attributes.** The required structural attributes (`type`, `name`, `fields`, `symbols`, `items`,
@@ -296,7 +299,11 @@ struct FullName; name::String; namespace::String; end       # fullname(x) = isem
   reader schema supplies a valid one.
 * **Parsing.** `Avro.parseschema(src; allow_invalid_names=false, allow_invalid_defaults=false,
   limits=Limits())`:
-    1. The source is an owned byte buffer: strings and byte vectors are used in place; an `IO` source is
+    1. The source is an owned contiguous byte buffer: `String`, `SubString{String}`, `Vector{UInt8}`,
+     `Mmap` vectors and unit-stride views of those are used in place; **every other `AbstractString` or
+     `AbstractVector{UInt8}`** (pointer-incompatible strings, stepped views, custom vectors) is first
+     copied into an Avro-owned, reserved buffer (category (c)), so JSON.jl never copies behind the
+     reservation boundary (exact-boundary tests with custom strings and stepped views); an `IO` source is
      read **incrementally** into an Avro-owned buffer whose capacity is reserved step by step and which
      stops after `max_schema_bytes + 1` bytes (`LimitError`; JSON.jl's own `lazy(io)` would read the
      whole stream first and is never used on an `IO`; tested on a non-seekable over-limit stream and at
@@ -305,18 +312,20 @@ struct FullName; name::String; namespace::String; end       # fullname(x) = isem
      **validates the text as strict UTF-8** (no overlongs, no raw surrogate code points, nothing above
      U+10FFFF; RFC 8259 requires UTF-8) **and the syntax of every escape** (`\uXXXX` hex digits, no
      invalid escapes) — JSON.jl does not validate UTF-8 and would return invalid `String`s — so malformed
-     bytes anywhere are `SchemaError`s/`DataError`s. The **Unicode-scalar requirement is contextual**:
-     an unpaired surrogate escape such as `"\uD800"` is a `SchemaError`/`DataError` where the value is
-     an Avro string (names, namespaces, aliases, enum symbols, default string values, datum strings, map
-     keys, union labels), but is **accepted and preserved verbatim** in `doc` and custom properties,
-     which are metadata kept as owned raw JSON text (RFC 8259 permits the escape; Java, avro-py and
-     fastavro accept such a `doc` — verified by the round-13 review; fixtures for schemas and OCF headers
-     with lone-surrogate metadata; materialising such a property as a Julia `String` substitutes U+FFFD,
-     documented; canonical form strips metadata, so fingerprints are unaffected) (negative and positive
-     cases for each context). Byte sources that are not contiguous one-based unit-stride storage
-     (`Vector{UInt8}`, `Mmap` vectors, unit-stride `SubArray`s of those) are copied into an Avro-owned,
-     reserved buffer first (category (c)); `fromjson` applies the same rule (stepped-view and
-     custom-vector tests).
+     bytes anywhere are `SchemaError`s/`DataError`s. **JSON strings are decoded uniformly** into Julia `String`s that preserve every lone surrogate escape
+     as its three-byte surrogate sequence (exactly what JSON.jl produces: `"\uD800"` → `ed a0 80`; a
+     Julia `String` may hold such bytes), never as U+FFFD; duplicate detection, equality, hashing,
+     sorting and the frozen representation all operate on those bytes, and the printer **re-escapes**
+     any surrogate sequence as `\uXXXX` so metadata round-trips verbatim (tested). The **Unicode-scalar
+     requirement is then applied contextually, after the fullname algorithm**: a value that is an Avro
+     string — a name or namespace *actually used* (an ignored namespace is never validated, §4.2 step
+     3), an enum symbol, a default string value, a datum string, a map key, a union label — must be
+     valid UTF-8 (`SchemaError`/`DataError` otherwise), while aliases ("any string" per the spec; an
+     alias carrying a surrogate simply never matches), `doc`, custom property names and values, and
+     nested metadata keys are preserved verbatim (Java, avro-py and fastavro accept such namespaces,
+     aliases and property names — verified by the round-14 review; fixtures for ignored-namespace,
+     invalid-name repair through aliases, alias, top-level and nested property keys, escaped duplicates,
+     and OCF headers; canonical form strips metadata, so fingerprints are unaffected). `fromjson` applies the same source, decoding and validation rules.
   2. The JSON is traversed with `JSON.lazy` (`applyobject`/`applyarray`) under its default
      `duplicate_keys=:overwrite` — JSON.jl's `:error` mode allocates an unbudgeted `Set{String}` per
      object — so recursion depth is ours and value byte spans are available; **duplicate keys are
@@ -325,8 +334,9 @@ struct FullName; name::String; namespace::String; end       # fullname(x) = isem
      decoded UTF-8 bytes, i.e. code points) in a charged vector of key references (no hashing, no
      `Dict`/`Set`); every compared byte is charged to the **comparison rule** of §4.4, and duplicates
      are `SchemaError`s (tests: simple escapes, BMP escapes, surrogate pairs, mixed spellings).
-  3. A `ParseContext{namespace stack, named-type table, depth, counters}` first applies the **fullname
-     algorithm** (a dotted `name` wins and any supplied `namespace` is ignored without validation; a
+    3. A `ParseContext{namespace stack, named-type table, depth, counters}` (its named-type table is a
+     sorted vector keyed by fullname bytes — at most `max_named_types` entries, so insertion moves are
+     bounded and charged to the comparison rule) first applies the **fullname algorithm** (a dotted `name` wins and any supplied `namespace` is ignored without validation; a
      simple name takes the explicit or inherited namespace) and then validates every rule on the
      resulting names: name and namespace grammar (unless `allow_invalid_names`), fullname uniqueness,
      primitive names never redefined, define-before-use (depth-first, left-to-right), field/symbol
@@ -396,7 +406,10 @@ end
 * **IO sources.** The container layer reads blocks of known size into owned buffers. `Avro.decode(schema,
   io; limits)` reads at most `max_datum_bytes + 1` bytes and errors if the datum is larger or if bytes
   remain.
-* **Encoder** is a growable `Vector{UInt8}` with `pos`, `ensureroom!` (checked growth), and write
+* **Encoder** is a growable `Vector{UInt8}` with `pos`, `ensureroom!` (checked growth by explicit
+  replacement: a new `Vector{UInt8}(undef, newcap)` of exact capacity is reserved and allocated, the
+  bytes copied, and the old buffer released — never `resize!`/`sizehint!`/`push!`, whose over-allocation
+  heuristics would allocate behind the reservation), and write
   primitives (`writelong` = 10-byte unrolled varint, `writebytes`, `writestring`, `writefloat`, …).
   `Encoder` is re-usable (`reset!`) and its buffer can be handed to a codec or `IO` without copying. No
   pre-sizing pass. **Encoding is bounded by the same `Limits` as decoding** (§4.4): per datum
@@ -482,19 +495,30 @@ their own options (`ntasks ≥ 1`, actual tasks capped at the block count; `Writ
 limits.max_block_bytes`).
 
 **Map structure (deterministic; no hashing anywhere in the guarded path).** `Avro.Map` keeps its keys
-and values in insertion order and an `Int32` permutation **sorted by decoded key bytes**, built once
-by a deterministic sort (`sort!` with an explicit `MergeSort`, whose scratch buffer of `nunique ÷ 2`
-`Int32`s is reserved before the sort and released after it); `getindex` is a binary search
+and values in insertion order and an `Int32` permutation **sorted by decoded key bytes** (`npairs ≤
+typemax(Int32)` is checked first), built once by an in-package deterministic merge sort over **all
+`npairs` candidates** with package-owned scratch (the construction peak is the `npairs` permutation plus
+`cld(npairs, 2)` scratch entries, both reserved before the sort; after sorting, duplicate groups are
+resolved last-wins and the permutation is compacted in place to `nunique`, so an all-duplicate map
+with `npairs = 10^6` and `nunique = 1` is charged for its million candidates during construction and
+for one entry afterwards — odd sizes and near-ceiling all-duplicate maps are gated); `getindex` is a binary search
 (≤ ⌈log2(nunique)⌉ + 1 comparisons, a fixed per-call bound that needs no budget after the map is
 handed to the caller); there are no seeds, probe limits, overflow indexes, rebuilds or growth, so memory
 and work are functions of the counts and key bytes alone and acceptance cannot depend on anything
 random. The **symbol-admission table** is a different, long-lived structure with the same property: a
 set of **sorted runs** of geometrically increasing size (a 1,024-entry unsorted recent buffer scanned
-linearly; when full it is sorted and merged with runs of equal size, as in a log-structured merge), so
-a lookup binary-searches ≤ log2(N ÷ 1024) + 1 runs, an insert costs O(log N) amortised moves, every
-move and comparison is charged to the admitting operation's comparison rule, and the capacity of every
-run and merge scratch is reserved before it is allocated (latency test: one million incremental
-admissions; capacity-boundary tests at `max_names`/`max_bytes`).
+linearly; when full it is sorted and merged with runs of equal size, as in a log-structured merge).
+Merges are **deamortised**: an in-progress merge advances by a fixed step of at most 2,048 moved
+entries per admission, lookups search both the old runs and the partially built run until the merge
+completes, and a failed admission leaves the table unchanged (staging is transactional); so one
+admission costs ≤ 1,024 comparisons in the recent buffer + ≤ log2(N ÷ 1024) + 1 binary searches +
+2,048 moves, a fixed per-operation bound that a one-symbol operation under the default allowance
+always affords. Merge maintenance is the table's own work (≤ N log N moves over its lifetime),
+charged to the table's `max_bytes`/capacity accounting and reserved before every run or scratch
+allocation, while the admitting operation's comparison rule is charged only for its own lookups and
+its fixed merge step (gate: one-symbol operations across every power-of-two boundary up to
+`max_names`; one million incremental admissions with latency recorded; capacity boundaries at
+`max_names`/`max_bytes`).
 
 **Comparison rule.** Let *compared bytes* be every key byte examined by duplicate-key detection (§4.2,
 §4.11) by map construction (the sort) and by symbol admission (run searches and merges; a moved index entry
@@ -576,7 +600,8 @@ allocated; nothing is ever rehashed, re-seeded or grown; **no formula depends on
 layout or on its collision-driven rehashing**, and the oracle gate includes duplicate-heavy and
 adversarial-key maps). **Typed fast-route shells** (§4.8) are measured once per `T` at plan
 construction from a probe instance built by the same constructor-free builder with zero/empty field
-values (`Base.summarysize` of the probe minus its referenced payload), so the charge is exact for
+values (`Base.summarysize` of the probe minus its referenced payload; a conservative 4 KiB is reserved
+before the probe is built and trued up afterwards), so the charge is exact for
 mutable heap objects (8-byte minimum even with no fields), for immutable non-isbits structs (inline in
 their parents, a heap object only when boxed) and for isbits layouts; the oracle covers generated
 nested, padded, mutable, zero-field, reference-bearing and nullable layouts and arrays of them. The test
@@ -603,7 +628,12 @@ before allocation, under its own `max_names`/`max_bytes`), and worker/coordinato
 are allocated lazily by the runtime and excluded, documented); (e) **schema and plan graphs** — every
 `Schema`/`Field`/`FullName` node, frozen JSON tree (props and defaults), parser state (`ParseContext`,
 name tables), printer/canonical/fingerprint buffers, read/write/resolving plan nodes and their
-memoisation tables — all of which use sorted vectors or `Avro.Map`, never `Base.Dict`/`Set` and never hashing, and JSON.jl's duplicate tracker is never enabled (§4.2) — charged per node by the
+memoisation tables — all of which are keyed by the **dense node IDs** assigned at parse time (a node-indexed dense array
+when the key is one node — plan memo tables, `PlanRef` targets; per-node small vectors of partner IDs
+when the key is a pair — equality visits, resolution memo entries, resolving-plan pairs — each
+insertion and scan charged to `max_resolution_work` as one unit of work, with adversarial
+reverse-ordered, cyclic and near-limit tests) or are sorted vectors with charged moves (the named-type
+table), never `Base.Dict`/`Set` and never hashing, and JSON.jl's duplicate tracker is never enabled (§4.2) — charged per node by the
 same kind of measured formulas under the budget of the operation that creates them (`parseschema`, `json`/`canonical`/`fingerprint`, `Avro.schema(T)`,
 `resolve`, prepared-codec construction — each an operation with its own ceiling, §"Budget scopes"), so
 a schema of `max_schema_nodes` nodes with large properties or defaults fails with a `LimitError`
@@ -612,9 +642,15 @@ plans near the ceiling). **Yield-time transfer:** `Rows`, `eachdatum` and `eachb
 value to the caller at yield; the operation releases that value's charge at the next iteration step
 (the caller now owns it) while the cumulative value/row/work counters persist, so a stream larger than
 the ceiling iterates under the ceiling when the caller does not retain the outputs (tested both ways);
-`Avro.Table` keeps everything charged until it returns the caller-owned table. Collections in the
-generic path are decoded incrementally: `sizehint!` is capped at `min(count, 1024)`, growth is by `push!`
-with the new capacity reserved before each growth step, the declared count is additionally bounded by
+`Avro.Table` keeps everything charged until it returns the caller-owned table. **Growth rule (every charged buffer).** No charged buffer is ever grown with `push!`, `resize!` or
+`sizehint!` (Julia's growth heuristics over-allocate behind the reservation: `sizehint!(Int[], 1)`
+retains three slots on Julia 1.12); growth always allocates an explicit replacement
+`Vector{T}(undef, newcap)` of exact capacity after reserving it (old and new storage are both charged
+during the copy; the old charge is released afterwards), through package-owned builders used by
+generic collections, streamed columns, the `Encoder`, owned JSON/IO buffers and compressor output
+buffers (allocation-hook gate: every allocation in a guarded path is preceded by a reservation of at
+least its size). Collections in the generic path are decoded incrementally with geometric replacement
+growth starting at `min(count, 1024)` elements, the declared count is additionally bounded by
 `remaining_bytes ÷ minsize(item schema)` when `minsize > 0`, and maps are decoded as key and value
 vectors first (charged as such) and materialised into one `Avro.Map` sized from the decoded pair count
 (duplicate keys: the last value wins, as in Java's `HashMap`-backed reader, documented and tested).
@@ -638,8 +674,8 @@ a fresh operation budget (the one-shot forms charge plan construction to that bu
 * A **read plan** is a tree of plan nodes, one per schema node. The **generic** plan family is dynamic
   (`Vector{ReadPlan}` children, one dynamic dispatch per child behind a function barrier) and produces
   the finite value set of §4.6; it never specialises on schema shape. Named-type recursion is represented
-  by `PlanRef` nodes: plans are built in two passes keyed by schema object identity (and by `(writer,
-  reader)` identity pairs for resolving plans), so `LongList`-style schemas and recursive writer/reader
+  by `PlanRef` nodes: plans are built in two passes keyed by the dense node IDs of §4.4 (and by
+  `(writer, reader)` ID pairs for resolving plans), so `LongList`-style schemas and recursive writer/reader
   pairs terminate; plan construction is charged to `max_resolution_work`.
 * The **typed** plan family (`Avro.DatumReader(schema, T)`, `Avro.Rows(src; T)`) specialises on a
   caller-supplied `T`: `RecordPlan{names, Ps<:Tuple}` unrolled via `ntuple`/`Val` (any width the caller
@@ -711,8 +747,9 @@ out-of-range values) with documented floor-to-ms loss for sub-ms units. The valu
 
 `Avro.resolve(writer::Schema, reader::Schema; union_resolution=:spec, limits=Limits()) ->
 ResolvedSchema` implements every rule of the "Schema Resolution" section, memoised on `(writer, reader)`
-identity pairs and **bounded by `max_resolution_work`** (every branch-match attempt, memo entry and
-resolving-plan node is charged; exceeding it is a `LimitError`):
+dense-ID pairs (§4.4 category (e)) and **bounded by `max_resolution_work`** (every branch-match
+attempt, memo entry, memo scan step and resolving-plan node is charged; exceeding it is a
+`LimitError`):
 
 * Match by kind: arrays/maps recursively; enums, fixed (plus size), records by unqualified name *after*
   applying the reader's type aliases; primitives equal or promotable `int→long/float/double`,
@@ -917,8 +954,8 @@ resolving-plan node is charged; exceeding it is a `LimitError`):
   level (SIGBUS); `mmap=false` (streamed) is the safe option for files that may change and is documented
   as such.
 * **Parallel decoding** (`Avro.Table` only, memory-mapped or byte sources, `ntasks > 1`, actual tasks
-  capped at the number of blocks; `IO`/streamed sources decode sequentially, growing columns geometrically and reserving each new
-  capacity — the same exact storage formula as below — before every `sizehint!`/`resize!`). The in-flight
+  capped at the number of blocks; `IO`/streamed sources decode sequentially, growing columns by the §4.4 growth rule — explicit exact-capacity replacements, each reserved
+  before allocation with the same storage formula as below). The in-flight
   block count is `inflight = min(max_inflight_blocks == 0 ? ntasks : max_inflight_blocks, ntasks,
   nblocks)`, further bounded at run time by the ceiling; a **fixed worker pool** of `min(ntasks,
   Threads.nthreads(), inflight)` tasks is created once (never one task per block), and its state is
@@ -1296,7 +1333,8 @@ container writer, and `Avro.write(io, x)` where `x` is not a table raises a clea
   `Base.Dict` and never hashing — with `max_names`/`max_bytes`) decides
   which untrusted strings may be interned: Tables field names (`Tables.columnnames` must return
   `Symbol`s) **and** typed datum values decoded into `Symbol` on every typed path (`DatumReader`,
-  `decode`, `decodesingle`, `fromjson`, `Rows`, `Table`; §4.8). `Avro.DEFAULT_ADMISSION` (1,000,000
+  `decode`, `decodesingle`, `fromjson`, `Rows`; §4.8 — `Avro.Table` has no `T` and admits only
+  column names). `Avro.DEFAULT_ADMISSION` (1,000,000
   names / 64 MiB) is process-wide; callers may pass their own object via `names=` (per tenant, per job)
   or `names=:trusted` to bypass admission for trusted sources. Exceeding the budget raises `LimitError`;
   strings already admitted do not count twice. `Avro.Rows` admits field names **lazily**, only when
@@ -1584,8 +1622,9 @@ in the fixture).
     empty `bytes`, `fixed`, wide decimals and nullable isbits columns are charged exactly; concatenated
     valid members decode for zstandard, xz and bzip2, zstandard skippable/empty frames and xz padding
     follow the §4.9 rules, and deflate rejects bytes after `BFINAL`; `Avro.Map` capacity and storage at
-    n = 0, 1, 11, 16, 17, 43, 1024 and under adversarial equal-hash keys (memory unchanged, lookups
-    correct, duplicate keys last-wins); schema/plan graphs near the ceiling (shallow wide schema, large
+    n = 0, 1, 11, 16, 17, 23, 43, 1001, 1024 (odd sizes included) and for all-duplicate, reversed and
+    long-common-prefix keys (construction peak equal to the `npairs` + `cld(npairs, 2)` formula, final
+    storage equal to the `nunique` formula, lookups correct, last-wins); schema/plan graphs near the ceiling (shallow wide schema, large
     defaults/props, large resolving plan) fail with `LimitError`; the `storagebytes` oracle with
     `exclude=Avro.Schema` for shared and distinct schema identities; output-buffer growth reserved
     before allocation; `Rows` streams more than the ceiling with unretained outputs and fails with
@@ -1604,7 +1643,11 @@ in the fixture).
     rule tripping on long-common-prefix keys and passing legitimate wide objects; dense empty/skippable
     codec members bounded by the value rule; caller-buffer mutation after `parseschema`; the fast route
     never calling a user constructor (mutable and immutable structs); typed-shell storage oracle over
-    generated layouts incl. zero-field mutable structs and arrays of them; lone-surrogate escapes
+    generated layouts incl. zero-field mutable structs and arrays of them; the growth rule's
+    allocation-hook gate on generic collections, streamed columns, the `Encoder` and owned buffers;
+    pointer-incompatible strings and stepped views copied at exact boundaries; dense-ID tables under
+    reverse-ordered fullnames, cyclic equality and near-`max_resolution_work` adversarial graphs;
+    one-symbol admissions across every power-of-two boundary; lone-surrogate escapes
     rejected in string contexts and preserved in `doc`/props with verbatim re-emission and unchanged
     fingerprints.
 11. **Concurrency**: multi-block files decoded with `ntasks ∈ {1,2,8}` produce identical tables **and
@@ -1919,10 +1962,18 @@ Decisions (each with rationale; reviewers may challenge any):
 42. The typed fast route builds `NamedTuple`s directly and structs with `Expr(:new)` generated for the
     compile-time type, never running user constructors; constructor validation belongs to the semantic
     route; typed shells are measured per `T` from a probe instance.
-44. Unpaired surrogate escapes are rejected in Avro string contexts and preserved verbatim in `doc` and
-    custom properties (raw owned JSON text; U+FFFD on materialisation), matching the oracles.
 43. A comparison rule (`max_compare_bytes_per_byte`) bounds key-comparison work alongside the value
     work rule, and codec members count as values.
+44. JSON strings are decoded uniformly, preserving lone surrogate escapes as surrogate byte sequences
+    that the printer re-escapes; the Unicode-scalar requirement applies contextually after the fullname
+    algorithm (names and namespaces actually used, enum symbols, default strings, datum strings, map
+    keys, union labels), while aliases, `doc`, custom property names/values and nested metadata keys
+    are preserved verbatim, matching the oracles.
+45. No charged buffer is grown with `push!`/`resize!`/`sizehint!`; growth is by reserved exact-capacity
+    replacement through package-owned builders.
+46. Category-(e) tables are keyed by dense node IDs (node-indexed arrays; per-node partner vectors for
+    pairs) with every insertion and scan charged to `max_resolution_work`; the admission table's merges
+    are deamortised to a fixed step per admission.
 
 Intentionally unresolved risks:
 
@@ -1986,6 +2037,17 @@ Review log:
   constructor relations that guarantee the first unit of progress (§4.4); empty-union semantics and
   alias normalisation (§4.2); `Nothing → null` and the exact sanitisation algorithm (§4.8); streamed
   compressed buffers reserved (§4.9).
+* **Round 14** (`reviews/codex-review-14.md`: 6 new findings — all majors — plus follow-ups; `VERDICT:
+  REVISE`). All adopted; dispositions in `reviews/response-14.md`. Changes: `Avro.Map` construction
+  peak over all `npairs` candidates with `cld(npairs, 2)` scratch and in-place compaction (§4.4);
+  uniform surrogate-preserving JSON string decoding with contextual validation after the fullname
+  algorithm and verbatim aliases/metadata (§4.2, decision 44); pointer-incompatible strings and
+  non-contiguous vectors copied before the reservation boundary (§4.2); dense node IDs for every
+  category-(e) table with charged scans (§4.2, §4.4, §4.5, §4.7, decision 46); deamortised admission
+  merges with a fixed per-admission step and transactional staging (§4.4); the growth rule — reserved
+  exact-capacity replacement instead of `push!`/`resize!`/`sizehint!` — for every charged buffer
+  (§4.3, §4.4, §4.9, decision 45); `Int32` bound check, probe-shell reservation, `Avro.Table` typed-path
+  clarification, `==` limits source, stale wording and decision order fixed.
 * **Round 13** (`reviews/codex-review-13.md`: 11 new findings — 6 majors, 5 minors — plus follow-ups;
   `VERDICT: REVISE`). All adopted; dispositions in `reviews/response-13.md`. Changes: hashing removed
   from the guarded path — `Avro.Map` is a sorted-permutation map and the admission table a sorted-runs
@@ -2060,7 +2122,7 @@ Review log:
   network used only for specs, dependencies, and interop tools.
 * Commands and results: recorded in `STATUS.md` in the worktree as phases complete (exact commands,
   Julia versions, pass/fail counts, benchmark numbers).
-* Current state: **plan under review (round 14); no production code changed yet.**
+* Current state: **plan under review (round 15); no production code changed yet.**
 
 ---
 
