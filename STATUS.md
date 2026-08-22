@@ -25,7 +25,8 @@ Readiness target of this task: **PR-ready** (plan §12); nothing is pushed.
 | 2 — Binary core | done (tests green on 1.10.11 and 1.12.6) | `decoder.jl`/`encoder.jl` (checked varints, strict bools/UTF-8, sized blocks, buffer growth), `plan_read.jl`/`plan_write.jl` (plan graphs, generic decode/skip with strict/fast validation incl. domain-checked skipped logical values, encode validation and branch recovery), `storage.jl` (§4.4 (b) formulas with `__init__`-measured constants, `storagebytes`/`heldbytes` oracle), `columns.jl` (schema-independent column builders), `typed.jl` (constructor-free fast route, semantic route, Symbol admission), `prepared.jl` (`DatumReader`/`DatumWriter`, one-shots), `jsonencoding.jl` (`tojson`/`fromjson`), `singleobject.jl` (single-object encoding, `SchemaStore`/`SchemaCache`), the closed value set `E` (`valuetypes`); gates: compile-cost (`test/gates.jl`), storage oracle (`test/storage.jl`), provisional latency (`test/latency.jl`), fuzz sample (`test/fuzz.jl`, `test/fuzz/`), avro-tools differential (`test/interop.jl`, opt-in), 1.x datum cases (`test/legacy.jl`), allocation budgets (`test/typed.jl`, `test/columns.jl`) |
 | 3 — Resolution and order | done (tests green on 1.10.11 and 1.12.6) | `resolution.jl` (`resolve`/`ResolvedSchema`/`resolvingplan`, both union policies, promote/default/enum-remap/union/wrap/resolved-record nodes, pair memo charged to `max_resolution_work`, reader-directed output), `compare.jl` (`comparebytes` lockstep over encoded datums, `compare` via canonical encodings); tests: 90 resolution cases incl. the Java evolution fixtures, 1,400 sort-order checks incl. all 51 Java vectors, cross-form arrays and the agreement property |
 | 4a — Strict containers and codecs | done (tests green on 1.10.11 and 1.12.6) | `codecs.jl` (+ bzip2/xz extensions: member rules, skippable frames, xz padding, per-member `max_codec_memory` enforcement, writer workspace/`windowLog` selection with per-frame verification, snappy CRC32), `container.jl` (strict `Reader`/`eachblock`/`eachdatum` over all sources, legacy mode incl. 1.x nameless fixed names, `decimal_byteorder=:little`, `Writer` with the atomic/failure contract and the reader-side output estimate, `Avro.write`/`tobuffer`, `inspect`); 79 codec + 501 container tests incl. every committed fixture vs its Java tojson lines, the high-window bombs and streaming past the ceiling |
-| 4b–4d — Tables, parallel, projection | not started | |
+| 4b — Tables basics and ownership | done (tests green on 1.10.11 and 1.12.6) | `tables.jl` (`Avro.Table` with per-block chunk materialisation, charged block table and deterministic assembly (finals reserved before chunks release), stored `Tables.Schema{nothing,nothing}` carrying names and eltypes in fields, `Tables.partitions`, DataAPI metadata; `Avro.Rows` in its three modes with lazy name admission and `Tables.columns` through the column builders; `Avro.Row`; `select=` projection with derived effective schemas that `Avro.write` round-trips; retained-schema write precedence; typed/non-record `Rows` written datum-wise); resolved-record column builders and the resolving `littledecimals` nodes; the complete writer preflight (plan §4.4: the reader's parsed schema graph via `parseschema(budget=)`, a stream reader's materialised metadata, the generic read plan, `blocktablecharge`, `readerblockpeak`, and the streamed-Table consumer projection `TablePreflight` for record roots, refused with `LimitError` before the crossing block is emitted); deamortised admission merges (`RunMerge`, MERGE_STEP 2,048, maintenance before mutation, slot-inclusive `max_bytes`); tests: `test/tables.jl` (105), `test/invariant.jl` (43: preflight == stream-reader retention, near-ceiling file × 4 source modes × 3 consumers, root-shape matrix, the 1,001-field × 10,000 one-row-block fixture on both sides, admission reuse/exhaustion), admission gates (67 incl. one million admissions ≈ 5 s) |
+| 4c–4d — Parallel, projection matrix | not started | |
 | 5 — Release engineering | not started | |
 
 ## Decisions taken without user direction during implementation
@@ -83,6 +84,21 @@ Readiness target of this task: **PR-ready** (plan §12); nothing is pushed.
 * fastavro was not re-run for the resolution matrix in this session (the authoring venv was not
   recreated); the Java fixtures (`ReadWithReader`, both readers) are the live oracle, and §8.5's full
   matrix runs in the CI interop job.
+
+* **Phase 4b decisions.** The writer preflight mirrors a *stream* reader's construction retention
+  (key/value buffers retained in addition to the entries), the conservative source mode; the
+  equal-charge test asserts exact equality against `Reader(path; mmap=false)`. The Table consumer
+  projection uses the §4.9 consumer-independent estimate minus a per-field `cellslack` (the slot part
+  chunk capacities already cover), so isbits and string columns project exactly and nested cells
+  conservatively; the projection applies to record roots only (`Reader`/`Rows` stream any root — the
+  176 MiB bytes-root file still writes and streams). Preflight arithmetic uses the live measured
+  storage constants (as 4a's estimates already did); `RECORDED_STORAGE` matches the certified 1.10/1.12
+  measurements and cross-read gates validate portability empirically. `Tables.columns(::Rows)` and
+  `Tables.partitions(::Rows)` hand ownership to the caller per block (caller-space concatenation); the
+  guaranteed bounded consumer is `Avro.Table`. `max_bytes` on `SymbolAdmission` now counts an 8-byte
+  index slot per name and reserves merge scratch (plan §4.4 wording); the docstring says so.
+* `Tables.istable`/`rowaccess` are value-level for `Avro.Rows` (mode is runtime state); typed and
+  non-record modes are plain iterators, and `Tables.partitions` on them is an `ArgumentError`.
 
 ## Commands run and results (2026-08-22)
 
