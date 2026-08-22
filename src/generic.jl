@@ -23,29 +23,40 @@ Map{V}() where {V} = Map{V}(String[], V[], Int32[])
 Build a map from `key => value` pairs (keys `AbstractString` or `Symbol`); copying, validated, charged
 to its own budget scope.
 """
-function Map(pairs; limits::Limits=Limits())
+function Map(@nospecialize(pairs); limits::Limits=Limits())
+    ks, vs = collectpairs(pairs)
     return withbudget(limits; direction=:encode) do budget
-        ks = String[]
-        vs = Any[]
-        for (k, v) in pairs
-            push!(ks, mapkey(k))
-            push!(vs, v)
-        end
-        V = isempty(vs) ? Any : mapreduce(typeof, typejoin, vs)
         addinput!(budget, inputbytes(ks))   # the copied key/value representation bytes are the comparison-rule denominator
-        buildmap(V, ks, Vector{V}(vs), budget)
+        convertmap(valuetype(vs), ks, vs, budget)
     end
 end
 
-Map{V}(pairs; limits::Limits=Limits()) where {V} = withbudget(limits; direction=:encode) do budget
+function Map{V}(@nospecialize(pairs); limits::Limits=Limits()) where {V}
+    ks, vs = collectpairs(pairs)
+    return withbudget(limits; direction=:encode) do budget
+        addinput!(budget, inputbytes(ks))
+        convertmap(V, ks, vs, budget)
+    end
+end
+
+# Copy `key => value` pairs into owned key and `Any` value vectors (one method instance for every input type).
+function collectpairs(@nospecialize(pairs))
     ks = String[]
-    vs = V[]
+    vs = Any[]
     for (k, v) in pairs
         push!(ks, mapkey(k))
-        push!(vs, convert(V, v))
+        push!(vs, v)
     end
-    addinput!(budget, inputbytes(ks))
-    buildmap(V, ks, vs, budget)
+    return ks, vs
+end
+
+convertmap(::Type{V}, ks::Vector{String}, vs::Vector{Any}, budget::Budget) where {V} = buildmap(V, ks, Vector{V}(vs), budget)
+
+# The value type of an inferred map: the promoted join of the value types (`Union{Missing,T}` for
+# `missing` and `T`), narrowed to the generic model's element types so the result is a member of `E`.
+function valuetype(vs::Vector{Any})
+    isempty(vs) && return Any
+    return narrowelement(mapreduce(typeof, Base.promote_typejoin, vs))
 end
 
 inputbytes(ks::Vector{String}) = sum(k -> sizeof(k) + 8, ks; init=0)
@@ -419,11 +430,55 @@ juliatype(::EnumSchema) = EnumValue
 juliatype(::RecordSchema) = Record
 decimaltype(l::DecimalLogical) = l.precision <= 38 ? Decimal : WideDecimal
 
-function elementtype(s::Schema)
-    t = juliatype(s)
-    (t === Vector{Any} || t === Map{Any} || t <: Vector || t <: Map) && return Any
-    return t
+# ---- the closed value set E (plan §4.6) --------------------------------------------------------------
+
+"""
+    Avro.LEAF_TYPES
+
+The leaf members `L` of the generic value model.
+"""
+const LEAF_TYPES = (Missing, Bool, Int32, Int64, Float32, Float64, Vector{UInt8}, String, Fixed, EnumValue, Decimal, WideDecimal,
+                    UUID, Date, Time, Timestamp{Millisecond}, Timestamp{Microsecond}, Timestamp{Nanosecond},
+                    LocalTimestamp{Millisecond}, LocalTimestamp{Microsecond}, LocalTimestamp{Nanosecond}, Duration)
+
+"""
+    Avro.valuetypes() -> Vector{Type}
+
+The closed set `E` of types a generic decode can produce: the leaves, `Record`, `UnionValue`,
+`Vector{x}`/`Map{x}` for `x` a leaf, `Record`, `UnionValue` or `Union{Missing,y}`, `Vector{Any}`,
+`Map{Any}`, and `Union{Missing,x}` for every non-missing member.
+"""
+function valuetypes()
+    elements = Any[LEAF_TYPES..., Record, UnionValue]
+    nullable = Any[Union{Missing,x} for x in (LEAF_TYPES[2:end]..., Record)]
+    composites = Any[Record, UnionValue]
+    for x in (elements..., nullable...)
+        push!(composites, Vector{x})
+        push!(composites, Map{x})
+    end
+    push!(composites, Vector{Any})
+    push!(composites, Map{Any})
+    all = Any[LEAF_TYPES..., composites...]
+    for x in (LEAF_TYPES[2:end]..., composites...)
+        push!(all, Union{Missing,x})
+    end
+    return unique(all)
 end
+
+"""
+    narrowelement(t::Type) -> Type
+
+The element type the generic model stores for values of type `t` inside an array or map (plan §4.6, one
+level of typed nesting): a leaf, `Record`, `UnionValue` or `Union{Missing,y}` for a non-missing leaf or
+`Record` is kept; every other type (nested arrays and maps, abstract joins) is stored as `Any`.
+"""
+function narrowelement(@nospecialize(t::Type))
+    t isa Union || return (t in LEAF_TYPES || t === Record || t === UnionValue) ? t : Any
+    u = Base.nonmissingtype(t)
+    return (t === Union{Missing,u} && ((u in LEAF_TYPES && u !== Missing) || u === Record)) ? t : Any
+end
+
+elementtype(s::Schema) = narrowelement(juliatype(s))
 
 juliatype(s::ArraySchema) = Vector{elementtype(s.items)}
 juliatype(s::MapSchema) = Map{elementtype(s.values)}
