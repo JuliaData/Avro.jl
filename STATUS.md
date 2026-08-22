@@ -24,7 +24,8 @@ Readiness target of this task: **PR-ready** (plan §12); nothing is pushed.
 | 1 — Schema model | done (tests green on 1.10.11 and 1.12.6) | `names.jl`, `jsonreader.jl` (Avro-owned RFC 8259 reader, WTF-8 strings, spans), `logical.jl`, `schema.jl` (parse/validate defaults/finalize/hash/equality/print/public constructors/`minsize`; nodes are heap objects with `const` fields), `canonical.jl` (PCF + CRC-64-AVRO/MD5/SHA-256 fingerprints), `generic.jl` (`Map`, `Record`, `EnumValue`, `Fixed`, `UnionValue`), `types.jl` (Julia type → schema derivation, name policy, `Tables.Schema`, value-level `schema`); tests |
 | 2 — Binary core | done (tests green on 1.10.11 and 1.12.6) | `decoder.jl`/`encoder.jl` (checked varints, strict bools/UTF-8, sized blocks, buffer growth), `plan_read.jl`/`plan_write.jl` (plan graphs, generic decode/skip with strict/fast validation incl. domain-checked skipped logical values, encode validation and branch recovery), `storage.jl` (§4.4 (b) formulas with `__init__`-measured constants, `storagebytes`/`heldbytes` oracle), `columns.jl` (schema-independent column builders), `typed.jl` (constructor-free fast route, semantic route, Symbol admission), `prepared.jl` (`DatumReader`/`DatumWriter`, one-shots), `jsonencoding.jl` (`tojson`/`fromjson`), `singleobject.jl` (single-object encoding, `SchemaStore`/`SchemaCache`), the closed value set `E` (`valuetypes`); gates: compile-cost (`test/gates.jl`), storage oracle (`test/storage.jl`), provisional latency (`test/latency.jl`), fuzz sample (`test/fuzz.jl`, `test/fuzz/`), avro-tools differential (`test/interop.jl`, opt-in), 1.x datum cases (`test/legacy.jl`), allocation budgets (`test/typed.jl`, `test/columns.jl`) |
 | 3 — Resolution and order | done (tests green on 1.10.11 and 1.12.6) | `resolution.jl` (`resolve`/`ResolvedSchema`/`resolvingplan`, both union policies, promote/default/enum-remap/union/wrap/resolved-record nodes, pair memo charged to `max_resolution_work`, reader-directed output), `compare.jl` (`comparebytes` lockstep over encoded datums, `compare` via canonical encodings); tests: 90 resolution cases incl. the Java evolution fixtures, 1,400 sort-order checks incl. all 51 Java vectors, cross-form arrays and the agreement property |
-| 4a–4d — Containers, Tables, parallel, projection | not started | |
+| 4a — Strict containers and codecs | done (tests green on 1.10.11 and 1.12.6) | `codecs.jl` (+ bzip2/xz extensions: member rules, skippable frames, xz padding, per-member `max_codec_memory` enforcement, writer workspace/`windowLog` selection with per-frame verification, snappy CRC32), `container.jl` (strict `Reader`/`eachblock`/`eachdatum` over all sources, legacy mode incl. 1.x nameless fixed names, `decimal_byteorder=:little`, `Writer` with the atomic/failure contract and the reader-side output estimate, `Avro.write`/`tobuffer`, `inspect`); 79 codec + 501 container tests incl. every committed fixture vs its Java tojson lines, the high-window bombs and streaming past the ceiling |
+| 4b–4d — Tables, parallel, projection | not started | |
 | 5 — Release engineering | not started | |
 
 ## Decisions taken without user direction during implementation
@@ -58,6 +59,17 @@ Readiness target of this task: **PR-ready** (plan §12); nothing is pushed.
 * avro-tools oracle limitation recorded (plan §8.4): zero-byte datums (null root, the empty record) —
   `fragtojson` prints nothing for them and `jsontofrag` hangs on `{}`; such schemas are skipped in the
   differential. Java tools run with stdin closed and a watchdog (a tool falling back to stdin hung).
+* Deflate tolerates ≤ 3 trailing bytes after the final block: fastavro writes its blocks as
+  `zlib.compress(...)[2:-1]`, leaving three checksum bytes, and the Phase 4a gate requires reading
+  fastavro files for every codec; longer suffixes stay a `CodecError`. The committed `-xz.avro` data
+  (like `-fastavro-*`) went through fastavro, which reselects union branches, so those fixtures are
+  compared leniently on non-nullable union fields (§8.5's branch-identity caveat).
+* `legacy=:avrojl1` has a third unambiguous tolerance: Avro.jl ≤ 1.1.2 wrote `fixed` schemas without
+  names (the committed 1.x fixtures embody it), so nameless fixed schemas get synthetic names at parse
+  time under the legacy flag. A `:big` read of a 1.x little-endian decimal fails the decode-side
+  precision validation (`DataError`) rather than yielding garbage.
+* `eachdatum` enforces `max_block_output_bytes` cumulatively per block from the actual decode charges;
+  the writer's estimate is a per-datum walk (`estimatevalue`) over the same storage formulas.
 * Per-version manifests (`Manifest-v1.10.toml`, ignored) run the 1.10 matrix beside the 1.12 one.
 * Typed decoding under a `reader_schema` takes the semantic route (generic reader values, then
   `StructUtils.make` in caller space); a fast route over resolving plans is deferred to the Phase 4d
