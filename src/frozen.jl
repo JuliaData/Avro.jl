@@ -1,8 +1,8 @@
 # Frozen containers (plan §4.2): the parser fills them and calls `freeze!` once; afterwards every
-# mutating method throws. Schema nodes are immutable structs holding these containers, so nothing
-# reachable from a frozen schema can be mutated through the public API. No hashing: `FrozenDict` is a
+# mutating method throws, so nothing reachable from a frozen schema can be mutated through the public
+# API. No hashing: `FrozenDict` is a
 # sorted key vector with binary search (the package never performs hash-table lookups of untrusted
-# keys, plan decision 35).
+# keys, plan decision 35). Schema nodes hold these containers in `const` fields.
 
 struct FrozenError <: Exception
     what::String

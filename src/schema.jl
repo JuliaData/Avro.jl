@@ -1,6 +1,7 @@
 # Schema model (plan §4.2): immutable, transitively frozen schema graphs with dense node ids, the
 # fullname algorithm, the contextual attribute grammar, the recursive default rule, printing and
-# structural equality.
+# structural equality. Nodes are heap objects with `const` fields (never inlined into the values that
+# reference them: `Record`, `EnumValue` and `Fixed` carry one 8-byte reference — plan §4.4 (b)).
 
 const Props = FrozenDict{String,Any}   # custom attributes as frozen JSON trees (raw number tokens)
 
@@ -59,38 +60,38 @@ end
 
 const Default = Union{NoDefault,DefaultValue}
 
-struct NullSchema <: Schema; props::Props; meta::NodeMeta; end
-struct BooleanSchema <: Schema; props::Props; meta::NodeMeta; end
-struct IntSchema <: Schema; logical::Union{Nothing,LogicalType}; props::Props; meta::NodeMeta; end
-struct LongSchema <: Schema; logical::Union{Nothing,LogicalType}; props::Props; meta::NodeMeta; end
-struct FloatSchema <: Schema; props::Props; meta::NodeMeta; end
-struct DoubleSchema <: Schema; props::Props; meta::NodeMeta; end
-struct BytesSchema <: Schema; logical::Union{Nothing,LogicalType}; props::Props; meta::NodeMeta; end
-struct StringSchema <: Schema; logical::Union{Nothing,LogicalType}; props::Props; meta::NodeMeta; end
-struct ArraySchema <: Schema; items::Schema; props::Props; meta::NodeMeta; end
-struct MapSchema <: Schema; values::Schema; props::Props; meta::NodeMeta; end
-struct UnionSchema <: Schema; branches::FrozenVector{Schema}; meta::NodeMeta; end
+mutable struct NullSchema <: Schema; const props::Props; const meta::NodeMeta; end
+mutable struct BooleanSchema <: Schema; const props::Props; const meta::NodeMeta; end
+mutable struct IntSchema <: Schema; const logical::Union{Nothing,LogicalType}; const props::Props; const meta::NodeMeta; end
+mutable struct LongSchema <: Schema; const logical::Union{Nothing,LogicalType}; const props::Props; const meta::NodeMeta; end
+mutable struct FloatSchema <: Schema; const props::Props; const meta::NodeMeta; end
+mutable struct DoubleSchema <: Schema; const props::Props; const meta::NodeMeta; end
+mutable struct BytesSchema <: Schema; const logical::Union{Nothing,LogicalType}; const props::Props; const meta::NodeMeta; end
+mutable struct StringSchema <: Schema; const logical::Union{Nothing,LogicalType}; const props::Props; const meta::NodeMeta; end
+mutable struct ArraySchema <: Schema; const items::Schema; const props::Props; const meta::NodeMeta; end
+mutable struct MapSchema <: Schema; const values::Schema; const props::Props; const meta::NodeMeta; end
+mutable struct UnionSchema <: Schema; const branches::FrozenVector{Schema}; const meta::NodeMeta; end
 
-struct FixedSchema <: Schema
-    name::FullName
-    aliases::FrozenVector{String}      # normalised fullnames
-    rawaliases::FrozenVector{String}   # as written, for re-emission
-    size::Int
-    logical::Union{Nothing,LogicalType}
-    props::Props
-    meta::NodeMeta
+mutable struct FixedSchema <: Schema
+    const name::FullName
+    const aliases::FrozenVector{String}      # normalised fullnames
+    const rawaliases::FrozenVector{String}   # as written, for re-emission
+    const size::Int
+    const logical::Union{Nothing,LogicalType}
+    const props::Props
+    const meta::NodeMeta
 end
 
-struct EnumSchema <: Schema
-    name::FullName
-    aliases::FrozenVector{String}
-    rawaliases::FrozenVector{String}
-    doc::Union{Nothing,String}
-    symbols::FrozenVector{String}
-    default::Default
-    symbolindex::FrozenDict{String,Int}
-    props::Props
-    meta::NodeMeta
+mutable struct EnumSchema <: Schema
+    const name::FullName
+    const aliases::FrozenVector{String}
+    const rawaliases::FrozenVector{String}
+    const doc::Union{Nothing,String}
+    const symbols::FrozenVector{String}
+    const default::Default
+    const symbolindex::FrozenDict{String,Int}
+    const props::Props
+    const meta::NodeMeta
 end
 
 struct Field
@@ -103,16 +104,16 @@ struct Field
     props::Props
 end
 
-struct RecordSchema <: Schema
-    name::FullName
-    aliases::FrozenVector{String}
-    rawaliases::FrozenVector{String}
-    doc::Union{Nothing,String}
-    iserror::Bool
-    props::Props
-    fields::FrozenVector{Field}              # filled after registration (self-references resolve), then frozen
-    fieldindex::FrozenDict{String,Int}
-    meta::NodeMeta
+mutable struct RecordSchema <: Schema
+    const name::FullName
+    const aliases::FrozenVector{String}
+    const rawaliases::FrozenVector{String}
+    const doc::Union{Nothing,String}
+    const iserror::Bool
+    const props::Props
+    const fields::FrozenVector{Field}              # filled after registration (self-references resolve), then frozen
+    const fieldindex::FrozenDict{String,Int}
+    const meta::NodeMeta
 end
 
 const NamedSchema = Union{RecordSchema,EnumSchema,FixedSchema}
