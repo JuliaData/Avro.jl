@@ -212,9 +212,34 @@ function Base.get(m::Map, k::AbstractString, default)
 end
 Base.get(m::Map, k::Symbol, default) = get(m, String(k), default)
 
-Base.:(==)(a::Map, b::Map) = a.keys == b.keys && a.vals == b.vals
-Base.isequal(a::Map, b::Map) = isequal(a.keys, b.keys) && isequal(a.vals, b.vals)
-Base.hash(a::Map, h::UInt) = hash(a.vals, hash(a.keys, hash(:AvroMap, h)))
+# Equality and hashing follow the sorted key order (insertion order is not part of the value).
+function Base.:(==)(a::Map, b::Map)
+    length(a.perm) == length(b.perm) || return false
+    result = true
+    for i in eachindex(a.perm)
+        ia, ib = a.perm[i], b.perm[i]
+        a.keys[ia] == b.keys[ib] || return false
+        eq = a.vals[ia] == b.vals[ib]
+        eq === false && return false
+        eq === missing && (result = missing)
+    end
+    return result
+end
+function Base.isequal(a::Map, b::Map)
+    length(a.perm) == length(b.perm) || return false
+    for i in eachindex(a.perm)
+        ia, ib = a.perm[i], b.perm[i]
+        (a.keys[ia] == b.keys[ib] && isequal(a.vals[ia], b.vals[ib])) || return false
+    end
+    return true
+end
+function Base.hash(a::Map, h::UInt)
+    h = hash(:AvroMap, h)
+    for i in a.perm
+        h = hash(a.vals[i], hash(a.keys[i], h))
+    end
+    return h
+end
 
 function Base.show(io::IO, m::Map{V}) where {V}
     print(io, "Avro.Map{", V, "}(")

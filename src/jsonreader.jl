@@ -75,7 +75,7 @@ appropriate error (`SchemaError`, `DataError`, …). Returns the maximum nesting
 """
 function prescan(buf::AbstractVector{UInt8}, maxbytes::Int, maxdepth::Int, errfn;
                  limitfn=(limit, observed, value) -> errfn("$limit exceeded ($observed > $value)", 0),
-                 bytelimit::Symbol=:max_bytes, depthlimit::Symbol=:max_depth)
+                 bytelimit::Symbol=:max_bytes, depthlimit::Symbol=:max_depth, lenient::Bool=false)
     n = length(buf)
     n <= maxbytes || limitfn(bytelimit, n, maxbytes)
     n >= 3 && buf[1] == 0xEF && buf[2] == 0xBB && buf[3] == 0xBF && errfn("a byte-order mark is not allowed", 1)
@@ -109,6 +109,9 @@ function prescan(buf::AbstractVector{UInt8}, maxbytes::Int, maxdepth::Int, errfn
         elseif b == UInt8(',') || b == UInt8(':')
             depth >= 1 || errfn("unexpected '$(Char(b))' outside a container", i)
             i += 1
+        elseif lenient && (b == UInt8('N') || b == UInt8('I') || (b == UInt8('-') && i < n && buf[i + 1] == UInt8('I')))
+            i = scanliteral(buf, i, n, b == UInt8('N') ? "NaN" : (b == UInt8('I') ? "Infinity" : "-Infinity"), errfn)
+            nvalues += 1
         elseif b == UInt8('-') || isdigit8(b)
             i = scannumber(buf, i, n, errfn)
             nvalues += 1
@@ -423,6 +426,7 @@ mutable struct JSONReader{B<:AbstractVector{UInt8}}
     const budget::Union{Nothing,Budget}
     pos::Int
     depth::Int
+    const lenient::Bool      # the non-JSON tokens NaN / Infinity / -Infinity (Java's decoder accepts them)
 end
 
 function skipws!(r::JSONReader)
@@ -445,9 +449,9 @@ duplicate keys are errors detected over decoded keys, numbers are raw `JSONNumbe
 """
 function parsejson(buf::AbstractVector{UInt8}; maxbytes::Int, maxdepth::Int, errfn, budget::Union{Nothing,Budget}=nothing,
                    limitfn=(limit, observed, value) -> errfn("$limit exceeded ($observed > $value)", 0),
-                   bytelimit::Symbol=:max_bytes, depthlimit::Symbol=:max_depth)
-    prescan(buf, maxbytes, maxdepth, errfn; limitfn=limitfn, bytelimit=bytelimit, depthlimit=depthlimit)
-    r = JSONReader(buf, length(buf), maxdepth, errfn, budget, 1, 0)
+                   bytelimit::Symbol=:max_bytes, depthlimit::Symbol=:max_depth, lenient::Bool=false)
+    prescan(buf, maxbytes, maxdepth, errfn; limitfn=limitfn, bytelimit=bytelimit, depthlimit=depthlimit, lenient=lenient)
+    r = JSONReader(buf, length(buf), maxdepth, errfn, budget, 1, 0, lenient)
     skipws!(r)
     v = parsevalue!(r)
     skipws!(r)
@@ -472,6 +476,10 @@ function parsevalue!(r::JSONReader)
         r.pos += 5; return false
     elseif b == UInt8('n')
         r.pos += 4; return nothing
+    elseif r.lenient && (b == UInt8('N') || b == UInt8('I') || (b == UInt8('-') && r.pos < r.n && r.buf[r.pos + 1] == UInt8('I')))
+        lit = b == UInt8('N') ? "NaN" : (b == UInt8('I') ? "Infinity" : "-Infinity")
+        r.pos += sizeof(lit)
+        return b == UInt8('N') ? NaN : (b == UInt8('I') ? Inf : -Inf)
     elseif b == UInt8('-') || isdigit8(b)
         start = r.pos
         r.pos = scannumber(r.buf, r.pos, r.n, r.errfn)
