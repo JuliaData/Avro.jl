@@ -126,7 +126,12 @@ encodeerror(msg::AbstractString, x) = throw(EncodeError(string(msg, " (got ", ty
 Encode `x` under `plan` into `e`, validating it against the schema and charging values to the budget.
 """
 function encode(p::WritePlan, e::Encoder, x)
-    countvalues!(e.budget)
+    b = e.budget
+    if b.values >= b.workcap && e.pos > e.credited
+        addinput!(b, e.pos - e.credited)               # encoded bytes are the encode side's work denominator
+        e.credited = e.pos
+    end
+    countvalues!(b)
     encodevalue(p, e, x)
     return nothing
 end

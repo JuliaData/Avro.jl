@@ -278,6 +278,10 @@
         @test e isa Avro.LimitError && e.limit in (:max_block_count, :max_values_per_byte, :max_total_values)
         @test_throws Avro.LimitError Avro.decode(arr, enc("\"long\"", 1 << 20) ; limits=Avro.Limits(work_allowance=0))   # work rule
         @test_throws Avro.LimitError Avro.encode(arr, Vector{Missing}(undef, 1 << 20); limits=Avro.Limits(max_total_values=1000))
+        bigarr = Avro.parseschema("{\"type\":\"array\",\"items\":\"boolean\"}")
+        @test length(Avro.encode(bigarr, fill(true, 200_000))) > 200_000       # produced bytes feed the encode work rule (> work_allowance values)
+        nullarr = Avro.parseschema("{\"type\":\"array\",\"items\":\"null\"}")
+        @test_throws Avro.LimitError Avro.encode(nullarr, Vector{Missing}(undef, 1 << 21))                    # a million nulls produce no bytes: the work rule trips
         deep = P("{\"type\":\"record\",\"name\":\"D\",\"fields\":[{\"name\":\"n\",\"type\":[\"null\",\"D\"]}]}")
         function nest(k)
             v = Avro.Record(deep, [missing])

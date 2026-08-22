@@ -11,11 +11,12 @@ mutable struct Encoder
     pos::Int          # number of bytes written
     const budget::Budget
     depth::Int
+    credited::Int     # bytes already credited to the work rule (plan §4.3: the output is the denominator)
 end
 
 function Encoder(budget::Budget; capacity::Int=256)
     reserve!(budget, bytesbytes(capacity))
-    return Encoder(Vector{UInt8}(undef, capacity), 0, budget, 0)
+    return Encoder(Vector{UInt8}(undef, capacity), 0, budget, 0, 0)
 end
 
 Base.length(e::Encoder) = e.pos
@@ -130,12 +131,14 @@ The written bytes as an exactly sized, caller-owned vector; the encoder is reset
 function Base.take!(e::Encoder)
     out = e.buf[1:e.pos]
     e.pos = 0
+    e.credited = 0
     return out
 end
 
 function reset!(e::Encoder)
     e.pos = 0
     e.depth = 0
+    e.credited = 0
     return e
 end
 
