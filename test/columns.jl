@@ -42,7 +42,7 @@
     budget = Avro.Budget(Avro.Limits(); available=1 << 40)
     before = budget.reserved
     c = Avro.makecolumn(Union{Missing,Int32}, Avro.IntPlan(), 1000, budget)
-    @test budget.reserved - before == 40 + 1000 * (4 + 1)                    # tag byte per isbits-union element
+    @test budget.reserved - before == 40 + 1000 * (4 + 1)                    # tag byte per isbits-union element (Avro.vectorbytes)
     before = budget.reserved
     Avro.makecolumn(String, Avro.StringPlan(), 1000, budget)
     @test budget.reserved - before == 40 + 1000 * 8
@@ -82,4 +82,13 @@
     cols = Avro.columnbuilders(bp, nothing, 100, budget)
     kernel(cols, d, 100)
     @test @allocated(kernel(cols, d, 100)) == 0
+    # a string column allocates exactly one String per cell (plan §9.12)
+    ss = P("{\"type\":\"record\",\"name\":\"S\",\"fields\":[{\"name\":\"s\",\"type\":\"string\"}]}")
+    sb = reduce(vcat, [Avro.encode(ss, (s="row$i",)) for i in 1:200])
+    scols = Avro.columnbuilders(Avro.readplan(ss), nothing, 200, budget)
+    sd = Avro.Decoder(sb, budget)
+    kernel(scols, sd, 200)
+    a100 = @allocations(kernel(scols, sd, 100))
+    a200 = @allocations(kernel(scols, sd, 200))
+    @test a200 - a100 == 100 && a100 <= 101                                 # one String per cell (at most one per call besides)
 end

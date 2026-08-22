@@ -26,6 +26,7 @@ include("logical.jl")
 include("schema.jl")
 include("canonical.jl")
 include("generic.jl")
+include("storage.jl")
 include("types.jl")
 include("decoder.jl")
 include("encoder.jl")
@@ -53,6 +54,11 @@ if VERSION >= v"1.11.0-DEV.469"
         :TimestampNanos, :LocalTimestampMillis, :LocalTimestampMicros, :LocalTimestampNanos, :DurationLogical, :UnknownLogical, :Map, :Record, :EnumValue, :Fixed, :UnionValue, :ordinal, :juliatype, :valuetypes, :minsize, :schema, :avroname, :avrosymbol, :AvroStyle,
         :DatumReader, :DatumWriter, :encode, :encode!, :decode, :tojson, :fromjson,
         :SchemaStore, :SchemaCache, :register!, :lookup, :encodesingle, :decodesingle))
+end
+
+function __init__()
+    STORAGE[] = measurestorage()
+    return nothing
 end
 
 end # module Avro

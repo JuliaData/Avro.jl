@@ -14,7 +14,7 @@ mutable struct Encoder
 end
 
 function Encoder(budget::Budget; capacity::Int=256)
-    reserve!(budget, 40 + capacity)
+    reserve!(budget, bytesbytes(capacity))
     return Encoder(Vector{UInt8}(undef, capacity), 0, budget, 0)
 end
 
@@ -33,10 +33,10 @@ function ensureroom!(e::Encoder, n::Int)
     newcap = max(need, min(2 * length(e.buf), length(e.buf) + (64 << 20)))
     newcap <= e.budget.limits.max_datum_bytes + e.budget.limits.max_block_bytes + (1 << 20) ||
         throw(LimitError(:max_datum_bytes, newcap, e.budget.limits.max_datum_bytes, :max_datum_bytes, :encode))
-    reserve!(e.budget, 40 + newcap)
+    reserve!(e.budget, bytesbytes(newcap))
     nb = Vector{UInt8}(undef, newcap)
     copyto!(nb, 1, e.buf, 1, e.pos)
-    release!(e.budget, 40 + length(e.buf))
+    release!(e.budget, bytesbytes(length(e.buf)))
     e.buf = nb
     return nothing
 end

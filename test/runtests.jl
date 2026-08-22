@@ -7,6 +7,7 @@ using Tables
 using Random
 
 const FIXTURES = joinpath(@__DIR__, "fixtures")
+include("valuegen.jl")
 
 @testset "Avro" begin
     include("limits.jl")
@@ -18,6 +19,7 @@ const FIXTURES = joinpath(@__DIR__, "fixtures")
     include("schema.jl")
     include("types.jl")
     include("binary.jl")
+    include("storage.jl")
     include("typed.jl")
     include("jsonencoding.jl")
     include("singleobject.jl")

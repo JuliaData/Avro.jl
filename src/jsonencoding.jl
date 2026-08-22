@@ -329,13 +329,14 @@ function jsonkind(s::StringSchema, j, ctx, depth)
         u === nothing && jsonerror("not an RFC 4122 uuid string: $(repr(j))")
         return u
     end
-    reserve!(ctx.budget, 16 + sizeof(j))
+    reserve!(ctx.budget, stringbytes(sizeof(j)))
     return j
 end
 
 function jsonkind(s::EnumSchema, j, ctx, depth)
     j isa String || jsonerror("expected an enum symbol string, got $(describejson(j))")
     haskey(s.symbolindex, j) || jsonerror("\"$j\" is not a symbol of enum $(fullname(s))")
+    reserve!(ctx.budget, enumvaluebytes())
     return EnumValue(s, Int32(s.symbolindex[j]), Val(:unchecked))
 end
 
@@ -344,7 +345,7 @@ function jsonkind(s::ArraySchema, j, ctx, depth)
     checkdepth(ctx.budget, depth)
     E = elementtype(s.items)
     n = length(j)
-    reserve!(ctx.budget, 40 + n * slotbytes(E))
+    reserve!(ctx.budget, vectorbytes(E, n))
     out = Vector{E}(undef, n)
     for i in 1:n
         out[i] = jsontovalue(s.items, j[i], ctx, depth + 1)
@@ -358,7 +359,7 @@ function jsonkind(s::MapSchema, j, ctx, depth)
     V = elementtype(s.values)
     ks = j.order.data
     n = length(ks)
-    reserve!(ctx.budget, 80 + n * (8 + slotbytes(V)))
+    reserve!(ctx.budget, vectorbytes(String, n) + vectorbytes(V, n))   # buildmap charges the struct and permutation
     keys = Vector{String}(undef, n)
     vals = Vector{V}(undef, n)
     for i in 1:n
@@ -379,7 +380,7 @@ function jsonkind(s::RecordSchema, j, ctx, depth)
             haskey(s.fieldindex, k) || jsonerror("unknown member \"$k\" of record $(fullname(s))")
         end
     end
-    reserve!(ctx.budget, 56 + 8 * n)
+    reserve!(ctx.budget, recordbytes(n))
     vals = Vector{Any}(undef, n)
     for (i, f) in enumerate(s.fields)
         if haskey(j, f.name)
@@ -432,7 +433,7 @@ function bytesfromjson(j, size::Int, ctx::JSONContext)
     isbytestring(j) || jsonerror("byte string has code points above U+00FF")
     n = length(j)
     size < 0 || n == size || jsonerror("fixed of size $size given $n bytes")
-    reserve!(ctx.budget, 40 + n)
+    reserve!(ctx.budget, bytesbytes(n))
     out = Vector{UInt8}(undef, n)
     for (i, c) in enumerate(j)
         out[i] = UInt8(c)

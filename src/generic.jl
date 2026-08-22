@@ -76,7 +76,7 @@ place (the vectors keep their `npairs` capacity).
 function buildmap(::Type{V}, keys::Vector{String}, vals::Vector{V}, budget::Union{Nothing,Budget}) where {V}
     n = length(keys)
     n <= typemax(Int32) || throw(ArgumentError("a map cannot hold more than $(typemax(Int32)) pairs"))
-    budget === nothing || reserve!(budget, 4 * n + 4 * cld(n, 2) + 128)
+    budget === nothing || reserve!(budget, mapshellbytes(n) + vectorbytes(Int32, cld(n, 2)))   # struct, permutation and the sort scratch
     perm = Vector{Int32}(undef, n)
     for i in 1:n
         perm[i] = Int32(i)
@@ -128,7 +128,7 @@ function buildmap(::Type{V}, keys::Vector{String}, vals::Vector{V}, budget::Unio
             perm = out
         end
     end
-    budget === nothing || release!(budget, 4 * cld(n, 2))
+    budget === nothing || release!(budget, vectorbytes(Int32, cld(n, 2)))
     return Map{V}(keys, vals, perm)
 end
 
@@ -279,7 +279,7 @@ struct Record
         vs = Any[v for v in values]
         length(vs) == length(schema.fields) || throw(ArgumentError("record \"$(fullname(schema))\" has $(length(schema.fields)) fields, got $(length(vs)) values"))
         return withbudget(limits; direction=:encode) do budget
-            reserve!(budget, 56 + 8 * length(vs))
+            reserve!(budget, recordbytes(length(vs)))
             new(schema, vs)
         end
     end
@@ -361,7 +361,7 @@ struct Fixed
     function Fixed(schema::FixedSchema, bytes::AbstractVector{UInt8}; limits::Limits=Limits())
         length(bytes) == schema.size || throw(ArgumentError("fixed \"$(fullname(schema))\" has size $(schema.size), got $(length(bytes)) bytes"))
         return withbudget(limits; direction=:encode) do budget
-            reserve!(budget, 56 + length(bytes))
+            reserve!(budget, fixedbytes(length(bytes)))
             new(schema, Vector{UInt8}(bytes))
         end
     end

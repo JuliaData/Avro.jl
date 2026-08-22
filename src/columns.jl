@@ -37,10 +37,8 @@ function columnbuilders(p::RecordPlan, selected::Union{Nothing,AbstractVector{In
     return cols
 end
 
-columnbytes(::Type{E}, n::Int) where {E} = 40 + n * slotbytes(E)
-
 function makecolumn(::Type{E}, plan::P, capacity::Int, budget::Budget) where {E,P<:ReadPlan}
-    reserve!(budget, columnbytes(E, capacity))
+    reserve!(budget, vectorbytes(E, capacity))
     return TypedColumn{E,P}(plan, Vector{E}(undef, capacity), 0)
 end
 
@@ -72,10 +70,10 @@ function decodecell!(c::TypedColumn{E}, d::Decoder) where {E}
 end
 
 function grow!(c::TypedColumn{E}, budget::Budget, newcap::Int) where {E}
-    reserve!(budget, columnbytes(E, newcap))
+    reserve!(budget, vectorbytes(E, newcap))
     nd = Vector{E}(undef, newcap)
     copyto!(nd, 1, c.data, 1, c.len)
-    release!(budget, columnbytes(E, length(c.data)))
+    release!(budget, vectorbytes(E, length(c.data)))
     c.data = nd
     return nothing
 end
@@ -88,10 +86,10 @@ The column trimmed to its row count (over-capacity storage released from the bud
 function finishcolumn!(c::TypedColumn{E}, budget::Budget) where {E}
     out = c.data
     if c.len != length(out)
-        reserve!(budget, columnbytes(E, c.len))
+        reserve!(budget, vectorbytes(E, c.len))
         out = Vector{E}(undef, c.len)
         copyto!(out, 1, c.data, 1, c.len)
-        release!(budget, columnbytes(E, length(c.data)))
+        release!(budget, vectorbytes(E, length(c.data)))
         c.data = out
     end
     return out

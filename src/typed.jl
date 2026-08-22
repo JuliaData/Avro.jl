@@ -392,7 +392,7 @@ function typedvalue(p::ArrayTarget{E}, d::Decoder, names) where {E}
         end
     end
     leave!(d)
-    g === nothing && (reserve!(d.budget, 40); return Vector{E}(undef, 0))
+    g === nothing && (reserve!(d.budget, STORAGE[].vector); return Vector{E}(undef, 0))
     return finish!(g, d)
 end
 
