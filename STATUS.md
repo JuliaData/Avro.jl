@@ -26,7 +26,8 @@ Readiness target of this task: **PR-ready** (plan §12); nothing is pushed.
 | 3 — Resolution and order | done (tests green on 1.10.11 and 1.12.6) | `resolution.jl` (`resolve`/`ResolvedSchema`/`resolvingplan`, both union policies, promote/default/enum-remap/union/wrap/resolved-record nodes, pair memo charged to `max_resolution_work`, reader-directed output), `compare.jl` (`comparebytes` lockstep over encoded datums, `compare` via canonical encodings); tests: 90 resolution cases incl. the Java evolution fixtures, 1,400 sort-order checks incl. all 51 Java vectors, cross-form arrays and the agreement property |
 | 4a — Strict containers and codecs | done (tests green on 1.10.11 and 1.12.6) | `codecs.jl` (+ bzip2/xz extensions: member rules, skippable frames, xz padding, per-member `max_codec_memory` enforcement, writer workspace/`windowLog` selection with per-frame verification, snappy CRC32), `container.jl` (strict `Reader`/`eachblock`/`eachdatum` over all sources, legacy mode incl. 1.x nameless fixed names, `decimal_byteorder=:little`, `Writer` with the atomic/failure contract and the reader-side output estimate, `Avro.write`/`tobuffer`, `inspect`); 79 codec + 501 container tests incl. every committed fixture vs its Java tojson lines, the high-window bombs and streaming past the ceiling |
 | 4b — Tables basics and ownership | done (tests green on 1.10.11 and 1.12.6) | `tables.jl` (`Avro.Table` with per-block chunk materialisation, charged block table and deterministic assembly (finals reserved before chunks release), stored `Tables.Schema{nothing,nothing}` carrying names and eltypes in fields, `Tables.partitions`, DataAPI metadata; `Avro.Rows` in its three modes with lazy name admission and `Tables.columns` through the column builders; `Avro.Row`; `select=` projection with derived effective schemas that `Avro.write` round-trips; retained-schema write precedence; typed/non-record `Rows` written datum-wise); resolved-record column builders and the resolving `littledecimals` nodes; the complete writer preflight (plan §4.4: the reader's parsed schema graph via `parseschema(budget=)`, a stream reader's materialised metadata, the generic read plan, `blocktablecharge`, `readerblockpeak`, and the streamed-Table consumer projection `TablePreflight` for record roots, refused with `LimitError` before the crossing block is emitted); deamortised admission merges (`RunMerge`, MERGE_STEP 2,048, maintenance before mutation, slot-inclusive `max_bytes`); tests: `test/tables.jl` (105), `test/invariant.jl` (43: preflight == stream-reader retention, near-ceiling file × 4 source modes × 3 consumers, root-shape matrix, the 1,001-field × 10,000 one-row-block fixture on both sides, admission reuse/exhaustion), admission gates (67 incl. one million admissions ≈ 5 s) |
-| 4c–4d — Parallel, projection matrix | not started | |
+| 4c — Parallel decode | done (tests green on 1.10.11 and 1.12.6, `-t4`) | `parallel.jl`: stage-1 `prescanblocks` (no decompression; charged block table; bad headers become a pending indexed failure), exact final-column preallocation, the direct head under the sequential rule (`decodedirect!` into final slices via reused `TypedColumn` builders — byte and mapped sources at every `ntasks`, including 1), higher blocks admitted strictly in order into headroom with complete worst-case reservations `W` (`blockworstcase`: compressed + `max_block_bytes` + `max_codec_memory` + exact chunk shells/capacities + `max_block_output_bytes` + `SCRATCH_STATE_MAX` 8 MiB), per-block worker budgets (ceiling = `W`) whose counters merge into the main budget at ordered commits, the admission-wave barrier, `@atomic` lowest-failing-index selection, per-worker codec instances, `ParallelStats`/`PARALLEL_HOOK` introspection; per-block output cap now enforced on the streamed chunk path too; gates: `test/parallel.jl` (99: `ntasks ∈ {1,2,8}` × default/raised limits × strict/fast identical results and counters, forced schedules, failure-kind pairings incl. content vs limit vs structural with byte-identical errors, speculative bound, GC stress), `test/rssgate.jl` (opt-in `AVRO_RSS_GATE=true`: warmed child, acknowledged baseline, 10 ms `ps` sampling; recorded on the M-series host: baseline 404.5 MB, peak 3146.9 MB on a 2 GiB half-ceiling table of 16 MiB blocks, 7 workers, in-flight high-water 8, `peak − baseline ≤ 4 GiB + 128 MiB`) |
+| 4d — Projection matrix and performance | not started | |
 | 5 — Release engineering | not started | |
 
 ## Decisions taken without user direction during implementation
@@ -99,6 +100,22 @@ Readiness target of this task: **PR-ready** (plan §12); nothing is pushed.
   index slot per name and reserves merge scratch (plan §4.4 wording); the docstring says so.
 * `Tables.istable`/`rowaccess` are value-level for `Avro.Rows` (mode is runtime state); typed and
   non-record modes are plain iterators, and `Tables.partitions` on them is an `ArgumentError`.
+
+* **Phase 4c decisions.** The worker-pool state term (`WORKER_STATE` × workers) lives in the admission
+  arithmetic only, not as a main-budget reservation — charging it polluted the failing `LimitError`'s
+  `observed` and broke identical acceptance by construction; pool memory (~64 KiB/worker) sits inside
+  the scratch allowance. Commits cannot fail on the ceiling (`job.reserved ≤ W` is released-then-
+  reserved), so acceptance divergence is impossible on the ceiling path; for blocks beyond the
+  per-block caps (malformed) the error kind may be `:max_total_bytes` instead of
+  `:max_block_output_bytes` when the ceiling intervenes first — same failing block either way.
+  `SCRATCH_STATE_MAX = 8 MiB` is the recorded per-block scratch/state maximum; every commit checks the
+  job's budget peak against its `W` (`peak_violations == 0` gated; observed job peaks ≈ 17 MiB on the
+  RSS fixture). Legacy mode (`legacy=:avrojl1`) disables workers (the trailing-bytes tolerance mutates
+  reader state); the direct path keeps full legacy parity. The wide 1,001-field fixture now *succeeds*
+  through mapped/byte `Table` (exact preallocation) and the streamed-IO refusal is tested via
+  `open(path)` — the writer preflight still models the streamed consumer, the largest guaranteed peak.
+  `Rows` keeps `IteratorSize` `SizeUnknown` at the type level (Base's protocol is type-level; a
+  per-instance `HasLength` for pre-scanned byte sources is not expressible without splitting the type).
 
 ## Commands run and results (2026-08-22)
 
