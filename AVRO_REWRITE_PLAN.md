@@ -1,6 +1,6 @@
 # Avro.jl 2.0 — Audit and Rewrite Plan
 
-Status: DRAFT v21 (revised after Codex review rounds 1–20; see §14 review log and `reviews/response-N.md`).
+Status: DRAFT v22 (revised after Codex review rounds 1–21; see §14 review log and `reviews/response-N.md`).
 Date: 2026-08-21/22. Repository: `JuliaData/Avro.jl`, local checkout `/Users/jacob.quinn/.julia/dev/Avro`,
 branch `jq/v2-rewrite` forked from `main` @ `0c7be10db6d83fd20806a8eceec9276a7aa8e21d` (v1.1.2, registered).
 Specification source pinned for this plan: `apache/avro` `main` @ `326950f40c1172f7564c757b0e51c39883721083`
@@ -192,9 +192,9 @@ requirements for later inclusion recorded.
    internal tables, and through input-bounded per-node charges for schema and plan graphs (§4.4
    categories (a)–(e)); work is bounded as a function of input bytes (values, comparisons and resolution
    effort); the one documented boundary is the typed conversion of §4.8, which runs after ownership
-   transfer in caller space; an **available-memory guard** lowers the
-   effective ceiling in constrained processes so the package fails with a `LimitError` rather than being
-   killed; writers enforce exactly the limits readers enforce — including the decoder requirements of
+   transfer in caller space; a best-effort **available-memory guard** lowers the
+   effective ceiling in constrained processes so that the package usually fails with a `LimitError`
+   before the process is killed; writers enforce exactly the limits readers enforce — including the decoder requirements of
    the codec frames they emit — so whatever a default writer produces a default reader accepts;
    package-detected malformed content always surfaces as an `AvroError`.
 3. **Stable generic values, opt-in specialisation.** Untrusted schemas never drive Julia compilation:
@@ -204,9 +204,10 @@ requirements for later inclusion recorded.
 4. **Stream by default, materialise on request.** Container reading is block-at-a-time with bounded
    in-flight memory; `Avro.Table` is the explicit materialisation and owns copies of everything; path
    sources are either memory-mapped or streamed — never read whole into memory.
-5. **No global mutable state**, with two documented exceptions: the default process-wide symbol
-   admission table (§6), because `Tables.columnnames` must return `Symbol`s, and the write-once storage
-   constants measured in `__init__` (§4.4), frozen before any public operation runs; callers may supply their own admission
+5. **No global mutable state**, with three documented exceptions: the default process-wide symbol
+   admission table (§6), because `Tables.columnnames` must return `Symbol`s; the write-once storage
+   constants measured in `__init__` (§4.4), frozen before any public operation runs; and the
+   package-wide `@atomic` pending-reservation counter of the available-memory guard (§4.4); callers may supply their own admission
    object instead, and every typed decoding path that interns (`DatumReader`, `decode`, `decodesingle`,
    `fromjson`, `Rows`; `Table` for column names) goes through the same boundary. Codec instances, buffers, budgets, and
    plans are owned by reader/writer objects or operations; hashes are computed at freeze time and stored
@@ -273,7 +274,8 @@ struct FullName; name::String; namespace::String; end       # fullname(x) = isem
   field's schema, so `-0.0` and `0.0` defaults differ and quoted `"NaN"` equals `"NaN"`; an invalid
   default retained under `allow_invalid_defaults` (`valid=false`) compares by its exact lexical span
   instead — `order`, normalised aliases, doc, `iserror`; `props` passed to a public constructor with
-  duplicate keys are an `ArgumentError`),
+  duplicate keys, or with keys that collide with structural attributes such as `type`, `name` or
+  `fields`, are an `ArgumentError`),
   symbols, enum default, size, logical type and attributes, and `props` compared as unordered maps of
   JSON values;
     recursion uses a visited set of `(a,b)` pairs keyed by the **dense node IDs** every schema node
@@ -369,7 +371,8 @@ struct FullName; name::String; namespace::String; end       # fullname(x) = isem
      `0x3f800001` as `Float32` but `0x3f800000` via `Float64`, and Java's `jsontofrag` emits
      `01 00 80 3f` — this vector is gated byte-for-byte for defaults and `fromjson`, together with midpoint, subnormal,
      overflow, underflow, huge-mantissa and huge-exponent differential vectors and linear time/allocation
-     checks), and numbers
+     checks; a token that overflows parses to ±`Inf` and one that underflows to ±0.0 or a subnormal per
+     IEEE 754, exactly as Java's `parseDouble`, and `-0.0` is preserved — for datums and defaults alike), and numbers
      inside metadata are stored as charged immutable **raw number tokens** (never `BigInt`/`BigFloat`),
      compared and hashed by their lexical bytes (`1`, `1.0` and `1e0` are three different property
      values, documented), re-emitted verbatim (tests: huge integers, mantissas and exponents in known fields, defaults, nested
@@ -525,7 +528,7 @@ Base.@kwdef struct Limits
     max_metadata_bytes::Int   = 16 << 20      # total OCF metadata (keys + values, including avro.schema)
     max_metadata_entries::Int = 10_000
     # concurrency
-    max_inflight_blocks::Int  = 0             # 0 = ntasks; the effective in-flight count is further bounded by the ceiling (§4.9)
+        max_inflight_blocks::Int  = 0             # higher blocks that may be in flight beyond the direct head; 0 = ntasks − 1; further bounded by the headroom (§4.9)
 end
 ```
 
@@ -534,10 +537,14 @@ ceiling is deliberately small: it is the amount of package-owned memory an untru
 use without anyone raising a limit, and typical Avro files (64 KiB blocks, 8 MiB codec windows) need a
 fraction of it. At the start of every operation the **effective ceiling** is
 `min(limits.max_total_bytes, available ÷ 2)` with `available = min(Sys.free_memory(),
-Sys.total_memory(), cgroup_remaining) − live_reservations`, where `cgroup_remaining` is read on Linux
-from cgroup v2 `memory.max`/`memory.current` (or v1 `memory.limit_in_bytes`/`memory.usage_in_bytes`)
-when readable and is `∞` otherwise, and `live_reservations` is a package-wide `@atomic` counter of
-every live operation's reservations (`free_memory` is host-wide on Julia ≤ 1.12 — documented); if the
+Sys.total_memory(), cgroup_remaining) − pending_reservations`, where `cgroup_remaining` is read on
+Linux from cgroup v2 `memory.max`/`memory.current` (or v1 `memory.limit_in_bytes`/`memory.usage_in_bytes`)
+when readable and is `∞` otherwise, and `pending_reservations` is a package-wide `@atomic` counter of
+bytes that live operations have **reserved but not yet allocated** (resident allocations are already
+visible to `free_memory`/`memory.current`, so only the not-yet-resident part is subtracted — no double
+counting); the counter uses checked, clamped arithmetic and is restored in a `finally` on every exit
+path (success, `LimitError`, interruption, writer poisoning, worker failure, abandonment via the
+`Rows`/`Reader`/`Writer` finalizers) (`free_memory` is host-wide on Julia ≤ 1.12 — documented); if the
 effective ceiling cannot admit the operation's first unit of progress (§4.9) the operation fails with
 a `LimitError` naming the available memory **before any allocation**. **The guard is best-effort**: it
 makes an OOM kill less likely in a constrained process but cannot promise to prevent one (process
@@ -601,10 +608,11 @@ maximum-length common-prefix names at every flush and carry boundary), by map co
 counts as 4 bytes). The rule `compared_bytes ≤ max_compare_bytes_per_byte × input_bytes +
 work_allowance` is enforced per operation (the allowance is the shared one; for operations without
 encoded input — constructed schemas, `Avro.schema(T)`, `tojson` — `input_bytes` is the serialised
-schema or produced text size); it admits every legitimate
-input (a merge sort compares ≤ ⌈log2 k⌉ + 1 times per key, and k ≤ `max_total_values` = 2^28 keys give ≤ 29
-× input) and
-bounds adversarial long-common-prefix keys. The writer's preflight (below) charges the same
+schema or produced text size); the multiplier is finalised by the
+Phase 4a gate from both comparisons and moves (a merge sort compares ≤ ⌈log2 k⌉ + 1 times per key and
+moves each permutation entry ⌈log2 k⌉ times, and k ≤ `max_total_values` = 2^28 keys give ≤ 29 × input
+in comparisons alone) so that the generated legitimate corpus passes; like every resource limit it can
+reject valid data by design and is raisable. The writer's preflight (below) charges the same
 deterministic comparison work for every map it writes (it knows each map's pair count and key bytes),
 so the comparison rule is part of the identical-limits invariant. Phase 2's latency gate adds wide
 objects and long-common-prefix keys to its fixtures and records `max_compare_bytes_per_byte` with the
@@ -650,7 +658,7 @@ roots, from bytes, a mapped path, `mmap=false` and a non-seekable `IO`, **in gen
 consumption**, **whenever both sides' effective ceilings (§4.4 available-memory guard) admit the
 writer-preflighted peak** — a reader on a host whose guard lowers its effective ceiling below that peak
 fails with the separate low-memory `LimitError`, which is a safety guarantee, not a readability
-failure under identical limits — (`reader_schema=nothing`, no typed `T`, `instants=:exact`, `decimal_byteorder=:big`,
+failure under identical limits — (`reader_schema=nothing`, no typed `T`, exact timestamp wrappers, `decimal_byteorder=:big`,
 `validate=:strict`, repair options matching the writer's), **under identical `Limits`, the same codec
 availability, and fresh or sufficient symbol-admission state**; for **portability across supported
 Julia versions and pinned codec-library revisions** the preflight uses conservative maxima — the
@@ -717,7 +725,7 @@ nested, padded, mutable, zero-field, reference-bearing and nullable layouts and 
 oracle is `Base.summarysize(x; exclude=Avro.Schema)` — schema references carried by `Fixed`,
 `EnumValue` and `Record` are excluded because the schema graph is charged once under category (e) — and
 the gate `storagebytes(x) ≥ summarysize` holds for generated values of **every member of `E`** and for
-the three identity-bearing types with shared and with distinct schema identities, and the `Avro.Row` shell (record reference plus admission reference) whose ownership transfers to the caller at yield; an isbits value stored
+the three identity-bearing types with shared and with distinct schema identities, and the `Avro.Row` shell (record reference plus admission reference, measured with the already-accounted `Record` and `SymbolAdmission` excluded) whose ownership transfers to the caller at yield; an isbits value stored
 inline in a typed column or chunk charges nothing here (its slot is in (a)); ownership of payload
 transfers from in-flight chunks to committed columns at commit **without re-charging**; **exactness covers the generic value set `E`, the column path, and the typed fast route's approved
 representations** (§4.8: isbits fields, `String`, `Vector{UInt8}`, `Vector{T}`, `Union{Missing,T}`,
@@ -738,7 +746,7 @@ before allocation, under its own `max_names`/`max_bytes`), and worker/coordinato
 are allocated lazily by the runtime and excluded, documented); (e) **schema and plan graphs** — every
 `Schema`/`Field`/`FullName` node, frozen JSON tree (props and defaults), parser state (`ParseContext`,
 name tables), printer/canonical/fingerprint buffers, read/write/resolving plan nodes and their
-memoisation tables — all of which are keyed by the **dense node IDs** assigned at parse time (a node-indexed dense array
+memoisation tables — all of which are keyed by the **dense node IDs** assigned by `freeze!` on every creation path (a node-indexed dense array
 when the key is one node — plan memo tables, `PlanRef` targets; per-node **sorted** small vectors of partner IDs
 when the key is a pair — equality visits, resolution memo entries, resolving-plan pairs — binary-searched,
 with every inspected entry and every insertion move charged to `max_resolution_work` (one node paired
@@ -807,7 +815,7 @@ a fresh operation budget (the one-shot forms charge plan construction to that bu
 * Write plans mirror read plans with value-extraction strategies for NamedTuples, StructUtils structs
   (§4.8), `Tables.AbstractRow`s (by column index), `AbstractDict`s, iterables, and the generic values.
 * **Prepared codecs.** `Avro.DatumReader(writer_schema, T=…; reader_schema, union_resolution, limits,
-  instants, validate, names)` owns its plans, is immutable after construction and **safe to share across
+  validate, names)` owns its plans, is immutable after construction and **safe to share across
   tasks** (each call allocates its own decoder state and operation budget): `reader(bytes)`,
   `reader(bytes, pos) -> (value, nextpos)`, `reader(io)`. `Avro.DatumWriter(schema; limits)` owns a
   reusable encoder and is therefore **single-owner**: `writer(x) -> Vector{UInt8}` returns a fresh owned
@@ -851,14 +859,16 @@ The **finite value set** `E` (enumerated in `src/values.jl` and asserted by a te
 | uuid (string / fixed 16) | `UUIDs.UUID` | string form must be RFC-4122 `8-4-4-4-12` hex, either case (`DataError` otherwise); fixed form is the 16 big-endian bytes; the representation (string vs fixed, letter case) is **not** carried by the value — round trips use the writer schema (§4.8) |
 | date | `Dates.Date` | any `Int32` day count is representable |
 | time-millis / time-micros | `Dates.Time` | exact (ns-resolution `Time`); decode range-checked to one day; **encode rejects non-aligned values** unless the caller aligns them with `Avro.truncate(x, P)`/`Avro.round(x, P)` (Java truncates silently — recorded deviation) |
-| timestamp-millis / micros / nanos | `Avro.Timestamp{Millisecond|Microsecond|Nanosecond}` — exact `Int64` ticks since the Unix epoch, a global instant | `DateTime(x)` is an explicit, **range-checked** conversion raising `Avro.ConversionError` (never `DataError`, never wrap), lossy (floor) for sub-ms units; `Avro.Timestamp{P}(::DateTime)` exact and range-checked; `ZonedDateTime` via the TimeZones extension: encoded as the UTC instant at the schema's precision (sub-unit precision is rejected like `Time`, §4.3), decoded as `Avro.Timestamp{P}` — the zone is not carried by Avro; `ZonedDateTime(x, tz)` is the explicit reconstruction |
+| timestamp-millis / micros / nanos | `Avro.Timestamp{Millisecond|Microsecond|Nanosecond}` — exact `Int64` ticks since the Unix epoch, a global instant | `DateTime(x)` is an explicit, **range-checked** conversion raising `Avro.ConversionError` (never `DataError`, never wrap), lossy (floor) for sub-ms units; `Avro.Timestamp{P}(::DateTime)` exact and range-checked; `ZonedDateTime` via the TimeZones extension: `Avro.schema(ZonedDateTime)` is `timestamp-millis` (a global instant at `DateTime` precision); encoded as the UTC instant at the schema's precision (sub-unit precision is rejected like `Time`, §4.3), decoded as `Avro.Timestamp{P}` — the zone is not carried by Avro; `ZonedDateTime(x, tz)` is the explicit reconstruction |
 | local-timestamp-millis / micros / nanos | `Avro.LocalTimestamp{Millisecond|Microsecond|Nanosecond}` — exact `Int64` ticks | same conversion rules |
 | duration | `Avro.Duration(months::UInt32, days::UInt32, millis::UInt32)` | little-endian unsigned |
 
-`instants=:exact` (default, all of `decode`/`DatumReader`/`Rows`/`Table`/`decodesingle`) keeps the
-wrappers; `instants=:datetime` converts every timestamp kind to `DateTime` (a `ConversionError` on
-out-of-range values) with documented floor-to-ms loss for sub-ms units. The value model is identical for
-`Avro.decode`, `Avro.Rows`, `Avro.Table` cells, defaults, JSON conversion, and sorting.
+Timestamps always decode to the exact wrappers in the generic model (there is no `instants=` option:
+`DateTime` is outside the closed set `E`); a `DateTime` is obtained either by the explicit, range-checked
+`DateTime(x)` conversion (`ConversionError`, floor-to-ms for sub-ms units) or by a typed target `T`
+whose field type is `DateTime` (the typed plan performs the same conversion; an explicit `T` is always
+authoritative). The value model is identical for `Avro.decode`, `Avro.Rows`, `Avro.Table` cells,
+defaults, JSON conversion, and sorting.
 
 ### 4.7 Schema resolution (`src/resolution.jl`)
 
@@ -1006,8 +1016,8 @@ attempt, memo entry, memo scan step and resolving-plan node is charged; exceedin
   allow_invalid_defaults=false, validate=:strict, mmap=true)` (do-block form available): parses the header (magic; metadata map decoded — into an `Avro.Map{Vector{UInt8}}`, charged; duplicate keys in the header map, including `avro.schema`/`avro.codec`, are a `DataError` — with the spec's
   `{"type":"map","values":"bytes"}` schema under `max_metadata_bytes`/`entries`; sync marker;
   `avro.schema` — required; its absence is a `DataError` — parsed with §4.2 under `max_schema_bytes` and the repair options), selects the codec from
-  `avro.codec` (`null`/absent, `deflate`, `snappy`, `bzip2`, `xz`, `zstandard`; unknown →
-  `UnsupportedCodecError`), and iterates blocks **strictly**: `0 ≤ count ≤ max_block_count`;
+  `avro.codec` (its bytes must be valid UTF-8 — a `DataError` otherwise, before any codec lookup;
+  `null`/absent, `deflate`, `snappy`, `bzip2`, `xz`, `zstandard`; unknown → `UnsupportedCodecError`), and iterates blocks **strictly**: `0 ≤ count ≤ max_block_count`;
   `0 ≤ size ≤ max_block_bytes` and `size ≤` remaining input — all checked before any arithmetic (tests
   use −1 and `typemin(Int64)` for both); block index ≤ `max_blocks`; data; sync (mismatch → `DataError`
   with block index); framing bytes credited to the work rule. **Codec contract — `max_codec_memory` has exactly one meaning: the cap on the complete decoder memory
@@ -1095,15 +1105,18 @@ attempt, memo entry, memo scan step and resolving-plan node is charged; exceedin
   its exact Julia storage (§4.4 category (a)), charging that capacity up front. Stage 2 decodes the lowest
   uncommitted block directly into the final columns and every higher in-flight block into per-block
   chunk columns, committing in index order:
-    1. **The lowest uncommitted block follows the sequential rule exactly and physically.** It decodes
-     **directly into its final-column slice** (its prefix-sum offset is known and the final columns are
+      1. **The direct head follows the sequential rule exactly and physically.** The caller's task is the
+     *head*: it decodes the lowest block that has not been assigned to a worker **directly into its
+     final-column slice** (when the lowest uncommitted block was already decoded into a chunk by a
+     worker, the head commits that chunk and moves on; assignment is in block order, so the head and
+     the workers together form one admission wave) (its prefix-sum offset is known and the final columns are
      preallocated), exactly as the `ntasks = 1` direct path does — no chunk columns, no parallel-only
      allocation of any kind — reserving actual sizes before every allocation (§4.4 categories
      (b)–(d)), never waiting for anything, and failing with a `LimitError` exactly when sequential
      decoding would fail at that block (`max_block_output_bytes` counts the slots and payload the block
      produces, identically on both paths).
     2. **Higher blocks are admitted strictly in block order and only into headroom.** Block *i* (not the
-     lowest) is admitted when `committed + capacity + sequential_peak_reserve + worker_state +
+          lowest) is admitted when `committed_payload + capacity + sequential_peak_reserve + worker_state +
      Σ_{in-flight j < i} W_j + W_i ≤ ceiling`, where `W_j` is the **complete worst-case reservation** of
      block *j*: its compressed size, `max_block_bytes` for the decompressed buffer, the codec workspace
      (§4.4 (c)), its chunk shells (`ncolumns` headers plus chunk capacities for `count_j` rows), the
@@ -1142,15 +1155,21 @@ attempt, memo entry, memo scan step and resolving-plan node is charged; exceedin
   sequential peak reserve (`sequential_peak_reserve` = one `W` for the lowest block, so that the lowest
   block's actual-size reservations always fit). **Work is identical to sequential for every successful
   operation** in deterministic units (each block decompressed and walked once) plus the assembly
-  copies, bounded exactly by `assembly_bytes ≤ committed_bytes`, where `committed_bytes` is the sum of
-  category (a) and (b) bytes committed by the coordinator; **on a failing operation** the parallel
+  copies, bounded exactly by `assembly_bytes ≤ committed_bytes`, where `committed_payload` (the
+  admission formula above) is the category-(b) payload committed so far — category-(a) capacity is the
+  separate `capacity` term, never added twice — and `committed_bytes` is the total of category-(a) slot
+  bytes and category-(b) payload bytes copied or moved out of chunked blocks; **on a failing operation** the parallel
   path may additionally have decoded the higher blocks that were in flight when the failure became
-  authoritative — at most `inflight − 1` blocks beyond the sequential run's work, each bounded by its
-  own per-block work caps — which the failure gates assert (the error itself is identical); measured CPU time is informational with a predeclared ≤ 1.5 × tolerance.
+  authoritative — at most `inflight` blocks beyond the sequential run's work when the direct head is
+  the authoritative failure, and at most `inflight − 1` when a higher block is — each bounded by its
+  own per-block work caps — which the failure gates assert with both forced schedules (the error
+  itself is identical); measured CPU time is informational with a predeclared ≤ 1.5 × tolerance on
+  successful runs and is only recorded on failures (one cap-bounded speculative block can dwarf an
+  immediate sequential failure).
   Under default limits (256 MiB ceiling; `W` at default caps is the sum of the declared terms — 16 MiB
   compressed, 16 MiB decompressed, 32 MiB codec workspace, 64 MiB chunk shells and payload, plus the
-  scratch maxima and per-block state, which the per-block caps bound to a few MiB — ≈ 130 MiB) at
-  most one extra block fits in flight — parallel speedups need raised limits, which the §10.2 thread gate states explicitly. The
+  scratch maxima and per-block state, whose default-cap maximum is measured and recorded in Phase 4a —
+  illustratively ≈ 130 MiB pending that measurement) at most one extra block fits in flight — parallel speedups need raised limits, which the §10.2 thread gate states explicitly. The
   parallel gates: identical results and identical acceptance for `ntasks ∈ {1,2,8}` under default and
   raised limits (incl. files whose total exceeds the ceiling, which fail at the same block index); forced
   schedules where higher blocks wait for commits; and the peak-RSS gate, whose method is fixed now: a
@@ -1179,7 +1198,7 @@ attempt, memo entry, memo scan step and resolving-plan node is charged; exceedin
   `Profile.Allocs` is used only as a secondary check) is the primary safety gate; RSS is the physical
   confirmation. The gate runs on highly compressible 16 MiB blocks and on a table whose final columns
   exceed half the ceiling.
-* `Avro.Writer(io_or_path, schema; codec=:null, level=nothing, metadata=Dict{String,Vector{UInt8}}(),
+* `Avro.Writer(io_or_path, schema; codec=:null, level=nothing, metadata=Dict{String,<:AbstractVector{UInt8}}() (values copied, so `b"…"` works),
   sync=nothing, block_bytes=64*1024, atomic=true, fsync=false, allow_invalid_names=false,
   allow_invalid_defaults=false, limits=Limits())`: **option validation** — a repaired schema
   (`GraphInfo` flags) requires the matching option (§4.4 invariant);
@@ -1192,9 +1211,13 @@ attempt, memo entry, memo scan step and resolving-plan node is charged; exceedin
   `Encoder` under every reader limit (§4.4 invariant), emits a block when `block_bytes` is reached, when
   the next datum would violate the block work rule, when the pending block's **exact reader-side
   output estimate** (§4.4 category (a)/(b) formulas, tracked per pending block) would exceed
-  `max_block_output_bytes`, when its datum count would exceed `max_block_count`, or on
+  `max_block_output_bytes` — one consumer-independent formula: the **generic representation** of the
+  block's datums (category-(b) payload plus 8 bytes per reference slot and `sizeof` per isbits slot of
+  the §4.6 values; row wrappers, chunk and column headers are not counted), applied identically by
+  `Reader`, `Rows` and `Table` — when its datum count would exceed `max_block_count`, or on
   `flush`/`close`; a single datum whose output estimate alone exceeds `max_block_output_bytes` is a
-  `LimitError` (fixture: an `array<string>` datum of four million empty strings — ≈ 4 MiB on the wire,
+  `LimitError`; the compressed block is checked against `max_block_bytes` before emission (an
+  incompressible block at the boundary is a fixture) (fixture: an `array<string>` datum of four million empty strings — ≈ 4 MiB on the wire,
   ≈ 96 MiB of reader-side slots and payload charges — is refused under defaults and accepted with a
   raised cap on both sides); `push!(w, datum)` / `write(w,
   datums)`; `close(w)` writes the final block and, for path targets, renames the sibling temp file into
@@ -1252,8 +1275,7 @@ attempt, memo entry, memo scan step and resolving-plan node is charged; exceedin
 ### 4.10 Single-object encoding and schema stores (`src/singleobject.jl`)
 
 `Avro.encodesingle(schema, x; limits) -> Vector{UInt8}` (marker `C3 01`, little-endian CRC-64-AVRO of
-the PCF, payload). `Avro.decodesingle(bytes, store; reader_schema=nothing, union_resolution=:spec,
-instants=:exact, validate=:strict, limits=Limits(), names=…, T=…)` validates the marker, looks up the
+the PCF, payload). `Avro.decodesingle(bytes, store; reader_schema=nothing, union_resolution=:spec, validate=:strict, limits=Limits(), names=…, T=…)` validates the marker, looks up the
 writer schema by fingerprint, **recomputes the fingerprint of the returned schema and rejects a
 mismatch**, resolves against `reader_schema` when given, decodes, and requires exact payload
 consumption. `SchemaStore` interface: `Avro.lookup(store, fp::UInt64; limits=Limits()) -> Schema` (throws
@@ -1408,7 +1430,15 @@ ext/AvroCodecBzip2Ext.jl, ext/AvroCodecXzExt.jl, ext/AvroTimeZonesExt.jl
 ### 5.1 Schemas
 
 ```julia
+Avro.Limits(; fields...)                                             # validated, fixed-default limits (§4.4); Avro.SchemaCache(; max_entries, max_bytes)
+Avro.AvroError and subtypes: SchemaError, EncodeError, ResolutionError, LimitError, CodecError, UnsupportedCodecError, ConversionError, UnknownSchemaError, AmbiguousSchemaError, WriterClosedError, DataError (§4.13)
 Avro.parseschema(src::Union{AbstractString, AbstractVector{UInt8}, IO}; allow_invalid_names=false, allow_invalid_defaults=false, limits=Limits()) -> Schema
+Avro.NullSchema(; props), Avro.BooleanSchema(; props), Avro.IntSchema(; logical, props), … Avro.StringSchema(; logical, props)   # primitives
+Avro.ArraySchema(items; props, limits), Avro.MapSchema(values; props, limits), Avro.UnionSchema(branches; limits)
+Avro.RecordSchema(name; namespace="", fields, aliases=String[], doc=nothing, iserror=false, props, limits=Limits())
+Avro.Field(name, schema; default=nothing, order=:ascending, aliases=String[], doc=nothing, props)
+Avro.EnumSchema(name, symbols; namespace, default, aliases, doc, props, limits), Avro.FixedSchema(name, size; namespace, logical, aliases, props, limits)
+    # public constructors validate every §4.2 rule, reject `props` keys that collide with structural keys, deep-copy frozen children, and freeze
 Avro.schema(T::Type; name=nothing, namespace=nothing, limits=Limits()) -> Schema   # Julia type → conventional schema (name policy §4.8; collisions/invalid names error)
 Avro.avroname(::Type{T}) -> (name, namespace)                        # overridable naming hook for nested/parametric types
 Avro.avrosymbol(::Type{E}, x::E) -> String                           # overridable enum symbol hook
@@ -1418,7 +1448,9 @@ Avro.schema(x::Avro.Table / Avro.Rows / Reader)                      # the effec
 Avro.ordinal(x::Avro.EnumValue / Avro.UnionValue) -> Int             # zero-based wire ordinal (indices in the value types are 1-based positions)
 Avro.register!(store, schema; limits=Limits()) -> UInt64; Avro.lookup(store, fp; limits=Limits()) -> Schema   # SchemaCache charges its own table budget; custom stores own theirs
 Avro.Row(record::Avro.Record; names=Avro.DEFAULT_ADMISSION)          # Tables row wrapper carrying admission provenance
-Avro.Record(schema, values; limits=Limits()), Avro.Fixed(schema, bytes; limits), Avro.EnumValue(schema, index; limits), Avro.UnionValue(index, x), Avro.Map(pairs; limits)   # public value constructors: validated (lengths, ranges, key uniqueness; UnionValue checks only index ≥ 1 — branch acceptance is checked at encode against the enclosing union) and copying into owned storage under their own budget scope
+Avro.Record(schema, values; limits=Limits()), Avro.Fixed(schema, bytes; limits=Limits()), Avro.EnumValue(schema, index; limits=Limits()), Avro.Map(pairs; limits=Limits())   # validated (lengths, ranges, key uniqueness), copying into owned storage under their own budget scope
+Avro.UnionValue(index, x)                                            # non-copying wrapper retaining `x`; checks only index ≥ 1 (branch acceptance is checked at encode against the enclosing union)
+Avro.schema(row::Avro.Row) -> Schema                                 # the wrapped record's schema
 Avro.json(schema; pretty=false, limits=Limits()) / JSON.json(schema) (uses Limits())   # spec JSON text
 Avro.canonical(schema; limits=Limits()) -> String                     # Parsing Canonical Form
 Avro.fingerprint(schema; algorithm=:crc64avro, limits=Limits()) -> UInt64 | Vector{UInt8} (md5/sha256)
@@ -1432,14 +1464,14 @@ Base.:(==), Base.hash, Base.show on schemas
 ### 5.2 Datums
 
 ```julia
-Avro.DatumReader(writer_schema, T=juliatype(effective reader); reader_schema=nothing, union_resolution=:spec, limits=Limits(), instants=:exact, validate=:strict, names=Avro.DEFAULT_ADMISSION)
+Avro.DatumReader(writer_schema, T=juliatype(effective reader); reader_schema=nothing, union_resolution=:spec, limits=Limits(), validate=:strict, names=Avro.DEFAULT_ADMISSION)
     reader(bytes) -> value;  reader(bytes, pos) -> (value, nextpos);  reader(io)         # shareable; per-call state and budget
 Avro.DatumWriter(schema; limits=Limits())
     writer(x) -> Vector{UInt8} (owned);  writer(enc_or_io, x)                           # single-owner (reusable encoder)
 Avro.encode(schema, x; limits) -> Vector{UInt8};  Avro.encode!(enc_or_io, schema, x; limits);  Avro.encode(x; limits)   # one-shot conveniences
-Avro.decode(writer_schema, src, T=…; reader_schema=nothing, union_resolution=:spec, limits=Limits(), instants=:exact, validate=:strict, names=…)
+Avro.decode(writer_schema, src, T=…; reader_schema=nothing, union_resolution=:spec, limits=Limits(), validate=:strict, names=…)
 Avro.decode(writer_schema, bytes, pos::Int, T=…; kw...) -> (value, nextpos)
-Avro.encodesingle(schema, x; limits); Avro.decodesingle(src, store; reader_schema=nothing, union_resolution=:spec, instants=:exact, validate=:strict, limits=Limits(), names=…, T=…)
+Avro.encodesingle(schema, x; limits); Avro.decodesingle(src, store; reader_schema=nothing, union_resolution=:spec, validate=:strict, limits=Limits(), names=…, T=…)
 Avro.tojson(schema, x; pretty=false, limits=Limits()) -> String;  Avro.fromjson(schema, json, T=…; strict=true, unknown=:ignore, limits=Limits(), names=…)
 Avro.compare(schema, a, b; limits=Limits()) -> Int;  Avro.comparebytes(schema, abytes, bbytes; limits=Limits(), validate=:strict) -> Int
 Avro.UnionValue(i, x), Avro.EnumValue, Avro.Fixed, Avro.Record, Avro.Map, Avro.Decimal, Avro.WideDecimal, Avro.Duration,
@@ -1450,10 +1482,10 @@ Avro.Timestamp{P}, Avro.LocalTimestamp{P}, Avro.truncate(x, P), Avro.round(x, P)
 
 ```julia
 Avro.Table(src; reader_schema=nothing, union_resolution=:spec, ntasks=Threads.nthreads(), limits=Limits(), legacy=nothing, decimal_byteorder=:big,
-           allow_invalid_names=false, allow_invalid_defaults=false, validate=:strict, mmap=true, instants=:exact, names=Avro.DEFAULT_ADMISSION, select=nothing)   # `select=` = projection pushdown (§6)
+           allow_invalid_names=false, allow_invalid_defaults=false, validate=:strict, mmap=true, names=Avro.DEFAULT_ADMISSION, select=nothing)   # `select=` = projection pushdown (§6)
     # Tables.jl columns table (record roots only); `Avro.metadata(t)`, `Avro.schema(t)`, `Avro.codec(t)`, `Avro.sync(t)`, `length`, `Tables.partitions` (per block)
-Avro.Rows(src; T=nothing, reader_schema=nothing, union_resolution, limits, legacy, decimal_byteorder, allow_invalid_names, allow_invalid_defaults, validate, mmap, instants, names, select=nothing)   # yields Avro.Row for record roots
-    # streaming datum iterator for any root schema (one decompressed block resident); Tables.rows/schema for record roots; `close`
+Avro.Rows(src; T=nothing, reader_schema=nothing, union_resolution, limits, legacy, decimal_byteorder, allow_invalid_names, allow_invalid_defaults, validate, mmap, names, select=nothing)
+    # three modes (§6): generic record mode yields Avro.Row and is a Tables row source with partitions; typed mode (T) is a plain iterator of T (writable through its retained schema, not a Tables source); non-record mode is a plain iterator; `close`
 Avro.Reader(src; limits, legacy, decimal_byteorder=:big, allow_invalid_names, allow_invalid_defaults, validate, mmap)   # block-level (do-block form available): header, `eachblock(r)` → (count, owned decompressed bytes), `eachdatum(r)`, `close`
 Avro.Writer(io_or_path, schema; codec=:null, level=nothing, metadata=Dict(), sync=nothing, block_bytes=64*1024, atomic=true, fsync=false, allow_invalid_names=false, allow_invalid_defaults=false, limits=Limits())
     push!(w, datum); Base.write(w, datums); flush(w); close(w; abort=false)
@@ -1521,7 +1553,8 @@ container writer, and `Avro.write(io, x)` where `x` is not a table raises a clea
   in decision 54). Gate for
   2.0: names, order, eltypes, `Tables.schema`, row count and values of `Avro.Table(src; select=cols)`
   equal `Tables.columntable(Avro.Table(src))[cols]` for a generated matrix of selections over every
-  fixture (multi-block files, empty records, `select=()`, nested and nullable fields), in both
+  fixture (multi-block files, empty records, `select=()`, nested and nullable fields, directly and
+  mutually recursive roots), in both
   validation modes, for `ntasks ∈ {1,2,8}`; malformed data inside projected-away fields is tested under
   each mode's documented policy; writing projected tables round-trips their derived schema.
 * **Cross-package smoke** (Phase 5): CSV → Avro → Arrow round trip with the registered Arrow 2.x and a
@@ -1538,7 +1571,7 @@ container writer, and `Avro.write(io, x)` where `x` is not a table raises a clea
   StructTypes → StructUtils customisation; `Avro.Record{names,T,N}`/`Avro.Enum{names}`/`Avro.Array`
   removed; enums decode as `Avro.EnumValue`, fixed as `Avro.Fixed`, nested records as `Avro.Record`,
   non-nullable unions as `Avro.UnionValue`; `Avro.Duration` fields are `UInt32`; `Avro.Decimal` byte
-  order and runtime scale; all timestamps decode as exact wrappers unless `instants=:datetime`;
+  order and runtime scale; all timestamps decode as exact wrappers (`DateTime` through explicit conversion or a typed `T`);
   `compress=:zstd` → `codec=:zstandard` (shim maps it); `Avro.write(io, x)` with a non-table `x` is no
   longer the datum writer; `readtable` returns columns, not lazy records; strict container validation;
   schema-less sources need an explicit schema; invalid Julia-derived names are errors rather than
@@ -1791,8 +1824,9 @@ in the fixture).
     content/budget pairs; for **successful** operations the deterministic counters (decompressions,
     values walked, comparisons/moves) equal the sequential run's and `assembly_bytes ≤
     committed_bytes`; for **failing** operations the selected error is identical, no block is retried,
-    and at most `inflight − 1` higher blocks beyond the sequential run's work were decoded, each within
-    its block caps (CPU time reported with the ≤ 1.5 × tolerance, informational); measured peak RSS with eight workers on 16 MiB highly compressible
+    and at most `inflight` higher blocks beyond the sequential run's work were decoded when the direct
+    head failed (`inflight − 1` when a higher block failed), each within its block caps, both schedules
+    forced (CPU time reported with the ≤ 1.5 × tolerance on successful runs, recorded on failures); measured peak RSS with `ntasks = 8` on 16 MiB highly compressible
     blocks decoded from a caller-owned byte buffer faulted before the baseline (in-flight high-water
     counter ≥ 2), and on a table whose final columns exceed half the ceiling, stays within the ceiling
     plus documented runtime overhead and the run completes (liveness); nullable
@@ -1924,7 +1958,7 @@ on Julia 1.10 and 1.12 at the end of every phase (and nothing more is implied by
 | **3 — Resolution and order** | `resolve` with both union policies, reader-directed output and the resolution work budget, resolving plans (memoised pairs), aliases, defaults (incl. invalid-default repair), enum defaults by symbol, decimal rule and all other logical pairings, `Avro.compare`/`comparebytes` (budgeted, exact consumption, canonical-encoding contract, cross-form arrays) | resolution matrix with direct expectations (both policies, every output direction, every logical pairing, work-limit case) plus Java/fastavro where observable; sort-order vectors from both Java comparators incl. NaN/−0.0/ignore/maps/signed-bytes deviation/logical types/non-minimal decimal/mixed-case UUID/cross-form arrays; `compare`/`comparebytes` agreement property |
 | **4a — Strict containers and codecs** | final latency calibration (container shapes added; all work and comparison constants fixed and recorded), Reader/Writer/`Avro.write` with strict validation (lower bounds, framing-credited work rule evaluated after decompression with no compressed-size pre-check, codec decoder caps with liblzma/zstd thresholds, EOS/consumption contract), streamed `mmap=false`, atomic path contract, full writer failure contract, option/header/schema validation against reader limits, **writer-side codec workspace charging and emitted-frame decoder-requirement checks (zstd `windowLog` selection + per-frame `fromFrame` verification)**, work-rule-driven block flushing, reserved-metadata rejection, codecs (+ extensions), legacy mode, `decimal_byteorder`, repair options, `Avro.inspect`, any-root `eachdatum`/`eachblock` (owned decompressed bytes), explicit-schema requirement for schema-less sources | Apache corpus reads; Java **and** fastavro read Julia files — checked after each codec lands; Julia reads Java and fastavro files for every codec and every root kind; the million-empty-string block reads under defaults; 1.x fixtures read under legacy options and rejected under strict; truncation/corruption/bomb/high-window/EOS/suffix/negative-header/work-rule/empty-file/zero-datum/metadata tests; **writer/reader invariant tests** (every zero-size and all-null-field root, near-ceiling multi-block files, maximal metadata and schema, and their combinations, with the writer's reader-peak preflight) pass under the fixed defaults; writer failure-injection and atomic-replacement tests on every OS; `mmap=false` streams a file larger than the ceiling; the non-UTF-8 metadata fixture (Julia/Java accept, fastavro rejects); concatenated-member blocks accepted for zstandard/xz/bzip2 with per-member caps, zstandard skippable frames and xz stream padding accepted per §4.9, deflate `BFINAL` suffix rejected, oracle behaviour recorded |
 | **4b — Tables basics and ownership** | `Avro.Table` (sequential), `Avro.Rows` in its three modes (generic record mode yielding `Avro.Row` with lazy admission; typed mode; non-record mode), partitions, DataAPI metadata interface, stored schemas, exact column-storage charging (isbits-union tag bytes) with chunked materialisation on streamed sources, the complete writer/reader consumer and source-mode gate (§4.4), symbol admission objects (names and typed values, binary and JSON), zero-column/zero-row behaviour, close semantics | `Table == columntable(Rows)` property; ownership/close tests (caller IO untouched); Tables and DataAPI interface tests; symbol-admission tests incl. caller-owned objects and repeated files |
-| **4c — Parallel decode** | block pre-scan with exact final-column preallocation (exact Julia storage incl. tag bytes), the lowest uncommitted block under the sequential rule, higher blocks admitted in order into headroom with full worst-case reservations (no eviction, no retry), fixed charged worker pool, streaming ordered assembly with ordered cumulative commits, lowest-index error selection across failure kinds | identical results **and acceptance** for `ntasks ∈ {1,2,8}` under default and raised limits; deterministic failure selection over forced schedules for every failure-kind pairing; GC-stress; peak RSS under the fixed §4.9 method (`peak − baseline ≤ effective ceiling + 128 MiB`, caller-owned faulted byte buffer, in-flight high-water ≥ 2) on highly compressible 16 MiB blocks with eight workers and on half-ceiling tables, with liveness; deterministic counters equal to sequential on successful operations and `assembly_bytes ≤ committed_bytes`; on failures the same error, no retry and at most `inflight − 1` speculative higher blocks within their caps (CPU time informational, ≤ 1.5 × tolerance) |
+| **4c — Parallel decode** | block pre-scan with exact final-column preallocation (exact Julia storage incl. tag bytes), the lowest uncommitted block under the sequential rule, higher blocks admitted in order into headroom with full worst-case reservations (no eviction, no retry), fixed charged worker pool, streaming ordered assembly with ordered cumulative commits, lowest-index error selection across failure kinds | identical results **and acceptance** for `ntasks ∈ {1,2,8}` under default and raised limits; deterministic failure selection over forced schedules for every failure-kind pairing; GC-stress; peak RSS under the fixed §4.9 method (`peak − baseline ≤ effective ceiling + 128 MiB`, caller-owned faulted byte buffer, in-flight high-water ≥ 2) on highly compressible 16 MiB blocks with `ntasks = 8` and on half-ceiling tables, with liveness; deterministic counters equal to sequential on successful operations and `assembly_bytes ≤ committed_bytes`; on failures the same error, no retry and at most `inflight` (head failure) or `inflight − 1` (higher-block failure) speculative higher blocks within their caps, both schedules forced (CPU time informational, ≤ 1.5 × tolerance on successful runs) |
 | **4d — Projection and performance** | `select=` projection on `Avro.Table`/`Avro.Rows` with skipping under both validation modes, derived effective schemas, performance work | projection equivalence matrix (selection × validation × `ntasks`) over every fixture incl. malformed data in projected-away fields under each mode's policy; writing projected tables round-trips their schema; §10.2 ratio gates on the named host under the measurement protocol |
 | **5 — Release engineering** | shims, docs (incl. limits guidance and the oracle-readability exceptions), examples, changelog, precompile workload, trim smoke, benchmarks doc, README, CI matrix live, coverage report, cross-package smoke | docs build without warnings; load-time budget; full local matrix green on 1.10/1.11/1.12 (+1.13-rc if installed); Aqua/JET; interop job green locally |
 
@@ -1932,8 +1966,8 @@ Readiness levels (this task stops at **PR-ready**; nothing is pushed):
 
 * **Review-ready**: clean exact local head; scoped diff; local supported-version tests, docs, licensing,
   and interop artifacts complete.
-* **PR-ready**: review-ready plus a reproducible branch and exact dependency pins (`[sources]` SHA with
-  the 1.10 bootstrap, jar checksum, Python pins, test Manifest) and the status record (§15) up to date.
+* **PR-ready**: review-ready plus a reproducible branch and exact dependency pins (jar checksum,
+  Python pins, test Manifest) and the status record (§15) up to date.
 * **Merge-ready**: hosted exact-head CI green and review issues resolved.
 * **RC-ready**: `[sources]` removed (the Tables pin is needed only by the 2.1 Scan work); **a clean environment instantiated from the exact RC
   source archive re-runs the complete matrix** (supported Julia versions, all codecs, interop, fuzz,
@@ -1951,8 +1985,8 @@ Readiness levels (this task stops at **PR-ready**; nothing is pushed):
   exceptions); we read every file they write
   (all six codecs, every root kind); oracle-verified resolution (both policies, reader-directed output)
   and sort order (incl. logical types, canonical-encoding contract).
-* Security: checked arithmetic, no `@inbounds` without a proven bound, no allocation sized by untrusted
-  counts, one fixed-default per-operation ceiling covering final-column capacity, committed payload and
+* Security: checked arithmetic, no `@inbounds` without a proven bound, no unchecked or unreserved
+  allocation (exact final columns are sized from validated counts after reservation), one fixed-default per-operation ceiling covering final-column capacity, committed payload and
   the lowest block's actual-size reservations and higher blocks' worst-case headroom reservations (no
   eviction, exact column storage incl. isbits-union tag bytes, streaming assembly into preallocated
   columns, a liveness argument, acceptance identical to sequential, deterministic work identical on successful operations and bounded by the in-flight higher blocks on failures), a best-effort available-memory
@@ -1966,8 +2000,8 @@ Readiness levels (this task stops at **PR-ready**; nothing is pushed):
   with bounded memory.
 * Streaming: `Rows`/`eachdatum`, `Writer`, `IO` and streamed path sources with one block resident;
   partitions for pipelines.
-* Concurrency: §4.14 contract; no global mutable state beyond the documented default admission table and the write-once storage
-  constants measured in `__init__`;
+* Concurrency: §4.14 contract; no global mutable state beyond the documented default admission table, the write-once storage
+  constants measured in `__init__` and the guard's pending-reservation counter;
   structured task lifecycle with deterministic failure selection across failure kinds.
 
 ---
@@ -1981,8 +2015,9 @@ Decisions (each with rationale; reviewers may challenge any):
    choose `Base.Enum`/`Symbol` (through admission)/`String`.
 3. Generic records are always `Avro.Record`; generic fixed values are `Avro.Fixed`; typed `T` is opt-in.
 4. All timestamp logical types decode to exact `Avro.Timestamp{P}`/`Avro.LocalTimestamp{P}` wrappers;
-   `DateTime` conversion is explicit, range-checked (`ConversionError`) and documented
-   (`instants=:datetime`); a naive `DateTime` derives `local-timestamp-millis`.
+      `DateTime` conversion is explicit, range-checked (`ConversionError`) and documented (`DateTime(x)`
+   or a typed `T` with `DateTime` fields; no `instants=` option); a naive `DateTime` derives
+   `local-timestamp-millis`.
 5. Decimals carry runtime `Int` scale (`Avro.Decimal` Int128 ≤ 38 digits, `Avro.WideDecimal` beyond);
    digit counts are validated on both encode and decode (stricter than Java on decode); encode requires
    exact scale equality.
@@ -2035,7 +2070,7 @@ Decisions (each with rationale; reviewers may challenge any):
     evicted, retried or restarted, every block is decoded once, assembly is ordered, and the lowest
     failing block index wins regardless of failure kind; acceptance is identical to sequential decoding
     by construction, deterministic work is identical on successful operations (assembly copies bounded
-    by `committed_bytes`) and bounded by at most `inflight − 1` speculative higher blocks on failures.
+    by `committed_bytes`) and bounded by at most `inflight` (head failure) or `inflight − 1` (higher-block failure) speculative higher blocks on failures.
 23. Only `fixed.size` among the optional numeric attributes is schema syntax; logical-type attributes are
     evaluated in context and malformed ones drop the annotation (Java-compatible); unknown attributes
     are never validated.
@@ -2374,13 +2409,28 @@ Review log:
   constructor claim, the narrowed no-hashing claim, the successfully-closed-writer qualification, the
   Phase 4a risk wording, decision order).
 
+* **Round 21** (`reviews/codex-review-21.md`: 3 majors, 17 minors, 2 nits; `VERDICT: REVISE`). All
+  adopted; dispositions in `reviews/response-21.md`. Changes: the `instants=` option is removed —
+  `DateTime` is reached by explicit conversion or a typed `T`, which is always authoritative (§4.6,
+  §5, §7, decision 4); the failure-work bound is `inflight` for head failures and `inflight − 1` for
+  higher-block failures with both schedules forced (§4.9, §9, §12, decision 22); and the minors (guard
+  wording, pending-reservation counter as the third global-state exception with checked arithmetic and
+  `finally` restoration, `Rows` synopsis by mode and `Avro.schema(::Row)`, direct-head role and
+  `max_inflight_blocks` semantics, `committed_payload`/`committed_bytes` definitions, one
+  consumer-independent `max_block_output_bytes` formula, `Avro.Row` oracle exclusions, the Phase 4a `W`
+  measurement and success-only CPU tolerance, comparison multiplier from comparisons and moves,
+  security wording, the public surface for `Limits`/`SchemaCache`/errors/schema constructors, structural
+  `props` collisions, non-copying `UnionValue`, `Avro.schema(ZonedDateTime)` and float overflow rules,
+  `avro.codec` UTF-8 and compressed-size checks, copied `AbstractVector{UInt8}` metadata, dense-ID
+  wording, recursive-root projection gates, PR-ready pins, `ntasks = 8` wording, Appendix B fixes).
+
 ## 15. Status record (maintained through implementation)
 
 * Assumptions: local-only work; no pushes/PRs/tags/registration; CSV/Arrow/Parquet checkouts untouched;
   network used only for specs, dependencies, and interop tools.
 * Commands and results: recorded in `STATUS.md` in the worktree as phases complete (exact commands,
   Julia versions, pass/fail counts, benchmark numbers).
-* Current state: **plan under review (round 21); no production code changed yet.**
+* Current state: **plan under review (round 22); no production code changed yet.**
 
 ---
 
@@ -2404,11 +2454,12 @@ reader = Avro.DatumReader(sch, MyWeather)   # prepared, shareable, typed (Struct
 reader(bytes)
 
 Avro.write("w.avro", table; codec=:zstandard, metadata=Dict("source"=>b"sensor"))
-t = Avro.Table("w.avro")                    # columns; `scan=Tables.Scan(...)` in a Scan-enabled release
-for row in Avro.Rows("w.avro")              # streaming, one block resident
+t = Avro.Table("w.avro"; select=(:station, :temp))   # columns; projection pushdown
+for row in Avro.Rows("w.avro")              # streaming, one block resident; `row` is an Avro.Row
     row.temp
 end
-w = Avro.Writer("out.avro", sch; codec=:snappy); push!(w, row); close(w)
+first_row = first(Avro.Rows("w.avro"))
+w = Avro.Writer("out.avro", sch; codec=:snappy); push!(w, first_row); close(w)
 
 big = Avro.Limits(max_total_bytes=16 << 30, max_block_bytes=64 << 20)   # explicit, both sides
 Avro.write("big.avro", bigtable; limits=big); Avro.Table("big.avro"; limits=big)
@@ -2418,6 +2469,6 @@ Avro.Table("w.avro"; reader_schema=new)     # resolved decode (spec union policy
 store = Avro.SchemaCache(); Avro.register!(store, sch)
 msg = Avro.encodesingle(sch, row); Avro.decodesingle(msg, store)
 Avro.Table("old.avro"; legacy=:avrojl1)     # file written by Avro.jl 1.x (padding / zstd name only)
-Avro.Table("ts.avro"; instants=:datetime)   # DateTime columns instead of exact timestamp wrappers
+
 Avro.Table("big.avro"; validate=:fast)      # opt-in fast skipping with documented blind spots
 ```
