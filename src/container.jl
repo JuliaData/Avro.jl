@@ -260,6 +260,29 @@ function littledecimals(p::ReadPlan, memo::IdDict{Any,Any}=IdDict{Any,Any}())
         end
         return out
     end
+    if p isa ResolvedRecordPlan
+        out = ResolvedRecordPlan(p.schema, Pair{Int,ReadPlan}[], copy(p.defaults), copy(p.boxes))
+        memo[p] = out
+        for (slot, plan) in p.steps
+            push!(out.steps, slot => littledecimals(plan, memo))
+        end
+        return out
+    elseif p isa UnionResolvePlan
+        out = UnionResolvePlan(ReadPlan[], p.readerindex, p.nullable, p.readerunion)
+        memo[p] = out
+        for b in p.branches
+            push!(out.branches, littledecimals(b, memo))
+        end
+        return out
+    elseif p isa WrapPlan
+        out = WrapPlan(littledecimals(p.inner, memo), p.readerindex, p.nullable)
+        memo[p] = out
+        return out
+    elseif p isa PromotePlan
+        out = PromotePlan(p.writer, littledecimals(p.reader, memo))
+        memo[p] = out
+        return out
+    end
     memo[p] = p
     return p
 end
@@ -733,6 +756,20 @@ how to supply one). `Tables.partitions` become block boundaries (each non-empty 
 function write(dst::Union{AbstractString,IO}, table; schema::Union{Nothing,Schema}=nothing,
                name::AbstractString="Record", namespace::AbstractString="", limits::Limits=Limits(), kw...)
     s = schema
+    s === nothing && (s = retainedschema(table))
+    if table isa Rows && getfield(table, :mode) !== :generic
+        w = Writer(dst, s; limits=limits, kw...)                # typed and non-record rows write datum-wise
+        ok = false
+        try
+            for v in table
+                push!(w, v)
+            end
+            ok = true
+        finally
+            ok ? close(w) : close(w; abort=true)
+        end
+        return dst
+    end
     w = nothing
     ok = false
     try

@@ -55,14 +55,16 @@ function decoderow!(cols::Vector{ColumnBuilder}, d::Decoder)
     leave!(d)
     return nothing
 end
-
 decodecell!(c::SkipColumn, d::Decoder) = skip(c.plan, d)
 
 function decodecell!(c::TypedColumn{E}, d::Decoder) where {E}
-    v = decode(c.plan, d)
+    return appendcell!(c, d.budget, decode(c.plan, d))
+end
+
+function appendcell!(c::TypedColumn{E}, budget::Budget, v) where {E}
     n = c.len + 1
     if n > length(c.data)
-        grow!(c, d.budget, max(2 * length(c.data), 4))
+        grow!(c, budget, max(2 * length(c.data), 4))
     end
     @inbounds c.data[n] = v
     c.len = n

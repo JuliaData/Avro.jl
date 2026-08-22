@@ -42,6 +42,7 @@ include("jsonencoding.jl")
 include("singleobject.jl")
 include("codecs.jl")
 include("container.jl")
+include("tables.jl")
 
 # `public` declarations parse only on Julia ≥ 1.11; evaluated through `Core.eval` so 1.10 still loads.
 if VERSION >= v"1.11.0-DEV.469"
@@ -60,7 +61,8 @@ if VERSION >= v"1.11.0-DEV.469"
         :SchemaStore, :SchemaCache, :register!, :lookup, :encodesingle, :decodesingle,
         :resolve, :ResolvedSchema, :compare, :comparebytes,
         :Reader, :Writer, :write, :tobuffer, :codecs, :inspect, :InspectReport,
-        :metadata, :codec, :sync, :writerschema, :eachblock, :eachdatum))
+        :metadata, :codec, :sync, :writerschema, :eachblock, :eachdatum,
+        :Table, :Rows, :Row, :record))
 end
 
 function __init__()

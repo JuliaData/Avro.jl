@@ -482,3 +482,49 @@ function skipvalue(p::ResolvedRecordPlan, d::Decoder)
     leave!(d)
     return nothing
 end
+
+# ---- column builders over resolved records (plan §6; used by Avro.Table and Rows partitions) ---------
+
+decoderow!(cols::Vector{ColumnBuilder}, d::Decoder, ::RecordPlan) = decoderow!(cols, d)
+
+"One resolved record row into reader-slot builders: writer-ordered steps, then the defaults."
+function decoderow!(cols::Vector{ColumnBuilder}, d::Decoder, p::ResolvedRecordPlan)
+    enter!(d)
+    for (slot, plan) in p.steps
+        if slot == 0 || cols[slot] isa SkipColumn
+            skip(plan, d)
+        else
+            decodecell!(cols[slot]::TypedColumn, d)
+        end
+    end
+    b = d.budget
+    for (slot, dp) in p.defaults
+        c = cols[slot]
+        c isa SkipColumn && continue
+        countvalues!(b)
+        appendcell!(c::TypedColumn, b, jsonvalue(dp.schema, dp.json, b))
+    end
+    leave!(d)
+    return nothing
+end
+
+function columnbuilders(p::ResolvedRecordPlan, selected::Union{Nothing,AbstractVector{Int}}, capacity::Int, budget::Budget)
+    capacity >= 0 || throw(ArgumentError("capacity must be non-negative"))
+    n = length(p.schema.fields)
+    plans = Vector{Union{Nothing,ReadPlan}}(nothing, n)
+    for (slot, plan) in p.steps
+        slot == 0 || (plans[slot] = plan)
+    end
+    for (slot, dp) in p.defaults
+        plans[slot] = dp
+    end
+    cols = Vector{ColumnBuilder}(undef, n)
+    for (i, f) in enumerate(p.schema.fields)
+        if selected === nothing || i in selected
+            cols[i] = makecolumn(juliatype(f.schema), plans[i], capacity, budget)
+        else
+            cols[i] = SkipColumn(plans[i])
+        end
+    end
+    return cols
+end
