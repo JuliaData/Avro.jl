@@ -23,7 +23,7 @@ Readiness target of this task: **PR-ready** (plan §12); nothing is pushed.
 | 0 — Foundation | done (tests green on 1.10.11 and 1.12.6) | legacy code removed; `Project.toml` 2.0.0-DEV with the agreed deps/compat; `test/Project.toml`; CI skeleton (`.github/workflows/CI.yml`); vendored Apache fixtures (`test/fixtures/apache`, pinned commit, LICENSE/NOTICE) and the generated corpus (`test/fixtures/generated`, `generate.sh`); Java harness (`test/interop/java`); benchmark baselines (`benchmarks/`); `errors.jl`, `frozen.jl`, `limits.jl` (validated limits, budget, available-memory guard), `admission.jl` (sorted-runs table), `values.jl` (schema-free value types); `public` gating; tests |
 | 1 — Schema model | done (tests green on 1.10.11 and 1.12.6) | `names.jl`, `jsonreader.jl` (Avro-owned RFC 8259 reader, WTF-8 strings, spans), `logical.jl`, `schema.jl` (parse/validate defaults/finalize/hash/equality/print/public constructors/`minsize`; nodes are heap objects with `const` fields), `canonical.jl` (PCF + CRC-64-AVRO/MD5/SHA-256 fingerprints), `generic.jl` (`Map`, `Record`, `EnumValue`, `Fixed`, `UnionValue`), `types.jl` (Julia type → schema derivation, name policy, `Tables.Schema`, value-level `schema`); tests |
 | 2 — Binary core | done (tests green on 1.10.11 and 1.12.6) | `decoder.jl`/`encoder.jl` (checked varints, strict bools/UTF-8, sized blocks, buffer growth), `plan_read.jl`/`plan_write.jl` (plan graphs, generic decode/skip with strict/fast validation incl. domain-checked skipped logical values, encode validation and branch recovery), `storage.jl` (§4.4 (b) formulas with `__init__`-measured constants, `storagebytes`/`heldbytes` oracle), `columns.jl` (schema-independent column builders), `typed.jl` (constructor-free fast route, semantic route, Symbol admission), `prepared.jl` (`DatumReader`/`DatumWriter`, one-shots), `jsonencoding.jl` (`tojson`/`fromjson`), `singleobject.jl` (single-object encoding, `SchemaStore`/`SchemaCache`), the closed value set `E` (`valuetypes`); gates: compile-cost (`test/gates.jl`), storage oracle (`test/storage.jl`), provisional latency (`test/latency.jl`), fuzz sample (`test/fuzz.jl`, `test/fuzz/`), avro-tools differential (`test/interop.jl`, opt-in), 1.x datum cases (`test/legacy.jl`), allocation budgets (`test/typed.jl`, `test/columns.jl`) |
-| 3 — Resolution and order | not started | |
+| 3 — Resolution and order | done (tests green on 1.10.11 and 1.12.6) | `resolution.jl` (`resolve`/`ResolvedSchema`/`resolvingplan`, both union policies, promote/default/enum-remap/union/wrap/resolved-record nodes, pair memo charged to `max_resolution_work`, reader-directed output), `compare.jl` (`comparebytes` lockstep over encoded datums, `compare` via canonical encodings); tests: 90 resolution cases incl. the Java evolution fixtures, 1,400 sort-order checks incl. all 51 Java vectors, cross-form arrays and the agreement property |
 | 4a–4d — Containers, Tables, parallel, projection | not started | |
 | 5 — Release engineering | not started | |
 
@@ -59,12 +59,24 @@ Readiness target of this task: **PR-ready** (plan §12); nothing is pushed.
   `fragtojson` prints nothing for them and `jsontofrag` hangs on `{}`; such schemas are skipped in the
   differential. Java tools run with stdin closed and a watchdog (a tool falling back to stdin hung).
 * Per-version manifests (`Manifest-v1.10.toml`, ignored) run the 1.10 matrix beside the 1.12 one.
+* Typed decoding under a `reader_schema` takes the semantic route (generic reader values, then
+  `StructUtils.make` in caller space); a fast route over resolving plans is deferred to the Phase 4d
+  performance work.
+* `compare` is implemented as `comparebytes` over canonical encodings (the §4.12 cross-API contract is
+  the definition); the encode-side work rule credits produced bytes lazily when the cached cap would
+  trip.
+* The §4.7 multi-match record errors trigger through name+alias pairs only: a duplicate alias or an
+  alias colliding with a field name is already a parse-time `SchemaError` (§4.2), so those corners are
+  unreachable from parsed schemas.
+* fastavro was not re-run for the resolution matrix in this session (the authoring venv was not
+  recreated); the Java fixtures (`ReadWithReader`, both readers) are the live oracle, and §8.5's full
+  matrix runs in the CI interop job.
 
 ## Commands run and results (2026-08-22)
 
-* `julia +1.12 --project=. -e 'using Pkg; Pkg.test()'` — 4943 tests pass (Julia 1.12.6; ~4.5 min:
+* `julia +1.12 --project=. -e 'using Pkg; Pkg.test()'` — 6,435 tests pass (Julia 1.12.6; ~4.5 min:
   latency gate ≈ 28 s, fuzz sample ≈ 1.5 min). `julia +1.10 --project=. -e 'using Pkg; Pkg.test()'` —
-  4943 tests pass (Julia 1.10.11; ~3.5 min).
+  6,435 tests pass (Julia 1.10.11; ~3.5 min). (After Phase 3.)
 * `AVRO_QUALITY_GATES=true … Pkg.test()` (1.12.6): JET `report_package` clean; Aqua clean except
   `stale_deps` — CodecZlib, CodecZstd, Snappy, TranscodingStreams, Zstd_jll, Mmap, JSON and
   PrecompileTools are declared for Phases 4a/5 and unused so far.
