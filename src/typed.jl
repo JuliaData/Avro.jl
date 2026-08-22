@@ -529,7 +529,10 @@ finishtyped(p::SemanticTarget{T}, v, names) where {T} = semanticvalue(T, v, name
 finishtyped(p, v, names) = v
 
 # StructUtils integration: generic values as sources.
-function StructUtils.applyeach(st::AvroStyle, f, r::Record)
+StructUtils.applyeach(st::AvroStyle, f, r::Record) = applyeachrecord(st, f, r)
+StructUtils.applyeach(st::AvroStyle, f::StructUtils.StructStyle, r::Record) = applyeachrecord(st, f, r)   # disambiguates the (f, style, x) form
+
+function applyeachrecord(st::AvroStyle, f, r::Record)
     s = getfield(r, :schema)
     vals = getfield(r, :values)
     for (i, fld) in enumerate(s.fields)
@@ -548,6 +551,10 @@ StructUtils.lower(::AvroStyle, x::UnionValue) = x.value
 StructUtils.lift(st::AvroStyle, ::Type{T}, x::UnionValue) where {T} = StructUtils.lift(st, T, x.value)
 StructUtils.lift(st::AvroStyle, ::Type{T}, x::EnumValue) where {T} = StructUtils.lift(st, T, String(x))
 StructUtils.lift(st::AvroStyle, ::Type{T}, x::Fixed) where {T} = StructUtils.lift(st, T, x.bytes)
+# zero-dimensional array targets (StructUtils' own special case) unwrap the same way
+StructUtils.lift(st::AvroStyle, ::Type{A}, x::UnionValue) where {A<:AbstractArray{T,0}} where {T} = StructUtils.lift(st, A, x.value)
+StructUtils.lift(st::AvroStyle, ::Type{A}, x::EnumValue) where {A<:AbstractArray{T,0}} where {T} = StructUtils.lift(st, A, String(x))
+StructUtils.lift(st::AvroStyle, ::Type{A}, x::Fixed) where {A<:AbstractArray{T,0}} where {T} = StructUtils.lift(st, A, x.bytes)
 StructUtils.lift(::AvroStyle, ::Type{Symbol}, x::AbstractString) = (admit!(currentadmission(), x), nothing)
 StructUtils.lift(::Type{DateTime}, x::Union{Timestamp,LocalTimestamp}) = DateTime(x)
 StructUtils.lift(::Type{T}, x::Union{Timestamp,LocalTimestamp}) where {T<:Union{Timestamp,LocalTimestamp}} = T(x.ticks)
