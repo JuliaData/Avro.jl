@@ -16,6 +16,7 @@ TimeZones = "f269a46b-ccf7-5d73-abea-4c690281aa53"
 TranscodingStreams = "3bb67fe8-82b1-5028-8e26-92a6c54297fa"
 UUIDs = "cf7118a7-6976-5b1a-9a39-7adc72f591a4"
 XZ_jll = "ffd25f8a-64ca-5728-b0f7-c24cf3aae800"
+Zlib_jll = "83775a58-1f1d-513f-b197-d71354ab007a"
 Zstd_jll = "3161d3a3-bdf6-5164-811a-617609db77b4"
 
 [compat]

@@ -39,6 +39,7 @@ include("typed.jl")
 include("prepared.jl")
 include("jsonencoding.jl")
 include("singleobject.jl")
+include("codecs.jl")
 
 # `public` declarations parse only on Julia ≥ 1.11; evaluated through `Core.eval` so 1.10 still loads.
 if VERSION >= v"1.11.0-DEV.469"
