@@ -106,7 +106,7 @@ function (w::DatumWriter)(io::IO, x)
     return withbudget(w.limits; direction=:encode) do budget
         e = Encoder(budget)
         encodedatum!(w.plan, e, x)
-        write(io, view(e.buf, 1:e.pos))
+        Base.write(io, view(e.buf, 1:e.pos))
         nothing
     end
 end

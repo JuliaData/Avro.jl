@@ -409,7 +409,7 @@ function escapejson(io::IO, s::AbstractString)
             print(io, "\\u", string(cp; base=16, pad=4))
             i += 3
         else
-            write(io, b); i += 1
+            Base.write(io, b); i += 1
         end
     end
     print(io, '"')

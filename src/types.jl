@@ -43,10 +43,10 @@ function sanitize(s::String)
     for c in s
         ok = (c == '_') || ('A' <= c <= 'Z') || ('a' <= c <= 'z') || ('0' <= c <= '9')
         if ok && c != '_'
-            write(io, c)
+            Base.write(io, c)
             prevus = false
         elseif !prevus
-            write(io, '_')
+            Base.write(io, '_')
             prevus = true
         end
     end

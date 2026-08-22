@@ -180,9 +180,9 @@ function printbytestring(io::IO, bytes::AbstractVector{UInt8})
             elseif b == 0x0D; print(io, "\\r") elseif b == 0x09; print(io, "\\t")
             else print(io, "\\u", string(b; base=16, pad=4)) end
         elseif b < 0x80
-            write(io, b)
+            Base.write(io, b)
         else
-            write(io, 0xC0 | (b >> 6), 0x80 | (b & 0x3F))
+            Base.write(io, 0xC0 | (b >> 6), 0x80 | (b & 0x3F))
         end
     end
     print(io, '"')
