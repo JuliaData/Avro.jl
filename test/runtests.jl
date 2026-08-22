@@ -20,6 +20,7 @@ const FIXTURES = joinpath(@__DIR__, "fixtures")
     include("binary.jl")
     include("typed.jl")
     include("jsonencoding.jl")
+    include("singleobject.jl")
     if get(ENV, "AVRO_QUALITY_GATES", "false") == "true"
         include("quality.jl")
     end

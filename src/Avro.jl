@@ -35,6 +35,7 @@ include("resolution.jl")
 include("typed.jl")
 include("prepared.jl")
 include("jsonencoding.jl")
+include("singleobject.jl")
 
 # `public` declarations parse only on Julia ≥ 1.11; evaluated through `Core.eval` so 1.10 still loads.
 if VERSION >= v"1.11.0-DEV.469"
@@ -49,7 +50,8 @@ if VERSION >= v"1.11.0-DEV.469"
         :ArraySchema, :MapSchema, :UnionSchema, :RecordSchema, :EnumSchema, :FixedSchema, :Field,
         :DecimalLogical, :UUIDLogical, :DateLogical, :TimeMillis, :TimeMicros, :TimestampMillis, :TimestampMicros,
         :TimestampNanos, :LocalTimestampMillis, :LocalTimestampMicros, :LocalTimestampNanos, :DurationLogical, :UnknownLogical, :Map, :Record, :EnumValue, :Fixed, :UnionValue, :ordinal, :juliatype, :minsize, :schema, :avroname, :avrosymbol, :AvroStyle,
-        :DatumReader, :DatumWriter, :encode, :encode!, :decode, :tojson, :fromjson))
+        :DatumReader, :DatumWriter, :encode, :encode!, :decode, :tojson, :fromjson,
+        :SchemaStore, :SchemaCache, :register!, :lookup, :encodesingle, :decodesingle))
 end
 
 end # module Avro
