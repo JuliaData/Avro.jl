@@ -115,51 +115,23 @@ function Table(src; reader_schema::Union{Nothing,Schema}=nothing, union_resoluti
             throw(ArgumentError("Avro.Table requires a record root; this source's root is $(kind(effective)) — use Avro.Rows or Avro.eachdatum"))
         sel = select === nothing ? nothing : selectindices(effective, select)
         outschema = sel === nothing ? effective : projectschema(effective, sel, limits)
-        counts = Int[]
-        chunkcols = Vector{Vector{AbstractVector}}()
-        reserve!(r.budget, blocktablecharge(0))
-        while (blk = nextblock!(r)) !== nothing
-            reserve!(r.budget, 32)                     # this block's block-table entry (plan §4.4)
-            count, bytes = blk
-            addrows!(r.budget, count)
-            reserve!(r.budget, bytesbytes(length(bytes)))
-            d = Decoder(bytes, r.budget; validate=r.validate)
-            cols = columnbuilders(plan, sel, count, r.budget)
-            for _ in 1:count
-                countvalues!(r.budget)
-                decoderow!(cols, d, plan)
+        keptidx = sel === nothing ? collect(1:length(effective.fields)) : sel
+        colstypes = Type[juliatype(f.schema) for f in outschema.fields]
+        if r.source isa BytesSource
+            # byte and mapped sources: pre-scan, exact final preallocation, direct/parallel decode (§4.9)
+            pre = prescanblocks(r)
+            nrows = pre.totalrows
+            finals = AbstractVector[]
+            for E in colstypes
+                reserve!(r.budget, vectorbytes(E, nrows))
+                push!(finals, Vector{E}(undef, nrows))
             end
-            d.pos == length(bytes) + 1 || throw(DataError("block datums did not consume the block exactly", d.pos))
-            release!(r.budget, bytesbytes(length(bytes)))
-            keep = AbstractVector[]
-            for i in (sel === nothing ? eachindex(cols) : sel)
-                push!(keep, finishcolumn!(cols[i]::TypedColumn, r.budget))
-            end
-            push!(chunkcols, keep)
-            push!(counts, count)
+            decodeblocks!(r, plan, sel, finals, keptidx, colstypes, pre, Int(ntasks))
+            counts = Int[e.count for e in pre.entries]
+        else
+            finals, counts = decodestreamed!(r, plan, sel, colstypes)
         end
         nrows = sum(counts; init=0)
-        ncols = length(outschema.fields)
-        finals = AbstractVector[]
-        for k in 1:ncols                               # both sets of reference slots coexist during assembly (plan §4.4)
-            E = juliatype(outschema.fields[k].schema)
-            reserve!(r.budget, vectorbytes(E, nrows))
-            push!(finals, Vector{E}(undef, nrows))
-        end
-        for k in 1:ncols
-            col = finals[k]
-            off = 0
-            for chunk in chunkcols
-                c = chunk[k]
-                copyto!(col, off + 1, c, 1, length(c))
-                off += length(c)
-            end
-        end
-        for chunk in chunkcols
-            for c in chunk
-                release!(r.budget, vectorbytes(eltype(c), length(c)))   # referenced payload transfers, counted once
-            end
-        end
         ranges = UnitRange{Int}[]
         off = 0
         for c in counts
@@ -220,6 +192,58 @@ function DataAPI.metadata(t::Table, key::AbstractString, default; style::Bool=fa
     m = getfield(t, :metadata)
     haskey(m, String(key)) || return style ? (default, :default) : default
     return DataAPI.metadata(t, key; style=style)
+end
+
+"The streamed consumer: per-block exact chunk columns assembled once at the end (plan §4.4/§4.9)."
+function decodestreamed!(r::Reader, plan, sel::Union{Nothing,Vector{Int}}, colstypes::Vector{Type})
+    counts = Int[]
+    chunkcols = Vector{Vector{AbstractVector}}()
+    reserve!(r.budget, blocktablecharge(0))
+    while (blk = nextblock!(r)) !== nothing
+        reserve!(r.budget, 32)                         # this block's block-table entry (plan §4.4)
+        count, bytes = blk
+        addrows!(r.budget, count)
+        reserve!(r.budget, bytesbytes(length(bytes)))
+        before = r.budget.reserved
+        d = Decoder(bytes, r.budget; validate=r.validate)
+        cols = columnbuilders(plan, sel, count, r.budget)
+        for _ in 1:count
+            countvalues!(r.budget)
+            decoderow!(cols, d, plan)
+        end
+        d.pos == length(bytes) + 1 || throw(DataError("block datums did not consume the block exactly", d.pos))
+        blockout = max(r.budget.reserved - before, 0)   # chunk slots and payload the block produced
+        blockout <= r.limits.max_block_output_bytes ||
+            throw(LimitError(:max_block_output_bytes, blockout, r.limits.max_block_output_bytes, :max_block_output_bytes, :decode))
+        release!(r.budget, bytesbytes(length(bytes)))
+        keep = AbstractVector[]
+        for i in (sel === nothing ? eachindex(cols) : sel)
+            push!(keep, finishcolumn!(cols[i]::TypedColumn, r.budget))
+        end
+        push!(chunkcols, keep)
+        push!(counts, count)
+    end
+    nrows = sum(counts; init=0)
+    finals = AbstractVector[]
+    for E in colstypes                                 # both sets of reference slots coexist during assembly (plan §4.4)
+        reserve!(r.budget, vectorbytes(E, nrows))
+        push!(finals, Vector{E}(undef, nrows))
+    end
+    for k in eachindex(finals)
+        col = finals[k]
+        off = 0
+        for chunk in chunkcols
+            c = chunk[k]
+            copyto!(col, off + 1, c, 1, length(c))
+            off += length(c)
+        end
+    end
+    for chunk in chunkcols
+        for c in chunk
+            release!(r.budget, vectorbytes(eltype(c), length(c)))   # referenced payload transfers, counted once
+        end
+    end
+    return (finals, counts)
 end
 
 # ---- Avro.Rows --------------------------------------------------------------------------------------

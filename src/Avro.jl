@@ -42,6 +42,7 @@ include("jsonencoding.jl")
 include("singleobject.jl")
 include("codecs.jl")
 include("container.jl")
+include("parallel.jl")
 include("tables.jl")
 
 # `public` declarations parse only on Julia ≥ 1.11; evaluated through `Core.eval` so 1.10 still loads.

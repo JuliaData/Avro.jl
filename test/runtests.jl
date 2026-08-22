@@ -27,6 +27,7 @@ include("valuegen.jl")
     include("container.jl")
     include("tables.jl")
     include("invariant.jl")
+    include("parallel.jl")
     include("resolution.jl")
     include("compare.jl")
     include("columns.jl")
@@ -39,5 +40,8 @@ include("valuegen.jl")
     end
     if get(ENV, "AVRO_INTEROP", "false") == "true"
         include("interop.jl")
+    end
+    if get(ENV, "AVRO_RSS_GATE", "false") == "true" && Sys.isunix()
+        include("rssgate.jl")
     end
 end

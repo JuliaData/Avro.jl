@@ -97,12 +97,15 @@
         end
         close(w2)
         e2 = try
-            Avro.Table(wide)
+            Avro.Table(open(wide))                               # the streamed consumer: chunk shells cross the ceiling
             nothing
         catch err
             err
         end
-        @test e2 isa Avro.LimitError && e2.limit === :max_total_bytes && e2.direction === :decode   # the chunk shells cross the default ceiling
+        @test e2 isa Avro.LimitError && e2.limit === :max_total_bytes && e2.direction === :decode
+        tm = Avro.Table(wide)                                    # the mapped direct path preallocates exactly and fits
+        @test length(tm) == 10_000 && length(Tables.columnnames(tm)) == 1001
+        @test all(ismissing, Tables.getcolumn(tm, :f1))
         rl = Avro.Rows(wide)                                     # streaming stays bounded and accepts
         @test count(Returns(true), rl) == 10_000
         close(rl)
