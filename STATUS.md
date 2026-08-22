@@ -21,17 +21,72 @@ Readiness target of this task: **PR-ready** (plan §12); nothing is pushed.
 | Phase | State | Notes |
 |---|---|---|
 | 0 — Foundation | done (tests green on 1.10.11 and 1.12.6) | legacy code removed; `Project.toml` 2.0.0-DEV with the agreed deps/compat; `test/Project.toml`; CI skeleton (`.github/workflows/CI.yml`); vendored Apache fixtures (`test/fixtures/apache`, pinned commit, LICENSE/NOTICE) and the generated corpus (`test/fixtures/generated`, `generate.sh`); Java harness (`test/interop/java`); benchmark baselines (`benchmarks/`); `errors.jl`, `frozen.jl`, `limits.jl` (validated limits, budget, available-memory guard), `admission.jl` (sorted-runs table), `values.jl` (schema-free value types); `public` gating; tests |
-| 1 — Schema model | done (tests green on 1.10.11 and 1.12.6) | `names.jl`, `jsonreader.jl` (Avro-owned RFC 8259 reader, WTF-8 strings, spans), `logical.jl`, `schema.jl` (parse/validate defaults/finalize/hash/equality/print/public constructors/`minsize`), `canonical.jl` (PCF + CRC-64-AVRO/MD5/SHA-256 fingerprints), `generic.jl` (`Map`, `Record`, `EnumValue`, `Fixed`, `UnionValue`), `types.jl` (Julia type → schema derivation, name policy, `Tables.Schema`, value-level `schema`); tests |
-| 2 — Binary core | in progress | done: `decoder.jl`/`encoder.jl` (checked varints, strict bools/UTF-8, sized blocks, buffer growth), `plan_read.jl`/`plan_write.jl` (plan graphs, generic decode/skip with strict/fast validation, encode with the §4.x validation and branch-recovery rules), `prepared.jl` (`DatumReader`/`DatumWriter`, `encode`/`decode` one-shots, `(bytes,pos)` and `IO` forms); `test/binary.jl` (760 tests: spec examples, boundaries, Java BlockingBinaryEncoder fixtures, cross-form pairs, TimeConversions vectors, limits, validation modes, random round-trip property). Remaining: typed fast route (`typed.jl`), JSON encoding, single-object encoding + `SchemaCache`, `columns.jl`, latency/compile/allocation gates |
+| 1 — Schema model | done (tests green on 1.10.11 and 1.12.6) | `names.jl`, `jsonreader.jl` (Avro-owned RFC 8259 reader, WTF-8 strings, spans), `logical.jl`, `schema.jl` (parse/validate defaults/finalize/hash/equality/print/public constructors/`minsize`; nodes are heap objects with `const` fields), `canonical.jl` (PCF + CRC-64-AVRO/MD5/SHA-256 fingerprints), `generic.jl` (`Map`, `Record`, `EnumValue`, `Fixed`, `UnionValue`), `types.jl` (Julia type → schema derivation, name policy, `Tables.Schema`, value-level `schema`); tests |
+| 2 — Binary core | done (tests green on 1.10.11 and 1.12.6) | `decoder.jl`/`encoder.jl` (checked varints, strict bools/UTF-8, sized blocks, buffer growth), `plan_read.jl`/`plan_write.jl` (plan graphs, generic decode/skip with strict/fast validation incl. domain-checked skipped logical values, encode validation and branch recovery), `storage.jl` (§4.4 (b) formulas with `__init__`-measured constants, `storagebytes`/`heldbytes` oracle), `columns.jl` (schema-independent column builders), `typed.jl` (constructor-free fast route, semantic route, Symbol admission), `prepared.jl` (`DatumReader`/`DatumWriter`, one-shots), `jsonencoding.jl` (`tojson`/`fromjson`), `singleobject.jl` (single-object encoding, `SchemaStore`/`SchemaCache`), the closed value set `E` (`valuetypes`); gates: compile-cost (`test/gates.jl`), storage oracle (`test/storage.jl`), provisional latency (`test/latency.jl`), fuzz sample (`test/fuzz.jl`, `test/fuzz/`), avro-tools differential (`test/interop.jl`, opt-in), 1.x datum cases (`test/legacy.jl`), allocation budgets (`test/typed.jl`, `test/columns.jl`) |
 | 3 — Resolution and order | not started | |
 | 4a–4d — Containers, Tables, parallel, projection | not started | |
 | 5 — Release engineering | not started | |
 
-## Commands run and results
+## Decisions taken without user direction during implementation
 
-See the git log for per-commit test results; the latest local validation is recorded below.
+* **Schema nodes are heap objects** (`mutable struct` with `const` fields): as plain immutable structs
+  they were inlined into every value referencing them (`sizeof(Avro.Record)` was 104 bytes, a
+  `Vector{EnumValue}` slot 104 bytes), which broke the §4.4 (b) formulas and the
+  `summarysize(x; exclude=Avro.Schema)` oracle. Nodes stay immutable; `===` is pointer identity.
+* Storage formulas charge identity-bearing structs stored inline in typed vectors at production as well
+  as for their slot (the decoder's charge model; also what Julia 1.10's `summarysize` reports);
+  `widedecimalbytes` keeps two limbs of GMP slack (the negative path over-allocates); the oracle is
+  capacity-aware (compacted maps keep their `npairs` slots, as §4.4 prescribes).
+* Typed fast-route shells are charged by formula (`16 + sizeof(T)` for non-isbits targets) rather than
+  measured per `T` from a probe instance (plan §4.4) — a simplification to revisit with the Phase 4b
+  storage oracle over typed layouts.
+* `Avro.Map(pairs)` narrows its inferred value type to the generic model (`promote_typejoin`, nested
+  collections as `Any`) and collects pairs with `@nospecialize`, so user value shapes compile nothing
+  new; the explicit `Map{V}(pairs)` keeps the caller's `V`.
+* The compile-cost gate's RSS bound is measured over a second thousand schemas: `Sys.maxrss` is a
+  high-water mark and the first thousand brings the GC heap to its steady-state peak (periodic
+  collections made the delta larger, not smaller).
+* `available_memory()` on macOS adds inactive pages (`host_statistics64`): `Sys.free_memory()` counts
+  only free pages, which fall to a few hundred MB on a busy host and tripped the guard under load.
+* Strict skipping domain-checks logical values (uuid text, time-of-day ranges, decimal payload and
+  precision) exactly like decoding — a gap the fuzz harness found; the only documented skip/decode
+  difference remains skipped-string UTF-8 (plan §4.3).
+* The work-rule cap is cached in the budget and recomputed when input arrives (`countvalues!` is one
+  checked addition and one comparison on the hot path).
+* Plan §12's fuzz "split gate" is read as the required CI sample (200 entries × 1,000 mutations, two
+  subprocess batches at a time) versus the full corpus under `AVRO_FUZZ_ITERATIONS`.
+* avro-tools oracle limitation recorded (plan §8.4): zero-byte datums (null root, the empty record) —
+  `fragtojson` prints nothing for them and `jsontofrag` hangs on `{}`; such schemas are skipped in the
+  differential. Java tools run with stdin closed and a watchdog (a tool falling back to stdin hung).
+* Per-version manifests (`Manifest-v1.10.toml`, ignored) run the 1.10 matrix beside the 1.12 one.
 
-* Julia 1.12.6 / 1.10.11: `Pkg.test()` — 264 tests pass (Phase 0 skeleton + names + JSON reader, 2026-08-22).
+## Commands run and results (2026-08-22)
+
+* `julia +1.12 --project=. -e 'using Pkg; Pkg.test()'` — 4943 tests pass (Julia 1.12.6; ~4.5 min:
+  latency gate ≈ 28 s, fuzz sample ≈ 1.5 min). `julia +1.10 --project=. -e 'using Pkg; Pkg.test()'` —
+  4943 tests pass (Julia 1.10.11; ~3.5 min).
+* `AVRO_QUALITY_GATES=true … Pkg.test()` (1.12.6): JET `report_package` clean; Aqua clean except
+  `stale_deps` — CodecZlib, CodecZstd, Snappy, TranscodingStreams, Zstd_jll, Mmap, JSON and
+  PrecompileTools are declared for Phases 4a/5 and unused so far.
+* `AVRO_INTEROP=true AVRO_TOOLS_JAR=… Pkg.test()` (1.12.6, OpenJDK 25, avro-tools 1.12.2 with the
+  pinned sha256): 58 checks pass — byte-exact `jsontofrag` agreement for every deterministic root and
+  record schema, semantic agreement in both directions for arrays and maps.
+* Compile-cost gate: 0 new method instances for Avro's functions after the `E` warm-up over 1,000 random
+  heterogeneous schemas; retained RSS growth over a second thousand 4–7 MB (both versions).
+* Storage oracle: `heldbytes(x) ≥ summarysize(x; exclude=Avro.Schema)` and decoder reservation ≥ formula
+  for every member of `E` (both union choices), wide records, nested collections, duplicate/prefix-heavy/
+  reversed maps and wide decimals of both signs (804 tests); layout probes equal the recorded constants
+  on 1.10.11 and 1.12.6.
+* Latency gate (worst-density legal inputs, single thread, Apple M-series): skip 16M one-boolean/14-null
+  records (256M values) 2.6 s / 2.5 s (1.12 / 1.10); column decode of 16M such rows 2.5 s / 2.2 s;
+  skip 2.77M depth-80 records at `max_total_values` 6.4 s / 6.9 s; 16M empty arrays 0.3 s / 0.2 s;
+  `fromjson` of a 60 MB object with 1 KB-prefix keys 0.4–0.7 s; a 600K-key reversed prefix map
+  0.1–0.2 s. All ≤ 10 s; constants remain provisional (plan §4.4).
+* Fuzz: the recorded sample (`test/fuzz/sample.tsv`, 200 × 1,000 = 200,000 cases) runs clean in 8
+  sandboxed batches; its first run found the two defects fixed in `Domain-check skipped logical
+  values…` (skip/decode equivalence for logical types; `escapename` byte slicing).
+* Allocation budgets: primitive decode 0, typed isbits record 0, column decode per isbits row 0, one
+  String per string cell.
 
 ## Remaining gaps and assumptions
 
@@ -42,4 +97,11 @@ See the git log for per-commit test results; the latest local validation is reco
   `cramjam==2.11.0`; Java oracle: avro-tools 1.12.2 (sha256
   `6220e8bc089aaf917cdad4cd358bd651fc0394c0e5ddb8b36da402012c294a68`), run on OpenJDK 25 locally and
   Temurin 21 in CI.
-* Readiness: not yet review-ready (Phase 0 in progress).
+* The latency gate's worst shape (deep-record skip, 6.4–6.9 s) leaves limited margin on slower CI hosts;
+  the plan finalises the provisional work constants at the Phase 4a calibration (lowering
+  `max_total_values` halves that time).
+* Invalidation counts (SnoopCompileCore) and per-`T` typed compile cost are not measured (informational
+  in plan §4.5).
+* Aqua `stale_deps` stays red until Phases 4a/5 consume the codec/JSON/Mmap/PrecompileTools dependencies.
+* Readiness: Phases 0–2 locally validated on both supported versions; not yet review-ready (Phases 3–5
+  pending).
