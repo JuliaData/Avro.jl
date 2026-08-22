@@ -115,6 +115,7 @@ function buildtyped(::Type{T}, s::Schema, p::ReadPlan, memo::TypedMemo) where {T
     T === Any && return GenericTarget(p)
     T === juliatype(s) && return GenericTarget(p)
     customhooks(T) && return SemanticTarget{T}(p)
+    isresolving(p) && return SemanticTarget{T}(p)           # resolved shapes decode as reader values, then convert
     s isa UnionSchema && return builduniontarget(T, s, p::UnionPlan, memo)
     if T isa Union
         _, inner = splitoptional(T)
