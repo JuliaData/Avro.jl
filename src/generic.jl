@@ -213,6 +213,7 @@ end
 Base.get(m::Map, k::Symbol, default) = get(m, String(k), default)
 
 Base.:(==)(a::Map, b::Map) = a.keys == b.keys && a.vals == b.vals
+Base.isequal(a::Map, b::Map) = isequal(a.keys, b.keys) && isequal(a.vals, b.vals)
 Base.hash(a::Map, h::UInt) = hash(a.vals, hash(a.keys, hash(:AvroMap, h)))
 
 function Base.show(io::IO, m::Map{V}) where {V}
@@ -269,6 +270,7 @@ Base.haskey(r::Record, name::AbstractString) = haskey(getfield(r, :schema).field
 Base.haskey(r::Record, name::Symbol) = haskey(r, String(name))
 Base.get(r::Record, name, default) = haskey(r, name) ? r[name] : default
 Base.:(==)(a::Record, b::Record) = fullname(getfield(a, :schema)) == fullname(getfield(b, :schema)) && getfield(a, :values) == getfield(b, :values)
+Base.isequal(a::Record, b::Record) = fullname(getfield(a, :schema)) == fullname(getfield(b, :schema)) && isequal(getfield(a, :values), getfield(b, :values))
 Base.hash(a::Record, h::UInt) = hash(getfield(a, :values), hash(fullname(getfield(a, :schema)), hash(:AvroRecord, h)))
 
 function Base.show(io::IO, r::Record)
@@ -349,7 +351,8 @@ struct UnionValue
     end
 end
 
-Base.:(==)(a::UnionValue, b::UnionValue) = a.index == b.index && isequal(a.value, b.value)
+Base.:(==)(a::UnionValue, b::UnionValue) = a.index == b.index && a.value == b.value
+Base.isequal(a::UnionValue, b::UnionValue) = a.index == b.index && isequal(a.value, b.value)
 Base.hash(a::UnionValue, h::UInt) = hash(a.value, hash(a.index, hash(:AvroUnion, h)))
 Base.show(io::IO, x::UnionValue) = (print(io, "Avro.UnionValue(", x.index, ", "); show(io, x.value); print(io, ")"))
 

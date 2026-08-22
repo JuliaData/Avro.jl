@@ -4,6 +4,7 @@ using Dates
 using UUIDs
 using StructUtils
 using Tables
+using Random
 
 const FIXTURES = joinpath(@__DIR__, "fixtures")
 
@@ -16,6 +17,7 @@ const FIXTURES = joinpath(@__DIR__, "fixtures")
     include("json.jl")
     include("schema.jl")
     include("types.jl")
+    include("binary.jl")
     if get(ENV, "AVRO_QUALITY_GATES", "false") == "true"
         include("quality.jl")
     end
