@@ -73,9 +73,11 @@ Validate the byte buffer as one JSON document without allocating: size ≤ `maxb
 BOM, no raw control characters in strings, no trailing content. `errfn(msg, pos)` must throw the
 appropriate error (`SchemaError`, `DataError`, …). Returns the maximum nesting depth.
 """
-function prescan(buf::AbstractVector{UInt8}, maxbytes::Int, maxdepth::Int, errfn)
+function prescan(buf::AbstractVector{UInt8}, maxbytes::Int, maxdepth::Int, errfn;
+                 limitfn=(limit, observed, value) -> errfn("$limit exceeded ($observed > $value)", 0),
+                 bytelimit::Symbol=:max_bytes, depthlimit::Symbol=:max_depth)
     n = length(buf)
-    n <= maxbytes || errfn("JSON document exceeds the size limit ($n > $maxbytes bytes)", 0)
+    n <= maxbytes || limitfn(bytelimit, n, maxbytes)
     n >= 3 && buf[1] == 0xEF && buf[2] == 0xBB && buf[3] == 0xBF && errfn("a byte-order mark is not allowed", 1)
     i = 1
     depth = 0
@@ -88,7 +90,7 @@ function prescan(buf::AbstractVector{UInt8}, maxbytes::Int, maxdepth::Int, errfn
             i += 1
         elseif b == UInt8('{') || b == UInt8('[')
             depth += 1
-            depth <= maxdepth || errfn("JSON nesting depth exceeds $maxdepth", i)
+            depth <= maxdepth || limitfn(depthlimit, depth, maxdepth)
             maxseen = max(maxseen, depth)
             depth <= 128 && (stack = b == UInt8('{') ? (stack | (UInt128(1) << (depth - 1))) : (stack & ~(UInt128(1) << (depth - 1))))
             nvalues += 1
@@ -441,8 +443,10 @@ end
 Pre-scan and parse one JSON document into a frozen tree (objects keep source key order in `order`,
 duplicate keys are errors detected over decoded keys, numbers are raw `JSONNumber` tokens).
 """
-function parsejson(buf::AbstractVector{UInt8}; maxbytes::Int, maxdepth::Int, errfn, budget::Union{Nothing,Budget}=nothing)
-    prescan(buf, maxbytes, maxdepth, errfn)
+function parsejson(buf::AbstractVector{UInt8}; maxbytes::Int, maxdepth::Int, errfn, budget::Union{Nothing,Budget}=nothing,
+                   limitfn=(limit, observed, value) -> errfn("$limit exceeded ($observed > $value)", 0),
+                   bytelimit::Symbol=:max_bytes, depthlimit::Symbol=:max_depth)
+    prescan(buf, maxbytes, maxdepth, errfn; limitfn=limitfn, bytelimit=bytelimit, depthlimit=depthlimit)
     r = JSONReader(buf, length(buf), maxdepth, errfn, budget, 1, 0)
     skipws!(r)
     v = parsevalue!(r)
