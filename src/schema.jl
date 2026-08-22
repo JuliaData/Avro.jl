@@ -174,14 +174,15 @@ mutable struct ParseContext
     const pending::Vector{RecordSchema}       # records registered but not yet filled
     const metas::Vector{NodeMeta}             # in creation order → dense ids
     const namedcount::Base.RefValue{Int}
+    const legacyfixednames::Bool              # legacy=:avrojl1: Avro.jl ≤ 1.1.2 wrote fixed schemas without names
     repaired_names::Bool
     repaired_defaults::Bool
     depth::Int
 end
 
-function ParseContext(limits::Limits, budget::Budget, allow_invalid_names::Bool, allow_invalid_defaults::Bool)
+function ParseContext(limits::Limits, budget::Budget, allow_invalid_names::Bool, allow_invalid_defaults::Bool, legacyfixednames::Bool=false)
     return ParseContext(limits, budget, allow_invalid_names, allow_invalid_defaults, FrozenDict{String,Schema}(),
-        RecordSchema[], NodeMeta[], Ref(0), false, false, 0)
+        RecordSchema[], NodeMeta[], Ref(0), legacyfixednames, false, false, 0)
 end
 
 schemaerror(msg::AbstractString, path::AbstractString) = throw(SchemaError(String(msg), String(path)))
@@ -272,14 +273,15 @@ JSON path) or `LimitError`. With `allow_invalid_names=true` invalid names are ad
 marked `repaired_names`); with `allow_invalid_defaults=true` invalid defaults are kept with
 `valid=false`.
 """
-function parseschema(src; allow_invalid_names::Bool=false, allow_invalid_defaults::Bool=false, limits::Limits=Limits())
+function parseschema(src; allow_invalid_names::Bool=false, allow_invalid_defaults::Bool=false, limits::Limits=Limits(),
+                     legacy_fixed_names::Bool=false)
     return withbudget(limits) do budget
         buf = sourcebytes(src, limits.max_schema_bytes, budget, SchemaError)
         errfn = (msg, pos) -> throw(SchemaError(string(msg, " (byte ", pos, ")"), "\$"))
         limitfn = (limit, observed, value) -> throw(LimitError(limit, observed, value, limit, :decode))
         tree = parsejson(buf; maxbytes=limits.max_schema_bytes, maxdepth=limits.max_schema_depth, errfn=errfn, budget=budget,
             limitfn=limitfn, bytelimit=:max_schema_bytes, depthlimit=:max_schema_depth)
-        ctx = ParseContext(limits, budget, allow_invalid_names, allow_invalid_defaults)
+        ctx = ParseContext(limits, budget, allow_invalid_names, allow_invalid_defaults, legacy_fixed_names)
         s = parsenode(ctx, tree, "", "\$", buf)
         isempty(ctx.pending) || schemaerror("internal error: unfilled record", "\$")
         return finalize!(ctx, s)
@@ -460,7 +462,12 @@ function register!(ctx::ParseContext, s::NamedSchema, path::String)
 end
 
 function parsefixed(ctx::ParseContext, obj::JSONObject, enclosing::String, path::String)
-    full, aliases, raw = parsenamed(ctx, obj, enclosing, path)
+    full, aliases, raw = if ctx.legacyfixednames && !haskey(obj, "name")
+        # Avro.jl ≤ 1.1.2 wrote nameless fixed schemas (they carry no references, so a synthetic name is unambiguous)
+        (FullName(string("_avrojl1_fixed_", length(ctx.metas) + 1), ""), freeze!(FrozenVector{String}()), freeze!(FrozenVector{String}()))
+    else
+        parsenamed(ctx, obj, enclosing, path)
+    end
     haskey(obj, "size") || schemaerror("fixed schema without \"size\"", path)
     sz = obj["size"]
     sz isa Int64 && sz >= 0 || schemaerror("fixed \"size\" must be a non-negative JSON integer", string(path, ".size"))

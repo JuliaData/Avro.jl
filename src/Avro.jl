@@ -11,6 +11,7 @@ module Avro
 
 using Dates
 using UUIDs
+using Random: RandomDevice, rand
 using Tables: Tables
 import MD5
 import SHA
@@ -40,6 +41,7 @@ include("prepared.jl")
 include("jsonencoding.jl")
 include("singleobject.jl")
 include("codecs.jl")
+include("container.jl")
 
 # `public` declarations parse only on Julia ≥ 1.11; evaluated through `Core.eval` so 1.10 still loads.
 if VERSION >= v"1.11.0-DEV.469"
@@ -56,7 +58,9 @@ if VERSION >= v"1.11.0-DEV.469"
         :TimestampNanos, :LocalTimestampMillis, :LocalTimestampMicros, :LocalTimestampNanos, :DurationLogical, :UnknownLogical, :Map, :Record, :EnumValue, :Fixed, :UnionValue, :ordinal, :juliatype, :valuetypes, :minsize, :schema, :avroname, :avrosymbol, :AvroStyle,
         :DatumReader, :DatumWriter, :encode, :encode!, :decode, :tojson, :fromjson,
         :SchemaStore, :SchemaCache, :register!, :lookup, :encodesingle, :decodesingle,
-        :resolve, :ResolvedSchema, :compare, :comparebytes))
+        :resolve, :ResolvedSchema, :compare, :comparebytes,
+        :Reader, :Writer, :write, :tobuffer, :codecs, :inspect, :InspectReport,
+        :metadata, :codec, :sync, :writerschema, :eachblock, :eachdatum))
 end
 
 function __init__()

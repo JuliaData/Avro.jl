@@ -28,7 +28,10 @@ struct DecimalPlan <: ReadPlan
     precision::Int
     scale::Int
     wide::Bool
+    little::Bool         # decimal_byteorder=:little — Avro.jl ≤ 1.1.2 wrote native-endian decimals
 end
+
+DecimalPlan(fixedsize::Int, precision::Int, scale::Int, wide::Bool) = DecimalPlan(fixedsize, precision, scale, wide, false)
 struct UUIDStringPlan <: ReadPlan end
 struct UUIDFixedPlan <: ReadPlan end
 struct DurationPlan <: ReadPlan end
@@ -207,7 +210,7 @@ function decimalunscaled(d::Decoder, p::DecimalPlan, start::Int, n::Int)
     if !p.wide && n <= 16
         v = Int128(0)
         @inbounds for i in 0:n - 1
-            v = (v << 8) | Int128(buf[start + i])
+            v = (v << 8) | Int128(buf[p.little ? start + n - 1 - i : start + i])
         end
         shift = 8 * (16 - n)
         v = (v << shift) >> shift   # sign-extend
@@ -216,9 +219,9 @@ function decimalunscaled(d::Decoder, p::DecimalPlan, start::Int, n::Int)
     end
     big = BigInt(0)
     @inbounds for i in 0:n - 1
-        big = (big << 8) | BigInt(buf[start + i])
+        big = (big << 8) | BigInt(buf[p.little ? start + n - 1 - i : start + i])
     end
-    if buf[start] >= 0x80
+    if buf[p.little ? start + n - 1 : start] >= 0x80
         big -= BigInt(1) << (8 * n)
     end
     ndigits(abs(big)) <= p.precision || dataerror(d, "decimal exceeds precision $(p.precision)")
