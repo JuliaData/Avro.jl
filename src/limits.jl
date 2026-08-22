@@ -248,8 +248,9 @@ mutable struct Budget
     blocks::Int
     members::Int
     resolution_work::Int
-    allowance_used::Int
+    allowance_used::Int     # the largest draw on work_allowance so far (maintained when input arrives)
     pending::Int            # this operation's contribution to GUARD.pending
+    workcap::Int            # min(max_total_values, max_values_per_byte × input_bytes + work_allowance)
 end
 
 function Budget(limits::Limits; direction::Symbol=:decode, available::Int=available_memory())
@@ -257,7 +258,7 @@ function Budget(limits::Limits; direction::Symbol=:decode, available::Int=availa
     ceiling = effective_ceiling(limits; available=available)
     need = first_unit_bytes(limits)
     ceiling >= need || throw(LimitError(:available_memory, available, need, :max_total_bytes, direction))
-    return Budget(limits, ceiling, direction, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+    return Budget(limits, ceiling, direction, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, min(limits.max_total_values, limits.work_allowance))
 end
 
 limiterror(b::Budget, limit::Symbol, observed::Int, value::Int) = LimitError(limit, observed, value, limit, b.direction)
@@ -329,7 +330,10 @@ work and comparison rules.
 """
 function addinput!(b::Budget, n::Int)
     n <= 0 && return b
+    l = b.limits
+    b.allowance_used = max(b.allowance_used, b.values - checked_mul(l.max_values_per_byte, b.input_bytes))   # values only grow between inputs
     b.input_bytes = checked_add(b.input_bytes, n)
+    b.workcap = min(l.max_total_values, checked_add(checked_mul(l.max_values_per_byte, b.input_bytes), l.work_allowance))
     return b
 end
 
@@ -337,22 +341,25 @@ end
     countvalues!(budget, n=1)
 
 Count `n` values (every value encountered, zero-size ones and codec members included) against
-`max_total_values` and the work rule `values ≤ max_values_per_byte × input_bytes + work_allowance`.
+`max_total_values` and the work rule `values ≤ max_values_per_byte × input_bytes + work_allowance`
+(the cap is cached by `addinput!`, so the hot path is one addition and one comparison).
 """
-function countvalues!(b::Budget, n::Int=1)
-    l = b.limits
-    b.values = checked_add(b.values, n)
-    b.values <= l.max_total_values || throw(limiterror(b, :max_total_values, b.values, l.max_total_values))
-    return checkwork!(b)
-end
-
-function checkwork!(b::Budget)
-    l = b.limits
-    cap = checked_add(checked_mul(l.max_values_per_byte, b.input_bytes), l.work_allowance)
-    b.values <= cap || throw(limiterror(b, :max_values_per_byte, b.values, cap))
-    b.allowance_used = max(b.allowance_used, b.values - checked_mul(l.max_values_per_byte, b.input_bytes))
+@inline function countvalues!(b::Budget, n::Int=1)
+    v = checked_add(b.values, n)
+    b.values = v
+    v <= b.workcap || workexceeded(b)
     return b
 end
+
+@noinline function workexceeded(b::Budget)
+    l = b.limits
+    b.values <= l.max_total_values || throw(limiterror(b, :max_total_values, b.values, l.max_total_values))
+    cap = checked_add(checked_mul(l.max_values_per_byte, b.input_bytes), l.work_allowance)
+    throw(limiterror(b, :max_values_per_byte, b.values, cap))
+end
+
+"The largest draw on `work_allowance` so far (values beyond `max_values_per_byte × input_bytes`)."
+allowanceused(b::Budget) = max(b.allowance_used, b.values - checked_mul(b.limits.max_values_per_byte, b.input_bytes))
 
 """
     addcompare!(budget, n)
