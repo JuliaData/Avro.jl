@@ -11,6 +11,7 @@ module Avro
 
 using Dates
 using UUIDs
+using Tables: Tables
 import MD5
 import SHA
 
@@ -25,6 +26,7 @@ include("logical.jl")
 include("schema.jl")
 include("canonical.jl")
 include("generic.jl")
+include("types.jl")
 
 # `public` declarations parse only on Julia ≥ 1.11; evaluated through `Core.eval` so 1.10 still loads.
 if VERSION >= v"1.11.0-DEV.469"
@@ -38,7 +40,7 @@ if VERSION >= v"1.11.0-DEV.469"
         :NullSchema, :BooleanSchema, :IntSchema, :LongSchema, :FloatSchema, :DoubleSchema, :BytesSchema, :StringSchema,
         :ArraySchema, :MapSchema, :UnionSchema, :RecordSchema, :EnumSchema, :FixedSchema, :Field,
         :DecimalLogical, :UUIDLogical, :DateLogical, :TimeMillis, :TimeMicros, :TimestampMillis, :TimestampMicros,
-        :TimestampNanos, :LocalTimestampMillis, :LocalTimestampMicros, :LocalTimestampNanos, :DurationLogical, :UnknownLogical, :Map, :Record, :EnumValue, :Fixed, :UnionValue, :ordinal, :juliatype, :minsize))
+        :TimestampNanos, :LocalTimestampMillis, :LocalTimestampMicros, :LocalTimestampNanos, :DurationLogical, :UnknownLogical, :Map, :Record, :EnumValue, :Fixed, :UnionValue, :ordinal, :juliatype, :minsize, :schema, :avroname, :avrosymbol, :AvroStyle))
 end
 
 end # module Avro

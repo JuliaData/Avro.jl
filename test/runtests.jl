@@ -1,6 +1,9 @@
 using Test
 using Avro
 using Dates
+using UUIDs
+using StructUtils
+using Tables
 
 const FIXTURES = joinpath(@__DIR__, "fixtures")
 
@@ -12,6 +15,7 @@ const FIXTURES = joinpath(@__DIR__, "fixtures")
     include("names.jl")
     include("json.jl")
     include("schema.jl")
+    include("types.jl")
     if get(ENV, "AVRO_QUALITY_GATES", "false") == "true"
         include("quality.jl")
     end

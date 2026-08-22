@@ -32,6 +32,7 @@ function Map(pairs; limits::Limits=Limits())
             push!(vs, v)
         end
         V = isempty(vs) ? Any : mapreduce(typeof, typejoin, vs)
+        addinput!(budget, inputbytes(ks))   # the copied key/value representation bytes are the comparison-rule denominator
         buildmap(V, ks, Vector{V}(vs), budget)
     end
 end
@@ -43,8 +44,11 @@ Map{V}(pairs; limits::Limits=Limits()) where {V} = withbudget(limits; direction=
         push!(ks, mapkey(k))
         push!(vs, convert(V, v))
     end
+    addinput!(budget, inputbytes(ks))
     buildmap(V, ks, vs, budget)
 end
+
+inputbytes(ks::Vector{String}) = sum(k -> sizeof(k) + 8, ks; init=0)
 
 mapkey(k::AbstractString) = String(k)
 mapkey(k::Symbol) = String(k)
@@ -233,14 +237,14 @@ provided by `Avro.Row`. Equality is structural.
 struct Record
     schema::RecordSchema
     values::Vector{Any}
-end
-
-function Record(schema::RecordSchema, values; limits::Limits=Limits())
-    vs = Any[v for v in values]
-    length(vs) == length(schema.fields) || throw(ArgumentError("record \"$(fullname(schema))\" has $(length(schema.fields)) fields, got $(length(vs)) values"))
-    return withbudget(limits; direction=:encode) do budget
-        reserve!(budget, 56 + 8 * length(vs))
-        Record(schema, vs)
+    Record(schema::RecordSchema, values::Vector{Any}, ::Val{:unchecked}) = new(schema, values)
+    function Record(schema::RecordSchema, values; limits::Limits=Limits())
+        vs = Any[v for v in values]
+        length(vs) == length(schema.fields) || throw(ArgumentError("record \"$(fullname(schema))\" has $(length(schema.fields)) fields, got $(length(vs)) values"))
+        return withbudget(limits; direction=:encode) do budget
+            reserve!(budget, 56 + 8 * length(vs))
+            new(schema, vs)
+        end
     end
 end
 
@@ -288,11 +292,11 @@ Equality is by fullname and symbol string.
 struct EnumValue
     schema::EnumSchema
     index::Int32
-end
-
-function EnumValue(schema::EnumSchema, index::Integer; limits::Limits=Limits())
-    1 <= index <= length(schema.symbols) || throw(ArgumentError("enum \"$(fullname(schema))\" has $(length(schema.symbols)) symbols; index $index is out of range"))
-    return EnumValue(schema, Int32(index))
+    EnumValue(schema::EnumSchema, index::Int32, ::Val{:unchecked}) = new(schema, index)
+    function EnumValue(schema::EnumSchema, index::Integer; limits::Limits=Limits())
+        1 <= index <= length(schema.symbols) || throw(ArgumentError("enum \"$(fullname(schema))\" has $(length(schema.symbols)) symbols; index $index is out of range"))
+        return new(schema, Int32(index))
+    end
 end
 
 function EnumValue(schema::EnumSchema, symbol::AbstractString; limits::Limits=Limits())
@@ -315,13 +319,13 @@ A generic fixed value (copied bytes of exactly `schema.size`). Equality is by fu
 struct Fixed
     schema::FixedSchema
     bytes::Vector{UInt8}
-end
-
-function Fixed(schema::FixedSchema, bytes::AbstractVector{UInt8}; limits::Limits=Limits())
-    length(bytes) == schema.size || throw(ArgumentError("fixed \"$(fullname(schema))\" has size $(schema.size), got $(length(bytes)) bytes"))
-    return withbudget(limits; direction=:encode) do budget
-        reserve!(budget, 56 + length(bytes))
-        Fixed(schema, Vector{UInt8}(bytes))
+    Fixed(schema::FixedSchema, bytes::Vector{UInt8}, ::Val{:unchecked}) = new(schema, bytes)
+    function Fixed(schema::FixedSchema, bytes::AbstractVector{UInt8}; limits::Limits=Limits())
+        length(bytes) == schema.size || throw(ArgumentError("fixed \"$(fullname(schema))\" has size $(schema.size), got $(length(bytes)) bytes"))
+        return withbudget(limits; direction=:encode) do budget
+            reserve!(budget, 56 + length(bytes))
+            new(schema, Vector{UInt8}(bytes))
+        end
     end
 end
 
