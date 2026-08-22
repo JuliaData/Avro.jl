@@ -18,6 +18,7 @@ const FIXTURES = joinpath(@__DIR__, "fixtures")
     include("schema.jl")
     include("types.jl")
     include("binary.jl")
+    include("typed.jl")
     if get(ENV, "AVRO_QUALITY_GATES", "false") == "true"
         include("quality.jl")
     end

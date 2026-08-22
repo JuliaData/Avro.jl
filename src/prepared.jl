@@ -12,7 +12,7 @@ and safe to share across tasks (every call allocates its own decoder state and b
 struct DatumReader{T}
     writer::Schema
     reader::Schema
-    plan::ReadPlan
+    plan::Union{ReadPlan,TypedPlan}
     limits::Limits
     validate::Symbol
     names::Union{SymbolAdmission,Symbol}
@@ -48,19 +48,18 @@ function (r::DatumReader{T})(bytes::AbstractVector{UInt8}) where {T}
 end
 
 function (r::DatumReader{T})(bytes::AbstractVector{UInt8}, pos::Integer) where {T}
-    return withbudget(r.limits) do budget
+    v, next = withbudget(r.limits) do budget
         buf = sourcebytes(bytes, r.limits.max_datum_bytes, budget, DataError)
-        offset = buf === bytes ? 0 : 0
         1 <= pos <= length(buf) + 1 || throw(ArgumentError("position $pos out of range"))
         addinput!(budget, length(buf) - pos + 1)
         d = Decoder(buf, budget; pos=Int(pos), validate=r.validate)
-        v = decodetyped(T, r.plan, d, r.names)
-        return (v, d.pos)
+        return (decodetyped(T, r.plan, d, r.names), d.pos)
     end
+    return (finishtyped(r.plan, v, r.names), next)     # semantic conversion runs in caller space
 end
 
 function (r::DatumReader{T})(io::IO) where {T}
-    return withbudget(r.limits) do budget
+    v = withbudget(r.limits) do budget
         buf = sourcebytes(io, r.limits.max_datum_bytes, budget, DataError)
         length(buf) <= r.limits.max_datum_bytes || throw(LimitError(:max_datum_bytes, length(buf), r.limits.max_datum_bytes, :max_datum_bytes, :decode))
         addinput!(budget, length(buf))
@@ -69,9 +68,11 @@ function (r::DatumReader{T})(io::IO) where {T}
         d.pos == length(buf) + 1 || throw(DataError("trailing bytes after the datum", d.pos))
         return v
     end
+    return finishtyped(r.plan, v, r.names)
 end
 
 decodetyped(::Type{Nothing}, plan::ReadPlan, d::Decoder, names) = decode(plan, d)
+decodetyped(::Type{T}, plan::TypedPlan, d::Decoder, names) where {T} = decodetyped(plan, d, names)
 
 """
     Avro.DatumWriter(schema; limits=Limits())
