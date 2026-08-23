@@ -478,28 +478,18 @@ builders (also faster). The result is an `Avro.Table` over the not-yet-iterated 
 """
 function Tables.columns(rows::Rows)
     out = getfield(rows, :outschema)
-    parts = Table[]
-    for t in Tables.partitions(rows)                 # also enforces the not-mid-block rule
-        push!(parts, t)
-    end
-    nrows = sum(length, parts; init=0)
-    finals = AbstractVector[]
-    for k in 1:length(out.fields)
-        E = juliatype(out.fields[k].schema)
-        col = Vector{E}(undef, nrows)
-        off = 0
-        for t in parts
-            c = Tables.getcolumn(t, k)
-            copyto!(col, off + 1, c, 1, length(c))
-            off += length(c)
-        end
-        push!(finals, col)
-    end
+    rows.remaining == 0 || throw(ArgumentError("Tables.columns cannot start mid-block; iterate one interface only"))
+    colstypes = Type[juliatype(f.schema) for f in out.fields]
+    finals, counts = decodestreamed!(rows.reader, rows.plan, rows.select, colstypes)
+    nrows = sum(counts; init=0)
     ranges = UnitRange{Int}[]
     off = 0
-    for t in parts
-        push!(ranges, off + 1:off + length(t))
-        off += length(t)
+    for count in counts
+        push!(ranges, off + 1:off + count)
+        off += count
+    end
+    for c in finals
+        release!(rows.reader.budget, vectorbytes(eltype(c), length(c)))
     end
     return Table(out, writerschema(rows), rowsymbols(rows), finals, nrows, ranges, metadata(rows), codec(rows), sync(rows))
 end

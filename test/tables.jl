@@ -83,6 +83,21 @@ import DataAPI
         limited = Avro.Rows(tiny; limits=Avro.Limits(max_block_output_bytes=1))
         @test_throws Avro.LimitError first(Tables.partitions(limited))
         close(limited)
+        column_io = IOBuffer()
+        column_schema = P("{\"type\":\"record\",\"name\":\"ColumnLimit\",\"fields\":[{\"name\":\"x\",\"type\":\"long\"}]}")
+        column_writer = Avro.Writer(column_io, column_schema; codec=:null, block_bytes=20_000)
+        for _ in 1:10_000
+            push!(column_writer, (x=Int64(0),))
+        end
+        close(column_writer)
+        column_rows = Avro.Rows(take!(column_io))
+        column_budget = column_rows.reader.budget
+        Avro.reserve!(column_budget, column_budget.ceiling - column_budget.reserved - 130_000)
+        try
+            @test_throws Avro.LimitError Tables.columns(column_rows)
+        finally
+            close(column_rows)
+        end
         @test Avro.Rows(rr -> sum(row.a for row in rr), buf()) == sum(1:250)
     end
     @testset "select= projection" begin
