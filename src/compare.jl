@@ -56,7 +56,7 @@ function checkorderable(s::Schema, visited::Vector{Int32}=Int32[])
 end
 
 function comparevalue(s::Schema, p::ReadPlan, da::Decoder, db::Decoder)
-    countvalues!(da.budget)
+    countvalues!(da.budget, 2)
     return comparekind(s, p, da, db)
 end
 
