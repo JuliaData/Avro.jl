@@ -157,24 +157,25 @@ requirement checked against `max_codec_memory` and reserved, members counted, th
 exhausted, and the output bounded by `max_block_bytes`.
 """
 function decompressblock(name::Symbol, ::NullCodec, payload::AbstractVector{UInt8}, limits::Limits, budget::Budget)
+    addinput!(budget, length(payload))
     addmembers!(budget)
     reserve!(budget, bytesbytes(length(payload)))
     return Vector{UInt8}(payload)
 end
 
 function decompressblock(name::Symbol, ::DeflateReader, payload::AbstractVector{UInt8}, limits::Limits, budget::Budget)
-    addmembers!(budget)
     reserve!(budget, DEFLATE_DECODER_BYTES)
     out = initialoutput(budget, length(payload), limits.max_block_bytes)
     consumed, out, outlen = transcodemember!(:deflate, DeflateDecompressor(), payload, 1, length(payload), out, 0, limits.max_block_bytes, budget)
     release!(budget, DEFLATE_DECODER_BYTES)
     trailing = length(payload) - consumed
     trailing <= 3 || throw(CodecError(:deflate, :decompress, "$trailing bytes after the final deflate block"))   # ≤ 3 = fastavro's stripped zlib checksum (§8.4)
+    addinput!(budget, outlen)
+    addmembers!(budget)
     return shrinkexact(budget, out, outlen)
 end
 
 function decompressblock(name::Symbol, ::SnappyCodec, payload::AbstractVector{UInt8}, limits::Limits, budget::Budget)
-    addmembers!(budget)
     n = length(payload)
     n >= 4 || throw(CodecError(:snappy, :decompress, "snappy block shorter than its 4-byte CRC"))
     datalen = n - 4
@@ -190,6 +191,8 @@ function decompressblock(name::Symbol, ::SnappyCodec, payload::AbstractVector{UI
     (st2 == Snappy.LibSnappy.SNAPPY_OK && Int(len[]) == m) || throw(CodecError(:snappy, :decompress, "snappy decompression failed (status $st2)"))
     stored = (UInt32(payload[n - 3]) << 24) | (UInt32(payload[n - 2]) << 16) | (UInt32(payload[n - 1]) << 8) | UInt32(payload[n])
     crc32(out) == stored || throw(CodecError(:snappy, :decompress, "snappy CRC mismatch"))
+    addinput!(budget, m)
+    addmembers!(budget)
     return out
 end
 
@@ -199,11 +202,12 @@ function decompressblock(name::Symbol, z::ZstdReader, payload::AbstractVector{UI
     out = initialoutput(budget, total, limits.max_block_bytes)
     outlen = 0
     pos = 1
+    members = 0
     while pos <= total
         rem = total - pos + 1
         fsz = zstd_framesize(payload, pos, rem)
         fsz === nothing && throw(CodecError(:zstandard, :decompress, "not a complete zstandard frame at payload byte $pos"))
-        addmembers!(budget)
+        members = checked_add(members, 1)
         if zstd_skippable(payload, pos, rem)
             pos += fsz
             continue
@@ -217,6 +221,8 @@ function decompressblock(name::Symbol, z::ZstdReader, payload::AbstractVector{UI
         consumed == fsz || throw(CodecError(:zstandard, :decompress, "zstandard frame not exactly consumed"))
         pos += fsz
     end
+    addinput!(budget, outlen)
+    addmembers!(budget, members)
     return shrinkexact(budget, out, outlen)
 end
 

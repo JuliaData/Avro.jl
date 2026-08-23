@@ -6,9 +6,15 @@ import CodecZstd, CodecZlib, TranscodingStreams, Zlib_jll
     data = reduce(vcat, [Vector{UInt8}("hello avro codec block $(i % 7) ") for i in 1:2000])
     function codecdec(name::Symbol, payload; limits=L)
         return Avro.withbudget(limits) do budget
-            Avro.addinput!(budget, length(payload))
             sym, rc = Avro.readercodec(String(name), limits, nothing)
             Avro.decompressblock(sym, rc, payload, limits, budget)
+        end
+    end
+    function codecstats(name::Symbol, payload; limits=L)
+        return Avro.withbudget(limits) do budget
+            sym, rc = Avro.readercodec(String(name), limits, nothing)
+            out = Avro.decompressblock(sym, rc, payload, limits, budget)
+            return (out, budget.members, budget.input_bytes)
         end
     end
     @testset "round trips (every codec, incl. empty)" begin
@@ -51,6 +57,10 @@ import CodecZstd, CodecZlib, TranscodingStreams, Zlib_jll
         skip = vcat(UInt8[0x50, 0x2a, 0x4d, 0x18], UInt8[0x04, 0x00, 0x00, 0x00], UInt8[1, 2, 3, 4])
         @test_throws Avro.CodecError codecdec(:zstandard, UInt8[])
         @test codecdec(:zstandard, vcat(f1, f2)) == Vector{UInt8}("abcdefg")
+        dense = Avro.Limits(max_values_per_byte=1, work_allowance=0)
+        one = Avro.compressblock(w, UInt8[0x01])
+        @test codecdec(:zstandard, vcat(one, one); limits=dense) == UInt8[0x01, 0x01]
+        @test codecstats(:zstandard, vcat(one, one)) == (UInt8[0x01, 0x01], 2, 2)
         @test codecdec(:zstandard, vcat(skip, f1, skip, f2, skip)) == Vector{UInt8}("abcdefg")
         @test codecdec(:zstandard, skip) == UInt8[]
         @test_throws Avro.CodecError codecdec(:zstandard, vcat(f1, UInt8[0x01, 0x02]))
@@ -83,6 +93,10 @@ import CodecZstd, CodecZlib, TranscodingStreams, Zlib_jll
         b2 = Avro.compressblock(bz, Vector{UInt8}("defg"))
         @test_throws Avro.CodecError codecdec(:bzip2, UInt8[])
         @test codecdec(:bzip2, vcat(b1, b2)) == Vector{UInt8}("abcdefg")
+        dense = Avro.Limits(max_values_per_byte=1, work_allowance=0)
+        bone = Avro.compressblock(bz, UInt8[0x01])
+        @test codecdec(:bzip2, vcat(bone, bone); limits=dense) == UInt8[0x01, 0x01]
+        @test codecstats(:bzip2, vcat(bone, bone)) == (UInt8[0x01, 0x01], 2, 2)
         @test_throws Avro.CodecError codecdec(:bzip2, vcat(b1, UInt8[0x00]))
         @test_throws Avro.CodecError codecdec(:bzip2, b1[1:end - 2])
         xz = Avro.writercodec(:xz, nothing, L)
@@ -91,6 +105,9 @@ import CodecZstd, CodecZlib, TranscodingStreams, Zlib_jll
         @test_throws Avro.CodecError codecdec(:xz, UInt8[])
         @test_throws Avro.CodecError codecdec(:xz, zeros(UInt8, 4))
         @test codecdec(:xz, vcat(x1, x2)) == Vector{UInt8}("abcdefg")
+        xone = Avro.compressblock(xz, UInt8[0x01])
+        @test codecdec(:xz, vcat(xone, xone); limits=dense) == UInt8[0x01, 0x01]
+        @test codecstats(:xz, vcat(xone, xone)) == (UInt8[0x01, 0x01], 2, 2)
         @test codecdec(:xz, vcat(x1, zeros(UInt8, 4), x2, zeros(UInt8, 8))) == Vector{UInt8}("abcdefg")
         @test codecdec(:xz, vcat(x1, zeros(UInt8, 4))) == Vector{UInt8}("abc")
         @test_throws Avro.CodecError codecdec(:xz, vcat(x1, zeros(UInt8, 3)))

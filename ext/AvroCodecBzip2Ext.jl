@@ -15,14 +15,17 @@ function Avro.decompressblock(name::Symbol, ::Bzip2Reader, payload::AbstractVect
     out = Avro.initialoutput(budget, total, limits.max_block_bytes)
     outlen = 0
     pos = 1
+    members = 0
     while pos <= total
-        Avro.addmembers!(budget)
         Avro.reserve!(budget, BZIP2_DECODER_BYTES)
         consumed, out, outlen = Avro.transcodemember!(:bzip2, Bzip2Decompressor(), payload, pos, total, out, outlen, limits.max_block_bytes, budget)
         Avro.release!(budget, BZIP2_DECODER_BYTES)
         consumed == 0 && throw(Avro.CodecError(:bzip2, :decompress, "invalid bzip2 stream at payload byte $pos"))
+        members = Avro.checked_add(members, 1)
         pos += consumed
     end
+    Avro.addinput!(budget, outlen)
+    Avro.addmembers!(budget, members)
     return Avro.shrinkexact(budget, out, outlen)
 end
 

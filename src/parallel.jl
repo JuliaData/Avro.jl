@@ -181,8 +181,8 @@ function decodedirect!(r::Reader, e::BlockEntry, plan, builders::Vector{ColumnBu
     src = r.source::BytesSource
     addblocks!(b)
     payload = view(src.buf, e.offset:e.offset + e.size - 1)
+    addinput!(b, varintlength(e.count) + varintlength(e.size) + 16)
     out = decompressblock(r.codecname, r.codec, payload, r.limits, b)
-    addinput!(b, length(out) + varintlength(e.count) + varintlength(e.size) + 16)
     n = e.count
     before = b.reserved
     if r.validate === :strict && r.legacy === :avrojl1
@@ -230,8 +230,8 @@ function decodejob!(job::BlockJob, r::Reader, plan, sel::Union{Nothing,Vector{In
         src = r.source::BytesSource
         payload = view(src.buf, e.offset:e.offset + e.size - 1)
         cname, codec = readercodec(String(r.codecname), r.limits, r.legacy)
+        addinput!(b, varintlength(e.count) + varintlength(e.size) + 16)
         out = decompressblock(cname, codec, payload, r.limits, b)
-        addinput!(b, length(out) + varintlength(e.count) + varintlength(e.size) + 16)
         n = e.count
         before = b.reserved
         if r.validate === :strict && r.legacy === :avrojl1

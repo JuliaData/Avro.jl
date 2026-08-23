@@ -315,7 +315,9 @@ function nextblock!(r::Reader; walk::Bool=true)
         (sourceeof(r.source) ? throw(DataError("truncated file", position(r.source))) : sourcebyte(r.source)) == r.sync[i] ||
             throw(DataError("sync marker mismatch after block $(r.blockindex)", position(r.source)))
     end
+    addinput!(r.budget, varintlength(count) + varintlength(size) + 16)
     bytes = if r.codecname === :null && payload isa Vector{UInt8}
+        addinput!(r.budget, length(payload))
         addmembers!(r.budget)
         payload                                       # a streamed null-codec payload is already owned
     else
@@ -323,7 +325,6 @@ function nextblock!(r::Reader; walk::Bool=true)
         release!(r.budget, payloadcharge(r.source, Int(size)))
         out
     end
-    addinput!(r.budget, length(bytes) + varintlength(count) + varintlength(size) + 16)
     n = Int(count)
     if r.validate === :strict && (walk || r.legacy === :avrojl1)
         d = Decoder(bytes, r.budget)
