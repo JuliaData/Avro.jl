@@ -1,5 +1,6 @@
 @testset "Documentation contracts" begin
-    @test Base.Docs.hasdoc(Avro, Symbol("encode!"))
+    binding = Base.Docs.Binding(Avro, Symbol("encode!"))
+    @test haskey(Base.Docs.meta(Avro), binding)
 
     root = normpath(joinpath(@__DIR__, ".."))
     readme = read(joinpath(root, "README.md"), String)
