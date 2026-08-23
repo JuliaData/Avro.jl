@@ -72,6 +72,10 @@
         @test_throws Avro.DataError Avro.comparebytes(s, vcat(good, UInt8[0x00]), good)
         @test_throws Avro.DataError Avro.comparebytes(s, good, vcat(good, UInt8[0x00]))
         @test_throws Avro.DataError Avro.comparebytes(s, UInt8[], good)
+        invalid_utf8 = UInt8[0x02, 0xff]
+        for mode in (:strict, :fast)
+            @test_throws Avro.DataError Avro.comparebytes(P("\"string\""), invalid_utf8, invalid_utf8; validate=mode)
+        end
         big = P("{\"type\":\"array\",\"items\":\"boolean\"}")
         bytes = Avro.encode(big, fill(true, 100_000))
         @test_throws Avro.LimitError Avro.comparebytes(big, bytes, bytes; limits=Avro.Limits(max_total_values=1000))
