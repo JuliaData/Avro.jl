@@ -241,14 +241,23 @@ struct UnionSchema <: Schema; branches::FrozenVector{Schema}; hash; end
 struct FixedSchema <: Schema; name::FullName; aliases::FrozenVector{String}; size::Int; logical; props; hash; end   # no `doc`: fixed defines none; a fixed `doc` lives in `props`
 struct EnumSchema <: Schema; name::FullName; aliases; doc; symbols::FrozenVector{String}; default::Default; symbolindex::FrozenDict{String,Int}; props; hash; end
 struct Field; name::String; schema::Schema; doc; default::Default; order::Order; aliases::FrozenVector{String}; props; end
-struct RecordSchema <: Schema       # immutable struct; `fields`/`fieldindex`/`hash` are frozen containers / a Ref that the parser
-    name::FullName; aliases; doc; iserror::Bool; props           # fills exactly once after registering the record (so
-    fields::FrozenVector{Field}; fieldindex::FrozenDict{String,Int}; hash::FrozenRef{UInt64}   # self-references resolve), then freezes
+mutable struct RecordSchema <: Schema   # heap node with all-`const` fields (see the amendment below);
+    const name::FullName; const aliases; const doc; const iserror::Bool; const props   # `fields`/`fieldindex`/`hash` are frozen
+    const fields::FrozenVector{Field}; const fieldindex::FrozenDict{String,Int}; const hash::FrozenRef{UInt64}   # containers / a Ref filled once, then frozen
 end
 struct FullName; name::String; namespace::String; end       # fullname(x) = isempty(ns) ? name : ns*"."*name
 ```
 
-* **Enforced, transitive immutability.** Every schema node is an immutable `struct`. `FrozenVector`,
+* **Amendment (implementation round 1, evidence-driven): heap schema nodes.** Every schema node is a
+  `mutable struct` whose fields are all `const` — semantically immutable (no field can ever be
+  reassigned), but guaranteed a stable heap identity. Plain immutable structs were inlined by Julia
+  into every value that references a schema (`sizeof(Avro.Record)` measured 104 bytes; a
+  `Vector{EnumValue}` slot 104 bytes), which broke the §4.4 category-(b) storage formulas and the
+  `Base.summarysize(x; exclude=Avro.Schema)` oracle — the schema graph must be charged once under
+  category (e), which requires values to hold *references*. Identity (`===` is pointer identity),
+  structural `==`/`hash`, recursion, the storage oracle and cross-version behaviour are certified by
+  the Phase 1/2 gates on Julia 1.10 and 1.12. The transitive-immutability contract below is unchanged.
+* **Enforced, transitive immutability.** Every schema node is semantically immutable. `FrozenVector`,
   `FrozenDict`, and `FrozenRef` are private containers with a `frozen` flag: the parser fills them and
   calls `freeze!` once (public constructors freeze immediately); after that every mutating method throws.
   `props` and default values are stored as **recursively frozen JSON trees** (`FrozenJSON`: frozen
@@ -539,8 +548,14 @@ end
 ceiling is deliberately small: it is the amount of package-owned memory an untrusted operation may
 use without anyone raising a limit, and typical Avro files (64 KiB blocks, 8 MiB codec windows) need a
 fraction of it. At the start of every operation the **effective ceiling** is
-`min(limits.max_total_bytes, available ÷ 2)` with `available = min(Sys.free_memory(),
-Sys.total_memory(), cgroup_remaining) − pending_reservations`, where `cgroup_remaining` is read on
+`min(limits.max_total_bytes, available ÷ 2)` with `available = min(host_free, Sys.total_memory(),
+cgroup_remaining) − pending_reservations`, where `host_free` is `Sys.free_memory()` except on macOS,
+where it is free **plus inactive** pages from `host_statistics64` (amendment, implementation round 1,
+evidence-driven: macOS keeps reclaimable memory in inactive/file-cache pages, so `Sys.free_memory()`
+reports only truly free pages — measured 0.08 GiB free on an otherwise healthy 96 GiB authoring host,
+under which even the default 256 MiB ceiling's first-unit check would fail and every operation would
+raise `:available_memory`; free + inactive measured ≈ 33 GiB on the same host, the OS's actual
+reclaimable estimate) — and `cgroup_remaining` is read on
 Linux from cgroup v2 `memory.max`/`memory.current` (or v1 `memory.limit_in_bytes`/`memory.usage_in_bytes`)
 when readable and is `∞` otherwise, and `pending_reservations` is a package-wide `@atomic` counter of
 bytes that live operations have **reserved but not yet allocated** (resident allocations are already
@@ -1092,9 +1107,15 @@ attempt, memo entry, memo scan step and resolving-plan node is charged; exceedin
   **sequential streaming block reader** — the file is never read whole into memory), `Vector{UInt8}`/
   views (caller-owned, not charged), `IO` (streaming: the compressed block buffer and its decompressed buffer are both reserved under the
   ceiling before they are allocated; one block resident), `IOBuffer` (its written bytes only).
-* **Legacy mode.** `legacy=:avrojl1` enables exactly two *unambiguous* tolerances for files written by
-  Avro.jl ≤ 1.1.2: `avro.codec == "zstd"` read as zstandard, and null-codec blocks with trailing bytes
-  after `count` datums accepted (one `@warn` per source). The 1.x native-endian decimal defect is **never
+* **Legacy mode.** `legacy=:avrojl1` enables exactly three *unambiguous* tolerances for files written
+  by Avro.jl ≤ 1.1.2: `avro.codec == "zstd"` read as zstandard; null-codec blocks with trailing bytes
+  after `count` datums accepted (one `@warn` per source); and **nameless fixed schemas** (amendment,
+  implementation round 1, evidence-driven: Avro.jl ≤ 1.1.2 serialised fixed schemas without a `"name"`
+  attribute — the committed real 1.1.2 fixtures prove it — so under `legacy=:avrojl1` a fixed schema
+  object in a **container header** whose `"name"` key is absent parses with a synthesised name
+  `_avrojl1_fixed_N`, `N` the 1-based ordinal of the nameless fixed in document order; the tolerance
+  applies only to the missing-key case — an invalid *present* name still requires
+  `allow_invalid_names=true` — and never outside legacy mode). The 1.x native-endian decimal defect is **never
   inferred**: reinterpreting fixed/bytes decimals little-endian requires the explicit keyword
   `decimal_byteorder=:little` (default `:big`); recovery covers `bytes` decimals (length-prefixed, so
   framing is intact) and `fixed` decimals whose declared size is 16 — 1.x wrote 16 bytes regardless of
@@ -1460,7 +1481,7 @@ ext/AvroCodecBzip2Ext.jl, ext/AvroCodecXzExt.jl, ext/AvroTimeZonesExt.jl
 Avro.Limits(; fields...)                                             # validated, fixed-default limits (§4.4); Avro.SchemaCache(; max_entries, max_bytes)
 Avro.AvroError and subtypes: SchemaError, EncodeError, ResolutionError, LimitError, CodecError, UnsupportedCodecError, ConversionError, UnknownSchemaError, AmbiguousSchemaError, WriterClosedError, DataError (§4.13)
 Avro.parseschema(src::Union{AbstractString, AbstractVector{UInt8}, IO}; allow_invalid_names=false, allow_invalid_defaults=false, limits=Limits()) -> Schema
-Avro.NullSchema(; props=(;)), Avro.BooleanSchema(; props=(;)), Avro.IntSchema(; logical=nothing, props=(;)), Avro.LongSchema(; logical=nothing, props=(;)), Avro.FloatSchema(; props=(;)), Avro.DoubleSchema(; props=(;)), Avro.BytesSchema(; logical=nothing, props=(;)), Avro.StringSchema(; logical=nothing, props=(;))
+Avro.NullSchema(; props=(;), limits=Limits()), Avro.BooleanSchema(; props=(;), limits=Limits()), Avro.IntSchema(; logical=nothing, props=(;), limits=Limits()), Avro.LongSchema(; logical=nothing, props=(;), limits=Limits()), Avro.FloatSchema(; props=(;), limits=Limits()), Avro.DoubleSchema(; props=(;), limits=Limits()), Avro.BytesSchema(; logical=nothing, props=(;), limits=Limits()), Avro.StringSchema(; logical=nothing, props=(;), limits=Limits()) — the §4.4 construction scope applies to the primitive wrappers exactly as to the complex constructors (amendment, implementation round 1)
 Avro.ArraySchema(items; props=(;), limits=Limits()), Avro.MapSchema(values; props=(;), limits=Limits()), Avro.UnionSchema(branches; limits=Limits())
 Avro.RecordSchema(name; namespace="", fields=Avro.Field[], aliases=String[], doc=nothing, iserror=false, props=(;), limits=Limits())
 Avro.RecordSchema(f, name; kw...)   # recursion: `f(ref)` runs with the record registered but unfilled and returns its fields (register-before-fill, as the parser does); mutual recursion nests builders (an inner `RecordSchema(g, …)` may use outer refs); if `f` throws, the partial graph is discarded and nothing is registered; direct constructors otherwise accept only acyclic graphs
@@ -2060,7 +2081,7 @@ Decisions (each with rationale; reviewers may challenge any):
    member as reported by the library (liblzma `memlimit`; `ZSTD_estimateDStreamSize_fromFrame`) —
    enforced on every member read and written (decision 28); it is not a process-memory cap; the xz
    workspace reservation is the cap itself because liblzma reports nothing before allocating.
-7. Strict container validation is the default; `legacy=:avrojl1` covers only the two unambiguous 1.x
+7. Strict container validation is the default; `legacy=:avrojl1` covers only the three unambiguous 1.x
    tolerances; decimal byte-order reinterpretation is explicit-only.
 8. `Avro.write(dst, table)` is the container writer; datum writing is `encode`/`encode!`/`DatumWriter`;
    schema-free `encode(x)` uses the documented conventional schema and is not a round-trip mechanism.
