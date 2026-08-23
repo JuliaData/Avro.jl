@@ -1,4 +1,6 @@
 @testset "1.x deprecation shims (plan §7)" begin
+    @test Avro.read !== Base.read
+
     leg = joinpath(@__DIR__, "fixtures", "generated", "legacy1x", "avrojl112-null.avro")
     t = @test_deprecated Avro.readtable(leg; decimal_byteorder=:little)   # a real 1.1.2 file
     @test t isa Avro.Table && length(t) == 2

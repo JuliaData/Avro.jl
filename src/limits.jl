@@ -160,7 +160,7 @@ end
 function read_int_file(path::AbstractString)
     isfile(path) || return nothing
     txt = try
-        strip(read(path, String))
+        strip(Base.read(path, String))
     catch
         return nothing
     end

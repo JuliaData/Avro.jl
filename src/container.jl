@@ -37,7 +37,7 @@ end
 
 function sourcebyte(s::StreamSource)
     eof(s.io) && throw(DataError("truncated file", 0))
-    return read(s.io, UInt8)
+    return Base.read(s.io, UInt8)
 end
 
 "A zig-zag varint long read byte-wise from the source (the container's counts and sizes)."
