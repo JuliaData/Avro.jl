@@ -106,6 +106,8 @@ function Table(src; reader_schema::Union{Nothing,Schema}=nothing, union_resoluti
                ntasks::Integer=Threads.nthreads(), limits::Limits=Limits(), legacy::Union{Nothing,Symbol}=nothing,
                decimal_byteorder::Symbol=:big, allow_invalid_names::Bool=false, allow_invalid_defaults::Bool=false,
                validate::Symbol=:strict, mmap::Bool=true, names=DEFAULT_ADMISSION, select=nothing)
+    1 <= ntasks <= typemax(Int) || throw(ArgumentError("ntasks must be in 1:$(typemax(Int)), got $ntasks"))
+    taskcount = Int(ntasks)
     adm = admission(names)
     r = Reader(src; limits=limits, legacy=legacy, decimal_byteorder=decimal_byteorder, allow_invalid_names=allow_invalid_names,
                allow_invalid_defaults=allow_invalid_defaults, validate=validate, mmap=mmap)
@@ -126,7 +128,7 @@ function Table(src; reader_schema::Union{Nothing,Schema}=nothing, union_resoluti
                 reserve!(r.budget, vectorbytes(E, nrows))
                 push!(finals, Vector{E}(undef, nrows))
             end
-            decodeblocks!(r, plan, sel, finals, keptidx, colstypes, pre, Int(ntasks))
+            decodeblocks!(r, plan, sel, finals, keptidx, colstypes, pre, taskcount)
             counts = Int[e.count for e in pre.entries]
         else
             finals, counts = decodestreamed!(r, plan, sel, colstypes)

@@ -18,6 +18,9 @@
     entriesof(bs) = Avro.Reader(IOBuffer(bs)) do r
         Avro.prescanblocks(r).entries
     end
+    for nt in (0, -1, big(typemax(Int)) + 1)
+        @test_throws ArgumentError Avro.Table(IOBuffer(bytes); ntasks=nt)
+    end
     @testset "identical results and acceptance for ntasks ∈ {1,2,8}, both limits, both modes" begin
         for nt in (1, 2, 8), lim in (Avro.Limits(), raised), val in (:strict, :fast)
             t = Avro.Table(IOBuffer(bytes); ntasks=nt, limits=lim, validate=val)
