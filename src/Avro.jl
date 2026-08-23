@@ -16,6 +16,7 @@ using Tables: Tables
 import MD5
 import SHA
 import JSON
+import Base: read
 
 include("errors.jl")
 include("frozen.jl")

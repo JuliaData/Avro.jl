@@ -37,4 +37,10 @@
     end
     @test e isa ArgumentError
     @test occursin("Avro.encode!", sprint(showerror, e))
+
+    streamed = joinpath(@__DIR__, "fixtures", "generated", "roots", "long-fastavro-null.avro")
+    Avro.Reader(streamed; mmap=false) do reader
+        @test Avro.codec(reader) === :null
+        @test !isempty(collect(Avro.eachdatum(reader)))
+    end
 end
