@@ -107,6 +107,7 @@ function readheader(s::BlockSource, limits::Limits, budget::Budget; legacy, allo
             size = sourcevarint(s)
             (0 <= size <= limits.max_metadata_bytes) || throw(LimitError(:max_metadata_bytes, Int(size), limits.max_metadata_bytes, :max_metadata_bytes, :decode))
         end
+        blockstart = position(s)
         count <= limits.max_metadata_entries || throw(LimitError(:max_metadata_entries, Int(count), limits.max_metadata_entries, :max_metadata_entries, :decode))
         for _ in 1:count
             countvalues!(budget)
@@ -125,6 +126,10 @@ function readheader(s::BlockSource, limits::Limits, budget::Budget; legacy, allo
             key in keys && throw(DataError("duplicate metadata key \"$(escapename(key))\"", position(s)))
             push!(keys, key)
             push!(vals, value)
+        end
+        if size >= 0
+            consumed = position(s) - blockstart
+            consumed == size || throw(DataError("metadata block declares $size bytes but its entries consume $consumed", position(s)))
         end
     end
     addinput!(budget, total)

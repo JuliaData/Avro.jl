@@ -193,6 +193,14 @@ Base.flush(f::FailIO) = flush(f.io)
         # no avro.schema
         noschema = vcat(collect(b"Obj\x01"), varint(0), collect(UInt8(1):UInt8(16)))
         @test_throws Avro.DataError readall(noschema)
+        key = Vector{UInt8}("avro.schema")
+        value = Vector{UInt8}("\"null\"")
+        pair = vcat(varint(length(key)), key, varint(length(value)), value)
+        sizedmetadata(n) = vcat(collect(b"Obj\x01"), varint(-1), varint(n), pair, varint(0), sync)
+        @test readall(sizedmetadata(length(pair))) == []
+        for declared in (0, length(pair) - 1, length(pair) + 1)
+            @test_throws Avro.DataError readall(sizedmetadata(declared))
+        end
     end
     @testset "writer failure injection, poisoning, atomic paths" begin
         rows = [(x=Int64(i),) for i in 1:10]
