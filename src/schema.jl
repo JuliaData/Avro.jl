@@ -312,21 +312,42 @@ function sourcebytes(src::AbstractVector{UInt8}, maxbytes::Int, budget::Budget, 
     return Vector{UInt8}(src)
 end
 function sourcebytes(io::IO, maxbytes::Int, budget::Budget, ::Type{E}) where {E}
-    out = UInt8[]
-    cap = min(64 * KiB, maxbytes + 1)
-    reserve!(budget, cap + 40)
-    sizehint!(out, cap)
-    chunk = Vector{UInt8}(undef, 64 * KiB)
+    readlimit = maxbytes == typemax(Int) ? typemax(Int) : maxbytes + 1
+    cap = min(64 * KiB, readlimit)
+    reserve!(budget, bytesbytes(cap))
+    out = Vector{UInt8}(undef, cap)
+    chunkcap = min(64 * KiB, readlimit)
+    reserve!(budget, bytesbytes(chunkcap))
+    chunk = Vector{UInt8}(undef, chunkcap)
+    len = 0
     while !eof(io)
-        n = readbytes!(io, chunk, min(length(chunk), maxbytes + 1 - length(out)))
+        n = readbytes!(io, chunk, min(length(chunk), readlimit - len))
         n == 0 && break
-        if length(out) + n > cap
-            newcap = min(max(2 * cap, length(out) + n), maxbytes + 1)
-            reserve_replacement!(budget, cap, newcap)
+        need = checked_add(len, n)
+        if need > cap
+            grown = cap > typemax(Int) - cap ? typemax(Int) : cap + cap
+            newcap = min(max(grown, need), readlimit)
+            reserve!(budget, bytesbytes(newcap))
+            replacement = Vector{UInt8}(undef, newcap)
+            copyto!(replacement, 1, out, 1, len)
+            release!(budget, bytesbytes(cap))
+            out = replacement
             cap = newcap
         end
-        append!(out, view(chunk, 1:n))
-        length(out) > maxbytes && throw(LimitError(:max_schema_bytes, length(out), maxbytes, E === SchemaError ? :max_schema_bytes : :max_datum_bytes, :decode))
+        copyto!(out, len + 1, chunk, 1, n)
+        len = need
+        if len > maxbytes
+            limit = E === SchemaError ? :max_schema_bytes : :max_datum_bytes
+            throw(LimitError(limit, len, maxbytes, limit, :decode))
+        end
+    end
+    release!(budget, bytesbytes(chunkcap))
+    if len != cap
+        reserve!(budget, bytesbytes(len))
+        exact = Vector{UInt8}(undef, len)
+        copyto!(exact, 1, out, 1, len)
+        release!(budget, bytesbytes(cap))
+        out = exact
     end
     return out
 end

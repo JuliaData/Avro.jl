@@ -127,6 +127,25 @@
         @atomic Avro.GUARD.pending = pending0
     end
 
+    @testset "guarded IO source normalization" begin
+        input = fill(UInt8(' '), 64 << 10)
+        budget = Avro.Budget(l; available=1 << 40)
+        bytes = Avro.sourcebytes(IOBuffer(input), length(input), budget, Avro.SchemaError)
+        @test bytes == input
+        @test budget.peak >= 2 * Avro.bytesbytes(length(input))
+        Avro.close!(budget)
+
+        datum_budget = Avro.Budget(l; available=1 << 40)
+        err = try
+            Avro.sourcebytes(IOBuffer(UInt8[0x01, 0x02]), 1, datum_budget, Avro.DataError)
+            nothing
+        catch e
+            e
+        end
+        @test err isa Avro.LimitError && err.limit == :max_datum_bytes && err.keyword == :max_datum_bytes
+        Avro.close!(datum_budget)
+    end
+
     @testset "Budget: work, comparison and count rules" begin
         b = Avro.Budget(l; available=1 << 40)
         Avro.addinput!(b, 10)
