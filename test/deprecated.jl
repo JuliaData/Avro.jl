@@ -19,4 +19,22 @@
     Avro.Reader(io2) do r
         @test Avro.codec(r) === :null
     end
+
+    bytes = @test_deprecated Avro.write(Int64(-4))
+    @test bytes == Avro.encode(Int64(-4))
+    @test_deprecated Avro.read(bytes, Int64) === Int64(-4)
+    datum_schema = Avro.parseschema("\"long\"")
+    schema_bytes = @test_deprecated Avro.write(Int32(7); schema=datum_schema)
+    @test_deprecated Avro.read(IOBuffer(schema_bytes), datum_schema) === Int64(7)
+    union_type = Union{Int64,String}
+    union_bytes = @test_deprecated Avro.write("legacy"; schema=union_type)
+    @test_deprecated Avro.read(union_bytes, union_type) == "legacy"
+    e = try
+        Avro.write(IOBuffer(), Int64(1))
+        nothing
+    catch err
+        err
+    end
+    @test e isa ArgumentError
+    @test occursin("Avro.encode!", sprint(showerror, e))
 end

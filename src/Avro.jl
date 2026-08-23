@@ -65,7 +65,8 @@ if VERSION >= v"1.11.0-DEV.469"
         :resolve, :ResolvedSchema, :compare, :comparebytes,
         :Reader, :Writer, :write, :tobuffer, :codecs, :inspect, :InspectReport,
         :metadata, :codec, :sync, :writerschema, :eachblock, :eachdatum,
-        :Table, :Rows, :Row, :record))
+        :Table, :Rows, :Row, :record,
+        :read, :readtable, :writetable))
 end
 
 function __init__()
