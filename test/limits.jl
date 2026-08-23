@@ -89,6 +89,18 @@
         @test (@atomic Avro.GUARD.pending) == pending0
     end
 
+    @testset "prepared reader restores guard after failure" begin
+        schema = Avro.parseschema("""{"type":"record","name":"Guarded","fields":[{"name":"payload","type":"bytes"},{"name":"valid","type":"boolean"}]}""")
+        bytes = Avro.encode(schema, (payload=zeros(UInt8, 1 << 20), valid=true))
+        bytes[end] = 0x02
+        reader = Avro.DatumReader(schema)
+        pending0 = @atomic Avro.GUARD.pending
+        @test_throws Avro.DataError reader(bytes)
+        pending1 = @atomic Avro.GUARD.pending
+        @test pending1 == pending0
+        @atomic Avro.GUARD.pending = pending0
+    end
+
     @testset "Budget: work, comparison and count rules" begin
         b = Avro.Budget(l; available=1 << 40)
         Avro.addinput!(b, 10)
