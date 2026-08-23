@@ -179,6 +179,7 @@ encodevalue(::WString, e::Encoder, x) = encodeerror("expected a string", x)
 
 function encodevalue(p::WFixed, e::Encoder, x::Fixed)
     (fullname(x.schema) == fullname(p.schema) && x.schema.size == p.schema.size) || encodeerror("fixed value of $(fullname(x.schema)) does not match $(fullname(p.schema))", x)
+    length(x.bytes) == p.schema.size || encodeerror("fixed $(fullname(p.schema)) needs exactly $(p.schema.size) bytes, got $(length(x.bytes))", x)
     writeraw!(e, x.bytes)
     return nothing
 end
@@ -365,6 +366,7 @@ function encodevalue(p::WMap, e::Encoder, x)
         for (k, v) in pairs
             ks = mapkeystring(k)
             isstrictutf8(ks) || encodeerror("map key is not valid UTF-8", k)
+            admitmapkey!(seen, ks, e.budget, k)
             writestring!(e, ks)
             encode(p.values, e, v)
         end
@@ -381,6 +383,15 @@ mappairs(x) = encodeerror("expected a map (an AbstractDict or NamedTuple)", x)
 mapkeystring(k::AbstractString) = String(k)
 mapkeystring(k::Symbol) = String(k)
 mapkeystring(k) = encodeerror("map keys must be strings or symbols", k)
+
+function admitmapkey!(seen::Vector{String}, key::String, budget::Budget, source)
+    for prior in seen
+        addcompare!(budget, min(sizeof(prior), sizeof(key)) + 1)
+        prior == key && encodeerror("map keys are duplicates after conversion to strings", source)
+    end
+    push!(seen, key)
+    return nothing
+end
 
 # unions: branch recovery (plan §4.6)
 function encodevalue(p::WUnion, e::Encoder, x)
@@ -460,6 +471,7 @@ end
 function encoderecord(p::WRecord, e::Encoder, x::Record)
     xs = getfield(x, :schema)
     vals = getfield(x, :values)
+    length(vals) == length(xs.fields) || encodeerror("record value has $(length(vals)) values for $(length(xs.fields)) fields", x)
     if xs === p.schema || (fullname(xs) == fullname(p.schema) && length(xs.fields) == length(p.schema.fields) && all(i -> xs.fields[i].name == p.schema.fields[i].name, eachindex(p.fields)))
         for (i, f) in enumerate(p.fields)
             encode(f, e, vals[i])
