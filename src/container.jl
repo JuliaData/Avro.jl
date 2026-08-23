@@ -288,7 +288,7 @@ function littledecimals(p::ReadPlan, memo::IdDict{Any,Any}=IdDict{Any,Any}())
 end
 
 "Read the next block into owned decompressed bytes; `nothing` at a clean end of the file."
-function nextblock!(r::Reader)
+function nextblock!(r::Reader; walk::Bool=true)
     checkopen(r)
     sourceeof(r.source) && return nothing
     count = sourcevarint(r.source)
@@ -315,7 +315,7 @@ function nextblock!(r::Reader)
     end
     addinput!(r.budget, length(bytes) + varintlength(count) + varintlength(size) + 16)
     n = Int(count)
-    if r.validate === :strict
+    if r.validate === :strict && (walk || r.legacy === :avrojl1)
         d = Decoder(bytes, r.budget)
         for _ in 1:n
             skip(r.plan, d)
@@ -371,7 +371,7 @@ function Base.iterate(it::EachDatum, ::Nothing=nothing)
     release!(b, it.lastcharge)
     it.lastcharge = 0
     while it.remaining == 0
-        blk = nextblock!(it.reader)
+        blk = nextblock!(it.reader; walk=false)
         blk === nothing && return nothing
         it.remaining = blk[1]
         it.bytes = blk[2]

@@ -199,7 +199,7 @@ function decodestreamed!(r::Reader, plan, sel::Union{Nothing,Vector{Int}}, colst
     counts = Int[]
     chunkcols = Vector{Vector{AbstractVector}}()
     reserve!(r.budget, blocktablecharge(0))
-    while (blk = nextblock!(r)) !== nothing
+    while (blk = nextblock!(r; walk=false)) !== nothing
         reserve!(r.budget, 32)                         # this block's block-table entry (plan §4.4)
         count, bytes = blk
         addrows!(r.budget, count)
@@ -341,7 +341,7 @@ function Base.iterate(rows::Rows, ::Nothing=nothing)
     release!(b, rows.lastcharge)
     rows.lastcharge = 0
     while rows.remaining == 0
-        blk = nextblock!(r)
+        blk = nextblock!(r; walk=false)
         blk === nothing && return nothing
         rows.remaining = blk[1]
         rows.bytes = blk[2]
@@ -442,7 +442,7 @@ function Base.iterate(it::RowsPartitions, ::Nothing=nothing)
     rows = it.rows
     rows.remaining == 0 || throw(ArgumentError("Tables.partitions cannot start mid-block; iterate one interface only"))
     r = rows.reader
-    blk = nextblock!(r)
+    blk = nextblock!(r; walk=false)
     blk === nothing && return nothing
     count, bytes = blk
     addrows!(r.budget, count)

@@ -185,7 +185,7 @@ function decodedirect!(r::Reader, e::BlockEntry, plan, builders::Vector{ColumnBu
     addinput!(b, length(out) + varintlength(e.count) + varintlength(e.size) + 16)
     n = e.count
     before = b.reserved
-    if r.validate === :strict
+    if r.validate === :strict && r.legacy === :avrojl1
         d0 = Decoder(out, b)
         for _ in 1:n
             skip(r.plan, d0)
@@ -234,7 +234,7 @@ function decodejob!(job::BlockJob, r::Reader, plan, sel::Union{Nothing,Vector{In
         addinput!(b, length(out) + varintlength(e.count) + varintlength(e.size) + 16)
         n = e.count
         before = b.reserved
-        if r.validate === :strict
+        if r.validate === :strict && r.legacy === :avrojl1
             d0 = Decoder(out, b)
             for _ in 1:n
                 skip(r.plan, d0)

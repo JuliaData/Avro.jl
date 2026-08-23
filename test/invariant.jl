@@ -12,6 +12,31 @@
         @test r.budget.reserved == w.preflightbase              # the same graph, metadata and read plan
         close(r)
     end
+    @testset "strict consumers charge each datum once" begin
+        lim = Avro.Limits(max_total_values=100, work_allowance=1000)
+        nullio = IOBuffer()
+        nullwriter = Avro.Writer(nullio, Avro.NullSchema(); limits=lim)
+        for _ in 1:60
+            push!(nullwriter, missing)
+        end
+        close(nullwriter)
+        nullbytes = take!(nullio)
+        @test Avro.Reader(r -> length(collect(Avro.eachdatum(r))), IOBuffer(nullbytes); limits=lim) == 60
+        nullrows = Avro.Rows(IOBuffer(nullbytes); limits=lim)
+        @test length(collect(nullrows)) == 60
+        close(nullrows)
+
+        empty_schema = P("{\"type\":\"record\",\"name\":\"Once\",\"fields\":[]}")
+        emptyio = IOBuffer()
+        emptywriter = Avro.Writer(emptyio, empty_schema; limits=lim)
+        for _ in 1:60
+            push!(emptywriter, (;))
+        end
+        close(emptywriter)
+        emptybytes = take!(emptyio)
+        @test length(Avro.Table(IOBuffer(emptybytes); limits=lim, ntasks=1)) == 60
+        Threads.nthreads() > 1 && @test length(Avro.Table(emptybytes; limits=lim, ntasks=2)) == 60
+    end
     @testset "a near-ceiling record file through every source mode and guaranteed consumer" begin
         lim = Avro.Limits(max_total_bytes=96 << 20, max_block_bytes=8 << 20, max_codec_memory=16 << 20,
                           max_block_output_bytes=32 << 20, max_bytes=8 << 20, max_datum_bytes=8 << 20)
