@@ -1163,7 +1163,7 @@ importmemo() = get(task_local_storage(), :avro_import_memo, nothing)
 function withbuilder(f)
     outer = builderdepth() == 0
     task_local_storage(:avro_builder_depth, builderdepth() + 1)
-    outer && task_local_storage(:avro_import_memo, FrozenDict{String,Schema}())
+    outer && task_local_storage(:avro_import_memo, FrozenDict{String,Tuple{Schema,Schema}}())
     try
         return f()
     finally
@@ -1365,13 +1365,33 @@ same constructor call) and deep-copied into the new graph otherwise, so every gr
 function importchild(s::Schema)
     isfilled(s.meta.id) || return s
     memo = importmemo()
-    return deepcopyschema(s, memo === nothing ? FrozenDict{String,Schema}() : memo)
+    return deepcopyschema(s, memo === nothing ? FrozenDict{String,Tuple{Schema,Schema}}() : memo)
 end
 
-function deepcopyschema(s::Schema, memo::FrozenDict{String,Schema})
+function memocopy(s::Schema, memo::FrozenDict{String,Schema})
+    return memo[fullname(s)]
+end
+
+function memocopy(s::Schema, memo::FrozenDict{String,Tuple{Schema,Schema}})
+    source, copy = memo[fullname(s)]
+    source === s || throw(ArgumentError("named schema \"$(fullname(s))\" is defined by more than one child schema"))
+    return copy
+end
+
+function remembercopy!(memo::FrozenDict{String,Schema}, s::Schema, copy::Schema)
+    memo[fullname(s)] = copy
+    return copy
+end
+
+function remembercopy!(memo::FrozenDict{String,Tuple{Schema,Schema}}, s::Schema, copy::Schema)
+    memo[fullname(s)] = (s, copy)
+    return copy
+end
+
+function deepcopyschema(s::Schema, memo::Union{FrozenDict{String,Schema},FrozenDict{String,Tuple{Schema,Schema}}})
     if s isa NamedSchema
         full = fullname(s)
-        haskey(memo, full) && return memo[full]
+        haskey(memo, full) && return memocopy(s, memo)
     end
     if s isa NullSchema
         return NullSchema(s.props, NodeMeta())
@@ -1401,16 +1421,16 @@ function deepcopyschema(s::Schema, memo::FrozenDict{String,Schema})
         return UnionSchema(freeze!(bs), NodeMeta())
     elseif s isa FixedSchema
         c = FixedSchema(s.name, s.aliases, s.rawaliases, s.size, s.logical, s.props, NodeMeta())
-        memo[fullname(s)] = c
+        remembercopy!(memo, s, c)
         return c
     elseif s isa EnumSchema
         c = EnumSchema(s.name, s.aliases, s.rawaliases, s.doc, s.symbols, s.default, s.symbolindex, s.props, NodeMeta())
-        memo[fullname(s)] = c
+        remembercopy!(memo, s, c)
         return c
     else
         fields = FrozenVector{Field}()
         c = RecordSchema(s.name, s.aliases, s.rawaliases, s.doc, s.iserror, s.props, fields, s.fieldindex, NodeMeta())
-        memo[fullname(s)] = c
+        remembercopy!(memo, s, c)
         for f in s.fields
             push!(fields, Field(f.name, deepcopyschema(f.schema, memo), f.doc, f.default, f.order, f.aliases, f.props))
         end

@@ -397,6 +397,9 @@ end
     two = Avro.RecordSchema("Seg"; fields=[Avro.Field("a", pt), Avro.Field("b", pt)])
     @test two.fields[1].schema !== pt && two.fields[1].schema === two.fields[2].schema && two == P(Avro.json(two))
     @test Avro.nodeid(two) == 0 && Avro.graphinfo(two).nodes == 3
+    left = Avro.RecordSchema("Duplicate"; fields=[Avro.Field("x", Avro.IntSchema())])
+    right = Avro.RecordSchema("Duplicate"; fields=[Avro.Field("y", Avro.StringSchema())])
+    @test_throws ArgumentError Avro.RecordSchema("ConflictingChildren"; fields=[Avro.Field("left", left), Avro.Field("right", right)])
     # minsize
     @test Avro.minsize(ll) == 2 && Avro.minsize(P("[]")) == typemax(Int) && Avro.minsize(P("""{"type":"enum","name":"E","symbols":[]}""")) == typemax(Int)
     @test Avro.minsize(P("""{"type":"record","name":"R","fields":[{"name":"n","type":"R"}]}""")) == typemax(Int)
