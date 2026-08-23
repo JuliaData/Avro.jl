@@ -75,6 +75,20 @@ Base.:(==)(a::Node, b::Node) = a.name == b.name && a.children == b.children
 Base.:(==)(a::Nested, b::Nested) = a.inner == b.inner && a.items == b.items && a.byname == b.byname
 end
 
+struct ResolvedDTO
+    a::Float64
+    b::Union{Missing,Int64}
+    z::Int32
+    ResolvedDTO() = error("the positional constructor must not run on the fast route")
+end
+
+struct Hooked
+    a::Float64
+    b::Union{Missing,Int64}
+    z::Int32
+end
+StructUtils.lift(::Avro.AvroStyle, ::Type{Hooked}, x) = Hooked(1.0, missing, Int32(0))
+
 @testset "Typed decoding" begin
     using .TypedTestTypes: Plain, Mut, Empty, MutEmpty, Bits, Guarded, Colour, red, green, blue, Tagged, WithDefault, NoDefault, Optional, LL, Node, Shape, Circle, Lifted, Wrapper, HasWrapper, SymField, Nested
     P = Avro.parseschema
@@ -280,5 +294,34 @@ end
             @test probeshell == (isbitstype(T) ? 0 : max(Int(Base.summarysize(Avro.emptyprobe(T))), 8))
         end
         @test Avro.measuredshell(@NamedTuple{a::Int64}) == 0
+    end
+
+    @testset "the direct typed route over resolving plans (plan §4.8, R18)" begin
+        w = P("{\"type\":\"record\",\"name\":\"E1\",\"fields\":[{\"name\":\"a\",\"type\":\"int\"},{\"name\":\"drop\",\"type\":\"string\"},{\"name\":\"b\",\"type\":[\"null\",\"long\"]}]}")
+        r = P("{\"type\":\"record\",\"name\":\"E1\",\"fields\":[{\"name\":\"a\",\"type\":\"double\"},{\"name\":\"b\",\"type\":[\"null\",\"long\"]},{\"name\":\"z\",\"type\":\"int\",\"default\":9}]}")
+        T = @NamedTuple{a::Float64, b::Union{Missing,Int64}, z::Int32}
+        dr = Avro.DatumReader(w, T; reader_schema=r)
+        @test dr.plan isa Avro.ResolvedRecordTarget                              # not the semantic fallback
+        @test dr(Avro.encode(w, (a=Int32(3), drop="x", b=Int64(7)))) == (a=3.0, b=7, z=Int32(9))
+        @test isequal(dr(Avro.encode(w, (a=Int32(1), drop="y", b=missing))), (a=1.0, b=missing, z=Int32(9)))
+        # an immutable struct target through Expr(:new), no constructor invoked
+        drs = Avro.DatumReader(w, ResolvedDTO; reader_schema=r)
+        @test drs.plan isa Avro.ResolvedRecordTarget
+        v = drs(Avro.encode(w, (a=Int32(2), drop="q", b=Int64(5))))
+        @test v.a == 2.0 && v.b == 5 && v.z == Int32(9)
+        # nested resolved records recurse onto the direct route
+        wn = P("{\"type\":\"record\",\"name\":\"O\",\"fields\":[{\"name\":\"in\",\"type\":{\"type\":\"record\",\"name\":\"I\",\"fields\":[{\"name\":\"x\",\"type\":\"int\"}]}}]}")
+        rn = P("{\"type\":\"record\",\"name\":\"O\",\"fields\":[{\"name\":\"in\",\"type\":{\"type\":\"record\",\"name\":\"I\",\"fields\":[{\"name\":\"x\",\"type\":\"long\"}]}}]}")
+        TN = @NamedTuple{in::@NamedTuple{x::Int64}}
+        drn = Avro.DatumReader(wn, TN; reader_schema=rn)
+        @test drn.plan isa Avro.ResolvedRecordTarget
+        @test drn(Avro.encode(wn, (in=(x=Int32(4),),))) == (in=(x=Int64(4),),)
+        # a custom-hooked target still takes the semantic route
+        drh = Avro.DatumReader(w, Hooked; reader_schema=r)
+        @test drh.plan isa Avro.SemanticTarget || !(drh.plan isa Avro.ResolvedRecordTarget)
+        # results agree with the semantic route on the same bytes
+        drg = Avro.DatumReader(w; reader_schema=r)
+        g = drg(Avro.encode(w, (a=Int32(3), drop="x", b=Int64(7))))
+        @test g.a == 3.0 && g.b == 7 && g.z == Int32(9)
     end
 end

@@ -116,7 +116,11 @@ function buildtyped(::Type{T}, s::Schema, p::ReadPlan, memo::TypedMemo) where {T
     T === Any && return GenericTarget(p)
     T === juliatype(s) && return GenericTarget(p)
     customhooks(T) && return SemanticTarget{T}(p)
-    isresolving(p) && return SemanticTarget{T}(p)           # resolved shapes decode as reader values, then convert
+    if isresolving(p)                                        # the settled eligibility analysis applies to
+        t = buildresolvedtyped(T, s, p, memo)                # resolved plans too (plan §4.8, R18); anything
+        t === nothing || return t                            # ineligible converts through the semantic route
+        return SemanticTarget{T}(p)
+    end
     s isa UnionSchema && return builduniontarget(T, s, p::UnionPlan, memo)
     if T isa Union
         _, inner = splitoptional(T)
@@ -305,6 +309,161 @@ function buildrecordplan(::Type{T}, s::RecordSchema, p::RecordPlan, memo::TypedM
     end
     ps = (plans...,)
     return RecordTarget{T,typeof(ps),(map...,)}(s, ps, defaults, measuredshell(T))
+end
+
+"""
+The direct typed route over resolving plans (plan §4.8, R18): promotions and enum remaps are leaves
+(their decode already yields the reader value); a two-branch-nullable reader union resolves through a
+wrapped or per-writer-branch target; resolved records decode writer-ordered steps straight into `T`'s
+fields with reader-only defaults materialised once at plan time. Returns `nothing` when ineligible.
+"""
+function buildresolvedtyped(::Type{T}, s::Schema, p::ReadPlan, memo::TypedMemo) where {T}
+    p isa Union{PromotePlan,EnumRemapPlan} && return buildleaftarget(T, p)
+    if p isa WrapPlan && p.nullable != 0 && s isa UnionSchema
+        N, inner = T isa Union ? splitoptional(T) : (Union{}, T)
+        inner === nothing && return nothing
+        return buildtyped(inner, s.branches[p.readerindex], p.inner, memo)   # the writer never encodes null here
+    end
+    if p isa UnionResolvePlan && p.nullable != 0 && s isa UnionSchema
+        N, inner = T isa Union ? splitoptional(T) : (Union{}, T)
+        (inner === nothing || N === Union{}) && return nothing
+        branches = TypedPlan[]
+        isnull = Bool[]
+        for (i, bp) in enumerate(p.branches)
+            if p.readerindex[i] == p.nullable
+                push!(branches, GenericTarget(bp))                            # decodes missing
+                push!(isnull, true)
+            else
+                bt = bp isa UnresolvableBranch ? GenericTarget(bp) :
+                     buildtyped(inner, s.branches[p.readerindex[i]], bp, memo)
+                bt isa SemanticTarget && return nothing
+                push!(branches, bt)
+                push!(isnull, false)
+            end
+        end
+        bs = (branches...,)
+        return ResolvedNullableTarget{N === Missing ? Missing : Nothing,typeof(bs)}(bs, isnull)
+    end
+    p isa ResolvedRecordPlan && s isa RecordSchema && return buildresolvedrecord(T, s, p, memo)
+    return nothing
+end
+
+"A resolved two-branch-nullable union into `Union{Missing|Nothing, X}` typed targets per writer branch."
+struct ResolvedNullableTarget{N,BS<:Tuple} <: TypedPlan
+    branches::BS
+    isnull::Vector{Bool}
+end
+
+function typedvalue(p::ResolvedNullableTarget{N}, d::Decoder, names) where {N}
+    i = readindex(d, length(p.branches))
+    if p.isnull[i]
+        skipnothing = typedvalue(p.branches[i], d, names)                     # consumes the writer branch (null: nothing)
+        return N === Missing ? missing : nothing
+    end
+    return typedvalue(p.branches[i], d, names)
+end
+
+"A resolved record decoded stepwise (writer order) directly into `T` (plan §4.8, R18)."
+struct ResolvedRecordTarget{T,PS<:Tuple,SLOTMAP} <: TypedPlan
+    schema::RecordSchema
+    plans::PS            # one target per writer step, writer order (SkipTarget when unmapped)
+    defaults::Vector{Any}
+    shell::Int
+end
+
+function buildresolvedrecord(::Type{T}, s::RecordSchema, p::ResolvedRecordPlan, memo::TypedMemo) where {T}
+    (T <: NamedTuple || (isstructtype(T) && !ismutabletype(T)) || ismutabletype(T)) || return nothing
+    T <: Union{AbstractArray,AbstractString,AbstractDict} && return nothing
+    names = fieldnames(T)
+    tags = StructUtils.fieldtags(AvroStyle(), T)
+    avronames = String[avrofieldname(tags, n) for n in names]
+    slotfor = zeros(Int, length(s.fields))               # reader slot -> T field
+    for (k, an) in enumerate(avronames)
+        i = get(s.fieldindex, an, 0)
+        i == 0 && continue
+        slotfor[i] = k
+    end
+    plans = TypedPlan[]
+    stepslot = Int[]
+    for (slot, sp) in p.steps
+        k = slot == 0 ? 0 : slotfor[slot]
+        if k == 0
+            push!(plans, SkipTarget(sp))
+            push!(stepslot, 0)
+        else
+            tp = buildtyped(fieldtype(T, k), s.fields[slot].schema, sp, memo)
+            tp isa SemanticTarget && return nothing
+            push!(plans, tp)
+            push!(stepslot, k)
+        end
+    end
+    defaults = Vector{Any}(undef, length(names))
+    defs = StructUtils.fielddefaults(AvroStyle(), T)
+    covered = falses(length(names))
+    for (j, k) in enumerate(stepslot)
+        k == 0 || (covered[k] = true)
+    end
+    for (slot, dp) in p.defaults
+        k = slotfor[slot]
+        k == 0 && continue
+        ft = fieldtype(T, k)
+        v = withbudget(graphlimits(s)) do budget
+            jsonvalue(dp.schema, dp.json, budget)
+        end
+        v2 = v isa ft ? v : try
+            convertleaf(ft, v)
+        catch
+            nothing
+        end
+        v2 isa ft || return nothing                       # a non-static or unconvertible default is ineligible
+        defaults[k] = v2
+        covered[k] = true
+    end
+    for k in eachindex(names)
+        covered[k] && continue
+        ft = fieldtype(T, k)
+        if haskey(defs, names[k])
+            v = defs[names[k]]
+            v isa ft || return nothing
+            defaults[k] = v
+        elseif Missing <: ft
+            defaults[k] = missing
+        elseif Nothing <: ft
+            defaults[k] = nothing
+        else
+            throw(ArgumentError("field $(names[k]) of $T has no writer field, no reader default and no static default"))
+        end
+    end
+    ps = (plans...,)
+    return ResolvedRecordTarget{T,typeof(ps),(stepslot...,)}(s, ps, defaults, measuredshell(T))
+end
+
+function typedvalue(p::ResolvedRecordTarget{T}, d::Decoder, names) where {T}
+    enter!(d)
+    reserve!(d.budget, p.shell)
+    v = resolvedrecordvalue(p, d, names)
+    leave!(d)
+    return v
+end
+
+@generated function resolvedrecordvalue(p::ResolvedRecordTarget{T,PS,SLOTMAP}, d::Decoder, names) where {T,PS,SLOTMAP}
+    body = Expr(:block)
+    plantypes = PS.parameters
+    for j in 1:length(plantypes)
+        if plantypes[j] <: SkipTarget
+            push!(body.args, :(skip(p.plans[$j].plan, d)))
+        else
+            push!(body.args, :($(Symbol("f", SLOTMAP[j])) = decodetyped(p.plans[$j], d, names)))
+        end
+    end
+    args = Any[]
+    for k in 1:fieldcount(T)
+        ft = fieldtype(T, k)
+        push!(args, k in SLOTMAP ? :($(Symbol("f", k))::$ft) : :(p.defaults[$k]::$ft))
+    end
+    construct = T <: NamedTuple ? :($T(($(args...),))) : Expr(:new, T, args...)
+    push!(body.args, :(return $construct))
+    return body
 end
 
 function buildarraytarget(::Type{T}, s::ArraySchema, p::ArrayPlan, memo::TypedMemo) where {T}
