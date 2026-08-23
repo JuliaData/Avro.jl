@@ -187,8 +187,12 @@
         @test_throws Avro.SchemaError P("""{"type":"record","name":"R","fields":[{"name":"f","type":"int","aliases":["g"]},{"name":"g","type":"int"}]}""")
         @test_throws Avro.SchemaError P("""{"type":"record","name":"R","fields":[{"name":"a","type":{"type":"fixed","name":"F","size":1,"aliases":["G"]}},{"name":"b","type":{"type":"fixed","name":"G","size":1}}]}""")
         @test_throws Avro.SchemaError P("""{"type":"record","name":"R","aliases":[1],"fields":[]}""")
-        # alias names must be valid names unless allow_invalid_names
-        @test_throws Avro.SchemaError P("""{"type":"record","name":"R","aliases":["bad-alias"],"fields":[]}""")
+        arbitrary = P("""{"type":"record","name":"R","aliases":["bad-alias"],"fields":[{"name":"f","type":"int","aliases":["bad-field"]}]}""")
+        @test arbitrary.aliases == ["bad-alias"]
+        @test arbitrary.fields[1].aliases == ["bad-field"]
+        @test !Avro.graphinfo(arbitrary).repaired_names
+        constructed = Avro.RecordSchema("R"; aliases=["bad-alias"], fields=[Avro.Field("f", Avro.IntSchema(); aliases=["bad-field"])])
+        @test constructed == arbitrary
         rep = P("""{"type":"record","name":"R","aliases":["bad-alias"],"fields":[{"name":"bad-field","type":"int"}]}"""; allow_invalid_names=true)
         @test Avro.graphinfo(rep).repaired_names
         @test_throws ArgumentError Avro.canonical(rep)

@@ -438,7 +438,7 @@ function parsenamed(ctx::ParseContext, obj::JSONObject, enclosing::String, path:
     raw = something(stringarrayattr(obj, "aliases", path), String[])
     aliases = String[]
     for (i, a) in enumerate(raw)
-        checkname(ctx, splitfullname(a)[1], "alias", string(path, ".aliases[", i - 1, "]"))
+        checknamebytes(ctx, a, "alias", string(path, ".aliases[", i - 1, "]"))
         na = normalizealias(a, full.namespace)
         na == fullname(full) && continue                       # self-alias: idempotent, ignored
         na in aliases && continue
@@ -574,7 +574,7 @@ function parsefield(ctx::ParseContext, obj::JSONObject, ns::String, path::String
     rawaliases = something(stringarrayattr(obj, "aliases", path), String[])
     aliases = String[]
     for (i, a) in enumerate(rawaliases)
-        checkname(ctx, a, "field alias", string(path, ".aliases[", i - 1, "]"))
+        checknamebytes(ctx, a, "field alias", string(path, ".aliases[", i - 1, "]"))
         a == name && continue
         a in aliases || push!(aliases, a)
     end
@@ -1206,7 +1206,6 @@ function publicnamed(name::AbstractString, namespace::AbstractString, aliases, s
     raw = String[String(a) for a in aliases]
     norm = String[]
     for a in raw
-        checkpublicname(splitfullname(a)[1], "alias")
         na = normalizealias(a, full.namespace)
         (na == fullname(full) || na in norm) && continue
         push!(norm, na)
@@ -1288,7 +1287,6 @@ function Field(name::AbstractString, schema::Schema; default=nodefault, order::S
     order in (:ascending, :descending, :ignore) || throw(ArgumentError("order must be :ascending, :descending or :ignore"))
     als = String[]
     for a in aliases
-        checkpublicname(a, "field alias")
         (String(a) == name || String(a) in als) && continue
         push!(als, String(a))
     end
