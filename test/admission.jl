@@ -94,4 +94,21 @@
     e3 = try Avro.admit!(cap, "over"); nothing catch err; err end
     @test e3 isa Avro.LimitError && e3.limit == :max_names && length(cap) == Avro.RUN_BASE + 1
     @test Avro.admit!(cap, "c0001") === :c0001            # existing names still admit after the failure
+
+    # A carry that cannot reserve its next merge must fail before it commits the new name.
+    transactional = Avro.SymbolAdmission(max_names=10_000, max_bytes=70_000)
+    admissionname(i) = "x$(lpad(i, 4, '0'))"
+    for i in 1:5_119
+        try
+            Avro.admit!(transactional, admissionname(i))
+        catch err
+            @test i == 4_097 && err isa Avro.LimitError && err.limit == :max_bytes
+            Avro.admit!(transactional, admissionname(i))
+        end
+    end
+    before = length(transactional)
+    carryerror = try Avro.admit!(transactional, admissionname(5_120)); nothing catch err; err end
+    @test carryerror isa Avro.LimitError && carryerror.limit == :max_bytes
+    @test length(transactional) == before
+    @test !Avro.contains_unlocked(transactional, admissionname(5_120))
 end

@@ -87,6 +87,63 @@
             error("boom")
         end
         @test (@atomic Avro.GUARD.pending) == pending0
+
+        if Threads.nthreads() > 1
+            concurrent = min(Threads.nthreads(), 8)
+            iterations = 10_000
+            large = Avro.Limits(max_total_bytes=16 << 30)
+            budgets = [Avro.Budget(large; available=typemax(Int)) for _ in 1:concurrent]
+            tasks = Task[]
+            for i in 1:concurrent
+                push!(tasks, Threads.@spawn begin
+                    for _ in 1:iterations
+                        Avro.reserve!(budgets[i], Avro.GUARD_CHUNK)
+                    end
+                end)
+            end
+            foreach(errormonitor, tasks)
+            foreach(fetch, tasks)
+            expected = pending0 + concurrent * iterations * Avro.GUARD_CHUNK
+            @test (@atomic Avro.GUARD.pending) == expected
+            drains = Task[]
+            for b in budgets
+                push!(drains, Threads.@spawn Avro.close!(b))
+            end
+            foreach(errormonitor, drains)
+            foreach(fetch, drains)
+            @test (@atomic Avro.GUARD.pending) == pending0
+        end
+    end
+
+    @testset "prepared reader restores guard after failure" begin
+        schema = Avro.parseschema("""{"type":"record","name":"Guarded","fields":[{"name":"payload","type":"bytes"},{"name":"valid","type":"boolean"}]}""")
+        bytes = Avro.encode(schema, (payload=zeros(UInt8, 1 << 20), valid=true))
+        bytes[end] = 0x02
+        reader = Avro.DatumReader(schema)
+        pending0 = @atomic Avro.GUARD.pending
+        @test_throws Avro.DataError reader(bytes)
+        pending1 = @atomic Avro.GUARD.pending
+        @test pending1 == pending0
+        @atomic Avro.GUARD.pending = pending0
+    end
+
+    @testset "guarded IO source normalization" begin
+        input = fill(UInt8(' '), 64 << 10)
+        budget = Avro.Budget(l; available=1 << 40)
+        bytes = Avro.sourcebytes(IOBuffer(input), length(input), budget, Avro.SchemaError)
+        @test bytes == input
+        @test budget.peak >= 2 * Avro.bytesbytes(length(input))
+        Avro.close!(budget)
+
+        datum_budget = Avro.Budget(l; available=1 << 40)
+        err = try
+            Avro.sourcebytes(IOBuffer(UInt8[0x01, 0x02]), 1, datum_budget, Avro.DataError)
+            nothing
+        catch e
+            e
+        end
+        @test err isa Avro.LimitError && err.limit == :max_datum_bytes && err.keyword == :max_datum_bytes
+        Avro.close!(datum_budget)
     end
 
     @testset "Budget: work, comparison and count rules" begin

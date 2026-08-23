@@ -25,3 +25,45 @@ function writetable(dst, table; compress::Union{Nothing,Symbol}=nothing, kw...)
     codecname = compress === nothing ? :null : compress === :zstd ? :zstandard : compress
     return write(dst, table; codec=codecname, kw...)
 end
+
+"""
+    Avro.write(x; schema=nothing, limits=Limits())
+
+Deprecated 1.x datum writer. Use [`Avro.encode`](@ref), or [`Avro.encode!`](@ref) for an `IO`.
+"""
+function write(x; schema=nothing, limits::Limits=Limits())
+    Base.depwarn("`Avro.write(x; schema=...)` is deprecated; use `Avro.encode(schema, x)`.", :write)
+    schema === nothing && return encode(x; limits=limits)
+    s = deprecatedschema(schema, limits)
+    return encode(s, x; limits=limits)
+end
+
+"""
+    Avro.read(source, T_or_schema)
+
+Deprecated 1.x datum reader. Use [`Avro.decode`](@ref) or a prepared [`Avro.DatumReader`](@ref).
+"""
+function read(src, s::Schema; limits::Limits=Limits(), kw...)
+    Base.depwarn("`Avro.read(src, schema)` is deprecated; use `Avro.decode(schema, src)`.", :read)
+    return deprecateddecode(src, s; limits=limits, kw...)
+end
+
+function read(src, ::Type{T}; schema=nothing, limits::Limits=Limits(), kw...) where {T}
+    Base.depwarn("`Avro.read(src, T)` is deprecated; use `Avro.decode(schema, src, T)`.", :read)
+    s = schema === nothing ? Avro.schema(T; limits=limits) : deprecatedschema(schema, limits)
+    return deprecateddecode(src, s, T; limits=limits, kw...)
+end
+
+function deprecatedschema(s, limits::Limits)
+    s isa Schema && return s
+    s isa Type && return Avro.schema(s; limits=limits)
+    throw(ArgumentError("`schema` must be an `Avro.Schema` or Julia type"))
+end
+
+function deprecateddecode(src::AbstractString, s::Schema, args...; kw...)
+    return open(src, "r") do io
+        decode(s, io, args...; kw...)
+    end
+end
+
+deprecateddecode(src, s::Schema, args...; kw...) = decode(s, src, args...; kw...)

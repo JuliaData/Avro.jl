@@ -73,7 +73,8 @@ the merge-sort scratch, sort the candidate indices by key bytes (every compared 
 comparison rule), resolve duplicates last-wins into the first occurrence's position, and compact in
 place (the vectors keep their `npairs` capacity).
 """
-function buildmap(::Type{V}, keys::Vector{String}, vals::Vector{V}, budget::Union{Nothing,Budget}) where {V}
+function buildmap(::Type{V}, keys::Vector{String}, vals::Vector{V}, budget::Union{Nothing,Budget};
+                  duplicateposition::Union{Nothing,Int}=nothing) where {V}
     n = length(keys)
     n <= typemax(Int32) || throw(ArgumentError("a map cannot hold more than $(typemax(Int32)) pairs"))
     budget === nothing || reserve!(budget, mapshellbytes(n) + vectorbytes(Int32, cld(n, 2)))   # struct, permutation and the sort scratch
@@ -95,6 +96,8 @@ function buildmap(::Type{V}, keys::Vector{String}, vals::Vector{V}, budget::Unio
                 j += 1
             end
             if j > i
+                duplicateposition === nothing ||
+                    throw(DataError("duplicate metadata key \"$(escapename(keys[perm[i]]))\"", duplicateposition))
                 first = minimum(view(perm, i:j))
                 last = maximum(view(perm, i:j))
                 vals[first] = vals[last]

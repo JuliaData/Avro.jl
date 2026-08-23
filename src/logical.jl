@@ -66,6 +66,30 @@ const SIMPLE_LOGICALS = Dict{String,Tuple{LogicalType,Tuple{Vararg{Symbol}}}}(
     "duration" => (DurationLogical(), (:fixed,)),
 )
 
+const LOG10_2_192_HI = UInt64(0x4d104d427de7fbcc)
+const LOG10_2_192_MID = UInt64(0x47c4acd605be48bc)
+const LOG10_2_192_LO = UInt64(0x13569862a1e8f9a4)
+const UINT64_WORD_MASK = UInt128(typemax(UInt64))
+
+function lowword(x::UInt128)
+    return UInt64(x & UINT64_WORD_MASK)
+end
+
+function mul_log10_2_bound(bits::UInt64, low::UInt64)
+    p0 = widemul(bits, low)
+    p1 = widemul(bits, LOG10_2_192_MID)
+    p2 = widemul(bits, LOG10_2_192_HI)
+    high0 = UInt64(p0 >> 64)
+    sum1 = high0 + lowword(p1)
+    carry1 = UInt64(sum1 < high0)
+    high1 = UInt64(p1 >> 64)
+    sum2 = high1 + lowword(p2)
+    carry2 = UInt64(sum2 < high1)
+    carried = sum2 + carry1
+    carry2 |= UInt64(carried < sum2)
+    return UInt64(p2 >> 64) + carry2
+end
+
 """
     maxdecimalprecision(size) -> Int
 
@@ -75,11 +99,12 @@ evaluated with checked, saturating integer arithmetic (never by constructing `2^
 """
 function maxdecimalprecision(size::Int)
     size <= 0 && return 0
-    bits = size >= typemax(Int) ÷ 8 ? typemax(Int) : 8 * size - 1
-    # log10(2) = 0.30102999566398... ; use an integer approximation that is exact for every practical size
-    # (floor((bits × 30103) ÷ 100000) never exceeds the true floor for bits < 2^40, and saturates beyond)
-    bits >= (typemax(Int) ÷ 30103) && return typemax(Int)
-    return (bits * 30103) ÷ 100000
+    bits = size > typemax(Int) ÷ 8 ? typemax(Int) : 8 * size - 1
+    # These adjacent 192-bit integers bracket log10(2) when divided by 2^192.
+    lower = mul_log10_2_bound(UInt64(bits), LOG10_2_192_LO)
+    upper = mul_log10_2_bound(UInt64(bits), LOG10_2_192_LO + 1)
+    lower == upper || throw(OverflowError("decimal precision exceeds the supported Int range"))
+    return Int(lower)
 end
 
 jsonint(x::Int64) = x

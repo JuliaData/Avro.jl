@@ -67,6 +67,9 @@
         @test_throws Avro.DataError dec(f, UInt8[1])
         g = Avro.FixedSchema("G", 2)
         @test_throws Avro.EncodeError enc(f, Avro.Fixed(g, UInt8[1, 2]))      # identity mismatch
+        mutable_fixed = Avro.Fixed(P(f), UInt8[1, 2])
+        push!(mutable_fixed.bytes, 0x03)
+        @test_throws Avro.EncodeError enc(f, mutable_fixed)
         e = "{\"type\":\"enum\",\"name\":\"E\",\"symbols\":[\"A\",\"B\"]}"
         @test hex(enc(e, "B")) == "02" && hex(enc(e, :A)) == "00" && hex(enc(e, Avro.EnumValue(P(e), 2))) == "02"
         @test_throws Avro.EncodeError enc(e, "C")
@@ -127,6 +130,7 @@
         @test_throws Avro.DataError dec(mp, hex2bytes("02" * "02ff" * "02" * "00"))    # invalid UTF-8 key
         @test_throws Avro.EncodeError enc(mp, Dict(1 => 2))
         @test_throws Avro.EncodeError enc(mp, [1, 2])
+        @test_throws Avro.EncodeError enc(mp, Dict{Any,Int32}(:a => 1, "a" => 2))
         # Java BlockingBinaryEncoder fixtures (sized blocks at every level) decode like the positive form
         arrmap = P(read(joinpath(FIXTURES, "generated", "blocking", "arrmap.avsc"), String))
         expected = [Avro.Map{Int64}([("a", 1), ("b", 2)]), Avro.Map{Int64}(), Avro.Map{Int64}([("c", 3)])]
@@ -148,6 +152,12 @@
         rs = P(r)
         @test hex(enc(r, (a=1, b="z"))) == "02027a" && hex(enc(r, Dict("a" => 1, "b" => "z"))) == "02027a" && hex(enc(r, Dict(:a => 1, :b => "z"))) == "02027a"
         @test hex(enc(r, Avro.Record(rs, [1, "z"]))) == "02027a"
+        short_record = Avro.Record(rs, [1, "z"])
+        empty!(short_record.values)
+        @test_throws Avro.EncodeError enc(r, short_record)
+        long_record = Avro.Record(rs, [1, "z"])
+        push!(long_record.values, 3)
+        @test_throws Avro.EncodeError enc(r, long_record)
         @test_throws Avro.EncodeError enc(r, (a=1,))                 # defaults never make a field optional when encoding
         @test_throws Avro.EncodeError enc(r, Dict("a" => 1))
         @test_throws Avro.EncodeError enc(r, 5)
@@ -274,6 +284,9 @@
         @test_throws Avro.LimitError Avro.encode(P("\"bytes\""), zeros(UInt8, 100); limits=Avro.Limits(max_bytes=50, max_datum_bytes=50))
         arr = P("{\"type\":\"array\",\"items\":\"null\"}")
         @test_throws Avro.LimitError Avro.decode(arr, hex2bytes("ffffffffff0f00"); limits=Avro.Limits(max_block_count=100))   # 2^31 nulls declared
+        blocklimits = Avro.Limits(max_block_count=2, max_total_values=100, work_allowance=100)
+        @test_throws Avro.LimitError Avro.encode(arr, fill(missing, 3); limits=blocklimits)
+        @test_throws Avro.LimitError Avro.encode(P("{\"type\":\"map\",\"values\":\"null\"}"), Dict("a" => missing, "b" => missing, "c" => missing); limits=blocklimits)
         e = try Avro.decode(arr, hex2bytes("ffffffffff0f00")); nothing catch err; err end
         @test e isa Avro.LimitError && e.limit in (:max_block_count, :max_values_per_byte, :max_total_values)
         @test_throws Avro.LimitError Avro.decode(arr, enc("\"long\"", 1 << 20) ; limits=Avro.Limits(work_allowance=0))   # work rule

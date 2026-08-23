@@ -116,6 +116,9 @@ end
 
 @testset "generic values" begin
     P = Avro.parseschema
+    extreme_datetime = DateTime(Dates.UTM(typemin(Int64)))
+    @test_throws Avro.ConversionError Avro.Timestamp{Millisecond}(extreme_datetime)
+    @test_throws Avro.ConversionError Avro.LocalTimestamp{Millisecond}(extreme_datetime)
     m = Avro.Map([("b", 2), ("a", 1), ("b", 3), ("c", 4)])
     @test collect(keys(m)) == ["b", "a", "c"] && m["b"] == 3 && m["a"] == 1 && collect(values(m)) == [3, 1, 4]   # last wins, first position
     @test length(m) == 3 && haskey(m, "c") && !haskey(m, "z") && get(m, "z", 0) == 0 && haskey(m, :a) && m[:a] == 1

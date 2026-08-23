@@ -56,7 +56,7 @@ function checkorderable(s::Schema, visited::Vector{Int32}=Int32[])
 end
 
 function comparevalue(s::Schema, p::ReadPlan, da::Decoder, db::Decoder)
-    countvalues!(da.budget)
+    countvalues!(da.budget, 2)
     return comparekind(s, p, da, db)
 end
 
@@ -78,9 +78,13 @@ comparekind(::FloatSchema, p, da::Decoder, db::Decoder) = comparefloat(readfloat
 comparekind(::DoubleSchema, p, da::Decoder, db::Decoder) = comparefloat(readdouble(da), readdouble(db))
 comparekind(s::EnumSchema, p, da::Decoder, db::Decoder) = cmp(readindex(da, length(s.symbols)), readindex(db, length(s.symbols)))
 
-function comparekind(::Union{BytesSchema,StringSchema}, p, da::Decoder, db::Decoder)
+function comparekind(s::Union{BytesSchema,StringSchema}, p, da::Decoder, db::Decoder)
     na = readlen(da, da.budget.limits.max_bytes, :max_bytes)
     nb = readlen(db, db.budget.limits.max_bytes, :max_bytes)
+    if s isa StringSchema
+        validutf8(da.buf, da.pos, da.pos + na - 1) || dataerror(da, "invalid UTF-8 in string")
+        validutf8(db.buf, db.pos, db.pos + nb - 1) || dataerror(db, "invalid UTF-8 in string")
+    end
     c = comparebuffers(da.buf, da.pos, na, db.buf, db.pos, nb, da.budget)
     da.pos += na
     db.pos += nb

@@ -13,9 +13,11 @@ The schema comes from `schema=`, else from the retained schema of an Avro source
 `Avro.Rows` or `Avro.Reader`), else from the source's `Tables.schema`. Sources without one need an
 explicit `schema=`. `Tables.partitions` become block boundaries.
 
-Writing to a path is **atomic**: output goes to a temporary file that is renamed over the target only
-on a successful `close` (`atomic=false` and `fsync=true` adjust this). A failed write never leaves a
-partial file at the target path.
+Writing to a path is **atomic by default**: output goes to a temporary file that is renamed over the
+target only on a successful `close`. With `atomic=true`, a failure leaves the target unchanged. With
+`atomic=false`, the destination is opened in place, so a failure can leave it truncated or containing
+complete blocks plus a partial final block. `fsync=true` syncs the file before rename, but does not sync
+the directory that contains it.
 
 [`Avro.Writer`](@ref) is the streaming form:
 
@@ -29,8 +31,10 @@ close(w)
 
 A `Writer` enforces every limit a reader enforces and preflights the reader's complete memory peak,
 so **everything a successfully closed writer emits is accepted by every guaranteed consumer under
-identical limits** (see [Limits and security](limits-and-security.md)). After an error the writer is
-poisoned: further use throws `Avro.WriterClosedError`.
+identical limits** (see [Limits and security](limits-and-security.md)). The first failure poisons the
+writer, including a rejected datum or limit failure from `push!`; further use throws
+`Avro.WriterClosedError` carrying the original cause. Closing a poisoned writer discards its buffered
+block. For `atomic=false` and caller-owned streams, no repair of partial output is promised.
 
 ## Reading
 
@@ -64,11 +68,14 @@ against the same cap, so a written file is always decodable under the same limit
 
 ## Inspection and 1.x files
 
-[`Avro.inspect`](@ref) reports a container's codec, schema, block structure and any detected defects
-without decoding data. Files written by Avro.jl ≤ 1.1.2 have known defects; read them with
+[`Avro.inspect`](@ref) reports header and framing issues, including a container's codec, schema, and
+block structure. It does not decode blocks and cannot infer payload padding or decimal byte order.
+Files written by Avro.jl ≤ 1.1.2 have known defects; read them with
 `legacy=:avrojl1` (padded null-codec blocks, the `zstd` codec name, unnamed fixed schemas) and
 `decimal_byteorder=:little` (native-endian fixed-16 decimals), and rewrite once:
 
 ```julia
-Avro.write("clean.avro", Avro.Rows("old.avro"; legacy=:avrojl1); codec=:zstandard)
+Avro.write("clean.avro",
+           Avro.Rows("old.avro"; legacy=:avrojl1, decimal_byteorder=:little);
+           codec=:zstandard)
 ```

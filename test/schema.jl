@@ -187,8 +187,12 @@
         @test_throws Avro.SchemaError P("""{"type":"record","name":"R","fields":[{"name":"f","type":"int","aliases":["g"]},{"name":"g","type":"int"}]}""")
         @test_throws Avro.SchemaError P("""{"type":"record","name":"R","fields":[{"name":"a","type":{"type":"fixed","name":"F","size":1,"aliases":["G"]}},{"name":"b","type":{"type":"fixed","name":"G","size":1}}]}""")
         @test_throws Avro.SchemaError P("""{"type":"record","name":"R","aliases":[1],"fields":[]}""")
-        # alias names must be valid names unless allow_invalid_names
-        @test_throws Avro.SchemaError P("""{"type":"record","name":"R","aliases":["bad-alias"],"fields":[]}""")
+        arbitrary = P("""{"type":"record","name":"R","aliases":["bad-alias"],"fields":[{"name":"f","type":"int","aliases":["bad-field"]}]}""")
+        @test arbitrary.aliases == ["bad-alias"]
+        @test arbitrary.fields[1].aliases == ["bad-field"]
+        @test !Avro.graphinfo(arbitrary).repaired_names
+        constructed = Avro.RecordSchema("R"; aliases=["bad-alias"], fields=[Avro.Field("f", Avro.IntSchema(); aliases=["bad-field"])])
+        @test constructed == arbitrary
         rep = P("""{"type":"record","name":"R","aliases":["bad-alias"],"fields":[{"name":"bad-field","type":"int"}]}"""; allow_invalid_names=true)
         @test Avro.graphinfo(rep).repaired_names
         @test_throws ArgumentError Avro.canonical(rep)
@@ -252,6 +256,10 @@
         @test P("""{"type":"fixed","name":"F","size":0,"logicalType":"decimal","precision":1}""").logical === nothing     # fixed(0): no DomainError
         @test P("""{"type":"fixed","name":"F","size":16,"logicalType":"decimal","precision":38}""").logical == Avro.DecimalLogical(38, 0)
         @test Avro.maxdecimalprecision(16) == 38 && Avro.maxdecimalprecision(1) == 2 && Avro.maxdecimalprecision(0) == 0
+        @test Avro.maxdecimalprecision(4721) == 11368
+        @test Avro.maxdecimalprecision(typemax(Int)) == 2776511644261678565
+        @test P("""{"type":"fixed","name":"F","size":4721,"logicalType":"decimal","precision":11368}""").logical == Avro.DecimalLogical(11368, 0)
+        @test P("""{"type":"fixed","name":"F","size":4721,"logicalType":"decimal","precision":11369}""").logical === nothing
         @test P("""{"type":"string","logicalType":"uuid"}""").logical isa Avro.UUIDLogical
         @test P("""{"type":"fixed","name":"U","size":16,"logicalType":"uuid"}""").logical isa Avro.UUIDLogical
         @test P("""{"type":"fixed","name":"U","size":15,"logicalType":"uuid"}""").logical === nothing
@@ -322,6 +330,12 @@
         @test i.logical isa Avro.DateLogical && i.props["logicalType"] == "date" && Avro.json(i) == "{\"type\":\"int\",\"logicalType\":\"date\"}"
         b = Avro.BytesSchema(; logical=Avro.DecimalLogical(9, 2), props=(doc="x",))
         @test b.logical == Avro.DecimalLogical(9, 2) && b.props["precision"] == 9 && b == P(Avro.json(b))
+        for invalid in (Avro.IntSchema(; logical=Avro.UUIDLogical()),
+                        Avro.BytesSchema(; logical=Avro.DateLogical()),
+                        Avro.StringSchema(; logical=Avro.TimestampMillis()))
+            @test invalid.logical === nothing
+            @test invalid == P(Avro.json(invalid))
+        end
         @test_throws ArgumentError Avro.IntSchema(; props=(type="x",))
         @test_throws ArgumentError Avro.IntSchema(; logical=Avro.DateLogical(), props=(logicalType="y",))
         @test Avro.NullSchema() == P("\"null\"") && Avro.StringSchema() == P("\"string\"")
@@ -383,6 +397,14 @@ end
     two = Avro.RecordSchema("Seg"; fields=[Avro.Field("a", pt), Avro.Field("b", pt)])
     @test two.fields[1].schema !== pt && two.fields[1].schema === two.fields[2].schema && two == P(Avro.json(two))
     @test Avro.nodeid(two) == 0 && Avro.graphinfo(two).nodes == 3
+    left = Avro.RecordSchema("Duplicate"; fields=[Avro.Field("x", Avro.IntSchema())])
+    right = Avro.RecordSchema("Duplicate"; fields=[Avro.Field("y", Avro.StringSchema())])
+    @test_throws ArgumentError Avro.RecordSchema("ConflictingChildren"; fields=[Avro.Field("left", left), Avro.Field("right", right)])
+    @test_throws ArgumentError Avro.RecordSchema("ConflictingBuilder") do _
+        nestedleft = Avro.RecordSchema("NestedDuplicate"; fields=[Avro.Field("x", Avro.IntSchema())])
+        nestedright = Avro.RecordSchema("NestedDuplicate"; fields=[Avro.Field("y", Avro.StringSchema())])
+        [Avro.Field("left", nestedleft), Avro.Field("right", nestedright)]
+    end
     # minsize
     @test Avro.minsize(ll) == 2 && Avro.minsize(P("[]")) == typemax(Int) && Avro.minsize(P("""{"type":"enum","name":"E","symbols":[]}""")) == typemax(Int)
     @test Avro.minsize(P("""{"type":"record","name":"R","fields":[{"name":"n","type":"R"}]}""")) == typemax(Int)
@@ -390,5 +412,7 @@ end
     @test Avro.minsize(P("""{"type":"record","name":"A","fields":[{"name":"b","type":{"type":"record","name":"B","fields":[{"name":"a","type":"A"}]}}]}""")) == typemax(Int)
     @test Avro.minsize(P("""{"type":"fixed","name":"F","size":7}""")) == 7 && Avro.minsize(P("\"double\"")) == 8 && Avro.minsize(P("\"null\"")) == 0
     @test Avro.minsize(P("""["int","string"]""")) == 2 && Avro.minsize(P("[" * join(["{\"type\":\"fixed\",\"name\":\"F$i\",\"size\":$(i == 64 ? 0 : 10)}" for i in 0:64], ",") * "]")) == 2   # the 65th branch (size 0) needs a 2-byte index
+    huge = Avro.RecordSchema("Huge"; fields=[Avro.Field("a", Avro.FixedSchema("A", typemax(Int) - 1)), Avro.Field("b", Avro.FixedSchema("B", 2))])
+    @test Avro.minsize(huge) == typemax(Int)
     @test Avro.varintlength(0) == 1 && Avro.varintlength(63) == 1 && Avro.varintlength(64) == 2
 end

@@ -8,9 +8,14 @@ const MAGIC = (UInt8('O'), UInt8('b'), UInt8('j'), 0x01)
 
 # ---- sources ----------------------------------------------------------------------------------------
 
-mutable struct BytesSource
-    const buf::Vector{UInt8}
+mutable struct BytesSource{B<:AbstractVector{UInt8}}
+    const buf::B
     pos::Int
+    const stop::Int
+end
+
+function BytesSource(buf::AbstractVector{UInt8}, pos::Int)
+    return BytesSource(buf, pos, length(buf))
 end
 
 mutable struct StreamSource
@@ -20,11 +25,11 @@ end
 
 const BlockSource = Union{BytesSource,StreamSource}
 
-sourceeof(s::BytesSource) = s.pos > length(s.buf)
+sourceeof(s::BytesSource) = s.pos > s.stop
 sourceeof(s::StreamSource) = eof(s.io)
 
 function sourcebyte(s::BytesSource)
-    s.pos <= length(s.buf) || throw(DataError("truncated file", s.pos))
+    s.pos <= s.stop || throw(DataError("truncated file", s.pos))
     b = s.buf[s.pos]
     s.pos += 1
     return b
@@ -32,7 +37,7 @@ end
 
 function sourcebyte(s::StreamSource)
     eof(s.io) && throw(DataError("truncated file", 0))
-    return read(s.io, UInt8)
+    return Base.read(s.io, UInt8)
 end
 
 "A zig-zag varint long read byte-wise from the source (the container's counts and sizes)."
@@ -55,7 +60,7 @@ Base.position(s::StreamSource) = Int(position(s.io))
 
 "Exactly `n` payload bytes: a view for byte sources (caller-owned), an owned charged buffer for streams."
 function sourcepayload(s::BytesSource, n::Int, budget::Budget)
-    s.pos + n - 1 <= length(s.buf) || throw(DataError("truncated file", s.pos))
+    n <= s.stop - s.pos + 1 || throw(DataError("truncated file", s.pos))
     out = view(s.buf, s.pos:s.pos + n - 1)
     s.pos += n
     return out
@@ -75,7 +80,7 @@ closesource(::BytesSource) = nothing
 closesource(s::StreamSource) = s.owned ? close(s.io) : nothing
 
 opensource(src::Vector{UInt8}; mmap::Bool=true) = BytesSource(src, 1)
-opensource(src::IOBuffer; mmap::Bool=true) = BytesSource(src.data isa Vector{UInt8} ? src.data : Vector{UInt8}(src.data), 1)  # its written bytes only (trimmed below)
+opensource(src::IOBuffer; mmap::Bool=true) = BytesSource(src.data, 1, src.size)
 opensource(src::IO; mmap::Bool=true) = StreamSource(src, false)
 function opensource(src::AbstractString; mmap::Bool=true)
     mmap || return StreamSource(open(src, "r"), true)
@@ -83,8 +88,7 @@ function opensource(src::AbstractString; mmap::Bool=true)
 end
 
 function opensource(src::IOBuffer, ::Val{:trim})
-    n = src.size
-    return BytesSource(n == length(src.data) && src.data isa Vector{UInt8} ? src.data : Vector{UInt8}(view(src.data, 1:n)), 1)
+    return BytesSource(src.data, 1, src.size)
 end
 
 # ---- header -----------------------------------------------------------------------------------------
@@ -107,6 +111,7 @@ function readheader(s::BlockSource, limits::Limits, budget::Budget; legacy, allo
             size = sourcevarint(s)
             (0 <= size <= limits.max_metadata_bytes) || throw(LimitError(:max_metadata_bytes, Int(size), limits.max_metadata_bytes, :max_metadata_bytes, :decode))
         end
+        blockstart = position(s)
         count <= limits.max_metadata_entries || throw(LimitError(:max_metadata_entries, Int(count), limits.max_metadata_entries, :max_metadata_entries, :decode))
         for _ in 1:count
             countvalues!(budget)
@@ -122,13 +127,16 @@ function readheader(s::BlockSource, limits::Limits, budget::Budget; legacy, allo
             total <= limits.max_metadata_bytes || throw(LimitError(:max_metadata_bytes, total, limits.max_metadata_bytes, :max_metadata_bytes, :decode))
             value = Vector{UInt8}(sourcepayload(s, Int(vlen), budget))
             reserve!(budget, stringbytes(sizeof(key)) + bytesbytes(length(value)))
-            key in keys && throw(DataError("duplicate metadata key \"$(escapename(key))\"", position(s)))
             push!(keys, key)
             push!(vals, value)
         end
+        if size >= 0
+            consumed = position(s) - blockstart
+            consumed == size || throw(DataError("metadata block declares $size bytes but its entries consume $consumed", position(s)))
+        end
     end
     addinput!(budget, total)
-    metadata = buildmap(Vector{UInt8}, keys, vals, budget)
+    metadata = buildmap(Vector{UInt8}, keys, vals, budget; duplicateposition=position(s))
     sync = ntuple(_ -> sourcebyte(s), 16)
     schemabytes = get(metadata, "avro.schema", nothing)
     schemabytes === nothing && throw(DataError("the container has no avro.schema", position(s)))
@@ -288,49 +296,57 @@ function littledecimals(p::ReadPlan, memo::IdDict{Any,Any}=IdDict{Any,Any}())
 end
 
 "Read the next block into owned decompressed bytes; `nothing` at a clean end of the file."
-function nextblock!(r::Reader)
+function nextblock!(r::Reader; walk::Bool=true)
     checkopen(r)
     sourceeof(r.source) && return nothing
-    count = sourcevarint(r.source)
-    (0 <= count <= r.limits.max_block_count) || (count < 0 ? throw(DataError("negative block count $count", position(r.source))) :
-                                                 throw(LimitError(:max_block_count, Int(count), r.limits.max_block_count, :max_block_count, :decode)))
-    size = sourcevarint(r.source)
-    (0 <= size <= r.limits.max_block_bytes) || (size < 0 ? throw(DataError("negative block size $size", position(r.source))) :
-                                                throw(LimitError(:max_block_bytes, Int(size), r.limits.max_block_bytes, :max_block_bytes, :decode)))
-    r.blockindex += 1
-    r.blockindex <= r.limits.max_blocks || throw(LimitError(:max_blocks, r.blockindex, r.limits.max_blocks, :max_blocks, :decode))
-    addblocks!(r.budget)
-    payload = sourcepayload(r.source, Int(size), r.budget)
-    for i in 1:16
-        (sourceeof(r.source) ? throw(DataError("truncated file", position(r.source))) : sourcebyte(r.source)) == r.sync[i] ||
-            throw(DataError("sync marker mismatch after block $(r.blockindex)", position(r.source)))
-    end
-    bytes = if r.codecname === :null && payload isa Vector{UInt8}
-        addmembers!(r.budget)
-        payload                                       # a streamed null-codec payload is already owned
-    else
-        out = decompressblock(r.codecname, r.codec, payload, r.limits, r.budget)
-        release!(r.budget, payloadcharge(r.source, Int(size)))
-        out
-    end
-    addinput!(r.budget, length(bytes) + varintlength(count) + varintlength(size) + 16)
-    n = Int(count)
-    if r.validate === :strict
-        d = Decoder(bytes, r.budget)
-        for _ in 1:n
-            skip(r.plan, d)
+    checkpoint = r.budget.reserved
+    try
+        count = sourcevarint(r.source)
+        (0 <= count <= r.limits.max_block_count) || (count < 0 ? throw(DataError("negative block count $count", position(r.source))) :
+                                                     throw(LimitError(:max_block_count, Int(count), r.limits.max_block_count, :max_block_count, :decode)))
+        size = sourcevarint(r.source)
+        (0 <= size <= r.limits.max_block_bytes) || (size < 0 ? throw(DataError("negative block size $size", position(r.source))) :
+                                                    throw(LimitError(:max_block_bytes, Int(size), r.limits.max_block_bytes, :max_block_bytes, :decode)))
+        r.blockindex += 1
+        r.blockindex <= r.limits.max_blocks || throw(LimitError(:max_blocks, r.blockindex, r.limits.max_blocks, :max_blocks, :decode))
+        addblocks!(r.budget)
+        addrows!(r.budget, Int(count))
+        payload = sourcepayload(r.source, Int(size), r.budget)
+        for i in 1:16
+            (sourceeof(r.source) ? throw(DataError("truncated file", position(r.source))) : sourcebyte(r.source)) == r.sync[i] ||
+                throw(DataError("sync marker mismatch after block $(r.blockindex)", position(r.source)))
         end
-        if d.pos != length(bytes) + 1
-            if r.legacy === :avrojl1 && r.codecname === :null
-                r.warned || (@warn "accepting trailing bytes after $(n) datums in a null-codec block (legacy=:avrojl1; Avro.jl ≤ 1.1.2 sizing cushion)" source = 1; r.warned = true)
-                resize!(bytes, d.pos - 1)
-            else
-                throw(DataError("block $(r.blockindex) declares $n datums but they consume $(d.pos - 1) of $(length(bytes)) bytes", d.pos))
+        addinput!(r.budget, varintlength(count) + varintlength(size) + 16)
+        bytes = if r.codecname === :null && payload isa Vector{UInt8}
+            addinput!(r.budget, length(payload))
+            addmembers!(r.budget)
+            payload                                       # a streamed null-codec payload is already owned
+        else
+            out = decompressblock(r.codecname, r.codec, payload, r.limits, r.budget)
+            release!(r.budget, payloadcharge(r.source, Int(size)))
+            out
+        end
+        n = Int(count)
+        if r.validate === :strict && (walk || r.legacy === :avrojl1)
+            d = Decoder(bytes, r.budget)
+            for _ in 1:n
+                skip(r.plan, d)
+            end
+            if d.pos != length(bytes) + 1
+                if r.legacy === :avrojl1 && r.codecname === :null
+                    r.warned || (@warn "accepting trailing bytes after $(n) datums in a null-codec block (legacy=:avrojl1; Avro.jl ≤ 1.1.2 sizing cushion)" source = 1; r.warned = true)
+                    resize!(bytes, d.pos - 1)
+                else
+                    throw(DataError("block $(r.blockindex) declares $n datums but they consume $(d.pos - 1) of $(length(bytes)) bytes", d.pos))
+                end
             end
         end
+        release!(r.budget, bytesbytes(length(bytes)))     # ownership transfers to the caller at yield
+        return (n, bytes)
+    catch
+        rollbackreservations!(r.budget, checkpoint)
+        rethrow()
     end
-    release!(r.budget, bytesbytes(length(bytes)))     # ownership transfers to the caller at yield
-    return (n, bytes)
 end
 
 struct EachBlock
@@ -371,7 +387,7 @@ function Base.iterate(it::EachDatum, ::Nothing=nothing)
     release!(b, it.lastcharge)
     it.lastcharge = 0
     while it.remaining == 0
-        blk = nextblock!(it.reader)
+        blk = nextblock!(it.reader; walk=false)
         blk === nothing && return nothing
         it.remaining = blk[1]
         it.bytes = blk[2]
@@ -573,10 +589,12 @@ end
 
 A container writer to a path (atomic by default: a sibling temp file renamed into place on `close`) or a
 caller-owned `IO` (flushed, never closed). Datums are buffered under every reader limit and a block is
-emitted at `block_bytes`, at the block caps, or on `flush`/`close`. The first failure poisons the writer
-(`WriterClosedError` carries the cause; the temp file is removed and the destination untouched);
-`close(w; abort=true)` discards the buffered block. The do-block form closes on success and aborts on
-error; a finalizer aborts a path-owned writer that was never closed.
+emitted at `block_bytes`, at the block caps, or on `flush`/`close`. The first failure poisons the writer,
+including a rejected datum or limit failure from `push!`; `WriterClosedError` carries the original cause.
+With `atomic=true`, the temp file is removed and the destination is untouched; `atomic=false` and
+caller-owned streams can retain partial output. `close(w; abort=true)` discards the buffered block. The
+do-block form closes on success and aborts on error; a finalizer aborts an unclosed writer without closing
+caller-owned I/O.
 """
 mutable struct Writer
     const sink::IO
@@ -694,7 +712,7 @@ function Writer(dst::Union{AbstractString,IO}, schema::Schema; codec::Symbol=:nu
         close!(budget)
         rethrow()
     end
-    w.path !== nothing && finalizer(w) do x
+    finalizer(w) do x
         x.closed || (x.closed = true; abortcleanup(x); close!(x.budget))
     end
     return w
@@ -731,6 +749,17 @@ end
 
 function Base.push!(w::Writer, datum)
     checkwritable(w)
+    try
+        return pushdatum!(w, datum)
+    catch e
+        poison!(w, e)
+        rethrow()
+    end
+end
+
+function pushdatum!(w::Writer, datum)
+    nextrows = checked_add(w.budget.rows, 1)
+    nextrows <= w.limits.max_rows || throw(limiterror(w.budget, :max_rows, nextrows, w.limits.max_rows))
     pf = w.preflight
     fp = nothing
     if datum isa NamedTuple
@@ -757,9 +786,13 @@ function Base.push!(w::Writer, datum)
                               w.pendingvalues + ev > checked_add(checked_mul(w.limits.max_values_per_byte, max(w.encoder.pos, 64)), w.limits.work_allowance))
         flushblock!(w)
     end
+    nextcount = checked_add(w.pendingcount, 1)
+    nextcount <= w.limits.max_block_count ||
+        throw(limiterror(w.budget, :max_block_count, nextcount, w.limits.max_block_count))
     start = w.encoder.pos
     try
         fp === nothing ? encodedatum!(w.plan, w.encoder, datum) : encodealigned!(fp, w.encoder, datum)
+        addrows!(w.budget, 1)
     catch
         w.encoder.pos = start                          # a rejected datum leaves the pending block intact
         rethrow()
@@ -782,6 +815,9 @@ end
 function flushblock!(w::Writer)
     w.pendingcount == 0 && return nothing
     try
+        nextblocks = checked_add(w.budget.blocks, 1)
+        nextblocks <= w.limits.max_blocks ||
+            throw(limiterror(w.budget, :max_blocks, nextblocks, w.limits.max_blocks))
         pf = w.preflight
         chunk = payload = rows = 0
         if pf !== nothing
@@ -824,6 +860,7 @@ function flushblock!(w::Writer)
         for b in w.syncmarker
             Base.write(w.sink, b)
         end
+        addblocks!(w.budget)
     catch e
         poison!(w, e)
         rethrow()
@@ -897,6 +934,8 @@ how to supply one). `Tables.partitions` become block boundaries (each non-empty 
 """
 function write(dst::Union{AbstractString,IO}, table; schema::Union{Nothing,Schema}=nothing,
                name::AbstractString="Record", namespace::AbstractString="", limits::Limits=Limits(), kw...)
+    (table isa Union{Rows,Tables.Partitioner} || Tables.istable(typeof(table))) ||
+        throw(ArgumentError("`Avro.write(dst, x)` writes Tables.jl sources; use `Avro.encode!` to write one datum"))
     s = schema
     s === nothing && (s = retainedschema(table))
     if table isa Rows && getfield(table, :mode) !== :generic

@@ -81,8 +81,9 @@ end
 
 function fromdatetime(::Type{T}, dt::DateTime) where {T<:Union{Timestamp,LocalTimestamp}}
     P = T.parameters[1]
-    ms = Dates.value(dt) - UNIX_EPOCH_MS
-    r = Base.Checked.mul_with_overflow(ms, Int64(tickscale(P)))
+    delta = Base.Checked.sub_with_overflow(Dates.value(dt), UNIX_EPOCH_MS)
+    delta[2] && throw(ConversionError("DateTime $dt does not fit a $(T)"))
+    r = Base.Checked.mul_with_overflow(delta[1], Int64(tickscale(P)))
     r[2] && throw(ConversionError("DateTime $dt does not fit a $(T)"))
     return T(r[1])
 end

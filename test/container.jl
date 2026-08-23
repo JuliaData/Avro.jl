@@ -17,6 +17,11 @@ function Base.unsafe_write(f::FailIO, p::Ptr{UInt8}, n::UInt)
 end
 Base.flush(f::FailIO) = flush(f.io)
 
+@noinline function abandonedwriter(io, schema)
+    writer = Avro.Writer(io, schema; codec=:zstandard)
+    return WeakRef(writer)
+end
+
 @testset "Container files" begin
     P = Avro.parseschema
     L = Avro.Limits()
@@ -33,6 +38,17 @@ Base.flush(f::FailIO) = flush(f.io)
         @test length(cases) > 150
         checked = 0
         for (file, base) in cases
+            if endswith(basename(file), "-fastavro-deflate.avro")
+                err = try
+                    Avro.Reader(r -> collect(Avro.eachdatum(r)), file)
+                    nothing
+                catch e
+                    e
+                end
+                @test err isa Avro.CodecError && occursin("bytes after the final deflate block", err.msg)
+                checked += 1
+                continue
+            end
             dir = dirname(file)
             jsonl = joinpath(dir, base * ".jsonl")
             isfile(jsonl) || (jsonl = joinpath(dirname(dir), "data", base * ".jsonl"))
@@ -133,6 +149,12 @@ Base.flush(f::FailIO) = flush(f.io)
     end
     @testset "sources: path, mmap=false stream, IO, bytes" begin
         rows = [(x=Int64(i),) for i in 1:100]
+        buffered = Avro.tobuffer(rows)
+        buffered_reader = Avro.Reader(buffered)
+        @test buffered_reader.source.buf === buffered.data
+        @test buffered_reader.source.stop == buffered.size
+        @test [v.x for v in Avro.eachdatum(buffered_reader)] == collect(1:100)
+        close(buffered_reader)
         path = joinpath(mktempdir(), "t.avro")
         Avro.write(path, rows; codec=:deflate, block_bytes=64)
         expected = collect(1:100)
@@ -193,6 +215,30 @@ Base.flush(f::FailIO) = flush(f.io)
         # no avro.schema
         noschema = vcat(collect(b"Obj\x01"), varint(0), collect(UInt8(1):UInt8(16)))
         @test_throws Avro.DataError readall(noschema)
+        key = Vector{UInt8}("avro.schema")
+        value = Vector{UInt8}("\"null\"")
+        pair = vcat(varint(length(key)), key, varint(length(value)), value)
+        sizedmetadata(n) = vcat(collect(b"Obj\x01"), varint(-1), varint(n), pair, varint(0), sync)
+        @test readall(sizedmetadata(length(pair))) == []
+        for declared in (0, length(pair) - 1, length(pair) + 1)
+            @test_throws Avro.DataError readall(sizedmetadata(declared))
+        end
+        encodedpair(k, v) = vcat(varint(sizeof(k)), Vector{UInt8}(k), varint(length(v)), v)
+        metadata_pairs = Vector{UInt8}[encodedpair("avro.schema", value)]
+        for i in 1:64
+            push!(metadata_pairs, encodedpair("key$(lpad(i, 4, '0'))", UInt8[]))
+        end
+        push!(metadata_pairs, encodedpair("key0001", UInt8[]))
+        duplicate_header = vcat(collect(b"Obj\x01"), varint(length(metadata_pairs)),
+                                reduce(vcat, metadata_pairs), varint(0), sync)
+        comparison_limits = Avro.Limits(max_compare_bytes_per_byte=0, work_allowance=100)
+        duplicate_error = try
+            Avro.Reader(duplicate_header; limits=comparison_limits)
+            nothing
+        catch err
+            err
+        end
+        @test duplicate_error isa Avro.LimitError && duplicate_error.limit == :max_compare_bytes_per_byte
     end
     @testset "writer failure injection, poisoning, atomic paths" begin
         rows = [(x=Int64(i),) for i in 1:10]
@@ -213,15 +259,74 @@ Base.flush(f::FailIO) = flush(f.io)
         @test_throws Avro.WriterClosedError push!(w, rows[1])
         close(w)
         @test_throws Avro.WriterClosedError push!(w, rows[1])
-        # a datum the schema rejects leaves the pending block intact
+        # the first rejected datum poisons the writer and close discards the pending block
         io2 = IOBuffer()
         w2 = Avro.Writer(io2, s)
         push!(w2, (x=Int64(1),))
-        @test_throws Avro.EncodeError push!(w2, (x="nope",))
-        push!(w2, (x=Int64(2),))
+        original = try
+            push!(w2, (x="nope",))
+            nothing
+        catch err
+            err
+        end
+        @test original isa Avro.EncodeError
+        followup = try
+            push!(w2, (x=Int64(2),))
+            nothing
+        catch err
+            err
+        end
+        @test followup isa Avro.WriterClosedError
+        if followup isa Avro.WriterClosedError
+            @test followup.cause === original
+        end
         close(w2)
-        seekstart(io2)
-        @test [v.x for v in readall(io2)] == [1, 2]
+        @test isopen(io2)
+        @test readall(io2) == []
+        afterclose = try
+            push!(w2, (x=Int64(3),))
+            nothing
+        catch err
+            err
+        end
+        @test afterclose isa Avro.WriterClosedError
+        if afterclose isa Avro.WriterClosedError
+            @test afterclose.cause === original
+        end
+        limitio = IOBuffer()
+        limitwriter = Avro.Writer(limitio, Avro.NullSchema(); limits=Avro.Limits(max_rows=0))
+        limitcause = try
+            push!(limitwriter, missing)
+            nothing
+        catch err
+            err
+        end
+        @test limitcause isa Avro.LimitError
+        if limitcause isa Avro.LimitError
+            @test limitcause.limit == :max_rows
+        end
+        limitfollowup = try
+            push!(limitwriter, missing)
+            nothing
+        catch err
+            err
+        end
+        @test limitfollowup isa Avro.WriterClosedError
+        if limitfollowup isa Avro.WriterClosedError
+            @test limitfollowup.cause === limitcause
+        end
+        close(limitwriter)
+        @test isopen(limitio)
+        @test readall(limitio) == []
+        close(limitwriter)
+        pending0 = @atomic Avro.GUARD.pending
+        abandoned_io = IOBuffer()
+        abandoned = abandonedwriter(abandoned_io, s)
+        GC.gc(true)
+        GC.gc(true)
+        @test abandoned.value === nothing
+        @test (@atomic Avro.GUARD.pending) == pending0
+        @test isopen(abandoned_io)
         # atomic path: the destination is untouched until close, replaced on close, kept on abort
         dir = mktempdir()
         dest = joinpath(dir, "out.avro")
@@ -273,6 +378,49 @@ Base.flush(f::FailIO) = flush(f.io)
         @test_throws Avro.LimitError readall(io3)                                                 # and the default reader refuses it
         seekstart(io3)
         @test length(Avro.Reader(r -> collect(Avro.eachdatum(r)), io3; limits=raised)[1]) == 4_000_000
+    end
+    @testset "malformed codec blocks release transient reservations" begin
+        rows = [(x=Int64(1),), (x=Int64(2),)]
+        function checkmalformed(src)
+            r = Avro.Reader(src)
+            blocks = Avro.eachblock(r)
+            baseline = r.budget.reserved
+            err = try
+                iterate(blocks)
+                nothing
+            catch e
+                e
+            end
+            @test err isa Avro.CodecError
+            @test r.budget.reserved == baseline
+            next = iterate(blocks)
+            @test next !== nothing
+            if next !== nothing
+                (count, bytes), _ = next
+                @test count == 1
+                @test Avro.decode(Avro.writerschema(r), bytes).x == 2
+            end
+            @test r.budget.reserved == baseline
+            close(r)
+            close(r)
+            return nothing
+        end
+        for codecname in (:deflate, :snappy, :zstandard, :bzip2, :xz)
+            bytes = take!(Avro.tobuffer(rows; codec=codecname, block_bytes=1))
+            entries = Avro.Reader(r -> Avro.prescanblocks(r).entries, bytes)
+            @test length(entries) == 2
+            firstentry = first(entries)
+            bad = copy(bytes)
+            fill!(view(bad, firstentry.offset:firstentry.offset + firstentry.size - 1), 0xff)
+            checkmalformed(bad)
+            mktemp() do path, io
+                write(io, bad)
+                close(io)
+                open(path) do input
+                    checkmalformed(input)
+                end
+            end
+        end
     end
     @testset "high-window codec bombs and streaming past the ceiling" begin
         hw = joinpath(gen, "highwindow")

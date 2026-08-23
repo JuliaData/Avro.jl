@@ -52,18 +52,23 @@ function (r::DatumReader{T,P})(bytes::AbstractVector{UInt8}, pos::Integer) where
     if bytes isa Vector{UInt8} && length(bytes) <= r.limits.max_datum_bytes
         sc = @atomicswap(r.scratch = nothing)          # pooled per-call state: ≤ 1 allocation per decode (§10.2)
         d = sc isa Decoder{Vector{UInt8}} ? sc : Decoder(UInt8[], Budget(r.limits); validate=r.validate)
-        resetbudget!(d.budget)
-        d.buf = bytes
-        d.pos = Int(pos)
-        d.stop = length(bytes)
-        d.depth = 0
-        1 <= pos <= length(bytes) + 1 || throw(ArgumentError("position $pos out of range"))
-        addinput!(d.budget, length(bytes) - Int(pos) + 1)
-        v = decodetyped(T, r.plan, d, r.names)
-        next = d.pos
-        d.buf = UInt8[]                                # never pin the caller's bytes from the pool
-        close!(d.budget)
-        @atomicswap(r.scratch = d)                     # a failed call drops its scratch instead
+        recycle = false
+        try
+            resetbudget!(d.budget)
+            d.buf = bytes
+            d.pos = Int(pos)
+            d.stop = length(bytes)
+            d.depth = 0
+            1 <= pos <= length(bytes) + 1 || throw(ArgumentError("position $pos out of range"))
+            addinput!(d.budget, length(bytes) - Int(pos) + 1)
+            v = decodetyped(T, r.plan, d, r.names)
+            next = d.pos
+            recycle = true
+        finally
+            d.buf = UInt8[]                            # never pin the caller's bytes from the pool
+            close!(d.budget)
+            recycle && @atomicswap(r.scratch = d)     # a failed call drops its scratch instead
+        end
         return (finishtyped(r.plan, v, r.names), next)
     end
     v, next = withbudget(r.limits) do budget
@@ -177,12 +182,18 @@ end
 """
     Avro.encode(schema, x; limits=Limits()) -> Vector{UInt8}
     Avro.encode(x; limits=Limits()) -> Vector{UInt8}          # conventional schema `Avro.schema(x)`
-    Avro.encode!(enc_or_io, schema, x; limits=Limits())
 
 One-shot encoding (builds a writer per call; use `DatumWriter` for repeated use).
 """
 encode(schema::Schema, x; limits::Limits=Limits()) = DatumWriter(schema; limits=limits)(x)
 encode(x; limits::Limits=Limits()) = encode(schema(x; limits=limits), x; limits=limits)
+
+"""
+    Avro.encode!(enc_or_io, schema, x; limits=Limits())
+
+One-shot encoding that appends one datum to the caller's encoder or stream. Use `DatumWriter` for
+repeated work.
+"""
 encode!(io::IO, schema::Schema, x; limits::Limits=Limits()) = DatumWriter(schema; limits=limits)(io, x)
 encode!(e::Encoder, schema::Schema, x; limits::Limits=Limits()) = DatumWriter(schema; limits=limits)(e, x)
 

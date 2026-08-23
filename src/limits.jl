@@ -160,7 +160,7 @@ end
 function read_int_file(path::AbstractString)
     isfile(path) || return nothing
     txt = try
-        strip(read(path, String))
+        strip(Base.read(path, String))
     catch
         return nothing
     end
@@ -272,6 +272,15 @@ when the reservation would exceed the operation's effective ceiling.
 """
 const GUARD_CHUNK = 1 << 20   # guard publication batch: each budget's unpublished slack stays < 1 MiB
 
+function updateguard!(delta::Int)
+    while true
+        old = @atomic GUARD.pending
+        new = max(clamped_add(old, delta), 0)
+        result = @atomicreplace GUARD.pending old => new
+        result.success && return new
+    end
+end
+
 function reserve!(b::Budget, n::Int)
     n >= 0 || throw(ArgumentError("reservation must be non-negative"))
     n == 0 && return b
@@ -282,7 +291,7 @@ function reserve!(b::Budget, n::Int)
     b.pending = clamped_add(b.pending, n)
     if b.pending - b.published >= GUARD_CHUNK          # batched: the global atomic is off the per-cell path
         delta = b.pending - b.published
-        @atomic GUARD.pending = clamped_add((@atomic GUARD.pending), delta)
+        updateguard!(delta)
         b.published = b.pending
     end
     return b
@@ -299,7 +308,7 @@ function allocated!(b::Budget, n::Int)
     b.pending -= n
     if b.published - b.pending >= GUARD_CHUNK || (b.pending == 0 && b.published > 0)
         delta = b.published - b.pending
-        @atomic GUARD.pending = max(clamped_add((@atomic GUARD.pending), -delta), 0)
+        updateguard!(-delta)
         b.published = b.pending
     end
     return b

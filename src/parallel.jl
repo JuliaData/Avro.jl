@@ -47,7 +47,7 @@ function prescanblocks(r::Reader)
             length(entries) < r.limits.max_blocks ||
                 throw(LimitError(:max_blocks, length(entries) + 1, r.limits.max_blocks, :max_blocks, :decode))
             off = src.pos
-            off + Int(size) - 1 <= length(src.buf) || throw(DataError("truncated file", off))
+            Int(size) <= src.stop - off + 1 || throw(DataError("truncated file", off))
             src.pos = off + Int(size)
             for i in 1:16
                 (sourceeof(src) ? throw(DataError("truncated file", src.pos)) : sourcebyte(src)) == r.sync[i] ||
@@ -181,11 +181,11 @@ function decodedirect!(r::Reader, e::BlockEntry, plan, builders::Vector{ColumnBu
     src = r.source::BytesSource
     addblocks!(b)
     payload = view(src.buf, e.offset:e.offset + e.size - 1)
+    addinput!(b, varintlength(e.count) + varintlength(e.size) + 16)
     out = decompressblock(r.codecname, r.codec, payload, r.limits, b)
-    addinput!(b, length(out) + varintlength(e.count) + varintlength(e.size) + 16)
     n = e.count
     before = b.reserved
-    if r.validate === :strict
+    if r.validate === :strict && r.legacy === :avrojl1
         d0 = Decoder(out, b)
         for _ in 1:n
             skip(r.plan, d0)
@@ -230,11 +230,11 @@ function decodejob!(job::BlockJob, r::Reader, plan, sel::Union{Nothing,Vector{In
         src = r.source::BytesSource
         payload = view(src.buf, e.offset:e.offset + e.size - 1)
         cname, codec = readercodec(String(r.codecname), r.limits, r.legacy)
+        addinput!(b, varintlength(e.count) + varintlength(e.size) + 16)
         out = decompressblock(cname, codec, payload, r.limits, b)
-        addinput!(b, length(out) + varintlength(e.count) + varintlength(e.size) + 16)
         n = e.count
         before = b.reserved
-        if r.validate === :strict
+        if r.validate === :strict && r.legacy === :avrojl1
             d0 = Decoder(out, b)
             for _ in 1:n
                 skip(r.plan, d0)
@@ -278,32 +278,47 @@ end
 function commitjob!(r::Reader, job::BlockJob, finals::Vector{AbstractVector}, keptidx::Vector{Int}, stats::ParallelStats)
     b = r.budget
     e = job.entry
-    phook(:commit, e.index)
-    release!(b, job.W)
-    reserve!(b, job.budget.reserved)                 # the block's retained chunks and payload
-    addblocks!(b)
-    addinput!(b, job.budget.input_bytes)
-    countvalues!(b, job.budget.values)
-    addcompare!(b, job.budget.compare_bytes)
-    b.members = checked_add(b.members, job.budget.members)
-    addrows!(b, e.count)
-    job.outputbytes <= r.limits.max_block_output_bytes ||
-        throw(LimitError(:max_block_output_bytes, job.outputbytes, r.limits.max_block_output_bytes, :max_block_output_bytes, :decode))
-    chunkcap = 0
-    cols = job.cols::Vector{ColumnBuilder}
-    for (pos, i) in enumerate(keptidx)
-        c = cols[i]::TypedColumn
-        copyto!(finals[pos], e.rowstart, c.data, 1, e.count)
-        moved = vectorbytes(eltype(c.data), e.count)
-        chunkcap = checked_add(chunkcap, moved)
-        stats.assembly_bytes = checked_add(stats.assembly_bytes, moved)
+    retained = job.budget.reserved
+    worstowned = true
+    retainedowned = false
+    committed = false
+    try
+        phook(:commit, e.index)
+        release!(b, job.W)
+        worstowned = false
+        reserve!(b, retained)                        # the block's retained chunks and payload
+        retainedowned = true
+        addblocks!(b)
+        addinput!(b, job.budget.input_bytes)
+        countvalues!(b, job.budget.values)
+        addcompare!(b, job.budget.compare_bytes)
+        b.members = checked_add(b.members, job.budget.members)
+        addrows!(b, e.count)
+        job.outputbytes <= r.limits.max_block_output_bytes ||
+            throw(LimitError(:max_block_output_bytes, job.outputbytes, r.limits.max_block_output_bytes, :max_block_output_bytes, :decode))
+        chunkcap = 0
+        cols = job.cols::Vector{ColumnBuilder}
+        for (pos, i) in enumerate(keptidx)
+            c = cols[i]::TypedColumn
+            copyto!(finals[pos], e.rowstart, c.data, 1, e.count)
+            moved = vectorbytes(eltype(c.data), e.count)
+            chunkcap = checked_add(chunkcap, moved)
+            stats.assembly_bytes = checked_add(stats.assembly_bytes, moved)
+        end
+        stats.committed_bytes = checked_add(stats.committed_bytes, retained)
+        stats.jobpeakmax = max(stats.jobpeakmax, job.budget.peak)
+        job.budget.peak <= job.W || (stats.peak_violations += 1)
+        release!(b, chunkcap)                        # references moved; payload transfers, counted once
+        close!(job.budget)
+        committed = true
+        return nothing
+    finally
+        if !committed
+            worstowned && release!(b, job.W)
+            retainedowned && release!(b, retained)
+            close!(job.budget)
+        end
     end
-    stats.committed_bytes = checked_add(stats.committed_bytes, job.budget.reserved)
-    stats.jobpeakmax = max(stats.jobpeakmax, job.budget.peak)
-    job.budget.peak <= job.W || (stats.peak_violations += 1)
-    release!(b, chunkcap)                            # references moved; payload transfers, counted once
-    close!(job.budget)
-    return nothing
 end
 
 function finalcounters!(stats::ParallelStats, b::Budget)
@@ -392,13 +407,13 @@ function decodeblocks!(r::Reader, plan, sel::Union{Nothing,Vector{Int}}, finals:
                 inflight -= 1
                 st = @atomic job.state
                 st === :done || throw(job.err::Exception)              # the lowest uncommitted block's own failure
+                jobs[tocommit] = nothing                               # commitjob! owns every reservation from here
                 try
                     commitjob!(r, job, finals, keptidx, stats)
                 catch
                     recordfailure!(fail, job.entry.index)
                     rethrow()
                 end
-                jobs[tocommit] = nothing
                 tocommit += 1
             end
             next = tocommit

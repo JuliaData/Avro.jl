@@ -18,6 +18,9 @@
     entriesof(bs) = Avro.Reader(IOBuffer(bs)) do r
         Avro.prescanblocks(r).entries
     end
+    for nt in (0, -1, big(typemax(Int)) + 1)
+        @test_throws ArgumentError Avro.Table(IOBuffer(bytes); ntasks=nt)
+    end
     @testset "identical results and acceptance for ntasks ∈ {1,2,8}, both limits, both modes" begin
         for nt in (1, 2, 8), lim in (Avro.Limits(), raised), val in (:strict, :fast)
             t = Avro.Table(IOBuffer(bytes); ntasks=nt, limits=lim, validate=val)
@@ -45,6 +48,21 @@
         else
             @test st8.nworkers == 0
         end
+    end
+    @testset "failed worker commit restores its reservation" begin
+        emptybytes = take!(Avro.tobuffer(rows[1:0]; schema=s))
+        reader = Avro.Reader(IOBuffer(emptybytes); limits=Avro.Limits(max_rows=0))
+        base = reader.budget.reserved
+        W = 500
+        Avro.reserve!(reader.budget, W)
+        jobbudget = Avro.Budget(reader.limits; available=1 << 40)
+        Avro.reserve!(jobbudget, 200)
+        entry = Avro.BlockEntry(1, 1, 0, 1, 1)
+        job = Avro.BlockJob(entry, W, jobbudget, Threads.Event(), nothing, 0, nothing, :done)
+        @test_throws Avro.LimitError Avro.commitjob!(reader, job, AbstractVector[], Int[], Avro.ParallelStats())
+        @test reader.budget.reserved == base
+        @test jobbudget.pending == 0
+        close(reader)
     end
     @testset "forced schedules: both interleavings produce the reference" begin
         for sched in (:headslow, :workerslow)

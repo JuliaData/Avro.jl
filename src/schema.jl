@@ -312,21 +312,42 @@ function sourcebytes(src::AbstractVector{UInt8}, maxbytes::Int, budget::Budget, 
     return Vector{UInt8}(src)
 end
 function sourcebytes(io::IO, maxbytes::Int, budget::Budget, ::Type{E}) where {E}
-    out = UInt8[]
-    cap = min(64 * KiB, maxbytes + 1)
-    reserve!(budget, cap + 40)
-    sizehint!(out, cap)
-    chunk = Vector{UInt8}(undef, 64 * KiB)
+    readlimit = maxbytes == typemax(Int) ? typemax(Int) : maxbytes + 1
+    cap = min(64 * KiB, readlimit)
+    reserve!(budget, bytesbytes(cap))
+    out = Vector{UInt8}(undef, cap)
+    chunkcap = min(64 * KiB, readlimit)
+    reserve!(budget, bytesbytes(chunkcap))
+    chunk = Vector{UInt8}(undef, chunkcap)
+    len = 0
     while !eof(io)
-        n = readbytes!(io, chunk, min(length(chunk), maxbytes + 1 - length(out)))
+        n = readbytes!(io, chunk, min(length(chunk), readlimit - len))
         n == 0 && break
-        if length(out) + n > cap
-            newcap = min(max(2 * cap, length(out) + n), maxbytes + 1)
-            reserve_replacement!(budget, cap, newcap)
+        need = checked_add(len, n)
+        if need > cap
+            grown = cap > typemax(Int) - cap ? typemax(Int) : cap + cap
+            newcap = min(max(grown, need), readlimit)
+            reserve!(budget, bytesbytes(newcap))
+            replacement = Vector{UInt8}(undef, newcap)
+            copyto!(replacement, 1, out, 1, len)
+            release!(budget, bytesbytes(cap))
+            out = replacement
             cap = newcap
         end
-        append!(out, view(chunk, 1:n))
-        length(out) > maxbytes && throw(LimitError(:max_schema_bytes, length(out), maxbytes, E === SchemaError ? :max_schema_bytes : :max_datum_bytes, :decode))
+        copyto!(out, len + 1, chunk, 1, n)
+        len = need
+        if len > maxbytes
+            limit = E === SchemaError ? :max_schema_bytes : :max_datum_bytes
+            throw(LimitError(limit, len, maxbytes, limit, :decode))
+        end
+    end
+    release!(budget, bytesbytes(chunkcap))
+    if len != cap
+        reserve!(budget, bytesbytes(len))
+        exact = Vector{UInt8}(undef, len)
+        copyto!(exact, 1, out, 1, len)
+        release!(budget, bytesbytes(cap))
+        out = exact
     end
     return out
 end
@@ -438,7 +459,7 @@ function parsenamed(ctx::ParseContext, obj::JSONObject, enclosing::String, path:
     raw = something(stringarrayattr(obj, "aliases", path), String[])
     aliases = String[]
     for (i, a) in enumerate(raw)
-        checkname(ctx, splitfullname(a)[1], "alias", string(path, ".aliases[", i - 1, "]"))
+        checknamebytes(ctx, a, "alias", string(path, ".aliases[", i - 1, "]"))
         na = normalizealias(a, full.namespace)
         na == fullname(full) && continue                       # self-alias: idempotent, ignored
         na in aliases && continue
@@ -574,7 +595,7 @@ function parsefield(ctx::ParseContext, obj::JSONObject, ns::String, path::String
     rawaliases = something(stringarrayattr(obj, "aliases", path), String[])
     aliases = String[]
     for (i, a) in enumerate(rawaliases)
-        checkname(ctx, a, "field alias", string(path, ".aliases[", i - 1, "]"))
+        checknamebytes(ctx, a, "field alias", string(path, ".aliases[", i - 1, "]"))
         a == name && continue
         a in aliases || push!(aliases, a)
     end
@@ -1075,9 +1096,15 @@ end
 # ---- public constructors ---------------------------------------------------------------------------
 
 function build(::Type{T}, propsin; logical=nothing, limits::Limits=Limits()) where {T<:PrimitiveSchema}
-    p = makeprops(propsin, ("type",), T === IntSchema || T === LongSchema || T === BytesSchema || T === StringSchema ? logical : nothing)
+    haslogical = T === IntSchema || T === LongSchema || T === BytesSchema || T === StringSchema
+    p = makeprops(propsin, ("type",), haslogical ? logical : nothing)
     meta = NodeMeta()
-    s = T <: Union{IntSchema,LongSchema,BytesSchema,StringSchema} ? T(logical, p, meta) : T(p, meta)
+    if haslogical
+        k = T === IntSchema ? :int : T === LongSchema ? :long : T === BytesSchema ? :bytes : :string
+        s = T(evaluatelogical(k, 0, p), p, meta)
+        return finalizepublic!(s, limits, 1, 0)
+    end
+    s = T(p, meta)
     return finalizepublic!(s, limits, 1, 0)
 end
 
@@ -1136,7 +1163,7 @@ importmemo() = get(task_local_storage(), :avro_import_memo, nothing)
 function withbuilder(f)
     outer = builderdepth() == 0
     task_local_storage(:avro_builder_depth, builderdepth() + 1)
-    outer && task_local_storage(:avro_import_memo, FrozenDict{String,Schema}())
+    outer && task_local_storage(:avro_import_memo, FrozenDict{String,Tuple{Schema,Schema}}())
     try
         return f()
     finally
@@ -1148,9 +1175,9 @@ end
 function finalizepublic!(s::Schema, limits::Limits, nodes::Int, named::Int)
     builderdepth() > 0 && return s
     metas = NodeMeta[]
-    namedcount = Ref(0)
-    collectmetas!(s, metas, namedcount)
-    info = GraphInfo(limits, false, false, length(metas), namedcount[])
+    namedtypes = FrozenDict{String,Schema}()
+    collectmetas!(s, metas, namedtypes)
+    info = GraphInfo(limits, false, false, length(metas), length(namedtypes))
     for (i, m) in enumerate(metas)
         isfilled(m.id) && continue
         fillonce!(m.id, Int32(i - 1))
@@ -1160,18 +1187,25 @@ function finalizepublic!(s::Schema, limits::Limits, nodes::Int, named::Int)
     return s
 end
 
-function collectmetas!(s::Schema, metas::Vector{NodeMeta}, namedcount::Base.RefValue{Int})
+function collectmetas!(s::Schema, metas::Vector{NodeMeta}, namedtypes::FrozenDict{String,Schema})
     any(m -> m === s.meta, metas) && return metas
     push!(metas, s.meta)
-    s isa NamedSchema && (namedcount[] += 1)
+    if s isa NamedSchema
+        full = fullname(s)
+        if haskey(namedtypes, full)
+            namedtypes[full] === s || throw(ArgumentError("named schema \"$full\" is defined more than once"))
+        else
+            namedtypes[full] = s
+        end
+    end
     if s isa ArraySchema
-        collectmetas!(s.items, metas, namedcount)
+        collectmetas!(s.items, metas, namedtypes)
     elseif s isa MapSchema
-        collectmetas!(s.values, metas, namedcount)
+        collectmetas!(s.values, metas, namedtypes)
     elseif s isa UnionSchema
-        foreach(b -> collectmetas!(b, metas, namedcount), s.branches)
+        foreach(b -> collectmetas!(b, metas, namedtypes), s.branches)
     elseif s isa RecordSchema
-        foreach(f -> collectmetas!(f.schema, metas, namedcount), s.fields)
+        foreach(f -> collectmetas!(f.schema, metas, namedtypes), s.fields)
     end
     return metas
 end
@@ -1200,7 +1234,6 @@ function publicnamed(name::AbstractString, namespace::AbstractString, aliases, s
     raw = String[String(a) for a in aliases]
     norm = String[]
     for a in raw
-        checkpublicname(splitfullname(a)[1], "alias")
         na = normalizealias(a, full.namespace)
         (na == fullname(full) || na in norm) && continue
         push!(norm, na)
@@ -1282,7 +1315,6 @@ function Field(name::AbstractString, schema::Schema; default=nodefault, order::S
     order in (:ascending, :descending, :ignore) || throw(ArgumentError("order must be :ascending, :descending or :ignore"))
     als = String[]
     for a in aliases
-        checkpublicname(a, "field alias")
         (String(a) == name || String(a) in als) && continue
         push!(als, String(a))
     end
@@ -1340,13 +1372,33 @@ same constructor call) and deep-copied into the new graph otherwise, so every gr
 function importchild(s::Schema)
     isfilled(s.meta.id) || return s
     memo = importmemo()
-    return deepcopyschema(s, memo === nothing ? FrozenDict{String,Schema}() : memo)
+    return deepcopyschema(s, memo === nothing ? FrozenDict{String,Tuple{Schema,Schema}}() : memo)
 end
 
-function deepcopyschema(s::Schema, memo::FrozenDict{String,Schema})
+function memocopy(s::Schema, memo::FrozenDict{String,Schema})
+    return memo[fullname(s)]
+end
+
+function memocopy(s::Schema, memo::FrozenDict{String,Tuple{Schema,Schema}})
+    source, copy = memo[fullname(s)]
+    source === s || throw(ArgumentError("named schema \"$(fullname(s))\" is defined by more than one child schema"))
+    return copy
+end
+
+function remembercopy!(memo::FrozenDict{String,Schema}, s::Schema, copy::Schema)
+    memo[fullname(s)] = copy
+    return copy
+end
+
+function remembercopy!(memo::FrozenDict{String,Tuple{Schema,Schema}}, s::Schema, copy::Schema)
+    memo[fullname(s)] = (s, copy)
+    return copy
+end
+
+function deepcopyschema(s::Schema, memo::Union{FrozenDict{String,Schema},FrozenDict{String,Tuple{Schema,Schema}}})
     if s isa NamedSchema
         full = fullname(s)
-        haskey(memo, full) && return memo[full]
+        haskey(memo, full) && return memocopy(s, memo)
     end
     if s isa NullSchema
         return NullSchema(s.props, NodeMeta())
@@ -1376,16 +1428,16 @@ function deepcopyschema(s::Schema, memo::FrozenDict{String,Schema})
         return UnionSchema(freeze!(bs), NodeMeta())
     elseif s isa FixedSchema
         c = FixedSchema(s.name, s.aliases, s.rawaliases, s.size, s.logical, s.props, NodeMeta())
-        memo[fullname(s)] = c
+        remembercopy!(memo, s, c)
         return c
     elseif s isa EnumSchema
         c = EnumSchema(s.name, s.aliases, s.rawaliases, s.doc, s.symbols, s.default, s.symbolindex, s.props, NodeMeta())
-        memo[fullname(s)] = c
+        remembercopy!(memo, s, c)
         return c
     else
         fields = FrozenVector{Field}()
         c = RecordSchema(s.name, s.aliases, s.rawaliases, s.doc, s.iserror, s.props, fields, s.fieldindex, NodeMeta())
-        memo[fullname(s)] = c
+        remembercopy!(memo, s, c)
         for f in s.fields
             push!(fields, Field(f.name, deepcopyschema(f.schema, memo), f.doc, f.default, f.order, f.aliases, f.props))
         end
@@ -1411,7 +1463,10 @@ end
 
 const INFINITE = typemax(Int)
 
-satadd(a::Int, b::Int) = (a == INFINITE || b == INFINITE) ? INFINITE : a + b
+function satadd(a::Int, b::Int)
+    (a == INFINITE || b == INFINITE || a > INFINITE - b) && return INFINITE
+    return a + b
+end
 
 function minsize(s::Schema, memo::Vector{Int}, active::BitVector)
     id = Int(nodeid(s)) + 1

@@ -1,7 +1,8 @@
 # Logical types
 
-Every logical type in the specification decodes to a dedicated Julia representation; unknown logical
-types fall back to their underlying type (and are preserved when re-encoding).
+Avro.jl maps the recognised logical types below to dedicated Julia representations. Unknown logical
+types fall back to their underlying type and are preserved when re-encoding. The Avro 1.12
+`big-decimal` logical type is deferred in 2.0 and follows this unknown-annotation behaviour.
 
 | Logical type | Julia | Notes |
 |---|---|---|

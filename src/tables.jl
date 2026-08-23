@@ -106,6 +106,8 @@ function Table(src; reader_schema::Union{Nothing,Schema}=nothing, union_resoluti
                ntasks::Integer=Threads.nthreads(), limits::Limits=Limits(), legacy::Union{Nothing,Symbol}=nothing,
                decimal_byteorder::Symbol=:big, allow_invalid_names::Bool=false, allow_invalid_defaults::Bool=false,
                validate::Symbol=:strict, mmap::Bool=true, names=DEFAULT_ADMISSION, select=nothing)
+    1 <= ntasks <= typemax(Int) || throw(ArgumentError("ntasks must be in 1:$(typemax(Int)), got $ntasks"))
+    taskcount = Int(ntasks)
     adm = admission(names)
     r = Reader(src; limits=limits, legacy=legacy, decimal_byteorder=decimal_byteorder, allow_invalid_names=allow_invalid_names,
                allow_invalid_defaults=allow_invalid_defaults, validate=validate, mmap=mmap)
@@ -126,7 +128,7 @@ function Table(src; reader_schema::Union{Nothing,Schema}=nothing, union_resoluti
                 reserve!(r.budget, vectorbytes(E, nrows))
                 push!(finals, Vector{E}(undef, nrows))
             end
-            decodeblocks!(r, plan, sel, finals, keptidx, colstypes, pre, Int(ntasks))
+            decodeblocks!(r, plan, sel, finals, keptidx, colstypes, pre, taskcount)
             counts = Int[e.count for e in pre.entries]
         else
             finals, counts = decodestreamed!(r, plan, sel, colstypes)
@@ -199,10 +201,9 @@ function decodestreamed!(r::Reader, plan, sel::Union{Nothing,Vector{Int}}, colst
     counts = Int[]
     chunkcols = Vector{Vector{AbstractVector}}()
     reserve!(r.budget, blocktablecharge(0))
-    while (blk = nextblock!(r)) !== nothing
+    while (blk = nextblock!(r; walk=false)) !== nothing
         reserve!(r.budget, 32)                         # this block's block-table entry (plan §4.4)
         count, bytes = blk
-        addrows!(r.budget, count)
         reserve!(r.budget, bytesbytes(length(bytes)))
         before = r.budget.reserved
         d = Decoder(bytes, r.budget; validate=r.validate)
@@ -341,7 +342,7 @@ function Base.iterate(rows::Rows, ::Nothing=nothing)
     release!(b, rows.lastcharge)
     rows.lastcharge = 0
     while rows.remaining == 0
-        blk = nextblock!(r)
+        blk = nextblock!(r; walk=false)
         blk === nothing && return nothing
         rows.remaining = blk[1]
         rows.bytes = blk[2]
@@ -351,7 +352,6 @@ function Base.iterate(rows::Rows, ::Nothing=nothing)
         rows.remaining == 0 && release!(b, bytesbytes(length(rows.bytes)))
     end
     rows.remaining -= 1
-    addrows!(b, 1)
     before = b.reserved
     v = decoderow(rows)
     rows.lastcharge = max(b.reserved - before, 0)
@@ -442,30 +442,37 @@ function Base.iterate(it::RowsPartitions, ::Nothing=nothing)
     rows = it.rows
     rows.remaining == 0 || throw(ArgumentError("Tables.partitions cannot start mid-block; iterate one interface only"))
     r = rows.reader
-    blk = nextblock!(r)
+    blk = nextblock!(r; walk=false)
     blk === nothing && return nothing
     count, bytes = blk
-    addrows!(r.budget, count)
-    reserve!(r.budget, bytesbytes(length(bytes)))
-    d = Decoder(bytes, r.budget; validate=r.validate)
-    plan = rows.plan
-    cols = columnbuilders(plan, rows.select, count, r.budget)
-    for _ in 1:count
-        countvalues!(r.budget)
-        decoderow!(cols, d, plan)
+    b = r.budget
+    baseline = b.reserved
+    try
+        reserve!(b, bytesbytes(length(bytes)))
+        before = b.reserved
+        d = Decoder(bytes, b; validate=r.validate)
+        plan = rows.plan
+        cols = columnbuilders(plan, rows.select, count, b)
+        for _ in 1:count
+            countvalues!(b)
+            decoderow!(cols, d, plan)
+        end
+        d.pos == length(bytes) + 1 || throw(DataError("block datums did not consume the block exactly", d.pos))
+        blockout = max(b.reserved - before, 0)
+        blockout <= r.limits.max_block_output_bytes ||
+            throw(LimitError(:max_block_output_bytes, blockout, r.limits.max_block_output_bytes, :max_block_output_bytes, :decode))
+        release!(b, bytesbytes(length(bytes)))
+        out = rows.outschema
+        sel = rows.select === nothing ? collect(eachindex(out.fields)) : rows.select
+        finals = AbstractVector[]
+        for i in sel
+            push!(finals, finishcolumn!(cols[i]::TypedColumn, b))
+        end
+        t = Table(out, r.schema, admitnames(out, rows.adm), finals, count, [1:count], r.metadata, r.codecname, r.sync)
+        return (t, nothing)
+    finally
+        release!(b, max(b.reserved - baseline, 0))       # completed output transfers at return; partial output dies here
     end
-    d.pos == length(bytes) + 1 || throw(DataError("block datums did not consume the block exactly", d.pos))
-    release!(r.budget, bytesbytes(length(bytes)))
-    out = rows.outschema
-    sel = rows.select === nothing ? collect(eachindex(out.fields)) : rows.select
-    finals = AbstractVector[]
-    for i in sel
-        c = finishcolumn!(cols[i]::TypedColumn, r.budget)
-        release!(r.budget, vectorbytes(eltype(c), length(c)))            # ownership transfers to the partition table
-        push!(finals, c)
-    end
-    t = Table(out, r.schema, admitnames(out, rows.adm), finals, count, [1:count], r.metadata, r.codecname, r.sync)
-    return (t, nothing)
 end
 
 """
@@ -475,30 +482,24 @@ builders (also faster). The result is an `Avro.Table` over the not-yet-iterated 
 """
 function Tables.columns(rows::Rows)
     out = getfield(rows, :outschema)
-    parts = Table[]
-    for t in Tables.partitions(rows)                 # also enforces the not-mid-block rule
-        push!(parts, t)
-    end
-    nrows = sum(length, parts; init=0)
-    finals = AbstractVector[]
-    for k in 1:length(out.fields)
-        E = juliatype(out.fields[k].schema)
-        col = Vector{E}(undef, nrows)
+    rows.remaining == 0 || throw(ArgumentError("Tables.columns cannot start mid-block; iterate one interface only"))
+    b = rows.reader.budget
+    baseline = b.reserved
+    try
+        colstypes = Type[juliatype(f.schema) for f in out.fields]
+        finals, counts = decodestreamed!(rows.reader, rows.plan, rows.select, colstypes)
+        nrows = sum(counts; init=0)
+        ranges = UnitRange{Int}[]
         off = 0
-        for t in parts
-            c = Tables.getcolumn(t, k)
-            copyto!(col, off + 1, c, 1, length(c))
-            off += length(c)
+        for count in counts
+            push!(ranges, off + 1:off + count)
+            off += count
         end
-        push!(finals, col)
+        t = Table(out, writerschema(rows), rowsymbols(rows), finals, nrows, ranges, metadata(rows), codec(rows), sync(rows))
+        return t
+    finally
+        release!(b, max(b.reserved - baseline, 0))       # completed output transfers at return; partial output dies here
     end
-    ranges = UnitRange{Int}[]
-    off = 0
-    for t in parts
-        push!(ranges, off + 1:off + length(t))
-        off += length(t)
-    end
-    return Table(out, writerschema(rows), rowsymbols(rows), finals, nrows, ranges, metadata(rows), codec(rows), sync(rows))
 end
 
 retainedschema(x) = nothing

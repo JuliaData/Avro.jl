@@ -47,7 +47,9 @@ Avro.jl 2.0 is a rewrite; this page maps every 1.x usage to its 2.0 form. `Avro.
 
 1.x wrote files with defects the strict reader rejects: null-codec blocks padded with garbage bytes,
 the non-standard codec name `zstd`, unnamed fixed schemas, and `decimal` values written
-**native-endian** as fixed-16. `Avro.inspect(file)` diagnoses them. Read with:
+**native-endian** as fixed-16. `Avro.inspect(file)` reports header and framing issues, including the
+codec name. It does not decode blocks and cannot infer payload padding or decimal byte order. Read
+with:
 
 ```julia
 t = Avro.Table("old.avro"; legacy=:avrojl1, decimal_byteorder=:little)  # byteorder only if decimals
