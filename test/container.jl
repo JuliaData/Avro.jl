@@ -17,6 +17,11 @@ function Base.unsafe_write(f::FailIO, p::Ptr{UInt8}, n::UInt)
 end
 Base.flush(f::FailIO) = flush(f.io)
 
+@noinline function abandonedwriter(io, schema)
+    writer = Avro.Writer(io, schema; codec=:zstandard)
+    return WeakRef(writer)
+end
+
 @testset "Container files" begin
     P = Avro.parseschema
     L = Avro.Limits()
@@ -265,10 +270,7 @@ Base.flush(f::FailIO) = flush(f.io)
         @test [v.x for v in readall(io2)] == [1, 2]
         pending0 = @atomic Avro.GUARD.pending
         abandoned_io = IOBuffer()
-        abandoned = let
-            leaked = Avro.Writer(abandoned_io, s; codec=:zstandard)
-            WeakRef(leaked)
-        end
+        abandoned = abandonedwriter(abandoned_io, s)
         GC.gc(true)
         GC.gc(true)
         @test abandoned.value === nothing
