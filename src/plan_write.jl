@@ -546,3 +546,58 @@ function fieldpositions(p::WRecord, ::Type{T}) where {T}
     push!(p.fieldmaps, T => positions)
     return positions
 end
+
+# ---- the aligned-NamedTuple fast path (Phase 4d performance work) ------------------------------------
+#
+# `Avro.write` streams Tables rows, most commonly NamedTuples whose fields align 1:1 with the record
+# plan. A per-writer cache holds the plan fields as a concrete tuple; the estimate and encode walks then
+# run the *same* per-plan functions monomorphized through tuple recursion — identical arithmetic and
+# validation, without per-field dynamic dispatch or boxing.
+
+"The plan-field tuple for `T`, or `nothing` when `T` is not an aligned NamedTuple of the record."
+function alignedplans(p::WritePlan, ::Type{T}) where {T}
+    p isa WRecord || return nothing
+    T <: NamedTuple || return nothing
+    n = length(p.fields)
+    (0 < n <= 32 && fieldcount(T) == n) || return nothing
+    fieldpositions(p, T) == 1:n || return nothing
+    return Tuple(p.fields)
+end
+
+@inline estfields(::Tuple{}, ::Tuple{}, slack::Union{Nothing,Vector{Int}}, i::Int) = (0, 0, 0)
+@inline function estfields(plans::Tuple, vals::Tuple, slack::Union{Nothing,Vector{Int}}, i::Int)
+    eb, ev = estimatevalue(first(plans), first(vals))
+    pb = slack === nothing ? 0 : max(eb - slack[i], 0)
+    reb, rev, rpb = estfields(Base.tail(plans), Base.tail(vals), slack, i + 1)
+    return (checked_add(eb, reb), ev + rev, checked_add(pb, rpb))
+end
+
+"The §4.9 estimate of one aligned row (the `estimaterootrecord` arithmetic, monomorphized)."
+function estimatealigned(plans::Tuple, x::NamedTuple, slack::Union{Nothing,Vector{Int}})
+    eb, ev, pb = estfields(plans, values(x), slack, 1)
+    return (checked_add(recordbytes(length(plans)), eb), 1 + ev, pb)
+end
+
+@inline encfields(e::Encoder, ::Tuple{}, ::Tuple{}) = nothing
+@inline function encfields(e::Encoder, plans::Tuple, vals::Tuple)
+    encode(first(plans), e, first(vals))
+    return encfields(e, Base.tail(plans), Base.tail(vals))
+end
+
+"""
+One aligned row through the same `encode` methods, monomorphized: the record-level prelude of
+`encode(::WritePlan, e, x)` plus `encodedatum!`'s datum-size check, then the fields in schema order.
+"""
+function encodealigned!(plans::Tuple, e::Encoder, x::NamedTuple)
+    start = e.pos
+    b = e.budget
+    if b.values >= b.workcap && e.pos > e.credited
+        addinput!(b, e.pos - e.credited)               # encoded bytes are the encode side's work denominator
+        e.credited = e.pos
+    end
+    countvalues!(b)                                    # the record value itself
+    encfields(e, plans, values(x))
+    n = e.pos - start
+    n <= b.limits.max_datum_bytes || throw(LimitError(:max_datum_bytes, n, b.limits.max_datum_bytes, :max_datum_bytes, :encode))
+    return nothing
+end

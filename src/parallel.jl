@@ -84,7 +84,7 @@ end
 
 "A per-block budget: the block's own caps and counters under a ceiling of exactly `W`."
 function blockbudget(limits::Limits, W::Int)
-    return Budget(limits, W, :decode, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    return Budget(limits, W, :decode, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
                   min(limits.max_total_values, limits.work_allowance))
 end
 
@@ -200,9 +200,10 @@ function decodedirect!(r::Reader, e::BlockEntry, plan, builders::Vector{ColumnBu
         end
     end
     d = Decoder(out, b; validate=r.validate)
+    cells = plan isa RecordPlan ? fuseskips(builders) : builders
     for _ in 1:n
         countvalues!(b)
-        decoderow!(builders, d, plan)
+        decoderow!(cells, d, plan)
     end
     d.pos == length(out) + 1 || throw(DataError("block datums did not consume the block exactly", d.pos))
     blockout = checked_add(max(b.reserved - before, 0), checked_mul(n, slotrow))
@@ -242,10 +243,11 @@ function decodejob!(job::BlockJob, r::Reader, plan, sel::Union{Nothing,Vector{In
                 throw(DataError("block $(e.index) declares $n datums but they consume $(d0.pos - 1) of $(length(out)) bytes", d0.pos))
         end
         cols = columnbuilders(plan, sel, n, b)
+        cells = plan isa RecordPlan ? fuseskips(cols) : cols
         d = Decoder(out, b; validate=r.validate)
         for _ in 1:n
             countvalues!(b)
-            decoderow!(cols, d, plan)
+            decoderow!(cells, d, plan)
         end
         d.pos == length(out) + 1 || throw(DataError("block datums did not consume the block exactly", d.pos))
         job.outputbytes = max(b.reserved - before, 0)

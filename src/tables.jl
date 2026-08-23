@@ -207,9 +207,10 @@ function decodestreamed!(r::Reader, plan, sel::Union{Nothing,Vector{Int}}, colst
         before = r.budget.reserved
         d = Decoder(bytes, r.budget; validate=r.validate)
         cols = columnbuilders(plan, sel, count, r.budget)
+        cells = plan isa RecordPlan ? fuseskips(cols) : cols
         for _ in 1:count
             countvalues!(r.budget)
-            decoderow!(cols, d, plan)
+            decoderow!(cells, d, plan)
         end
         d.pos == length(bytes) + 1 || throw(DataError("block datums did not consume the block exactly", d.pos))
         blockout = max(r.budget.reserved - before, 0)   # chunk slots and payload the block produced

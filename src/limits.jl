@@ -250,6 +250,7 @@ mutable struct Budget
     resolution_work::Int
     allowance_used::Int     # the largest draw on work_allowance so far (maintained when input arrives)
     pending::Int            # this operation's contribution to GUARD.pending
+    published::Int          # the part of `pending` already pushed to GUARD (batched, best-effort)
     workcap::Int            # min(max_total_values, max_values_per_byte × input_bytes + work_allowance)
 end
 
@@ -258,7 +259,7 @@ function Budget(limits::Limits; direction::Symbol=:decode, available::Int=availa
     ceiling = effective_ceiling(limits; available=available)
     need = first_unit_bytes(limits)
     ceiling >= need || throw(LimitError(:available_memory, available, need, :max_total_bytes, direction))
-    return Budget(limits, ceiling, direction, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, min(limits.max_total_values, limits.work_allowance))
+    return Budget(limits, ceiling, direction, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, min(limits.max_total_values, limits.work_allowance))
 end
 
 limiterror(b::Budget, limit::Symbol, observed::Int, value::Int) = LimitError(limit, observed, value, limit, b.direction)
@@ -269,6 +270,8 @@ limiterror(b::Budget, limit::Symbol, observed::Int, value::Int) = LimitError(lim
 Reserve `n` bytes of package-owned memory before allocating them. Throws `LimitError(:max_total_bytes)`
 when the reservation would exceed the operation's effective ceiling.
 """
+const GUARD_CHUNK = 1 << 20   # guard publication batch: each budget's unpublished slack stays < 1 MiB
+
 function reserve!(b::Budget, n::Int)
     n >= 0 || throw(ArgumentError("reservation must be non-negative"))
     n == 0 && return b
@@ -277,7 +280,11 @@ function reserve!(b::Budget, n::Int)
     b.reserved = total
     b.peak = max(b.peak, total)
     b.pending = clamped_add(b.pending, n)
-    @atomic GUARD.pending = clamped_add((@atomic GUARD.pending), n)
+    if b.pending - b.published >= GUARD_CHUNK          # batched: the global atomic is off the per-cell path
+        delta = b.pending - b.published
+        @atomic GUARD.pending = clamped_add((@atomic GUARD.pending), delta)
+        b.published = b.pending
+    end
     return b
 end
 
@@ -290,7 +297,11 @@ function allocated!(b::Budget, n::Int)
     n <= 0 && return b
     n = min(n, b.pending)
     b.pending -= n
-    @atomic GUARD.pending = max(clamped_add((@atomic GUARD.pending), -n), 0)
+    if b.published - b.pending >= GUARD_CHUNK || (b.pending == 0 && b.published > 0)
+        delta = b.published - b.pending
+        @atomic GUARD.pending = max(clamped_add((@atomic GUARD.pending), -delta), 0)
+        b.published = b.pending
+    end
     return b
 end
 
@@ -314,6 +325,25 @@ Return every pending reservation to the guard (called in the `finally` of every 
 """
 function close!(b::Budget)
     allocated!(b, b.pending)
+    return b
+end
+
+"Zero a budget for reuse by a prepared per-call path (guard bookkeeping settled first)."
+function resetbudget!(b::Budget)
+    close!(b)
+    b.reserved = 0
+    b.peak = 0
+    b.values = 0
+    b.input_bytes = 0
+    b.compare_bytes = 0
+    b.rows = 0
+    b.blocks = 0
+    b.members = 0
+    b.resolution_work = 0
+    b.allowance_used = 0
+    b.pending = 0
+    b.published = 0
+    b.workcap = min(b.limits.max_total_values, b.limits.work_allowance)
     return b
 end
 

@@ -594,6 +594,8 @@ mutable struct Writer
     const encoder::Encoder
     const preflightbase::Int
     const preflight::Union{Nothing,TablePreflight}
+    fasttype::Any                    # single-entry aligned-NamedTuple cache (Phase 4d)
+    fastplans::Any
     pendingcount::Int
     pendingbytes::Int
     pendingvalues::Int
@@ -665,7 +667,7 @@ function Writer(dst::Union{AbstractString,IO}, schema::Schema; codec::Symbol=:nu
         end
         encoder = Encoder(budget)
         w = Writer(sink, path, atomic ? temppath : nothing, schema, plan, wcodec, syncmarker, limits, budget,
-                   Int(block_bytes), atomic, fsync, ownsink, encoder, preflightbase, preflight, 0, 0, 0, false, nothing)
+                   Int(block_bytes), atomic, fsync, ownsink, encoder, preflightbase, preflight, nothing, nothing, 0, 0, 0, false, nothing)
         try
             for m in MAGIC
                 Base.write(sink, m)
@@ -729,7 +731,19 @@ end
 function Base.push!(w::Writer, datum)
     checkwritable(w)
     pf = w.preflight
-    if pf === nothing
+    fp = nothing
+    if datum isa NamedTuple
+        if w.fasttype === typeof(datum)
+            fp = w.fastplans
+        else
+            fp = alignedplans(w.plan, typeof(datum))
+            w.fasttype = typeof(datum)
+            w.fastplans = fp
+        end
+    end
+    if fp !== nothing
+        eb, ev, pp = estimatealigned(fp, datum, pf === nothing ? nothing : pf.slack)
+    elseif pf === nothing
         eb, ev = estimatevalue(w.plan, datum)
         pp = 0
     else
@@ -744,7 +758,7 @@ function Base.push!(w::Writer, datum)
     end
     start = w.encoder.pos
     try
-        encodedatum!(w.plan, w.encoder, datum)
+        fp === nothing ? encodedatum!(w.plan, w.encoder, datum) : encodealigned!(fp, w.encoder, datum)
     catch
         w.encoder.pos = start                          # a rejected datum leaves the pending block intact
         rethrow()

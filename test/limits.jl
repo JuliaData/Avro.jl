@@ -61,13 +61,15 @@
         pending0 = @atomic Avro.GUARD.pending
         Avro.reserve!(b, 1000)
         @test b.reserved == 1000 && b.peak == 1000 && b.pending == 1000
-        @test (@atomic Avro.GUARD.pending) == pending0 + 1000
+        @test (@atomic Avro.GUARD.pending) == pending0                              # publication batches at GUARD_CHUNK
+        Avro.reserve!(b, Avro.GUARD_CHUNK)
+        @test (@atomic Avro.GUARD.pending) == pending0 + 1000 + Avro.GUARD_CHUNK    # crossing the batch publishes all slack
         Avro.allocated!(b, 400)
-        @test b.pending == 600
-        @test (@atomic Avro.GUARD.pending) == pending0 + 600
-        Avro.release!(b, 1000)
+        @test b.pending == 600 + Avro.GUARD_CHUNK
+        @test (@atomic Avro.GUARD.pending) == pending0 + 1000 + Avro.GUARD_CHUNK    # removals batch too
+        Avro.release!(b, 1000 + Avro.GUARD_CHUNK)
         @test b.reserved == 0 && b.pending == 0
-        @test (@atomic Avro.GUARD.pending) == pending0
+        @test (@atomic Avro.GUARD.pending) == pending0                              # a full drain republishes
         @test_throws Avro.LimitError Avro.reserve!(b, b.ceiling + 1)
         Avro.reserve!(b, b.ceiling)   # exactly the ceiling is admitted
         @test_throws Avro.LimitError Avro.reserve!(b, 1)

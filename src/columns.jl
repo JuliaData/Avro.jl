@@ -13,8 +13,51 @@ mutable struct TypedColumn{E,P<:ReadPlan} <: ColumnBuilder
 end
 
 "A field that is not selected: skipped under the active validation mode."
-struct SkipColumn <: ColumnBuilder
-    plan::ReadPlan
+struct SkipColumn{P<:ReadPlan} <: ColumnBuilder
+    plan::P                 # concrete: the skip devirtualizes (§10.2 projection work)
+end
+
+"""
+Consecutive unselected fields fused into one cell: in `:fast` mode a run of fixed-width leaves is
+jumped in a single bounds check with its values counted in bulk (identical work-rule arithmetic);
+otherwise — and always in `:strict` mode — every member is skipped and validated individually.
+"""
+struct SkipRun <: ColumnBuilder
+    plans::Vector{ReadPlan}
+    fastbytes::Int          # the run's total fixed width, or -1 when any member is dynamic
+end
+
+"The fixed encoded width of a skipped leaf, or -1 (varints, length-prefixed and nested values)."
+skipwidth(@nospecialize(p::ReadPlan)) = p isa NullPlan ? 0 :
+    p isa BoolPlan ? 1 :
+    p isa FloatPlan ? 4 :
+    p isa DoublePlan ? 8 :
+    p isa DurationPlan ? 12 :
+    p isa UUIDFixedPlan ? 16 :
+    p isa FixedPlan ? p.schema.size : -1
+
+"Fuse consecutive `SkipColumn`s of `cols` into `SkipRun`s (the per-field vector stays untouched)."
+function fuseskips(cols::Vector{ColumnBuilder})
+    out = ColumnBuilder[]
+    i = 1
+    while i <= length(cols)
+        if cols[i] isa SkipColumn && i < length(cols) && cols[i + 1] isa SkipColumn
+            plans = ReadPlan[]
+            width = 0
+            while i <= length(cols) && cols[i] isa SkipColumn
+                p = (cols[i]::SkipColumn).plan
+                push!(plans, p)
+                w = skipwidth(p)
+                width = (width < 0 || w < 0) ? -1 : width + w
+                i += 1
+            end
+            push!(out, SkipRun(plans, width))
+        else
+            push!(out, cols[i])
+            i += 1
+        end
+    end
+    return out
 end
 
 """
@@ -56,6 +99,47 @@ function decoderow!(cols::Vector{ColumnBuilder}, d::Decoder)
     return nothing
 end
 decodecell!(c::SkipColumn, d::Decoder) = skip(c.plan, d)
+
+function decodecell!(c::SkipRun, d::Decoder)
+    if d.validate === :fast
+        if c.fastbytes >= 0
+            countvalues!(d.budget, length(c.plans))
+            skipfixed(d, c.fastbytes)
+            return nothing
+        end
+        b = d.budget
+        for p in c.plans                               # devirtualized common leaves (closed kind set)
+            if p isa StringPlan || p isa BytesPlan
+                countvalues!(b)
+                skiplen(d)
+            elseif p isa DoublePlan
+                countvalues!(b)
+                skipfixed(d, 8)
+            elseif p isa Union{LongPlan,TimestampPlan,LocalTimestampPlan}
+                countvalues!(b)
+                readlong(d)
+            elseif p isa Union{IntPlan,DatePlan}
+                countvalues!(b)
+                readint(d)
+            elseif p isa BoolPlan
+                countvalues!(b)
+                readbool(d)                            # bools stay domain-checked in both modes (§4.3)
+            elseif p isa FloatPlan
+                countvalues!(b)
+                skipfixed(d, 4)
+            elseif p isa NullPlan
+                countvalues!(b)
+            else
+                skip(p, d)
+            end
+        end
+        return nothing
+    end
+    for p in c.plans
+        skip(p, d)
+    end
+    return nothing
+end
 
 function decodecell!(c::TypedColumn{E}, d::Decoder) where {E}
     return appendcell!(c, d.budget, decode(c.plan, d))

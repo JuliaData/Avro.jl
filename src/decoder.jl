@@ -9,7 +9,7 @@ A cursor over a contiguous byte buffer: `pos` is the next byte to read and `stop
 (inclusive). `budget` is the operation's `Budget`; `validate` is `:strict` or `:fast`.
 """
 mutable struct Decoder{B<:AbstractVector{UInt8}}
-    const buf::B
+    buf::B                  # non-const: prepared readers reuse the decoder across calls (§10.2)
     pos::Int
     stop::Int
     depth::Int
