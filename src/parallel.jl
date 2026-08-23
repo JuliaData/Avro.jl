@@ -278,32 +278,47 @@ end
 function commitjob!(r::Reader, job::BlockJob, finals::Vector{AbstractVector}, keptidx::Vector{Int}, stats::ParallelStats)
     b = r.budget
     e = job.entry
-    phook(:commit, e.index)
-    release!(b, job.W)
-    reserve!(b, job.budget.reserved)                 # the block's retained chunks and payload
-    addblocks!(b)
-    addinput!(b, job.budget.input_bytes)
-    countvalues!(b, job.budget.values)
-    addcompare!(b, job.budget.compare_bytes)
-    b.members = checked_add(b.members, job.budget.members)
-    addrows!(b, e.count)
-    job.outputbytes <= r.limits.max_block_output_bytes ||
-        throw(LimitError(:max_block_output_bytes, job.outputbytes, r.limits.max_block_output_bytes, :max_block_output_bytes, :decode))
-    chunkcap = 0
-    cols = job.cols::Vector{ColumnBuilder}
-    for (pos, i) in enumerate(keptidx)
-        c = cols[i]::TypedColumn
-        copyto!(finals[pos], e.rowstart, c.data, 1, e.count)
-        moved = vectorbytes(eltype(c.data), e.count)
-        chunkcap = checked_add(chunkcap, moved)
-        stats.assembly_bytes = checked_add(stats.assembly_bytes, moved)
+    retained = job.budget.reserved
+    worstowned = true
+    retainedowned = false
+    committed = false
+    try
+        phook(:commit, e.index)
+        release!(b, job.W)
+        worstowned = false
+        reserve!(b, retained)                        # the block's retained chunks and payload
+        retainedowned = true
+        addblocks!(b)
+        addinput!(b, job.budget.input_bytes)
+        countvalues!(b, job.budget.values)
+        addcompare!(b, job.budget.compare_bytes)
+        b.members = checked_add(b.members, job.budget.members)
+        addrows!(b, e.count)
+        job.outputbytes <= r.limits.max_block_output_bytes ||
+            throw(LimitError(:max_block_output_bytes, job.outputbytes, r.limits.max_block_output_bytes, :max_block_output_bytes, :decode))
+        chunkcap = 0
+        cols = job.cols::Vector{ColumnBuilder}
+        for (pos, i) in enumerate(keptidx)
+            c = cols[i]::TypedColumn
+            copyto!(finals[pos], e.rowstart, c.data, 1, e.count)
+            moved = vectorbytes(eltype(c.data), e.count)
+            chunkcap = checked_add(chunkcap, moved)
+            stats.assembly_bytes = checked_add(stats.assembly_bytes, moved)
+        end
+        stats.committed_bytes = checked_add(stats.committed_bytes, retained)
+        stats.jobpeakmax = max(stats.jobpeakmax, job.budget.peak)
+        job.budget.peak <= job.W || (stats.peak_violations += 1)
+        release!(b, chunkcap)                        # references moved; payload transfers, counted once
+        close!(job.budget)
+        committed = true
+        return nothing
+    finally
+        if !committed
+            worstowned && release!(b, job.W)
+            retainedowned && release!(b, retained)
+            close!(job.budget)
+        end
     end
-    stats.committed_bytes = checked_add(stats.committed_bytes, job.budget.reserved)
-    stats.jobpeakmax = max(stats.jobpeakmax, job.budget.peak)
-    job.budget.peak <= job.W || (stats.peak_violations += 1)
-    release!(b, chunkcap)                            # references moved; payload transfers, counted once
-    close!(job.budget)
-    return nothing
 end
 
 function finalcounters!(stats::ParallelStats, b::Budget)
@@ -392,13 +407,13 @@ function decodeblocks!(r::Reader, plan, sel::Union{Nothing,Vector{Int}}, finals:
                 inflight -= 1
                 st = @atomic job.state
                 st === :done || throw(job.err::Exception)              # the lowest uncommitted block's own failure
+                jobs[tocommit] = nothing                               # commitjob! owns every reservation from here
                 try
                     commitjob!(r, job, finals, keptidx, stats)
                 catch
                     recordfailure!(fail, job.entry.index)
                     rethrow()
                 end
-                jobs[tocommit] = nothing
                 tocommit += 1
             end
             next = tocommit
