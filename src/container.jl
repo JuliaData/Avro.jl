@@ -583,12 +583,12 @@ end
 
 A container writer to a path (atomic by default: a sibling temp file renamed into place on `close`) or a
 caller-owned `IO` (flushed, never closed). Datums are buffered under every reader limit and a block is
-emitted at `block_bytes`, at the block caps, or on `flush`/`close`. Rejected datums are recoverable and
-leave the pending block intact. An I/O, compression, flush or close failure poisons the writer
-(`WriterClosedError` carries the cause). With `atomic=true`, the temp file is removed and the destination
-is untouched; `atomic=false` and caller-owned streams can retain partial output. `close(w; abort=true)`
-discards the buffered block. The do-block form closes on success and aborts on error; a finalizer aborts
-an unclosed writer without closing caller-owned I/O.
+emitted at `block_bytes`, at the block caps, or on `flush`/`close`. The first failure poisons the writer,
+including a rejected datum or limit failure from `push!`; `WriterClosedError` carries the original cause.
+With `atomic=true`, the temp file is removed and the destination is untouched; `atomic=false` and
+caller-owned streams can retain partial output. `close(w; abort=true)` discards the buffered block. The
+do-block form closes on success and aborts on error; a finalizer aborts an unclosed writer without closing
+caller-owned I/O.
 """
 mutable struct Writer
     const sink::IO
@@ -743,6 +743,15 @@ end
 
 function Base.push!(w::Writer, datum)
     checkwritable(w)
+    try
+        return pushdatum!(w, datum)
+    catch e
+        poison!(w, e)
+        rethrow()
+    end
+end
+
+function pushdatum!(w::Writer, datum)
     nextrows = checked_add(w.budget.rows, 1)
     nextrows <= w.limits.max_rows || throw(limiterror(w.budget, :max_rows, nextrows, w.limits.max_rows))
     pf = w.preflight

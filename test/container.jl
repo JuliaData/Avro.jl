@@ -259,15 +259,66 @@ end
         @test_throws Avro.WriterClosedError push!(w, rows[1])
         close(w)
         @test_throws Avro.WriterClosedError push!(w, rows[1])
-        # a datum the schema rejects leaves the pending block intact
+        # the first rejected datum poisons the writer and close discards the pending block
         io2 = IOBuffer()
         w2 = Avro.Writer(io2, s)
         push!(w2, (x=Int64(1),))
-        @test_throws Avro.EncodeError push!(w2, (x="nope",))
-        push!(w2, (x=Int64(2),))
+        original = try
+            push!(w2, (x="nope",))
+            nothing
+        catch err
+            err
+        end
+        @test original isa Avro.EncodeError
+        followup = try
+            push!(w2, (x=Int64(2),))
+            nothing
+        catch err
+            err
+        end
+        @test followup isa Avro.WriterClosedError
+        if followup isa Avro.WriterClosedError
+            @test followup.cause === original
+        end
         close(w2)
-        seekstart(io2)
-        @test [v.x for v in readall(io2)] == [1, 2]
+        @test isopen(io2)
+        @test readall(io2) == []
+        afterclose = try
+            push!(w2, (x=Int64(3),))
+            nothing
+        catch err
+            err
+        end
+        @test afterclose isa Avro.WriterClosedError
+        if afterclose isa Avro.WriterClosedError
+            @test afterclose.cause === original
+        end
+        limitio = IOBuffer()
+        limitwriter = Avro.Writer(limitio, Avro.NullSchema(); limits=Avro.Limits(max_rows=0))
+        limitcause = try
+            push!(limitwriter, missing)
+            nothing
+        catch err
+            err
+        end
+        @test limitcause isa Avro.LimitError
+        if limitcause isa Avro.LimitError
+            @test limitcause.limit == :max_rows
+        end
+        limitfollowup = try
+            push!(limitwriter, missing)
+            nothing
+        catch err
+            err
+        end
+        @test limitfollowup isa Avro.WriterClosedError
+        if limitfollowup isa Avro.WriterClosedError
+            @test limitfollowup.cause === limitcause
+        end
+        close(limitwriter)
+        @test isopen(limitio)
+        @test readall(limitio) == []
+        close(limitwriter)
         pending0 = @atomic Avro.GUARD.pending
         abandoned_io = IOBuffer()
         abandoned = abandonedwriter(abandoned_io, s)
