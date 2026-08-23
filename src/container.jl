@@ -918,7 +918,7 @@ how to supply one). `Tables.partitions` become block boundaries (each non-empty 
 """
 function write(dst::Union{AbstractString,IO}, table; schema::Union{Nothing,Schema}=nothing,
                name::AbstractString="Record", namespace::AbstractString="", limits::Limits=Limits(), kw...)
-    (table isa Rows || Tables.istable(typeof(table))) ||
+    (table isa Union{Rows,Tables.Partitioner} || Tables.istable(typeof(table))) ||
         throw(ArgumentError("`Avro.write(dst, x)` writes Tables.jl sources; use `Avro.encode!` to write one datum"))
     s = schema
     s === nothing && (s = retainedschema(table))

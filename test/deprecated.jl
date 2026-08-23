@@ -38,6 +38,10 @@
     @test e isa ArgumentError
     @test occursin("Avro.encode!", sprint(showerror, e))
 
+    partitioned = Tables.partitioner([[(x=Int64(1),)], [(x=Int64(2),)]])
+    partitioned_io = Avro.tobuffer(partitioned)
+    @test Tables.getcolumn(Avro.Table(partitioned_io), :x) == [1, 2]
+
     streamed = joinpath(@__DIR__, "fixtures", "generated", "roots", "long-fastavro-null.avro")
     Avro.Reader(streamed; mmap=false) do reader
         @test Avro.codec(reader) === :null
