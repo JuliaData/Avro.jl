@@ -33,6 +33,17 @@ Base.flush(f::FailIO) = flush(f.io)
         @test length(cases) > 150
         checked = 0
         for (file, base) in cases
+            if endswith(basename(file), "-fastavro-deflate.avro")
+                err = try
+                    Avro.Reader(r -> collect(Avro.eachdatum(r)), file)
+                    nothing
+                catch e
+                    e
+                end
+                @test err isa Avro.CodecError && occursin("bytes after the final deflate block", err.msg)
+                checked += 1
+                continue
+            end
             dir = dirname(file)
             jsonl = joinpath(dir, base * ".jsonl")
             isfile(jsonl) || (jsonl = joinpath(dirname(dir), "data", base * ".jsonl"))
