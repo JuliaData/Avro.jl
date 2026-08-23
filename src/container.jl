@@ -8,9 +8,14 @@ const MAGIC = (UInt8('O'), UInt8('b'), UInt8('j'), 0x01)
 
 # ---- sources ----------------------------------------------------------------------------------------
 
-mutable struct BytesSource
-    const buf::Vector{UInt8}
+mutable struct BytesSource{B<:AbstractVector{UInt8}}
+    const buf::B
     pos::Int
+    const stop::Int
+end
+
+function BytesSource(buf::AbstractVector{UInt8}, pos::Int)
+    return BytesSource(buf, pos, length(buf))
 end
 
 mutable struct StreamSource
@@ -20,11 +25,11 @@ end
 
 const BlockSource = Union{BytesSource,StreamSource}
 
-sourceeof(s::BytesSource) = s.pos > length(s.buf)
+sourceeof(s::BytesSource) = s.pos > s.stop
 sourceeof(s::StreamSource) = eof(s.io)
 
 function sourcebyte(s::BytesSource)
-    s.pos <= length(s.buf) || throw(DataError("truncated file", s.pos))
+    s.pos <= s.stop || throw(DataError("truncated file", s.pos))
     b = s.buf[s.pos]
     s.pos += 1
     return b
@@ -55,7 +60,7 @@ Base.position(s::StreamSource) = Int(position(s.io))
 
 "Exactly `n` payload bytes: a view for byte sources (caller-owned), an owned charged buffer for streams."
 function sourcepayload(s::BytesSource, n::Int, budget::Budget)
-    s.pos + n - 1 <= length(s.buf) || throw(DataError("truncated file", s.pos))
+    n <= s.stop - s.pos + 1 || throw(DataError("truncated file", s.pos))
     out = view(s.buf, s.pos:s.pos + n - 1)
     s.pos += n
     return out
@@ -75,7 +80,7 @@ closesource(::BytesSource) = nothing
 closesource(s::StreamSource) = s.owned ? close(s.io) : nothing
 
 opensource(src::Vector{UInt8}; mmap::Bool=true) = BytesSource(src, 1)
-opensource(src::IOBuffer; mmap::Bool=true) = BytesSource(src.data isa Vector{UInt8} ? src.data : Vector{UInt8}(src.data), 1)  # its written bytes only (trimmed below)
+opensource(src::IOBuffer; mmap::Bool=true) = BytesSource(src.data, 1, src.size)
 opensource(src::IO; mmap::Bool=true) = StreamSource(src, false)
 function opensource(src::AbstractString; mmap::Bool=true)
     mmap || return StreamSource(open(src, "r"), true)
@@ -83,8 +88,7 @@ function opensource(src::AbstractString; mmap::Bool=true)
 end
 
 function opensource(src::IOBuffer, ::Val{:trim})
-    n = src.size
-    return BytesSource(n == length(src.data) && src.data isa Vector{UInt8} ? src.data : Vector{UInt8}(view(src.data, 1:n)), 1)
+    return BytesSource(src.data, 1, src.size)
 end
 
 # ---- header -----------------------------------------------------------------------------------------

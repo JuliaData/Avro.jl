@@ -133,6 +133,12 @@ Base.flush(f::FailIO) = flush(f.io)
     end
     @testset "sources: path, mmap=false stream, IO, bytes" begin
         rows = [(x=Int64(i),) for i in 1:100]
+        buffered = Avro.tobuffer(rows)
+        buffered_reader = Avro.Reader(buffered)
+        @test buffered_reader.source.buf === buffered.data
+        @test buffered_reader.source.stop == buffered.size
+        @test [v.x for v in Avro.eachdatum(buffered_reader)] == collect(1:100)
+        close(buffered_reader)
         path = joinpath(mktempdir(), "t.avro")
         Avro.write(path, rows; codec=:deflate, block_bytes=64)
         expected = collect(1:100)

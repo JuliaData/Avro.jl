@@ -47,7 +47,7 @@ function prescanblocks(r::Reader)
             length(entries) < r.limits.max_blocks ||
                 throw(LimitError(:max_blocks, length(entries) + 1, r.limits.max_blocks, :max_blocks, :decode))
             off = src.pos
-            off + Int(size) - 1 <= length(src.buf) || throw(DataError("truncated file", off))
+            Int(size) <= src.stop - off + 1 || throw(DataError("truncated file", off))
             src.pos = off + Int(size)
             for i in 1:16
                 (sourceeof(src) ? throw(DataError("truncated file", src.pos)) : sourcebyte(src)) == r.sync[i] ||
