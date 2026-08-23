@@ -195,6 +195,7 @@ end
 
 function decompressblock(name::Symbol, z::ZstdReader, payload::AbstractVector{UInt8}, limits::Limits, budget::Budget)
     total = length(payload)
+    total > 0 || throw(CodecError(:zstandard, :decompress, "zstandard payload has no frame"))
     out = initialoutput(budget, total, limits.max_block_bytes)
     outlen = 0
     pos = 1

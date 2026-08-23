@@ -11,6 +11,7 @@ struct Bzip2Reader end
 
 function Avro.decompressblock(name::Symbol, ::Bzip2Reader, payload::AbstractVector{UInt8}, limits::Avro.Limits, budget::Avro.Budget)
     total = length(payload)
+    total > 0 || throw(Avro.CodecError(:bzip2, :decompress, "bzip2 payload has no stream"))
     out = Avro.initialoutput(budget, total, limits.max_block_bytes)
     outlen = 0
     pos = 1
