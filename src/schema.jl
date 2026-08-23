@@ -1415,7 +1415,10 @@ end
 
 const INFINITE = typemax(Int)
 
-satadd(a::Int, b::Int) = (a == INFINITE || b == INFINITE) ? INFINITE : a + b
+function satadd(a::Int, b::Int)
+    (a == INFINITE || b == INFINITE || a > INFINITE - b) && return INFINITE
+    return a + b
+end
 
 function minsize(s::Schema, memo::Vector{Int}, active::BitVector)
     id = Int(nodeid(s)) + 1

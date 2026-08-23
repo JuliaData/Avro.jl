@@ -400,5 +400,7 @@ end
     @test Avro.minsize(P("""{"type":"record","name":"A","fields":[{"name":"b","type":{"type":"record","name":"B","fields":[{"name":"a","type":"A"}]}}]}""")) == typemax(Int)
     @test Avro.minsize(P("""{"type":"fixed","name":"F","size":7}""")) == 7 && Avro.minsize(P("\"double\"")) == 8 && Avro.minsize(P("\"null\"")) == 0
     @test Avro.minsize(P("""["int","string"]""")) == 2 && Avro.minsize(P("[" * join(["{\"type\":\"fixed\",\"name\":\"F$i\",\"size\":$(i == 64 ? 0 : 10)}" for i in 0:64], ",") * "]")) == 2   # the 65th branch (size 0) needs a 2-byte index
+    huge = Avro.RecordSchema("Huge"; fields=[Avro.Field("a", Avro.FixedSchema("A", typemax(Int) - 1)), Avro.Field("b", Avro.FixedSchema("B", 2))])
+    @test Avro.minsize(huge) == typemax(Int)
     @test Avro.varintlength(0) == 1 && Avro.varintlength(63) == 1 && Avro.varintlength(64) == 2
 end
