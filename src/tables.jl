@@ -445,30 +445,34 @@ function Base.iterate(it::RowsPartitions, ::Nothing=nothing)
     blk = nextblock!(r; walk=false)
     blk === nothing && return nothing
     count, bytes = blk
-    reserve!(r.budget, bytesbytes(length(bytes)))
-    before = r.budget.reserved
-    d = Decoder(bytes, r.budget; validate=r.validate)
-    plan = rows.plan
-    cols = columnbuilders(plan, rows.select, count, r.budget)
-    for _ in 1:count
-        countvalues!(r.budget)
-        decoderow!(cols, d, plan)
+    b = r.budget
+    baseline = b.reserved
+    try
+        reserve!(b, bytesbytes(length(bytes)))
+        before = b.reserved
+        d = Decoder(bytes, b; validate=r.validate)
+        plan = rows.plan
+        cols = columnbuilders(plan, rows.select, count, b)
+        for _ in 1:count
+            countvalues!(b)
+            decoderow!(cols, d, plan)
+        end
+        d.pos == length(bytes) + 1 || throw(DataError("block datums did not consume the block exactly", d.pos))
+        blockout = max(b.reserved - before, 0)
+        blockout <= r.limits.max_block_output_bytes ||
+            throw(LimitError(:max_block_output_bytes, blockout, r.limits.max_block_output_bytes, :max_block_output_bytes, :decode))
+        release!(b, bytesbytes(length(bytes)))
+        out = rows.outschema
+        sel = rows.select === nothing ? collect(eachindex(out.fields)) : rows.select
+        finals = AbstractVector[]
+        for i in sel
+            push!(finals, finishcolumn!(cols[i]::TypedColumn, b))
+        end
+        t = Table(out, r.schema, admitnames(out, rows.adm), finals, count, [1:count], r.metadata, r.codecname, r.sync)
+        return (t, nothing)
+    finally
+        release!(b, max(b.reserved - baseline, 0))       # completed output transfers at return; partial output dies here
     end
-    d.pos == length(bytes) + 1 || throw(DataError("block datums did not consume the block exactly", d.pos))
-    blockout = max(r.budget.reserved - before, 0)
-    blockout <= r.limits.max_block_output_bytes ||
-        throw(LimitError(:max_block_output_bytes, blockout, r.limits.max_block_output_bytes, :max_block_output_bytes, :decode))
-    release!(r.budget, bytesbytes(length(bytes)))
-    out = rows.outschema
-    sel = rows.select === nothing ? collect(eachindex(out.fields)) : rows.select
-    finals = AbstractVector[]
-    for i in sel
-        c = finishcolumn!(cols[i]::TypedColumn, r.budget)
-        release!(r.budget, vectorbytes(eltype(c), length(c)))            # ownership transfers to the partition table
-        push!(finals, c)
-    end
-    t = Table(out, r.schema, admitnames(out, rows.adm), finals, count, [1:count], r.metadata, r.codecname, r.sync)
-    return (t, nothing)
 end
 
 """
@@ -479,19 +483,23 @@ builders (also faster). The result is an `Avro.Table` over the not-yet-iterated 
 function Tables.columns(rows::Rows)
     out = getfield(rows, :outschema)
     rows.remaining == 0 || throw(ArgumentError("Tables.columns cannot start mid-block; iterate one interface only"))
-    colstypes = Type[juliatype(f.schema) for f in out.fields]
-    finals, counts = decodestreamed!(rows.reader, rows.plan, rows.select, colstypes)
-    nrows = sum(counts; init=0)
-    ranges = UnitRange{Int}[]
-    off = 0
-    for count in counts
-        push!(ranges, off + 1:off + count)
-        off += count
+    b = rows.reader.budget
+    baseline = b.reserved
+    try
+        colstypes = Type[juliatype(f.schema) for f in out.fields]
+        finals, counts = decodestreamed!(rows.reader, rows.plan, rows.select, colstypes)
+        nrows = sum(counts; init=0)
+        ranges = UnitRange{Int}[]
+        off = 0
+        for count in counts
+            push!(ranges, off + 1:off + count)
+            off += count
+        end
+        t = Table(out, writerschema(rows), rowsymbols(rows), finals, nrows, ranges, metadata(rows), codec(rows), sync(rows))
+        return t
+    finally
+        release!(b, max(b.reserved - baseline, 0))       # completed output transfers at return; partial output dies here
     end
-    for c in finals
-        release!(rows.reader.budget, vectorbytes(eltype(c), length(c)))
-    end
-    return Table(out, writerschema(rows), rowsymbols(rows), finals, nrows, ranges, metadata(rows), codec(rows), sync(rows))
 end
 
 retainedschema(x) = nothing

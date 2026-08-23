@@ -78,10 +78,57 @@ import DataAPI
         pts = collect(Tables.partitions(rp))
         close(rp)
         @test sum(length, pts) == 250 && all(p -> p isa Avro.Table, pts) && length(pts) > 1
+        string_schema = P("{\"type\":\"record\",\"name\":\"StringBlocks\",\"fields\":[{\"name\":\"x\",\"type\":\"string\"}]}")
+        string_io = IOBuffer()
+        string_writer = Avro.Writer(string_io, string_schema)
+        string_values = [repeat("a", 1024), repeat("b", 1024), repeat("c", 1024)]
+        for x in string_values
+            push!(string_writer, (; x))
+            flush(string_writer)
+        end
+        close(string_writer)
+        string_data = take!(string_io)
+        string_rows = Avro.Rows(string_data)
+        string_budget = string_rows.reader.budget
+        string_base = string_budget.reserved
+        string_parts = Avro.Table[]
+        partitions = Tables.partitions(string_rows)
+        for _ in string_values
+            part, _ = iterate(partitions)
+            push!(string_parts, part)
+            @test string_budget.reserved == string_base
+        end
+        @test iterate(partitions) === nothing
+        @test [only(Tables.getcolumn(part, :x)) for part in string_parts] == string_values
+        close(string_rows)
+        string_column_rows = Avro.Rows(string_data)
+        string_column_budget = string_column_rows.reader.budget
+        string_column_base = string_column_budget.reserved
+        string_table = Tables.columns(string_column_rows)
+        @test Tables.getcolumn(string_table, :x) == string_values
+        @test string_column_budget.reserved == string_column_base
+        close(string_column_rows)
+        retained_rows = Avro.Rows(string_data)
+        retained_budget = retained_rows.reader.budget
+        Avro.reserve!(retained_budget, retained_budget.ceiling - retained_budget.reserved - 4096)
+        retained_base = retained_budget.reserved
+        @test_throws Avro.LimitError Tables.columns(retained_rows)
+        @test retained_budget.reserved == retained_base
+        close(retained_rows)
+        rejected_rows = Avro.Rows(string_data; names=Avro.SymbolAdmission(max_names=0))
+        rejected_budget = rejected_rows.reader.budget
+        rejected_base = rejected_budget.reserved
+        @test_throws Avro.LimitError first(Tables.partitions(rejected_rows))
+        @test rejected_budget.reserved == rejected_base
+        close(rejected_rows)
+        close(rejected_rows)
         tiny_schema = P("{\"type\":\"record\",\"name\":\"Tiny\",\"fields\":[{\"name\":\"x\",\"type\":\"string\"}]}")
         tiny = take!(Avro.tobuffer([(x="abcdefghij",)]; schema=tiny_schema))
         limited = Avro.Rows(tiny; limits=Avro.Limits(max_block_output_bytes=1))
+        limited_budget = limited.reader.budget
+        limited_base = limited_budget.reserved
         @test_throws Avro.LimitError first(Tables.partitions(limited))
+        @test limited_budget.reserved == limited_base
         close(limited)
         column_io = IOBuffer()
         column_schema = P("{\"type\":\"record\",\"name\":\"ColumnLimit\",\"fields\":[{\"name\":\"x\",\"type\":\"long\"}]}")
@@ -93,8 +140,10 @@ import DataAPI
         column_rows = Avro.Rows(take!(column_io))
         column_budget = column_rows.reader.budget
         Avro.reserve!(column_budget, column_budget.ceiling - column_budget.reserved - 130_000)
+        column_base = column_budget.reserved
         try
             @test_throws Avro.LimitError Tables.columns(column_rows)
+            @test column_budget.reserved == column_base
         finally
             close(column_rows)
         end
