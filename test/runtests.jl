@@ -29,6 +29,7 @@ include("valuegen.jl")
     include("invariant.jl")
     include("parallel.jl")
     include("projection.jl")
+    include("deprecated.jl")
     include("resolution.jl")
     include("compare.jl")
     include("columns.jl")
@@ -47,5 +48,8 @@ include("valuegen.jl")
     end
     if get(ENV, "AVRO_PERF", "false") == "true"
         include("perf.jl")
+    end
+    if get(ENV, "AVRO_SMOKE", "false") == "true"
+        include("smoke.jl")
     end
 end

@@ -514,6 +514,22 @@ function encoderecord(p::WRecord, e::Encoder, x::T) where {T}
     return nothing
 end
 
+"""
+A row yielded by `Tables.rows` that satisfies the row interface without subtyping
+`Tables.AbstractRow` (`DataFrames.DataFrameRow`, …): `Avro.write` wraps it so field access goes
+through the Tables interface instead of `getfield`.
+"""
+struct TableRow{R}
+    row::R
+end
+
+function encoderecord(p::WRecord, e::Encoder, x::TableRow)
+    for (i, f) in enumerate(p.schema.fields)
+        encode(p.fields[i], e, rowfield(x.row, f.name))
+    end
+    return nothing
+end
+
 function rowfield(row, name::String)
     for c in Tables.columnnames(row)
         String(c) == name && return Tables.getcolumn(row, c)

@@ -473,6 +473,7 @@ valuelength(x) = x isa AbstractVector{UInt8} ? length(x) : 0
 
 function recordfieldvalue(p::WRecord, x, i::Int)
     x isa Record && return getfield(x, :values)[i]
+    x isa TableRow && return rowfield(x.row, p.schema.fields[i].name)
     name = p.schema.fields[i].name
     x isa AbstractDict && return dictfield(x, name)
     x isa Tables.AbstractRow && return rowfield(x, name)
@@ -923,7 +924,7 @@ function write(dst::Union{AbstractString,IO}, table; schema::Union{Nothing,Schem
             end
             w === nothing && (w = Writer(dst, s; limits=limits, kw...))
             for row in rows
-                push!(w, row)
+                push!(w, row isa Union{NamedTuple,Record,AbstractDict,Tables.AbstractRow} ? row : TableRow(row))
             end
             flushblock!(w)
         end

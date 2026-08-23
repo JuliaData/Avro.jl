@@ -1,5 +1,8 @@
 [deps]
 Aqua = "4c88cf16-eb10-579e-8560-4a9242c79595"
+Arrow = "69666777-d1a9-59fb-9406-91d4454c9d45"
+CSV = "336ed68f-0bac-5ca0-87d4-7b16caf5d00b"
+DataFrames = "a93c6f00-e57d-5684-b7b6-d8193f3e46c0"
 CodecBzip2 = "523fee87-0ab8-5b00-afb7-3ecf72e48cfd"
 CodecXz = "ba30903b-d9e8-5048-a5ec-d1f5b0d4b47b"
 CodecZlib = "944b1d66-785c-5afd-91f1-9de20f533193"
@@ -21,6 +24,9 @@ Zstd_jll = "3161d3a3-bdf6-5164-811a-617609db77b4"
 
 [compat]
 Aqua = "0.8"
+Arrow = "2"
+CSV = "0.10"
+DataFrames = "1"
 CodecBzip2 = "0.8"
 CodecXz = "0.7"
 JET = "0.9, 0.10"

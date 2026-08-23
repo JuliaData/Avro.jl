@@ -112,4 +112,13 @@
         wide = "{" * join(["\"k$(i)\":$i" for i in 1:200], ",") * "}"
         @test_throws Avro.LimitError parse(wide; budget=bc)
     end
+
+    @testset "JSON.json overload" begin
+        import JSON
+        s = Avro.parseschema("{\"type\":\"record\",\"name\":\"J\",\"fields\":[{\"name\":\"x\",\"type\":\"long\"}]}")
+        @test JSON.json(s) == Avro.json(s)
+        io = IOBuffer()
+        JSON.json(io, s)
+        @test String(take!(io)) == Avro.json(s)
+    end
 end

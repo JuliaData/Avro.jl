@@ -15,6 +15,7 @@ using Random: RandomDevice, rand
 using Tables: Tables
 import MD5
 import SHA
+import JSON
 
 include("errors.jl")
 include("frozen.jl")
@@ -44,6 +45,7 @@ include("codecs.jl")
 include("container.jl")
 include("parallel.jl")
 include("tables.jl")
+include("deprecated.jl")
 
 # `public` declarations parse only on Julia ≥ 1.11; evaluated through `Core.eval` so 1.10 still loads.
 if VERSION >= v"1.11.0-DEV.469"
@@ -71,4 +73,9 @@ function __init__()
     return nothing
 end
 
+"`JSON.json` prints an `Avro.Schema` as its schema JSON (parsing is Avro-owned; plan §11)."
+JSON.json(s::Schema) = json(s)
+JSON.json(io::IO, s::Schema) = (Base.write(io, json(s)); nothing)
+
+include("precompile.jl")
 end # module Avro

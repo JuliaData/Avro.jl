@@ -112,6 +112,11 @@ function truncate(t::Time, ::Type{P}) where {P<:Dates.TimePeriod}
     return Time(Nanosecond(fld(ns, unit) * unit))
 end
 
+"""
+    Avro.round(t::Time, P)
+
+Round-to-nearest alignment; see [`Avro.truncate`](@ref).
+"""
 function round(t::Time, ::Type{P}) where {P<:Dates.TimePeriod}
     ns = Dates.value(t)
     unit = P === Millisecond ? 1_000_000 : (P === Microsecond ? 1_000 : 1)
