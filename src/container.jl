@@ -695,7 +695,7 @@ function Writer(dst::Union{AbstractString,IO}, schema::Schema; codec::Symbol=:nu
         close!(budget)
         rethrow()
     end
-    w.path !== nothing && finalizer(w) do x
+    finalizer(w) do x
         x.closed || (x.closed = true; abortcleanup(x); close!(x.budget))
     end
     return w

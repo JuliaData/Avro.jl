@@ -222,6 +222,17 @@ Base.flush(f::FailIO) = flush(f.io)
         close(w2)
         seekstart(io2)
         @test [v.x for v in readall(io2)] == [1, 2]
+        pending0 = @atomic Avro.GUARD.pending
+        abandoned_io = IOBuffer()
+        abandoned = let
+            leaked = Avro.Writer(abandoned_io, s; codec=:zstandard)
+            WeakRef(leaked)
+        end
+        GC.gc(true)
+        GC.gc(true)
+        @test abandoned.value === nothing
+        @test (@atomic Avro.GUARD.pending) == pending0
+        @test isopen(abandoned_io)
         # atomic path: the destination is untouched until close, replaced on close, kept on abort
         dir = mktempdir()
         dest = joinpath(dir, "out.avro")
