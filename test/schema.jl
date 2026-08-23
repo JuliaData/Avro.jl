@@ -256,6 +256,10 @@
         @test P("""{"type":"fixed","name":"F","size":0,"logicalType":"decimal","precision":1}""").logical === nothing     # fixed(0): no DomainError
         @test P("""{"type":"fixed","name":"F","size":16,"logicalType":"decimal","precision":38}""").logical == Avro.DecimalLogical(38, 0)
         @test Avro.maxdecimalprecision(16) == 38 && Avro.maxdecimalprecision(1) == 2 && Avro.maxdecimalprecision(0) == 0
+        @test Avro.maxdecimalprecision(4721) == 11368
+        @test Avro.maxdecimalprecision(typemax(Int)) == 2776511644261678565
+        @test P("""{"type":"fixed","name":"F","size":4721,"logicalType":"decimal","precision":11368}""").logical == Avro.DecimalLogical(11368, 0)
+        @test P("""{"type":"fixed","name":"F","size":4721,"logicalType":"decimal","precision":11369}""").logical === nothing
         @test P("""{"type":"string","logicalType":"uuid"}""").logical isa Avro.UUIDLogical
         @test P("""{"type":"fixed","name":"U","size":16,"logicalType":"uuid"}""").logical isa Avro.UUIDLogical
         @test P("""{"type":"fixed","name":"U","size":15,"logicalType":"uuid"}""").logical === nothing
