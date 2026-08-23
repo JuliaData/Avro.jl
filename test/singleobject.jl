@@ -17,6 +17,12 @@
         @test Avro.decodesingle(wbin, store) == w1
         @test Avro.decodesingle(IOBuffer(wbin), store) == w1
         @test Avro.decodesingle(wbin, store; T=NamedTuple{(:station, :time, :temp),Tuple{String,Int,Int}}) == (station="011990-99999", time=-619524000000, temp=0)
+        nullschema = Avro.NullSchema()
+        Avro.register!(store, nullschema)
+        nullmessage = Avro.encodesingle(nullschema, nothing)
+        @test Avro.decodesingle(nullmessage, store) === missing
+        @test Avro.decodesingle(nullmessage, store; T=Nothing) === nothing
+        @test_throws ArgumentError Avro.decodesingle(nullmessage, store; T=1)
         @test Avro.lookup(store, fp) === ws
         @test_throws Avro.UnknownSchemaError Avro.lookup(store, fp + 1)
         # Apache messageV1 fixture

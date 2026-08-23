@@ -110,7 +110,8 @@ selects a typed target.
 """
 function decodesingle(src::AbstractVector{UInt8}, store::SchemaStore; reader_schema::Union{Nothing,Schema}=nothing,
                       union_resolution::Symbol=:spec, validate::Symbol=:strict, limits::Limits=Limits(),
-                      names=DEFAULT_ADMISSION, T::Type=Nothing)
+                      names=DEFAULT_ADMISSION, T=nothing)
+    T === nothing || T isa Type || throw(ArgumentError("T must be a type or nothing"))
     n = length(src)
     n >= 10 || throw(DataError("single-object message shorter than the 10-byte header", n + 1))
     (src[1] == SINGLE_OBJECT_MARKER[1] && src[2] == SINGLE_OBJECT_MARKER[2]) || throw(DataError("missing single-object marker C3 01", 1))
@@ -124,7 +125,7 @@ function decodesingle(src::AbstractVector{UInt8}, store::SchemaStore; reader_sch
     actual == fp || throw(DataError("the schema store returned a schema with fingerprint $(string(actual; base=16)) for $(string(fp; base=16))", 3))
     n - 10 <= limits.max_datum_bytes || throw(LimitError(:max_datum_bytes, n - 10, limits.max_datum_bytes, :max_datum_bytes, :decode))
     payload = view(src, 11:n)
-    reader = T === Nothing ? DatumReader(writer; reader_schema=reader_schema, union_resolution=union_resolution, limits=limits, validate=validate, names=names) :
+    reader = T === nothing ? DatumReader(writer; reader_schema=reader_schema, union_resolution=union_resolution, limits=limits, validate=validate, names=names) :
              DatumReader(writer, T; reader_schema=reader_schema, union_resolution=union_resolution, limits=limits, validate=validate, names=names)
     return reader(payload)
 end
