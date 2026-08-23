@@ -447,6 +447,7 @@ function Base.iterate(it::RowsPartitions, ::Nothing=nothing)
     count, bytes = blk
     addrows!(r.budget, count)
     reserve!(r.budget, bytesbytes(length(bytes)))
+    before = r.budget.reserved
     d = Decoder(bytes, r.budget; validate=r.validate)
     plan = rows.plan
     cols = columnbuilders(plan, rows.select, count, r.budget)
@@ -455,6 +456,9 @@ function Base.iterate(it::RowsPartitions, ::Nothing=nothing)
         decoderow!(cols, d, plan)
     end
     d.pos == length(bytes) + 1 || throw(DataError("block datums did not consume the block exactly", d.pos))
+    blockout = max(r.budget.reserved - before, 0)
+    blockout <= r.limits.max_block_output_bytes ||
+        throw(LimitError(:max_block_output_bytes, blockout, r.limits.max_block_output_bytes, :max_block_output_bytes, :decode))
     release!(r.budget, bytesbytes(length(bytes)))
     out = rows.outschema
     sel = rows.select === nothing ? collect(eachindex(out.fields)) : rows.select

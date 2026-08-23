@@ -78,6 +78,11 @@ import DataAPI
         pts = collect(Tables.partitions(rp))
         close(rp)
         @test sum(length, pts) == 250 && all(p -> p isa Avro.Table, pts) && length(pts) > 1
+        tiny_schema = P("{\"type\":\"record\",\"name\":\"Tiny\",\"fields\":[{\"name\":\"x\",\"type\":\"string\"}]}")
+        tiny = take!(Avro.tobuffer([(x="abcdefghij",)]; schema=tiny_schema))
+        limited = Avro.Rows(tiny; limits=Avro.Limits(max_block_output_bytes=1))
+        @test_throws Avro.LimitError first(Tables.partitions(limited))
+        close(limited)
         @test Avro.Rows(rr -> sum(row.a for row in rr), buf()) == sum(1:250)
     end
     @testset "select= projection" begin
