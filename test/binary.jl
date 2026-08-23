@@ -284,6 +284,9 @@
         @test_throws Avro.LimitError Avro.encode(P("\"bytes\""), zeros(UInt8, 100); limits=Avro.Limits(max_bytes=50, max_datum_bytes=50))
         arr = P("{\"type\":\"array\",\"items\":\"null\"}")
         @test_throws Avro.LimitError Avro.decode(arr, hex2bytes("ffffffffff0f00"); limits=Avro.Limits(max_block_count=100))   # 2^31 nulls declared
+        blocklimits = Avro.Limits(max_block_count=2, max_total_values=100, work_allowance=100)
+        @test_throws Avro.LimitError Avro.encode(arr, fill(missing, 3); limits=blocklimits)
+        @test_throws Avro.LimitError Avro.encode(P("{\"type\":\"map\",\"values\":\"null\"}"), Dict("a" => missing, "b" => missing, "c" => missing); limits=blocklimits)
         e = try Avro.decode(arr, hex2bytes("ffffffffff0f00")); nothing catch err; err end
         @test e isa Avro.LimitError && e.limit in (:max_block_count, :max_values_per_byte, :max_total_values)
         @test_throws Avro.LimitError Avro.decode(arr, enc("\"long\"", 1 << 20) ; limits=Avro.Limits(work_allowance=0))   # work rule

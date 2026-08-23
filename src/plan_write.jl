@@ -332,6 +332,7 @@ function encodevalue(p::WArray, e::Encoder, x)
     items = arrayitems(x)
     enter!(e)
     n = length(items)
+    checkblockcount(e, n)
     if n > 0
         writelong!(e, Int64(n))
         for v in items
@@ -360,6 +361,7 @@ function encodevalue(p::WMap, e::Encoder, x)
     pairs = mappairs(x)
     enter!(e)
     n = length(pairs)
+    checkblockcount(e, n)
     if n > 0
         writelong!(e, Int64(n))
         seen = String[]
@@ -373,6 +375,12 @@ function encodevalue(p::WMap, e::Encoder, x)
     end
     writelong!(e, Int64(0))
     leave!(e)
+    return nothing
+end
+
+function checkblockcount(e::Encoder, n::Int)
+    limit = e.budget.limits.max_block_count
+    n <= limit || throw(limiterror(e.budget, :max_block_count, n, limit))
     return nothing
 end
 
