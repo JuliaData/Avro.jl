@@ -303,6 +303,14 @@ function writercodec(name::Symbol, level, limits::Limits)
     throw(UnsupportedCodecError(String(name), get(EXTENSION_PACKAGES, name, nothing)))
 end
 
+"An upper bound on `compressblock`'s output allocation, reserved before the codec runs (R04)."
+function compressbound(w::WriterCodec, n::Int)
+    w.name === :null && return 0
+    w.name === :snappy && return bytesbytes(Int(Snappy.LibSnappy.snappy_max_compressed_length(UInt(n))) + 4)
+    w.name === :zstandard && return bytesbytes(Int(ccall((:ZSTD_compressBound, Zstd_jll.libzstd), Csize_t, (Csize_t,), n)))
+    return bytesbytes(n + (n >> 9) + 96)               # deflate and the extension codecs: zlib-style worst case
+end
+
 "Compress one block's encoded bytes (snappy appends the big-endian CRC32 of the uncompressed data)."
 function compressblock(w::WriterCodec, bytes::Vector{UInt8})
     w.name === :null && return bytes

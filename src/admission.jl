@@ -133,8 +133,12 @@ end
 
 Admit `s` (if new, counting it against the table's budgets) and return `Symbol(s)`.
 """
-function admit!(a::SymbolAdmission, s::AbstractString)
+function admit!(a::SymbolAdmission, s::AbstractString; budget::Union{Nothing,Budget}=nothing)
     str = String(s)
+    if budget !== nothing                              # the admitting operation's own lookup and merge-step work (§4.4, R07)
+        addcompare!(budget, checked_mul(max(sizeof(str), 1), length(a.recent) + 34 * (length(a.runs) + 1)))
+        a.merge === nothing || addcompare!(budget, 8 * MERGE_STEP)
+    end
     lock(a.lock) do
         step_unlocked!(a)                 # maintenance first: a failure below leaves the table unchanged
         contains_unlocked(a, str) && return nothing
@@ -155,7 +159,7 @@ function admit!(a::SymbolAdmission, s::AbstractString)
     return Symbol(str)
 end
 
-admit!(::Symbol, s::AbstractString) = Symbol(s)   # `:trusted` bypass (validated by callers)
+admit!(::Symbol, s::AbstractString; budget::Union{Nothing,Budget}=nothing) = Symbol(s)   # `:trusted` bypass (validated by callers)
 
 """
     admission(names) -> SymbolAdmission | Symbol

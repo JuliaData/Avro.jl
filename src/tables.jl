@@ -22,7 +22,7 @@ end
 
 Row(record::Record; names=DEFAULT_ADMISSION) = Row(record, admission(names))
 
-admitnames(s::RecordSchema, adm) = Symbol[admit!(adm, f.name) for f in s.fields]
+admitnames(s::RecordSchema, adm, budget::Union{Nothing,Budget}=nothing) = Symbol[admit!(adm, f.name; budget=budget) for f in s.fields]
 
 Tables.columnnames(r::Row) = admitnames(getfield(getfield(r, :record), :schema), getfield(r, :admission))
 Tables.getcolumn(r::Row, i::Int) = getfield(getfield(r, :record), :values)[i]
@@ -140,7 +140,7 @@ function Table(src; reader_schema::Union{Nothing,Schema}=nothing, union_resoluti
             push!(ranges, off + 1:off + c)
             off += c
         end
-        outnames = admitnames(outschema, adm)
+        outnames = admitnames(outschema, adm, r.budget)
         return Table(outschema, r.schema, outnames, finals, nrows, ranges, r.metadata, r.codecname, r.sync)
     finally
         close(r)
@@ -322,7 +322,7 @@ function rowsymbols(rows::Rows)
     getfield(rows, :mode) === :generic || throw(ArgumentError("only the generic record mode has columns"))
     s = getfield(rows, :symbols)
     s === nothing || return s
-    s = admitnames(getfield(rows, :outschema), getfield(rows, :adm))     # names admit lazily, on first request
+    s = admitnames(getfield(rows, :outschema), getfield(rows, :adm), getfield(rows, :reader).budget)   # names admit lazily, on first request
     setfield!(rows, :symbols, s)
     return s
 end

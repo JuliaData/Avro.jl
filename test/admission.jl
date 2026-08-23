@@ -111,4 +111,14 @@
     @test carryerror isa Avro.LimitError && carryerror.limit == :max_bytes
     @test length(transactional) == before
     @test !Avro.contains_unlocked(transactional, admissionname(5_120))
+
+    # the admitting operation's lookup and merge-step work charges its own budget (§4.4, R07)
+    ab = Avro.SymbolAdmission(max_names=1 << 16, max_bytes=1 << 24)
+    bud = Avro.Budget(Avro.Limits())
+    Avro.addinput!(bud, 1 << 20)
+    before = bud.compare_bytes
+    Avro.admit!(ab, "charged-name"; budget=bud)
+    @test bud.compare_bytes > before
+    @test Avro.admit!(:trusted, "any"; budget=bud) === :any
+    Avro.close!(bud)
 end

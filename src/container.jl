@@ -120,13 +120,20 @@ function readheader(s::BlockSource, limits::Limits, budget::Budget; legacy, allo
             (0 <= klen <= limits.max_metadata_bytes) || throw(DataError("invalid metadata key length $klen", position(s)))
             kbytes = sourcepayload(s, Int(klen), budget)
             validutf8(kbytes, 1, length(kbytes)) || throw(DataError("metadata key is not valid UTF-8", position(s)))
+            reserve!(budget, stringbytes(Int(klen)))               # the retained key, before its copy
             key = String(Vector{UInt8}(kbytes))
+            release!(budget, payloadcharge(s, Int(klen)))          # a stream key buffer is transient
             vlen = sourcevarint(s)
             (0 <= vlen <= limits.max_metadata_bytes) || throw(DataError("invalid metadata value length $vlen", position(s)))
             total = checked_add(total, Int(klen) + Int(vlen))
             total <= limits.max_metadata_bytes || throw(LimitError(:max_metadata_bytes, total, limits.max_metadata_bytes, :max_metadata_bytes, :decode))
-            value = Vector{UInt8}(sourcepayload(s, Int(vlen), budget))
-            reserve!(budget, stringbytes(sizeof(key)) + bytesbytes(length(value)))
+            vpayload = sourcepayload(s, Int(vlen), budget)
+            value = if vpayload isa Vector{UInt8}
+                vpayload                                            # a stream buffer is owned and already charged
+            else
+                reserve!(budget, bytesbytes(Int(vlen)))             # a byte-source view is copied, reserved first
+                Vector{UInt8}(vpayload)
+            end
             push!(keys, key)
             push!(vals, value)
         end
@@ -636,24 +643,28 @@ function Writer(dst::Union{AbstractString,IO}, schema::Schema; codec::Symbol=:nu
         (sync isa AbstractVector{UInt8} && length(sync) == 16) || throw(ArgumentError("sync must be exactly 16 bytes"))
         ntuple(i -> sync[i], 16)
     end
-    entries = Tuple{String,Vector{UInt8}}[]
-    schemajson = json(schema)
-    sizeof(schemajson) <= limits.max_schema_bytes || throw(LimitError(:max_schema_bytes, sizeof(schemajson), limits.max_schema_bytes, :max_schema_bytes, :encode))
-    push!(entries, ("avro.schema", Vector{UInt8}(codeunits(schemajson))))
-    push!(entries, ("avro.codec", Vector{UInt8}(codeunits(String(codec)))))
     metadata isa AbstractDict{<:AbstractString,<:AbstractVector{UInt8}} || throw(ArgumentError("metadata must map strings to byte vectors"))
-    for (k, v) in metadata
-        startswith(k, "avro.") && throw(ArgumentError("metadata keys in the avro.* namespace are reserved (got \"$k\"); avro.schema and avro.codec come from the constructor"))
-        isstrictutf8(k) || throw(ArgumentError("metadata keys must be valid UTF-8"))
-        push!(entries, (String(k), Vector{UInt8}(v)))
-    end
-    length(entries) <= limits.max_metadata_entries || throw(LimitError(:max_metadata_entries, length(entries), limits.max_metadata_entries, :max_metadata_entries, :encode))
-    total = sum(e -> sizeof(e[1]) + length(e[2]), entries; init=0)
-    total <= limits.max_metadata_bytes || throw(LimitError(:max_metadata_bytes, total, limits.max_metadata_bytes, :max_metadata_bytes, :encode))
+    budget = Budget(limits; direction=:encode)                    # the budget exists before any header allocation (R04)
     wcodec = writercodec(codec, level, limits)
-    budget = Budget(limits; direction=:encode)
     w = try
         reserve!(budget, wcodec.workspace)
+        jw = BoundedWriter(budget, limits.max_schema_bytes)       # the schema JSON is produced charged and bounded
+        printschema(jw, schema, "", FrozenDict{String,Bool}(), false, 0)
+        schemajson = String(take!(jw.io))
+        entries = Tuple{String,Vector{UInt8}}[]
+        reserve!(budget, stringbytes(11) + bytesbytes(sizeof(schemajson)))
+        push!(entries, ("avro.schema", Vector{UInt8}(codeunits(schemajson))))
+        reserve!(budget, stringbytes(10) + bytesbytes(sizeof(String(codec))))
+        push!(entries, ("avro.codec", Vector{UInt8}(codeunits(String(codec)))))
+        for (k, v) in metadata
+            startswith(k, "avro.") && throw(ArgumentError("metadata keys in the avro.* namespace are reserved (got \"$k\"); avro.schema and avro.codec come from the constructor"))
+            isstrictutf8(k) || throw(ArgumentError("metadata keys must be valid UTF-8"))
+            reserve!(budget, stringbytes(sizeof(k)) + bytesbytes(length(v)))   # each retained copy, before it is made
+            push!(entries, (String(k), Vector{UInt8}(v)))
+        end
+        length(entries) <= limits.max_metadata_entries || throw(LimitError(:max_metadata_entries, length(entries), limits.max_metadata_entries, :max_metadata_entries, :encode))
+        total = sum(e -> sizeof(e[1]) + length(e[2]), entries; init=0)
+        total <= limits.max_metadata_bytes || throw(LimitError(:max_metadata_bytes, total, limits.max_metadata_bytes, :max_metadata_bytes, :encode))
         plan = writeplan(schema; budget=budget)
         # The reader's construction retention, preflighted under the writer's budget (plan §4.4): the
         # parsed schema graph a reader builds from the same JSON, the materialised metadata of a stream
@@ -664,8 +675,7 @@ function Writer(dst::Union{AbstractString,IO}, schema::Schema; codec::Symbol=:nu
         pfkeys = String[]
         pfvals = Vector{UInt8}[]
         for (k, v) in entries
-            reserve!(budget, checked_add(bytesbytes(sizeof(k)), bytesbytes(length(v))))   # a stream reader's key and value buffers
-            reserve!(budget, checked_add(stringbytes(sizeof(k)), bytesbytes(length(v))))  # the retained metadata entry
+            reserve!(budget, checked_add(stringbytes(sizeof(k)), bytesbytes(length(v))))  # the retained metadata entry (byte and stream readers now charge identically)
             push!(pfkeys, k)
             push!(pfvals, v)
         end
@@ -838,7 +848,10 @@ function flushblock!(w::Writer)
             projected <= w.budget.ceiling ||
                 throw(LimitError(:max_total_bytes, projected, w.budget.ceiling, :max_total_bytes, :encode))
         end
+        reserve!(w.budget, bytesbytes(w.encoder.pos))              # the pending-block copy, before take! (R04)
         blockbytes = take!(w.encoder)
+        cbound = compressbound(w.wcodec, length(blockbytes))
+        reserve!(w.budget, cbound)                                  # the compressor's output bound, before it allocates
         compressed = compressblock(w.wcodec, blockbytes)
         length(compressed) <= w.limits.max_block_bytes ||
             throw(LimitError(:max_block_bytes, length(compressed), w.limits.max_block_bytes, :max_block_bytes, :encode))
@@ -860,6 +873,8 @@ function flushblock!(w::Writer)
         for b in w.syncmarker
             Base.write(w.sink, b)
         end
+        addinput!(w.budget, varintlength(w.pendingcount) + varintlength(length(compressed)) + 16)   # the reader's framing denominator (R08)
+        release!(w.budget, checked_add(bytesbytes(length(blockbytes)), cbound))                     # the flush transients
         addblocks!(w.budget)
     catch e
         poison!(w, e)

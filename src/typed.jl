@@ -344,12 +344,12 @@ typedvalue(p::GenericTarget, d::Decoder, names) = decodevalue(p.plan, d)
 typedvalue(p::SemanticTarget{T}, d::Decoder, names) where {T} = semanticvalue(T, decodevalue(p.plan, d), names)
 typedvalue(p::LeafTarget{T}, d::Decoder, names) where {T} = convertleaf(T, decodevalue(p.plan, d))::T
 typedvalue(p::LeafTarget{String,EnumPlan}, d::Decoder, names) = p.plan.schema.symbols[readindex(d, length(p.plan.schema.symbols))]
-typedvalue(p::SymbolTarget{StringPlan}, d::Decoder, names) = admit!(names, readstring(d))
+typedvalue(p::SymbolTarget{StringPlan}, d::Decoder, names) = admit!(names, readstring(d); budget=d.budget)
 typedvalue(p::RefTarget{T}, d::Decoder, names) where {T} = typedvalue(p.plan::TypedPlan, d, names)::T
 
 function typedvalue(p::SymbolTarget{EnumPlan}, d::Decoder, names)
     syms = p.plan.schema.symbols
-    return admit!(names, syms[readindex(d, length(syms))])
+    return admit!(names, syms[readindex(d, length(syms))]; budget=d.budget)
 end
 
 function typedvalue(p::EnumTarget{T}, d::Decoder, names) where {T}
