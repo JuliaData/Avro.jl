@@ -182,12 +182,18 @@ end
 """
     Avro.encode(schema, x; limits=Limits()) -> Vector{UInt8}
     Avro.encode(x; limits=Limits()) -> Vector{UInt8}          # conventional schema `Avro.schema(x)`
-    Avro.encode!(enc_or_io, schema, x; limits=Limits())
 
 One-shot encoding (builds a writer per call; use `DatumWriter` for repeated use).
 """
 encode(schema::Schema, x; limits::Limits=Limits()) = DatumWriter(schema; limits=limits)(x)
 encode(x; limits::Limits=Limits()) = encode(schema(x; limits=limits), x; limits=limits)
+
+"""
+    Avro.encode!(enc_or_io, schema, x; limits=Limits())
+
+One-shot encoding that appends one datum to the caller's encoder or stream. Use `DatumWriter` for
+repeated work.
+"""
 encode!(io::IO, schema::Schema, x; limits::Limits=Limits()) = DatumWriter(schema; limits=limits)(io, x)
 encode!(e::Encoder, schema::Schema, x; limits::Limits=Limits()) = DatumWriter(schema; limits=limits)(e, x)
 

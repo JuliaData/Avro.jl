@@ -1,4 +1,6 @@
 @testset "Documentation contracts" begin
+    @test Base.Docs.hasdoc(Avro, Symbol("encode!"))
+
     root = normpath(joinpath(@__DIR__, ".."))
     readme = read(joinpath(root, "README.md"), String)
     changelog = read(joinpath(root, "CHANGELOG.md"), String)
