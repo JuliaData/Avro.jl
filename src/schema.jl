@@ -1175,9 +1175,9 @@ end
 function finalizepublic!(s::Schema, limits::Limits, nodes::Int, named::Int)
     builderdepth() > 0 && return s
     metas = NodeMeta[]
-    namedcount = Ref(0)
-    collectmetas!(s, metas, namedcount)
-    info = GraphInfo(limits, false, false, length(metas), namedcount[])
+    namedtypes = FrozenDict{String,Schema}()
+    collectmetas!(s, metas, namedtypes)
+    info = GraphInfo(limits, false, false, length(metas), length(namedtypes))
     for (i, m) in enumerate(metas)
         isfilled(m.id) && continue
         fillonce!(m.id, Int32(i - 1))
@@ -1187,18 +1187,25 @@ function finalizepublic!(s::Schema, limits::Limits, nodes::Int, named::Int)
     return s
 end
 
-function collectmetas!(s::Schema, metas::Vector{NodeMeta}, namedcount::Base.RefValue{Int})
+function collectmetas!(s::Schema, metas::Vector{NodeMeta}, namedtypes::FrozenDict{String,Schema})
     any(m -> m === s.meta, metas) && return metas
     push!(metas, s.meta)
-    s isa NamedSchema && (namedcount[] += 1)
+    if s isa NamedSchema
+        full = fullname(s)
+        if haskey(namedtypes, full)
+            namedtypes[full] === s || throw(ArgumentError("named schema \"$full\" is defined more than once"))
+        else
+            namedtypes[full] = s
+        end
+    end
     if s isa ArraySchema
-        collectmetas!(s.items, metas, namedcount)
+        collectmetas!(s.items, metas, namedtypes)
     elseif s isa MapSchema
-        collectmetas!(s.values, metas, namedcount)
+        collectmetas!(s.values, metas, namedtypes)
     elseif s isa UnionSchema
-        foreach(b -> collectmetas!(b, metas, namedcount), s.branches)
+        foreach(b -> collectmetas!(b, metas, namedtypes), s.branches)
     elseif s isa RecordSchema
-        foreach(f -> collectmetas!(f.schema, metas, namedcount), s.fields)
+        foreach(f -> collectmetas!(f.schema, metas, namedtypes), s.fields)
     end
     return metas
 end
