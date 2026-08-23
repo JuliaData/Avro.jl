@@ -68,11 +68,14 @@ against the same cap, so a written file is always decodable under the same limit
 
 ## Inspection and 1.x files
 
-[`Avro.inspect`](@ref) reports a container's codec, schema, block structure and any detected defects
-without decoding data. Files written by Avro.jl ≤ 1.1.2 have known defects; read them with
+[`Avro.inspect`](@ref) reports header and framing issues, including a container's codec, schema, and
+block structure. It does not decode blocks and cannot infer payload padding or decimal byte order.
+Files written by Avro.jl ≤ 1.1.2 have known defects; read them with
 `legacy=:avrojl1` (padded null-codec blocks, the `zstd` codec name, unnamed fixed schemas) and
 `decimal_byteorder=:little` (native-endian fixed-16 decimals), and rewrite once:
 
 ```julia
-Avro.write("clean.avro", Avro.Rows("old.avro"; legacy=:avrojl1); codec=:zstandard)
+Avro.write("clean.avro",
+           Avro.Rows("old.avro"; legacy=:avrojl1, decimal_byteorder=:little);
+           codec=:zstandard)
 ```

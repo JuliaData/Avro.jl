@@ -1,7 +1,7 @@
 # Schema evolution
 
-Avro resolves data written under one schema against a reader's schema. Every read path takes
-`reader_schema=`:
+Avro resolves data written under one schema against a reader's schema. Use `reader_schema=` on
+`Avro.decode`, `Avro.DatumReader`, `Avro.decodesingle`, `Avro.Table`, and `Avro.Rows`:
 
 ```julia
 reader = Avro.parseschema("""{"type":"record","name":"Person","fields":[
