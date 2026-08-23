@@ -109,6 +109,13 @@ function shrinkexact(budget::Budget, buf::Vector{UInt8}, len::Int)
     return out
 end
 
+"Release every reservation acquired after `checkpoint` on a failed ownership transfer."
+function rollbackreservations!(budget::Budget, checkpoint::Int)
+    delta = budget.reserved - checkpoint
+    delta > 0 && release!(budget, delta)
+    return nothing
+end
+
 codecmessage(err::TranscodingStreams.Error) = TranscodingStreams.haserror(err) ? sprint(showerror, err.error) : "codec failure"
 
 """
@@ -157,73 +164,97 @@ requirement checked against `max_codec_memory` and reserved, members counted, th
 exhausted, and the output bounded by `max_block_bytes`.
 """
 function decompressblock(name::Symbol, ::NullCodec, payload::AbstractVector{UInt8}, limits::Limits, budget::Budget)
-    addinput!(budget, length(payload))
-    addmembers!(budget)
-    reserve!(budget, bytesbytes(length(payload)))
-    return Vector{UInt8}(payload)
+    checkpoint = budget.reserved
+    try
+        addinput!(budget, length(payload))
+        addmembers!(budget)
+        reserve!(budget, bytesbytes(length(payload)))
+        return Vector{UInt8}(payload)
+    catch
+        rollbackreservations!(budget, checkpoint)
+        rethrow()
+    end
 end
 
 function decompressblock(name::Symbol, ::DeflateReader, payload::AbstractVector{UInt8}, limits::Limits, budget::Budget)
-    reserve!(budget, DEFLATE_DECODER_BYTES)
-    out = initialoutput(budget, length(payload), limits.max_block_bytes)
-    consumed, out, outlen = transcodemember!(:deflate, DeflateDecompressor(), payload, 1, length(payload), out, 0, limits.max_block_bytes, budget)
-    release!(budget, DEFLATE_DECODER_BYTES)
-    trailing = length(payload) - consumed
-    trailing == 0 || throw(CodecError(:deflate, :decompress, "$trailing bytes after the final deflate block"))
-    addinput!(budget, outlen)
-    addmembers!(budget)
-    return shrinkexact(budget, out, outlen)
+    checkpoint = budget.reserved
+    try
+        reserve!(budget, DEFLATE_DECODER_BYTES)
+        out = initialoutput(budget, length(payload), limits.max_block_bytes)
+        consumed, out, outlen = transcodemember!(:deflate, DeflateDecompressor(), payload, 1, length(payload), out, 0, limits.max_block_bytes, budget)
+        release!(budget, DEFLATE_DECODER_BYTES)
+        trailing = length(payload) - consumed
+        trailing == 0 || throw(CodecError(:deflate, :decompress, "$trailing bytes after the final deflate block"))
+        addinput!(budget, outlen)
+        addmembers!(budget)
+        return shrinkexact(budget, out, outlen)
+    catch
+        rollbackreservations!(budget, checkpoint)
+        rethrow()
+    end
 end
 
 function decompressblock(name::Symbol, ::SnappyCodec, payload::AbstractVector{UInt8}, limits::Limits, budget::Budget)
-    n = length(payload)
-    n >= 4 || throw(CodecError(:snappy, :decompress, "snappy block shorter than its 4-byte CRC"))
-    datalen = n - 4
-    result = Ref{Csize_t}(0)
-    st = GC.@preserve payload Snappy.LibSnappy.snappy_uncompressed_length(pointer(payload), datalen, result)
-    st == Snappy.LibSnappy.SNAPPY_OK || throw(CodecError(:snappy, :decompress, "invalid snappy data (status $st)"))
-    m = Int(result[])
-    m <= limits.max_block_bytes || throw(LimitError(:max_block_bytes, m, limits.max_block_bytes, :max_block_bytes, :decode))
-    reserve!(budget, bytesbytes(m))
-    out = Vector{UInt8}(undef, m)
-    len = Ref{Csize_t}(m)
-    st2 = GC.@preserve payload out Snappy.LibSnappy.snappy_uncompress(pointer(payload), datalen, pointer(out), len)
-    (st2 == Snappy.LibSnappy.SNAPPY_OK && Int(len[]) == m) || throw(CodecError(:snappy, :decompress, "snappy decompression failed (status $st2)"))
-    stored = (UInt32(payload[n - 3]) << 24) | (UInt32(payload[n - 2]) << 16) | (UInt32(payload[n - 1]) << 8) | UInt32(payload[n])
-    crc32(out) == stored || throw(CodecError(:snappy, :decompress, "snappy CRC mismatch"))
-    addinput!(budget, m)
-    addmembers!(budget)
-    return out
+    checkpoint = budget.reserved
+    try
+        n = length(payload)
+        n >= 4 || throw(CodecError(:snappy, :decompress, "snappy block shorter than its 4-byte CRC"))
+        datalen = n - 4
+        result = Ref{Csize_t}(0)
+        st = GC.@preserve payload Snappy.LibSnappy.snappy_uncompressed_length(pointer(payload), datalen, result)
+        st == Snappy.LibSnappy.SNAPPY_OK || throw(CodecError(:snappy, :decompress, "invalid snappy data (status $st)"))
+        m = Int(result[])
+        m <= limits.max_block_bytes || throw(LimitError(:max_block_bytes, m, limits.max_block_bytes, :max_block_bytes, :decode))
+        reserve!(budget, bytesbytes(m))
+        out = Vector{UInt8}(undef, m)
+        len = Ref{Csize_t}(m)
+        st2 = GC.@preserve payload out Snappy.LibSnappy.snappy_uncompress(pointer(payload), datalen, pointer(out), len)
+        (st2 == Snappy.LibSnappy.SNAPPY_OK && Int(len[]) == m) || throw(CodecError(:snappy, :decompress, "snappy decompression failed (status $st2)"))
+        stored = (UInt32(payload[n - 3]) << 24) | (UInt32(payload[n - 2]) << 16) | (UInt32(payload[n - 1]) << 8) | UInt32(payload[n])
+        crc32(out) == stored || throw(CodecError(:snappy, :decompress, "snappy CRC mismatch"))
+        addinput!(budget, m)
+        addmembers!(budget)
+        return out
+    catch
+        rollbackreservations!(budget, checkpoint)
+        rethrow()
+    end
 end
 
 function decompressblock(name::Symbol, z::ZstdReader, payload::AbstractVector{UInt8}, limits::Limits, budget::Budget)
-    total = length(payload)
-    total > 0 || throw(CodecError(:zstandard, :decompress, "zstandard payload has no frame"))
-    out = initialoutput(budget, total, limits.max_block_bytes)
-    outlen = 0
-    pos = 1
-    members = 0
-    while pos <= total
-        rem = total - pos + 1
-        fsz = zstd_framesize(payload, pos, rem)
-        fsz === nothing && throw(CodecError(:zstandard, :decompress, "not a complete zstandard frame at payload byte $pos"))
-        members = checked_add(members, 1)
-        if zstd_skippable(payload, pos, rem)
+    checkpoint = budget.reserved
+    try
+        total = length(payload)
+        total > 0 || throw(CodecError(:zstandard, :decompress, "zstandard payload has no frame"))
+        out = initialoutput(budget, total, limits.max_block_bytes)
+        outlen = 0
+        pos = 1
+        members = 0
+        while pos <= total
+            rem = total - pos + 1
+            fsz = zstd_framesize(payload, pos, rem)
+            fsz === nothing && throw(CodecError(:zstandard, :decompress, "not a complete zstandard frame at payload byte $pos"))
+            members = checked_add(members, 1)
+            if zstd_skippable(payload, pos, rem)
+                pos += fsz
+                continue
+            end
+            est = zstd_frameestimate(payload, pos, rem)
+            est === nothing && throw(CodecError(:zstandard, :decompress, "unreadable zstandard frame header at payload byte $pos"))
+            est <= limits.max_codec_memory || throw(CodecError(:zstandard, :decompress, "the frame at payload byte $pos needs $est bytes of decoder memory; max_codec_memory is $(limits.max_codec_memory)"))
+            reserve!(budget, est)
+            consumed, out, outlen = transcodemember!(:zstandard, ZstdDecompressor(windowLogMax=z.windowlogmax), payload, pos, pos + fsz - 1, out, outlen, limits.max_block_bytes, budget)
+            release!(budget, est)
+            consumed == fsz || throw(CodecError(:zstandard, :decompress, "zstandard frame not exactly consumed"))
             pos += fsz
-            continue
         end
-        est = zstd_frameestimate(payload, pos, rem)
-        est === nothing && throw(CodecError(:zstandard, :decompress, "unreadable zstandard frame header at payload byte $pos"))
-        est <= limits.max_codec_memory || throw(CodecError(:zstandard, :decompress, "the frame at payload byte $pos needs $est bytes of decoder memory; max_codec_memory is $(limits.max_codec_memory)"))
-        reserve!(budget, est)
-        consumed, out, outlen = transcodemember!(:zstandard, ZstdDecompressor(windowLogMax=z.windowlogmax), payload, pos, pos + fsz - 1, out, outlen, limits.max_block_bytes, budget)
-        release!(budget, est)
-        consumed == fsz || throw(CodecError(:zstandard, :decompress, "zstandard frame not exactly consumed"))
-        pos += fsz
+        addinput!(budget, outlen)
+        addmembers!(budget, members)
+        return shrinkexact(budget, out, outlen)
+    catch
+        rollbackreservations!(budget, checkpoint)
+        rethrow()
     end
-    addinput!(budget, outlen)
-    addmembers!(budget, members)
-    return shrinkexact(budget, out, outlen)
 end
 
 decompressblock(name::Symbol, state, payload::AbstractVector{UInt8}, limits::Limits, budget::Budget) =

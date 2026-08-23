@@ -14,43 +14,49 @@ lzma_encoder_memusage(preset::Integer) = ccall((:lzma_easy_encoder_memusage, XZ_
 lzma_decoder_memusage(preset::Integer) = ccall((:lzma_easy_decoder_memusage, XZ_jll.liblzma), UInt64, (UInt32,), preset)
 
 function Avro.decompressblock(name::Symbol, r::XzReader, payload::AbstractVector{UInt8}, limits::Avro.Limits, budget::Avro.Budget)
-    total = length(payload)
-    total > 0 || throw(Avro.CodecError(:xz, :decompress, "xz payload has no stream"))
-    out = Avro.initialoutput(budget, total, limits.max_block_bytes)
-    outlen = 0
-    pos = 1
-    sawstream = false
-    members = 0
-    while pos <= total
-        if payload[pos] == 0x00
-            sawstream || throw(Avro.CodecError(:xz, :decompress, "xz stream padding precedes the first stream"))
+    checkpoint = budget.reserved
+    try
+        total = length(payload)
+        total > 0 || throw(Avro.CodecError(:xz, :decompress, "xz payload has no stream"))
+        out = Avro.initialoutput(budget, total, limits.max_block_bytes)
+        outlen = 0
+        pos = 1
+        sawstream = false
+        members = 0
+        while pos <= total
+            if payload[pos] == 0x00
+                sawstream || throw(Avro.CodecError(:xz, :decompress, "xz stream padding precedes the first stream"))
+                run = 0
+                while pos + run <= total && payload[pos + run] == 0x00
+                    run += 1
+                end
+                (run % 4 == 0 && pos + run > total) || throw(Avro.CodecError(:xz, :decompress, "invalid xz stream padding at payload byte $pos"))
+                break                                                  # trailing padding in multiples of four ends the payload
+            end
+            Avro.reserve!(budget, limits.max_codec_memory)
+            consumed, out, outlen = Avro.transcodemember!(:xz, XzDecompressor(memlimit=r.memlimit, flags=UInt32(0)), payload, pos, total, out, outlen, limits.max_block_bytes, budget)
+            Avro.release!(budget, limits.max_codec_memory)
+            consumed == 0 && throw(Avro.CodecError(:xz, :decompress, "invalid xz stream at payload byte $pos"))
+            sawstream = true
+            members = Avro.checked_add(members, 1)
+            pos += consumed
+            # inter-stream padding: maximal zero run in a multiple of four
             run = 0
             while pos + run <= total && payload[pos + run] == 0x00
                 run += 1
             end
-            (run % 4 == 0 && pos + run > total) || throw(Avro.CodecError(:xz, :decompress, "invalid xz stream padding at payload byte $pos"))
-            break                                                  # trailing padding in multiples of four ends the payload
+            if run > 0
+                run % 4 == 0 || throw(Avro.CodecError(:xz, :decompress, "invalid xz stream padding at payload byte $pos"))
+                pos += run
+            end
         end
-        Avro.reserve!(budget, limits.max_codec_memory)
-        consumed, out, outlen = Avro.transcodemember!(:xz, XzDecompressor(memlimit=r.memlimit, flags=UInt32(0)), payload, pos, total, out, outlen, limits.max_block_bytes, budget)
-        Avro.release!(budget, limits.max_codec_memory)
-        consumed == 0 && throw(Avro.CodecError(:xz, :decompress, "invalid xz stream at payload byte $pos"))
-        sawstream = true
-        members = Avro.checked_add(members, 1)
-        pos += consumed
-        # inter-stream padding: maximal zero run in a multiple of four
-        run = 0
-        while pos + run <= total && payload[pos + run] == 0x00
-            run += 1
-        end
-        if run > 0
-            run % 4 == 0 || throw(Avro.CodecError(:xz, :decompress, "invalid xz stream padding at payload byte $pos"))
-            pos += run
-        end
+        Avro.addinput!(budget, outlen)
+        Avro.addmembers!(budget, members)
+        return Avro.shrinkexact(budget, out, outlen)
+    catch
+        Avro.rollbackreservations!(budget, checkpoint)
+        rethrow()
     end
-    Avro.addinput!(budget, outlen)
-    Avro.addmembers!(budget, members)
-    return Avro.shrinkexact(budget, out, outlen)
 end
 
 function xzwriter(level, limits::Avro.Limits)

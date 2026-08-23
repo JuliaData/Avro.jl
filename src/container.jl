@@ -299,48 +299,54 @@ end
 function nextblock!(r::Reader; walk::Bool=true)
     checkopen(r)
     sourceeof(r.source) && return nothing
-    count = sourcevarint(r.source)
-    (0 <= count <= r.limits.max_block_count) || (count < 0 ? throw(DataError("negative block count $count", position(r.source))) :
-                                                 throw(LimitError(:max_block_count, Int(count), r.limits.max_block_count, :max_block_count, :decode)))
-    size = sourcevarint(r.source)
-    (0 <= size <= r.limits.max_block_bytes) || (size < 0 ? throw(DataError("negative block size $size", position(r.source))) :
-                                                throw(LimitError(:max_block_bytes, Int(size), r.limits.max_block_bytes, :max_block_bytes, :decode)))
-    r.blockindex += 1
-    r.blockindex <= r.limits.max_blocks || throw(LimitError(:max_blocks, r.blockindex, r.limits.max_blocks, :max_blocks, :decode))
-    addblocks!(r.budget)
-    addrows!(r.budget, Int(count))
-    payload = sourcepayload(r.source, Int(size), r.budget)
-    for i in 1:16
-        (sourceeof(r.source) ? throw(DataError("truncated file", position(r.source))) : sourcebyte(r.source)) == r.sync[i] ||
-            throw(DataError("sync marker mismatch after block $(r.blockindex)", position(r.source)))
-    end
-    addinput!(r.budget, varintlength(count) + varintlength(size) + 16)
-    bytes = if r.codecname === :null && payload isa Vector{UInt8}
-        addinput!(r.budget, length(payload))
-        addmembers!(r.budget)
-        payload                                       # a streamed null-codec payload is already owned
-    else
-        out = decompressblock(r.codecname, r.codec, payload, r.limits, r.budget)
-        release!(r.budget, payloadcharge(r.source, Int(size)))
-        out
-    end
-    n = Int(count)
-    if r.validate === :strict && (walk || r.legacy === :avrojl1)
-        d = Decoder(bytes, r.budget)
-        for _ in 1:n
-            skip(r.plan, d)
+    checkpoint = r.budget.reserved
+    try
+        count = sourcevarint(r.source)
+        (0 <= count <= r.limits.max_block_count) || (count < 0 ? throw(DataError("negative block count $count", position(r.source))) :
+                                                     throw(LimitError(:max_block_count, Int(count), r.limits.max_block_count, :max_block_count, :decode)))
+        size = sourcevarint(r.source)
+        (0 <= size <= r.limits.max_block_bytes) || (size < 0 ? throw(DataError("negative block size $size", position(r.source))) :
+                                                    throw(LimitError(:max_block_bytes, Int(size), r.limits.max_block_bytes, :max_block_bytes, :decode)))
+        r.blockindex += 1
+        r.blockindex <= r.limits.max_blocks || throw(LimitError(:max_blocks, r.blockindex, r.limits.max_blocks, :max_blocks, :decode))
+        addblocks!(r.budget)
+        addrows!(r.budget, Int(count))
+        payload = sourcepayload(r.source, Int(size), r.budget)
+        for i in 1:16
+            (sourceeof(r.source) ? throw(DataError("truncated file", position(r.source))) : sourcebyte(r.source)) == r.sync[i] ||
+                throw(DataError("sync marker mismatch after block $(r.blockindex)", position(r.source)))
         end
-        if d.pos != length(bytes) + 1
-            if r.legacy === :avrojl1 && r.codecname === :null
-                r.warned || (@warn "accepting trailing bytes after $(n) datums in a null-codec block (legacy=:avrojl1; Avro.jl ≤ 1.1.2 sizing cushion)" source = 1; r.warned = true)
-                resize!(bytes, d.pos - 1)
-            else
-                throw(DataError("block $(r.blockindex) declares $n datums but they consume $(d.pos - 1) of $(length(bytes)) bytes", d.pos))
+        addinput!(r.budget, varintlength(count) + varintlength(size) + 16)
+        bytes = if r.codecname === :null && payload isa Vector{UInt8}
+            addinput!(r.budget, length(payload))
+            addmembers!(r.budget)
+            payload                                       # a streamed null-codec payload is already owned
+        else
+            out = decompressblock(r.codecname, r.codec, payload, r.limits, r.budget)
+            release!(r.budget, payloadcharge(r.source, Int(size)))
+            out
+        end
+        n = Int(count)
+        if r.validate === :strict && (walk || r.legacy === :avrojl1)
+            d = Decoder(bytes, r.budget)
+            for _ in 1:n
+                skip(r.plan, d)
+            end
+            if d.pos != length(bytes) + 1
+                if r.legacy === :avrojl1 && r.codecname === :null
+                    r.warned || (@warn "accepting trailing bytes after $(n) datums in a null-codec block (legacy=:avrojl1; Avro.jl ≤ 1.1.2 sizing cushion)" source = 1; r.warned = true)
+                    resize!(bytes, d.pos - 1)
+                else
+                    throw(DataError("block $(r.blockindex) declares $n datums but they consume $(d.pos - 1) of $(length(bytes)) bytes", d.pos))
+                end
             end
         end
+        release!(r.budget, bytesbytes(length(bytes)))     # ownership transfers to the caller at yield
+        return (n, bytes)
+    catch
+        rollbackreservations!(r.budget, checkpoint)
+        rethrow()
     end
-    release!(r.budget, bytesbytes(length(bytes)))     # ownership transfers to the caller at yield
-    return (n, bytes)
 end
 
 struct EachBlock

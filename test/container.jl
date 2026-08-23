@@ -379,6 +379,49 @@ end
         seekstart(io3)
         @test length(Avro.Reader(r -> collect(Avro.eachdatum(r)), io3; limits=raised)[1]) == 4_000_000
     end
+    @testset "malformed codec blocks release transient reservations" begin
+        rows = [(x=Int64(1),), (x=Int64(2),)]
+        function checkmalformed(src)
+            r = Avro.Reader(src)
+            blocks = Avro.eachblock(r)
+            baseline = r.budget.reserved
+            err = try
+                iterate(blocks)
+                nothing
+            catch e
+                e
+            end
+            @test err isa Avro.CodecError
+            @test r.budget.reserved == baseline
+            next = iterate(blocks)
+            @test next !== nothing
+            if next !== nothing
+                (count, bytes), _ = next
+                @test count == 1
+                @test Avro.decode(Avro.writerschema(r), bytes).x == 2
+            end
+            @test r.budget.reserved == baseline
+            close(r)
+            close(r)
+            return nothing
+        end
+        for codecname in (:deflate, :snappy, :zstandard, :bzip2, :xz)
+            bytes = take!(Avro.tobuffer(rows; codec=codecname, block_bytes=1))
+            entries = Avro.Reader(r -> Avro.prescanblocks(r).entries, bytes)
+            @test length(entries) == 2
+            firstentry = first(entries)
+            bad = copy(bytes)
+            fill!(view(bad, firstentry.offset:firstentry.offset + firstentry.size - 1), 0xff)
+            checkmalformed(bad)
+            mktemp() do path, io
+                write(io, bad)
+                close(io)
+                open(path) do input
+                    checkmalformed(input)
+                end
+            end
+        end
+    end
     @testset "high-window codec bombs and streaming past the ceiling" begin
         hw = joinpath(gen, "highwindow")
         for name in ("zstd-window1g.avro", "xz-dict1g.avro")

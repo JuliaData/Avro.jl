@@ -115,6 +115,32 @@ import CodecZstd, CodecZlib, TranscodingStreams, Zlib_jll
         @test_throws Avro.CodecError codecdec(:xz, vcat(x1, UInt8[0x00, 0x00, 0x00, 0x01]))
         @test_throws Avro.CodecError codecdec(:xz, x1[1:end - 4])
     end
+    @testset "failed decompression restores transient reservations" begin
+        good = Dict{Symbol,Vector{UInt8}}()
+        bad = Dict{Symbol,Vector{UInt8}}()
+        for name in (:deflate, :snappy, :zstandard, :bzip2, :xz)
+            good[name] = Avro.compressblock(Avro.writercodec(name, nothing, L), Vector{UInt8}("reservation"))
+        end
+        bad[:deflate] = good[:deflate][1:end - 1]
+        snappybad = copy(good[:snappy])
+        snappybad[end] = snappybad[end] ⊻ 0x01
+        bad[:snappy] = snappybad
+        bad[:zstandard] = vcat(good[:zstandard], UInt8[0x01, 0x02])
+        bad[:bzip2] = vcat(good[:bzip2], UInt8[0x00])
+        bad[:xz] = vcat(good[:xz], zeros(UInt8, 3))
+        for name in (:deflate, :snappy, :zstandard, :bzip2, :xz)
+            budget = Avro.Budget(L; available=1 << 40)
+            sym, reader = Avro.readercodec(String(name), L, nothing)
+            baseline = budget.reserved
+            @test_throws Avro.CodecError Avro.decompressblock(sym, reader, bad[name], L, budget)
+            @test budget.reserved == baseline
+            out = Avro.decompressblock(sym, reader, good[name], L, budget)
+            @test out == Vector{UInt8}("reservation")
+            Avro.release!(budget, Avro.bytesbytes(length(out)))
+            @test budget.reserved == baseline
+            Avro.close!(budget)
+        end
+    end
     @testset "crc32 against zlib" begin
         rng = Random.Xoshiro(5)
         for n in (0, 1, 7, 100, 10_000)
