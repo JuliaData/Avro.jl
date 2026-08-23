@@ -509,7 +509,7 @@ end
 # ---- the writer's reader preflight (plan §4.4) -------------------------------------------------------
 
 "The reader-retained charge of the block table: one entry per block (offset, size, count, cumulative rows)."
-blocktablecharge(nblocks::Int) = checked_add(STORAGE[].vector, checked_mul(32, nblocks))
+blocktablecharge(nblocks::Int) = checked_add(STORAGE[].vector, checked_mul(40, nblocks))   # a 5-Int BlockEntry (R06)
 
 """
 One block's transient reader-side peak (plan §4.4): the compressed and decompressed buffers, the codec's
@@ -842,6 +842,7 @@ function flushblock!(w::Writer)
                 chunk = checked_add(chunk, vectorbytes(E, n))
                 finals = checked_add(finals, vectorbytes(E, rows))
             end
+            chunk = checked_add(chunk, STORAGE[].vector + 8 * length(pf.cols))   # the block's outer chunk container (R06)
             payload = checked_add(pf.payload, pf.pendingpayload)
             projected = checked_add(checked_add(w.preflightbase, blocktablecharge(pf.nblocks + 1)),
                                     checked_add(checked_add(chunk, payload), finals))

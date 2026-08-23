@@ -18,8 +18,8 @@ end
 "Per-block worst-case scratch-and-state allowance of `W` (plan §4.9; job peaks are gated against `W`)."
 const SCRATCH_STATE_MAX = 8 * MiB
 
-"The coordinator's charged per-worker state allowance (task stacks are runtime-owned, documented)."
-const WORKER_STATE = 64 * 1024
+"The settled charged per-worker state allowance (plan §4.4; task stacks are runtime-owned, documented)."
+const WORKER_STATE = 16 * 1024
 
 struct PrescanResult
     entries::Vector{BlockEntry}
@@ -30,7 +30,10 @@ end
 "Walk block headers without decompression (charged block table; a bad header becomes a pending failure)."
 function prescanblocks(r::Reader)
     src = r.source::BytesSource
+    tablecap = 64
+    reserve!(r.budget, blocktablecharge(tablecap))     # the block table grows by reserved exact-capacity replacement (§4.4)
     entries = BlockEntry[]
+    sizehint!(entries, tablecap)
     rows = 0
     pending = nothing
     startpos = src.pos
@@ -56,6 +59,13 @@ function prescanblocks(r::Reader)
             newrows = checked_add(rows, Int(count))
             newrows <= r.limits.max_rows ||
                 throw(LimitError(:max_rows, newrows, r.limits.max_rows, :max_rows, :decode))
+            if length(entries) == tablecap
+                newcap = 2 * tablecap
+                reserve!(r.budget, blocktablecharge(newcap))
+                release!(r.budget, blocktablecharge(tablecap))
+                tablecap = newcap
+                sizehint!(entries, tablecap)
+            end
             push!(entries, BlockEntry(length(entries) + 1, off, Int(size), Int(count), rows + 1))
             rows = newrows
         end
@@ -64,7 +74,6 @@ function prescanblocks(r::Reader)
         pending = e
     end
     src.pos = startpos
-    reserve!(r.budget, blocktablecharge(length(entries)))
     return PrescanResult(entries, rows, pending)
 end
 
@@ -201,9 +210,15 @@ function decodedirect!(r::Reader, e::BlockEntry, plan, builders::Vector{ColumnBu
     end
     d = Decoder(out, b; validate=r.validate)
     cells = plan isa RecordPlan ? fuseskips(builders) : builders
+    cap = r.limits.max_block_output_bytes
+    done = 0
     for _ in 1:n
         countvalues!(b)
         decoderow!(cells, d, plan)
+        done += 1                                       # the cap is enforced per row, so the error kind
+        rowout = checked_add(max(b.reserved - before, 0), checked_mul(done, slotrow))
+        rowout <= cap ||                                # never depends on remaining ceiling headroom (R06)
+            throw(LimitError(:max_block_output_bytes, rowout, cap, :max_block_output_bytes, :decode))
     end
     d.pos == length(out) + 1 || throw(DataError("block datums did not consume the block exactly", d.pos))
     blockout = checked_add(max(b.reserved - before, 0), checked_mul(n, slotrow))
@@ -245,9 +260,13 @@ function decodejob!(job::BlockJob, r::Reader, plan, sel::Union{Nothing,Vector{In
         cols = columnbuilders(plan, sel, n, b)
         cells = plan isa RecordPlan ? fuseskips(cols) : cols
         d = Decoder(out, b; validate=r.validate)
+        cap = r.limits.max_block_output_bytes
         for _ in 1:n
             countvalues!(b)
             decoderow!(cells, d, plan)
+            rowout = max(b.reserved - before, 0)
+            rowout <= cap ||
+                throw(LimitError(:max_block_output_bytes, rowout, cap, :max_block_output_bytes, :decode))
         end
         d.pos == length(out) + 1 || throw(DataError("block datums did not consume the block exactly", d.pos))
         job.outputbytes = max(b.reserved - before, 0)
@@ -366,13 +385,15 @@ function decodeblocks!(r::Reader, plan, sel::Union{Nothing,Vector{Int}}, finals:
         return stats
     end
     fail = FailBox(typemax(Int))
+    poolstate = checked_add(poolstate, STORAGE[].vector + 8 * nblocks)   # jobs vector rides the wave charge
     jobs = Vector{Union{Nothing,BlockJob}}(nothing, nblocks)
     ch = Channel{BlockJob}(nblocks)
     workers = Task[Threads.@spawn workerloop(ch, r, plan, sel, fail) for _ in 1:nworkers]
     foreach(errormonitor, workers)
     inflight = 0
-    next = 1
-    tocommit = 1
+    wavecharged = false                                # the settled 16 KiB per-worker state, charged per
+    next = 1                                           # admission wave and released at drain, so the
+    tocommit = 1                                       # sequential-tail arithmetic stays identical (R06)
     try
         while tocommit <= nblocks
             head = entries[next]
@@ -382,7 +403,12 @@ function decodeblocks!(r::Reader, plan, sel::Union{Nothing,Vector{Int}}, finals:
             while next <= nblocks && inflight < inflightcap
                 e2 = entries[next]
                 Wi = blockworstcase(r.limits, e2, cols)
-                checked_add(checked_add(b.reserved, Whead), checked_add(Wi, poolstate)) <= b.ceiling || break
+                need = wavecharged ? Wi : checked_add(Wi, poolstate)
+                checked_add(checked_add(b.reserved, Whead), need) <= b.ceiling || break
+                if !wavecharged
+                    reserve!(b, poolstate)
+                    wavecharged = true
+                end
                 reserve!(b, Wi)
                 job = BlockJob(e2, Wi, blockbudget(r.limits, Wi), Threads.Event(), nothing, 0, nothing, :pending)
                 jobs[next] = job
@@ -416,6 +442,10 @@ function decodeblocks!(r::Reader, plan, sel::Union{Nothing,Vector{Int}}, finals:
                 end
                 tocommit += 1
             end
+            if inflight == 0 && wavecharged
+                release!(b, poolstate)
+                wavecharged = false
+            end
             next = tocommit
         end
         pre.pending === nothing || throw(pre.pending)
@@ -436,5 +466,6 @@ function decodeblocks!(r::Reader, plan, sel::Union{Nothing,Vector{Int}}, finals:
             release!(b, job.W)
             close!(job.budget)
         end
+        wavecharged && release!(b, poolstate)
     end
 end
