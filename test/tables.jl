@@ -263,4 +263,24 @@ import DataAPI
         t00 = Avro.Table(buf(); select=())
         @test length(t00) == 250 && isempty(Tables.columnnames(t00))
     end
+
+    @testset "Rows length via the byte-source pre-scan (plan §6, R09)" begin
+        bytes = take!(Avro.tobuffer([(a=Int64(i),) for i in 1:250]; block_bytes=128))
+        rl = Avro.Rows(IOBuffer(bytes))
+        @test Base.IteratorSize(typeof(rl)) === Base.HasLength()
+        @test length(rl) == 250
+        @test count(Returns(true), rl) == 250                        # the pre-scan count matches iteration
+        close(rl)
+        p = joinpath(mktempdir(), "rows.avro")
+        write(p, bytes)
+        rs = Avro.Rows(open(p))                                      # a streamed source stays SizeUnknown
+        @test Base.IteratorSize(typeof(rs)) === Base.SizeUnknown()
+        @test count(Returns(true), rs) == 250
+        close(rs)
+        cut = bytes[1:end - 3]                                       # a structural tail: SizeUnknown, error at the block
+        rc = Avro.Rows(IOBuffer(cut))
+        @test Base.IteratorSize(typeof(rc)) === Base.SizeUnknown()
+        @test_throws Avro.DataError collect(rc)
+        close(rc)
+    end
 end

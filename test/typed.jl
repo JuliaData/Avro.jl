@@ -272,4 +272,13 @@ end
         @test Avro.DatumReader(bs, Bits)(IOBuffer(bb)) === Bits(3, 1.5f0, true)
         @test Avro.DatumReader(bs, Bits)(vcat(bb, bb), length(bb) + 1) == (Bits(3, 1.5f0, true), 2 * length(bb) + 1)
     end
+
+    @testset "measured typed shells (plan §4.4, R10)" begin
+        for T in (@NamedTuple{a::Int64, s::String}, @NamedTuple{a::Int64, b::Float64},
+                  @NamedTuple{s::String, v::Vector{Int64}}, @NamedTuple{})
+            probeshell = Avro.measuredshell(T)
+            @test probeshell == (isbitstype(T) ? 0 : max(Int(Base.summarysize(Avro.emptyprobe(T))), 8))
+        end
+        @test Avro.measuredshell(@NamedTuple{a::Int64}) == 0
+    end
 end

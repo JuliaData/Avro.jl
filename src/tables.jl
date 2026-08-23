@@ -266,7 +266,7 @@ yielding `Avro.Row`, with lazy column-name admission and per-block `Tables.parti
 values. `select=` applies to the generic record mode only. `close(rows)` is idempotent; the do-block
 form closes on exit.
 """
-mutable struct Rows
+mutable struct Rows{L}                     # L::Bool — a byte-source pre-scan supplied an exact length (R09)
     const reader::Reader
     const mode::Symbol                     # :generic, :typed or :nonrecord
     const effective::Schema
@@ -275,6 +275,7 @@ mutable struct Rows
     const T::Any
     const adm::Union{SymbolAdmission,Symbol}
     const select::Union{Nothing,Vector{Int}}
+    const nrows::Int                       # exact datum count when L (0 otherwise)
     symbols::Union{Nothing,Vector{Symbol}} # lazy
     bytes::Vector{UInt8}
     decoder::Union{Nothing,Decoder{Vector{UInt8}}}
@@ -298,7 +299,14 @@ function Rows(src; T=nothing, reader_schema::Union{Nothing,Schema}=nothing, unio
         sel = select === nothing ? nothing : selectindices(effective, select)
         outschema = mode === :generic ? (sel === nothing ? effective : projectschema(effective, sel, limits)) : nothing
         rowplan = mode === :typed ? typedplan(T, effective, plan, limits) : plan
-        return Rows(r, mode, effective, outschema, rowplan, T, adm, sel, nothing, UInt8[], nothing, 0, 0, 0)
+        nrows = -1
+        if r.source isa BytesSource
+            pre = prescanblocks(r)                      # headers only; the table charge is transient
+            release!(r.budget, blocktablecharge(max(64, nextpow2rows(length(pre.entries)))))
+            pre.pending === nothing && (nrows = pre.totalrows)   # a structural error keeps SizeUnknown
+        end                                                       # so acceptance matches streamed sources
+        nrows >= 0 && return Rows{true}(r, mode, effective, outschema, rowplan, T, adm, sel, nrows, nothing, UInt8[], nothing, 0, 0, 0)
+        return Rows{false}(r, mode, effective, outschema, rowplan, T, adm, sel, 0, nothing, UInt8[], nothing, 0, 0, 0)
     catch
         close(r)
         rethrow()
@@ -337,8 +345,19 @@ Tables.rows(rows::Rows) = rows
 Tables.schema(rows::Rows) = storedschema(rowsymbols(rows), getfield(rows, :outschema))
 Tables.columnnames(rows::Rows) = rowsymbols(rows)
 
-Base.IteratorSize(::Type{Rows}) = Base.SizeUnknown()
-Base.IteratorEltype(::Type{Rows}) = Base.EltypeUnknown()
+"The block-table capacity the pre-scan grew to for `n` entries (its growth doubles from 64)."
+function nextpow2rows(n::Int)
+    cap = 64
+    while cap < n
+        cap *= 2
+    end
+    return cap
+end
+
+Base.IteratorSize(::Type{<:Rows}) = Base.SizeUnknown()
+Base.IteratorSize(::Type{Rows{true}}) = Base.HasLength()
+Base.length(rows::Rows{true}) = getfield(rows, :nrows)
+Base.IteratorEltype(::Type{<:Rows}) = Base.EltypeUnknown()
 
 function Base.iterate(rows::Rows, ::Nothing=nothing)
     r = rows.reader

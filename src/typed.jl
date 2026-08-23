@@ -69,6 +69,7 @@ struct RecordTarget{T,PS<:Tuple,MAP} <: TypedPlan
     schema::RecordSchema
     plans::PS
     defaults::Vector{Any}
+    shell::Int          # measured per `T` from an empty probe (plan §4.4, R10)
 end
 
 "Recursion through the user's own recursive types (filled after construction; a function barrier)."
@@ -303,7 +304,7 @@ function buildrecordplan(::Type{T}, s::RecordSchema, p::RecordPlan, memo::TypedM
         end
     end
     ps = (plans...,)
-    return RecordTarget{T,typeof(ps),(map...,)}(s, ps, defaults)
+    return RecordTarget{T,typeof(ps),(map...,)}(s, ps, defaults, measuredshell(T))
 end
 
 function buildarraytarget(::Type{T}, s::ArraySchema, p::ArrayPlan, memo::TypedMemo) where {T}
@@ -449,10 +450,29 @@ end
 
 function typedvalue(p::RecordTarget{T}, d::Decoder, names) where {T}
     enter!(d)
-    reserve!(d.budget, shellbytes(T))
+    reserve!(d.budget, p.shell)
     v = recordvalue(p, d, names)
     leave!(d)
     return v
+end
+
+"""
+The heap shell of one decoded `T`, measured once per plan from an empty probe (`Expr(:new, T)` with no
+fields: reference fields stay undefined, so `Base.summarysize` reports exactly the header plus the
+inline layout — including nested inline structs — and no referenced payload; plan §4.4, R10). The
+checked fallback bound covers types `:new` cannot probe.
+"""
+@generated emptyprobe(::Type{T}) where {T} = Expr(:new, T)
+
+function measuredshell(::Type{T}) where {T}
+    isbitstype(T) && return 0
+    ismutabletype(T) || isstructtype(T) || return 16 + sizeof(T)
+    probe = try
+        emptyprobe(T)
+    catch
+        return sizeof(T) + 8 * fieldcount(T) + 64      # the §4.4 checked bound
+    end
+    return max(Int(Base.summarysize(probe)), 8)
 end
 
 shellbytes(::Type{T}) where {T} = isbitstype(T) ? 0 : 16 + sizeof(T)
