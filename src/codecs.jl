@@ -169,7 +169,7 @@ function decompressblock(name::Symbol, ::DeflateReader, payload::AbstractVector{
     consumed, out, outlen = transcodemember!(:deflate, DeflateDecompressor(), payload, 1, length(payload), out, 0, limits.max_block_bytes, budget)
     release!(budget, DEFLATE_DECODER_BYTES)
     trailing = length(payload) - consumed
-    trailing <= 3 || throw(CodecError(:deflate, :decompress, "$trailing bytes after the final deflate block"))   # ≤ 3 = fastavro's stripped zlib checksum (§8.4)
+    trailing == 0 || throw(CodecError(:deflate, :decompress, "$trailing bytes after the final deflate block"))
     addinput!(budget, outlen)
     addmembers!(budget)
     return shrinkexact(budget, out, outlen)

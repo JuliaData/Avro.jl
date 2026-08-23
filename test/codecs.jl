@@ -75,7 +75,8 @@ import CodecZstd, CodecZlib, TranscodingStreams, Zlib_jll
     @testset "deflate and snappy strictness" begin
         w = Avro.writercodec(:deflate, nothing, L)
         block = Avro.compressblock(w, data)
-        @test codecdec(:deflate, vcat(block, UInt8[0x01, 0x02, 0x03])) == data     # ≤ 3 suffix bytes: fastavro strips the zlib checksum to three bytes
+        @test_throws Avro.CodecError codecdec(:deflate, vcat(block, UInt8[0x01]))
+        @test_throws Avro.CodecError codecdec(:deflate, vcat(block, UInt8[0x01, 0x02, 0x03]))
         @test_throws Avro.CodecError codecdec(:deflate, vcat(block, UInt8[0x01, 0x02, 0x03, 0x04]))
         @test_throws Avro.CodecError codecdec(:deflate, block[1:end - 1])
         sn = Avro.writercodec(:snappy, nothing, L)
