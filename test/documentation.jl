@@ -10,6 +10,8 @@
     security = read(joinpath(root, "docs", "src", "manual", "limits-and-security.md"), String)
     logical = read(joinpath(root, "docs", "src", "manual", "logicaltypes.md"), String)
     containersource = read(joinpath(root, "src", "container.jl"), String)
+    flatreadme = lowercase(replace(readme, r"\s+" => " "))
+    flatchangelog = lowercase(replace(changelog, r"\s+" => " "))
     flatcontainer = lowercase(replace(container, r"\s+" => " "))
     flatsecurity = lowercase(replace(security, r"\s+" => " "))
 
@@ -28,4 +30,16 @@
     @test !occursin("complete implementation of the avro specification", lowercase(changelog))
     @test !occursin("every logical type", lowercase(logical))
     @test occursin("big-decimal", logical) && occursin("deferred", logical)
+    @test occursin("Avro.Rows(\"old.avro\"; legacy=:avrojl1, decimal_byteorder=:little)", readme)
+    @test occursin("reports header and framing issues", flatreadme)
+    @test occursin("does not decode blocks or infer decimal byte order", flatreadme)
+    @test !occursin("reports what a file needs", flatreadme)
+    @test !occursin("1.x data defects are detectable", flatchangelog)
+    @test occursin("does not diagnose payload padding or decimal byte order", flatchangelog)
+    resolvingapis = "`reader_schema=` on `avro.decode`, `avro.datumreader`, `avro.decodesingle`, " *
+                    "`avro.table`, and `avro.rows`"
+    @test occursin(resolvingapis, flatreadme)
+    @test occursin(resolvingapis, flatchangelog)
+    @test !occursin("`reader_schema=` on every read path", flatreadme)
+    @test !occursin("`reader_schema=` on every read path", flatchangelog)
 end

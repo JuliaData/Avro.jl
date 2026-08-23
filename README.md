@@ -48,8 +48,9 @@ value = Avro.decode(s, bytes)
 
 * **Broad format support**: every primitive, named and complex type; all Avro 1.12 logical types except
   `big-decimal`, which is preserved as an unknown annotation and deferred; schema evolution
-  (`reader_schema=` on every read path, both union-resolution
-  policies); canonical form and fingerprints; the Avro sort order (`Avro.compare`/`Avro.comparebytes`);
+  (`reader_schema=` on `Avro.decode`, `Avro.DatumReader`, `Avro.decodesingle`, `Avro.Table`, and
+  `Avro.Rows`; both union-resolution policies); canonical form and fingerprints; the Avro sort order
+  (`Avro.compare`/`Avro.comparebytes`);
   single-object encoding with schema stores; the JSON encoding (`Avro.tojson`/`Avro.fromjson`).
 * **Object container files**: `Avro.write`/`Avro.Table`/`Avro.Rows`/`Avro.Reader` with the
   `null`, `deflate`, `snappy`, `zstandard` codecs built in and `bzip2`/`xz` as package extensions;
@@ -73,10 +74,13 @@ Files written by Avro.jl ≤ 1.1.2 have known defects (padded null-codec blocks,
 native-endian decimals). Read them with the legacy options and rewrite them once:
 
 ```julia
-Avro.write("clean.avro", Avro.Rows("old.avro"; legacy=:avrojl1); codec=:zstandard)
+Avro.write("clean.avro",
+           Avro.Rows("old.avro"; legacy=:avrojl1, decimal_byteorder=:little);
+           codec=:zstandard)
 ```
 
-`Avro.inspect("old.avro")` reports what a file needs. See the migration guide in the documentation for
+`Avro.inspect("old.avro")` reports header and framing issues, including the legacy `zstd` codec name.
+It does not decode blocks or infer decimal byte order. See the migration guide in the documentation for
 the 1.x → 2.0 API changes (`writetable`/`readtable` still work, with deprecation warnings).
 
 ## Documentation
