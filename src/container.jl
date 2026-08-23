@@ -127,7 +127,6 @@ function readheader(s::BlockSource, limits::Limits, budget::Budget; legacy, allo
             total <= limits.max_metadata_bytes || throw(LimitError(:max_metadata_bytes, total, limits.max_metadata_bytes, :max_metadata_bytes, :decode))
             value = Vector{UInt8}(sourcepayload(s, Int(vlen), budget))
             reserve!(budget, stringbytes(sizeof(key)) + bytesbytes(length(value)))
-            key in keys && throw(DataError("duplicate metadata key \"$(escapename(key))\"", position(s)))
             push!(keys, key)
             push!(vals, value)
         end
@@ -137,7 +136,7 @@ function readheader(s::BlockSource, limits::Limits, budget::Budget; legacy, allo
         end
     end
     addinput!(budget, total)
-    metadata = buildmap(Vector{UInt8}, keys, vals, budget)
+    metadata = buildmap(Vector{UInt8}, keys, vals, budget; duplicateposition=position(s))
     sync = ntuple(_ -> sourcebyte(s), 16)
     schemabytes = get(metadata, "avro.schema", nothing)
     schemabytes === nothing && throw(DataError("the container has no avro.schema", position(s)))

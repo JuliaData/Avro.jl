@@ -207,6 +207,22 @@ Base.flush(f::FailIO) = flush(f.io)
         for declared in (0, length(pair) - 1, length(pair) + 1)
             @test_throws Avro.DataError readall(sizedmetadata(declared))
         end
+        encodedpair(k, v) = vcat(varint(sizeof(k)), Vector{UInt8}(k), varint(length(v)), v)
+        metadata_pairs = Vector{UInt8}[encodedpair("avro.schema", value)]
+        for i in 1:64
+            push!(metadata_pairs, encodedpair("key$(lpad(i, 4, '0'))", UInt8[]))
+        end
+        push!(metadata_pairs, encodedpair("key0001", UInt8[]))
+        duplicate_header = vcat(collect(b"Obj\x01"), varint(length(metadata_pairs)),
+                                reduce(vcat, metadata_pairs), varint(0), sync)
+        comparison_limits = Avro.Limits(max_compare_bytes_per_byte=0, work_allowance=100)
+        duplicate_error = try
+            Avro.Reader(duplicate_header; limits=comparison_limits)
+            nothing
+        catch err
+            err
+        end
+        @test duplicate_error isa Avro.LimitError && duplicate_error.limit == :max_compare_bytes_per_byte
     end
     @testset "writer failure injection, poisoning, atomic paths" begin
         rows = [(x=Int64(i),) for i in 1:10]
