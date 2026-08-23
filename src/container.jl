@@ -584,10 +584,12 @@ end
 
 A container writer to a path (atomic by default: a sibling temp file renamed into place on `close`) or a
 caller-owned `IO` (flushed, never closed). Datums are buffered under every reader limit and a block is
-emitted at `block_bytes`, at the block caps, or on `flush`/`close`. The first failure poisons the writer
-(`WriterClosedError` carries the cause; the temp file is removed and the destination untouched);
-`close(w; abort=true)` discards the buffered block. The do-block form closes on success and aborts on
-error; a finalizer aborts a path-owned writer that was never closed.
+emitted at `block_bytes`, at the block caps, or on `flush`/`close`. Rejected datums are recoverable and
+leave the pending block intact. An I/O, compression, flush or close failure poisons the writer
+(`WriterClosedError` carries the cause). With `atomic=true`, the temp file is removed and the destination
+is untouched; `atomic=false` and caller-owned streams can retain partial output. `close(w; abort=true)`
+discards the buffered block. The do-block form closes on success and aborts on error; a finalizer aborts
+an unclosed writer without closing caller-owned I/O.
 """
 mutable struct Writer
     const sink::IO

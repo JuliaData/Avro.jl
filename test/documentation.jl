@@ -6,6 +6,7 @@
     container = read(joinpath(root, "docs", "src", "manual", "container.md"), String)
     security = read(joinpath(root, "docs", "src", "manual", "limits-and-security.md"), String)
     logical = read(joinpath(root, "docs", "src", "manual", "logicaltypes.md"), String)
+    containersource = read(joinpath(root, "src", "container.jl"), String)
     flatcontainer = lowercase(replace(container, r"\s+" => " "))
     flatsecurity = lowercase(replace(security, r"\s+" => " "))
 
@@ -17,6 +18,8 @@
     @test occursin("does not sync the directory", flatcontainer)
     @test occursin("rejected datums are recoverable", flatcontainer)
     @test occursin("an i/o, compression, flush or close failure poisons the writer", flatcontainer)
+    @test occursin("Rejected datums are recoverable", containersource)
+    @test !occursin("The first failure poisons the writer", containersource)
 
     @test !occursin("every logical type", lowercase(readme))
     @test !occursin("complete implementation of the avro specification", lowercase(changelog))
