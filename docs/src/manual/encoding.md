@@ -21,7 +21,9 @@ dw = Avro.DatumWriter(s)               # accepts any encodable value
 dwT = Avro.DatumWriter(s, T)           # the typed kernel: zero allocations for aligned NamedTuples
 ```
 
-Prepared objects are immutable and safe to share across tasks.
+`DatumReader` objects are safe to share across tasks because each call owns its decoder state.
+`DatumWriter` retains reusable encoder and typed-plan state and is single-owner; do not call the same
+writer concurrently. Schemas and plans are immutable and shareable.
 
 ## The generic value model
 

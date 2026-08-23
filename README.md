@@ -46,8 +46,9 @@ value = Avro.decode(s, bytes)
 
 ## Highlights
 
-* **Complete format support**: every primitive, named and complex type; every logical type in the
-  specification; schema evolution (`reader_schema=` on every read path, both union-resolution
+* **Broad format support**: every primitive, named and complex type; all Avro 1.12 logical types except
+  `big-decimal`, which is preserved as an unknown annotation and deferred; schema evolution
+  (`reader_schema=` on every read path, both union-resolution
   policies); canonical form and fingerprints; the Avro sort order (`Avro.compare`/`Avro.comparebytes`);
   single-object encoding with schema stores; the JSON encoding (`Avro.tojson`/`Avro.fromjson`).
 * **Object container files**: `Avro.write`/`Avro.Table`/`Avro.Rows`/`Avro.Reader` with the

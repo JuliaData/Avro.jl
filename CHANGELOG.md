@@ -6,10 +6,11 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [2.0.0] - Unreleased
 
-Avro.jl 2.0 is a ground-up rewrite: a complete implementation of the Avro specification with fixed,
-portable resource limits, strict validation by default, parallel container decoding, and oracle-tested
+Avro.jl 2.0 is a ground-up rewrite of the Avro data-format implementation, with fixed, portable
+resource limits, strict validation by default, parallel container decoding, and oracle-tested
 interoperability. It is SemVer-breaking; deprecation shims cover the main 1.x entry points for one
-major cycle.
+major cycle. The Avro 1.12 `big-decimal` logical type is preserved as an unknown annotation and is
+deferred.
 
 ### Added
 

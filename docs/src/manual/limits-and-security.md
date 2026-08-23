@@ -67,7 +67,8 @@ encode); time values are never silently truncated on encode (Java truncates).
 
 ## Concurrency and ownership
 
-Prepared objects (`DatumReader`, `DatumWriter`, schemas, plans) are immutable and shareable.
-`Reader`/`Rows`/`Writer` are single-operation objects. Parallel decoding uses only headroom under the
-ceiling and never changes results or acceptance. Truncating a memory-mapped file during a read is
-undefined at the OS level — use `mmap=false` for files that may change.
+`DatumReader`, schemas, plans and `Limits` are safe to share across tasks. `DatumWriter` retains
+reusable mutable state and is single-owner. `Reader`/`Rows`/`Writer` are also single-operation objects.
+Parallel decoding uses only headroom under the ceiling and never changes results or acceptance.
+Truncating a memory-mapped file during a read is undefined at the OS level — use `mmap=false` for files
+that may change.

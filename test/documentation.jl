@@ -1,0 +1,25 @@
+@testset "Documentation contracts" begin
+    root = normpath(joinpath(@__DIR__, ".."))
+    readme = read(joinpath(root, "README.md"), String)
+    changelog = read(joinpath(root, "CHANGELOG.md"), String)
+    encoding = read(joinpath(root, "docs", "src", "manual", "encoding.md"), String)
+    container = read(joinpath(root, "docs", "src", "manual", "container.md"), String)
+    security = read(joinpath(root, "docs", "src", "manual", "limits-and-security.md"), String)
+    logical = read(joinpath(root, "docs", "src", "manual", "logicaltypes.md"), String)
+    flatcontainer = lowercase(replace(container, r"\s+" => " "))
+    flatsecurity = lowercase(replace(security, r"\s+" => " "))
+
+    @test occursin("`DatumReader` objects are safe to share across tasks", encoding)
+    @test occursin("`DatumWriter` retains reusable encoder", encoding) && occursin("single-owner", encoding)
+    @test occursin("`datumwriter` retains reusable mutable state and is single-owner", flatsecurity)
+    @test occursin("`atomic=false`, the destination is opened in place", flatcontainer)
+    @test occursin("failure can leave it truncated or containing complete blocks plus a partial final block", flatcontainer)
+    @test occursin("does not sync the directory", flatcontainer)
+    @test occursin("rejected datums are recoverable", flatcontainer)
+    @test occursin("an i/o, compression, flush or close failure poisons the writer", flatcontainer)
+
+    @test !occursin("every logical type", lowercase(readme))
+    @test !occursin("complete implementation of the avro specification", lowercase(changelog))
+    @test !occursin("every logical type", lowercase(logical))
+    @test occursin("big-decimal", logical) && occursin("deferred", logical)
+end
