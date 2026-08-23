@@ -2485,7 +2485,7 @@ Review log:
   network used only for specs, dependencies, and interop tools.
 * Commands and results: recorded in `STATUS.md` in the worktree as phases complete (exact commands,
   Julia versions, pass/fail counts, benchmark numbers).
-* Current state: **plan agreed (Codex round 23: `VERDICT: AGREE`; Claude: no material objections remain); Phases 0–4c implemented and locally validated on Julia 1.10.11 and 1.12.6 (see `STATUS.md`); Phase 4d next.** No production code changed before agreement.
+* Current state: **plan agreed (Codex round 23: `VERDICT: AGREE`; Claude: no material objections remain); Phases 0–4d implemented and locally validated on Julia 1.10.11 and 1.12.6 (see `STATUS.md`); Phase 5 (release engineering) next.** No production code changed before agreement.
 
 ---
 
