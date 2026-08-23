@@ -300,6 +300,7 @@ function nextblock!(r::Reader; walk::Bool=true)
     r.blockindex += 1
     r.blockindex <= r.limits.max_blocks || throw(LimitError(:max_blocks, r.blockindex, r.limits.max_blocks, :max_blocks, :decode))
     addblocks!(r.budget)
+    addrows!(r.budget, Int(count))
     payload = sourcepayload(r.source, Int(size), r.budget)
     for i in 1:16
         (sourceeof(r.source) ? throw(DataError("truncated file", position(r.source))) : sourcebyte(r.source)) == r.sync[i] ||
@@ -731,6 +732,8 @@ end
 
 function Base.push!(w::Writer, datum)
     checkwritable(w)
+    nextrows = checked_add(w.budget.rows, 1)
+    nextrows <= w.limits.max_rows || throw(limiterror(w.budget, :max_rows, nextrows, w.limits.max_rows))
     pf = w.preflight
     fp = nothing
     if datum isa NamedTuple
@@ -757,9 +760,13 @@ function Base.push!(w::Writer, datum)
                               w.pendingvalues + ev > checked_add(checked_mul(w.limits.max_values_per_byte, max(w.encoder.pos, 64)), w.limits.work_allowance))
         flushblock!(w)
     end
+    nextcount = checked_add(w.pendingcount, 1)
+    nextcount <= w.limits.max_block_count ||
+        throw(limiterror(w.budget, :max_block_count, nextcount, w.limits.max_block_count))
     start = w.encoder.pos
     try
         fp === nothing ? encodedatum!(w.plan, w.encoder, datum) : encodealigned!(fp, w.encoder, datum)
+        addrows!(w.budget, 1)
     catch
         w.encoder.pos = start                          # a rejected datum leaves the pending block intact
         rethrow()
@@ -782,6 +789,9 @@ end
 function flushblock!(w::Writer)
     w.pendingcount == 0 && return nothing
     try
+        nextblocks = checked_add(w.budget.blocks, 1)
+        nextblocks <= w.limits.max_blocks ||
+            throw(limiterror(w.budget, :max_blocks, nextblocks, w.limits.max_blocks))
         pf = w.preflight
         chunk = payload = rows = 0
         if pf !== nothing
@@ -824,6 +834,7 @@ function flushblock!(w::Writer)
         for b in w.syncmarker
             Base.write(w.sink, b)
         end
+        addblocks!(w.budget)
     catch e
         poison!(w, e)
         rethrow()

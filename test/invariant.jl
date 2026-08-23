@@ -37,6 +37,23 @@
         @test length(Avro.Table(IOBuffer(emptybytes); limits=lim, ntasks=1)) == 60
         Threads.nthreads() > 1 && @test length(Avro.Table(emptybytes; limits=lim, ntasks=2)) == 60
     end
+    @testset "writer and reader enforce cumulative row and block limits" begin
+        for limits in (Avro.Limits(max_block_count=0), Avro.Limits(max_rows=0))
+            writer = Avro.Writer(IOBuffer(), Avro.NullSchema(); limits=limits)
+            @test_throws Avro.LimitError push!(writer, missing)
+            close(writer; abort=true)
+        end
+        blockwriter = Avro.Writer(IOBuffer(), Avro.NullSchema(); limits=Avro.Limits(max_blocks=0))
+        push!(blockwriter, missing)
+        @test_throws Avro.LimitError close(blockwriter)
+
+        io = IOBuffer()
+        writer = Avro.Writer(io, Avro.NullSchema())
+        push!(writer, missing)
+        close(writer)
+        bytes = take!(io)
+        @test_throws Avro.LimitError Avro.Reader(r -> collect(Avro.eachdatum(r)), IOBuffer(bytes); limits=Avro.Limits(max_rows=0))
+    end
     @testset "a near-ceiling record file through every source mode and guaranteed consumer" begin
         lim = Avro.Limits(max_total_bytes=96 << 20, max_block_bytes=8 << 20, max_codec_memory=16 << 20,
                           max_block_output_bytes=32 << 20, max_bytes=8 << 20, max_datum_bytes=8 << 20)

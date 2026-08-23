@@ -202,7 +202,6 @@ function decodestreamed!(r::Reader, plan, sel::Union{Nothing,Vector{Int}}, colst
     while (blk = nextblock!(r; walk=false)) !== nothing
         reserve!(r.budget, 32)                         # this block's block-table entry (plan §4.4)
         count, bytes = blk
-        addrows!(r.budget, count)
         reserve!(r.budget, bytesbytes(length(bytes)))
         before = r.budget.reserved
         d = Decoder(bytes, r.budget; validate=r.validate)
@@ -351,7 +350,6 @@ function Base.iterate(rows::Rows, ::Nothing=nothing)
         rows.remaining == 0 && release!(b, bytesbytes(length(rows.bytes)))
     end
     rows.remaining -= 1
-    addrows!(b, 1)
     before = b.reserved
     v = decoderow(rows)
     rows.lastcharge = max(b.reserved - before, 0)
@@ -445,7 +443,6 @@ function Base.iterate(it::RowsPartitions, ::Nothing=nothing)
     blk = nextblock!(r; walk=false)
     blk === nothing && return nothing
     count, bytes = blk
-    addrows!(r.budget, count)
     reserve!(r.budget, bytesbytes(length(bytes)))
     before = r.budget.reserved
     d = Decoder(bytes, r.budget; validate=r.validate)
