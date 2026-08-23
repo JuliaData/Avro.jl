@@ -87,6 +87,32 @@
             error("boom")
         end
         @test (@atomic Avro.GUARD.pending) == pending0
+
+        if Threads.nthreads() > 1
+            concurrent = min(Threads.nthreads(), 8)
+            iterations = 10_000
+            large = Avro.Limits(max_total_bytes=16 << 30)
+            budgets = [Avro.Budget(large; available=typemax(Int)) for _ in 1:concurrent]
+            tasks = Task[]
+            for i in 1:concurrent
+                push!(tasks, Threads.@spawn begin
+                    for _ in 1:iterations
+                        Avro.reserve!(budgets[i], Avro.GUARD_CHUNK)
+                    end
+                end)
+            end
+            foreach(errormonitor, tasks)
+            foreach(fetch, tasks)
+            expected = pending0 + concurrent * iterations * Avro.GUARD_CHUNK
+            @test (@atomic Avro.GUARD.pending) == expected
+            drains = Task[]
+            for b in budgets
+                push!(drains, Threads.@spawn Avro.close!(b))
+            end
+            foreach(errormonitor, drains)
+            foreach(fetch, drains)
+            @test (@atomic Avro.GUARD.pending) == pending0
+        end
     end
 
     @testset "prepared reader restores guard after failure" begin
