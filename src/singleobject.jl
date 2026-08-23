@@ -27,8 +27,8 @@ mutable struct SchemaCache <: SchemaStore
     const lock::ReentrantLock
     const max_entries::Int
     const max_bytes::Int
-    const fingerprints::Vector{UInt64}
-    const schemas::Vector{Schema}
+    fingerprints::Vector{UInt64}    # exact-capacity replacement on insert (§4.4 growth rule)
+    schemas::Vector{Schema}
     bytes::Int
 end
 
@@ -60,10 +60,18 @@ function register!(c::SchemaCache, s::Schema; limits::Limits=Limits())
         end
         n = length(c.fingerprints) + 1
         n <= c.max_entries || throw(LimitError(:max_entries, n, c.max_entries, :max_entries, :decode))
-        cost = sizeof(pcf) + 64
+        cost = sizeof(pcf) + 64 + 16                   # PCF text + entry overhead + the two index slots
         c.bytes + cost <= c.max_bytes || throw(LimitError(:max_bytes, c.bytes + cost, c.max_bytes, :max_bytes, :decode))
-        insert!(c.fingerprints, i, fp)
-        insert!(c.schemas, i, s)
+        nf = Vector{UInt64}(undef, n)                  # exact-capacity replacement (§4.4 growth rule):
+        ns = Vector{Schema}(undef, n)                  # capacity equals length, and a failure above
+        copyto!(nf, 1, c.fingerprints, 1, i - 1)       # leaves the table untouched (transactional)
+        copyto!(ns, 1, c.schemas, 1, i - 1)
+        nf[i] = fp
+        ns[i] = s
+        copyto!(nf, i + 1, c.fingerprints, i, n - i)
+        copyto!(ns, i + 1, c.schemas, i, n - i)
+        c.fingerprints = nf
+        c.schemas = ns
         c.bytes += cost
         return fp
     end
@@ -89,15 +97,24 @@ The single-object encoding of `x`: `C3 01`, the little-endian CRC-64-AVRO finger
 Parsing Canonical Form, and the binary datum.
 """
 function encodesingle(s::Schema, x; limits::Limits=Limits())
-    fp = crc64avro(canonical(s; limits=limits))
-    payload = encode(s, x; limits=limits)
-    out = Vector{UInt8}(undef, 10 + length(payload))
-    out[1], out[2] = SINGLE_OBJECT_MARKER
-    for i in 0:7
-        out[3 + i] = UInt8((fp >> (8 * i)) & 0xff)
+    graphinfo(s).repaired_names && throw(ArgumentError("a schema with repaired invalid names has no Parsing Canonical Form"))
+    return withbudget(limits; direction=:encode) do budget    # one operation budget (plan §4.4, amendment round 1)
+        w = BoundedWriter(budget, limits.max_schema_bytes)
+        canonicalprint(w, s, FrozenDict{String,Bool}())
+        fp = crc64avro(String(take!(w.io)))
+        plan = writeplan(s; budget=budget)
+        e = Encoder(budget)
+        encodedatum!(plan, e, x)
+        npayload = e.pos
+        reserve!(budget, bytesbytes(10 + npayload))
+        out = Vector{UInt8}(undef, 10 + npayload)
+        out[1], out[2] = SINGLE_OBJECT_MARKER
+        for i in 0:7
+            out[3 + i] = UInt8((fp >> (8 * i)) & 0xff)
+        end
+        copyto!(out, 11, e.buf, 1, npayload)
+        return out
     end
-    copyto!(out, 11, payload, 1, length(payload))
-    return out
 end
 
 """
@@ -121,13 +138,25 @@ function decodesingle(src::AbstractVector{UInt8}, store::SchemaStore; reader_sch
     end
     writer = lookup(store, fp; limits=limits)
     writer isa Schema || throw(ArgumentError("the schema store returned $(typeof(writer)), not an Avro.Schema"))
-    actual = crc64avro(canonical(writer; limits=limits))
-    actual == fp || throw(DataError("the schema store returned a schema with fingerprint $(string(actual; base=16)) for $(string(fp; base=16))", 3))
     n - 10 <= limits.max_datum_bytes || throw(LimitError(:max_datum_bytes, n - 10, limits.max_datum_bytes, :max_datum_bytes, :decode))
-    payload = view(src, 11:n)
-    reader = T === nothing ? DatumReader(writer; reader_schema=reader_schema, union_resolution=union_resolution, limits=limits, validate=validate, names=names) :
-             DatumReader(writer, T; reader_schema=reader_schema, union_resolution=union_resolution, limits=limits, validate=validate, names=names)
-    return reader(payload)
+    v, plan2, adm = withbudget(limits) do budget               # one operation budget (plan §4.4, amendment round 1)
+        w = BoundedWriter(budget, limits.max_schema_bytes)
+        canonicalprint(w, writer, FrozenDict{String,Bool}())
+        actual = crc64avro(String(take!(w.io)))
+        actual == fp || throw(DataError("the schema store returned a schema with fingerprint $(string(actual; base=16)) for $(string(fp; base=16))", 3))
+        effective = reader_schema === nothing ? writer : reader_schema
+        plan = reader_schema === nothing ? readplan(writer; budget=budget) :
+               resolvingplan(writer, reader_schema; union_resolution=union_resolution, limits=limits)
+        tplan = T === nothing ? plan : typedplan(T, effective, plan, limits)
+        adm0 = admission(names)
+        payload = view(src, 11:n)
+        addinput!(budget, length(payload))
+        d = Decoder(payload, budget; validate=validate)
+        v0 = decodetyped(T === nothing ? Nothing : T, tplan, d, adm0)
+        d.pos == length(payload) + 1 || throw(DataError("trailing bytes after the datum", d.pos + 10))
+        return (v0, tplan, adm0)
+    end
+    return finishtyped(plan2, v, adm)                          # semantic conversion in caller space
 end
 
 function decodesingle(io::IO, store::SchemaStore; limits::Limits=Limits(), kw...)

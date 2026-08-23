@@ -8,14 +8,17 @@ The Parsing Canonical Form of `schema`: primitives as bare strings, named types 
 later references by fullname, no whitespace, no attributes other than the canonical ones. A graph with
 repaired invalid names has no specification PCF and raises `ArgumentError`.
 """
-function canonical(s::Schema; limits::Limits=Limits())
+function canonical(s::Schema; limits::Limits=graphlimits(s))
     graphinfo(s).repaired_names && throw(ArgumentError("a schema with repaired invalid names has no Parsing Canonical Form"))
-    io = IOBuffer()
-    canonicalprint(io, s, FrozenDict{String,Bool}())
-    return String(take!(io))
+    return withbudget(limits) do budget
+        w = BoundedWriter(budget, limits.max_schema_bytes)
+        canonicalprint(w, s, FrozenDict{String,Bool}())
+        return String(take!(w.io))
+    end
 end
 
 function canonicalprint(io::IO, s::Schema, seen::FrozenDict{String,Bool})
+    countnode!(io)
     if s isa PrimitiveSchema
         print(io, '"', kind(s), '"')
     elseif s isa UnionSchema
@@ -40,6 +43,7 @@ function canonicalprint(io::IO, s::Schema, seen::FrozenDict{String,Bool})
             return nothing
         end
         seen[full] = true
+        chargeseen!(io, 32 + sizeof(full))
         print(io, "{\"name\":")
         escapejson(io, full)
         if s isa FixedSchema
@@ -104,7 +108,7 @@ crc64avro(s::AbstractString) = crc64avro(codeunits(s))
 
 A fingerprint of the Parsing Canonical Form: `:crc64avro` (`UInt64`), `:md5` or `:sha256` (bytes).
 """
-function fingerprint(s::Schema; algorithm::Symbol=:crc64avro, limits::Limits=Limits())
+function fingerprint(s::Schema; algorithm::Symbol=:crc64avro, limits::Limits=graphlimits(s))
     pcf = canonical(s; limits=limits)
     algorithm === :crc64avro && return crc64avro(pcf)
     algorithm === :md5 && return MD5.md5(pcf)

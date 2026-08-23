@@ -415,4 +415,42 @@ end
     huge = Avro.RecordSchema("Huge"; fields=[Avro.Field("a", Avro.FixedSchema("A", typemax(Int) - 1)), Avro.Field("b", Avro.FixedSchema("B", 2))])
     @test Avro.minsize(huge) == typemax(Int)
     @test Avro.varintlength(0) == 1 && Avro.varintlength(63) == 1 && Avro.varintlength(64) == 2
+
+    @testset "construction scope enforces graph limits (plan §4.4, amendment round 1)" begin
+        tight = Avro.Limits(max_schema_nodes=1)
+        @test_throws Avro.LimitError Avro.ArraySchema(Avro.LongSchema(); limits=tight)
+        @test_throws Avro.LimitError Avro.NullSchema(; limits=Avro.Limits(max_schema_nodes=0))
+        @test_throws Avro.LimitError Avro.FixedSchema("x"^2000, 4)                       # name bytes
+        @test_throws Avro.LimitError Avro.FixedSchema("F", 4; limits=Avro.Limits(max_named_types=0))
+        @test_throws Avro.LimitError Avro.schema(NamedTuple{(:a,),Tuple{Int64}}; limits=Avro.Limits(max_schema_nodes=1))
+        @test_throws Avro.LimitError Avro.EnumSchema("E", ["a", "b", "c"]; limits=Avro.Limits(max_enum_symbols=2))
+        let s = Avro.LongSchema(), lim = Avro.Limits(max_schema_depth=4)
+            e = try
+                for _ in 1:6
+                    s = Avro.ArraySchema(s; limits=lim)
+                end
+                nothing
+            catch err
+                err
+            end
+            @test e isa Avro.LimitError && e.limit === :max_schema_depth
+        end
+        @test Avro.json(Avro.ArraySchema(Avro.LongSchema())) == "{\"type\":\"array\",\"items\":\"long\"}"
+    end
+
+    @testset "bounded charging printers (plan §4.4, amendment round 1)" begin
+        s = P("{\"type\":\"record\",\"name\":\"BP\",\"fields\":[{\"name\":\"a\",\"type\":\"long\"},{\"name\":\"b\",\"type\":\"string\"}]}")
+        tiny = Avro.Limits(max_schema_bytes=16)
+        for f in (Avro.json, Avro.canonical, Avro.fingerprint)
+            e = try
+                f(s; limits=tiny)
+                nothing
+            catch err
+                err
+            end
+            @test e isa Avro.LimitError && e.limit === :max_schema_bytes
+        end
+        @test Avro.json(s) == Avro.json(Avro.parseschema(Avro.json(s)))                  # recorded-limits default round-trips
+        @test occursin("BP", sprint(show, s))                                            # show never throws for admitted schemas
+    end
 end

@@ -90,4 +90,25 @@
         @test e isa Avro.UnknownSchemaError && e.fingerprint == Avro.fingerprint(ws)
         @test occursin("fingerprint", sprint(showerror, e))
     end
+
+    @testset "one operation budget; transactional exact-capacity cache (plan §4.4, amendment round 1)" begin
+        s1 = P("{\"type\":\"record\",\"name\":\"C1\",\"fields\":[{\"name\":\"a\",\"type\":\"long\"}]}")
+        s2 = P("{\"type\":\"record\",\"name\":\"C2\",\"fields\":[{\"name\":\"a\",\"type\":\"long\"}]}")
+        c = Avro.SchemaCache(max_entries=1)
+        fp1 = Avro.register!(c, s1)
+        @test_throws Avro.LimitError Avro.register!(c, s2)                               # the failed insert left the table untouched
+        @test length(c) == 1 && Avro.lookup(c, fp1) === s1
+        cb = Avro.SchemaCache(max_bytes=8)
+        @test_throws Avro.LimitError Avro.register!(cb, s1)
+        @test length(cb) == 0
+        c2 = Avro.SchemaCache()
+        for s in (s1, s2)
+            Avro.register!(c2, s)
+        end
+        @test length(c2.fingerprints) == length(c2.schemas) == 2                          # exact-capacity replacement
+        msg = Avro.encodesingle(s1, (a=Int64(7),))
+        @test Avro.decodesingle(msg, c2).a === Int64(7)
+        big = Avro.encodesingle(s1, (a=typemax(Int64),))
+        @test Avro.decodesingle(big, c2).a === typemax(Int64)
+    end
 end
