@@ -521,9 +521,9 @@ Base.@kwdef struct Limits
     max_codec_memory::Int     = 32 << 20      # ONE meaning: cap on the COMPLETE decoder memory requirement of one codec member as reported by the library (xz `memlimit`; zstd `ZSTD_estimateDStreamSize_fromFrame`); enforced on every frame read and written (§4.9)
     # ONE per-operation ceiling for package-owned memory (committed output + in-flight reservations + internal tables + owned input copies + codec workspaces)
     max_total_bytes::Int      = 256 << 20     # FIXED, portable default (256 MiB); raise explicitly on every side that processes the data
-    max_total_values::Int     = 1 << 28       # values decoded or encoded, including zero-size ones (provisional; set by the latency gate below)
+    max_total_values::Int     = 3 << 26       # values decoded or encoded, including zero-size ones (finalised, round-1 calibration: the worst legal shape - depth-80 record skipping - is bounded by total values, not density; 2^28 values measured 9.5-9.6 s against the 10 s gate on the authoring host, and 3*2^26 (~201M) restores ~28% headroom)
     max_rows::Int             = 1 << 28       # container datums per operation (provisional; same gate)
-    max_values_per_byte::Int  = 16            # WORK RULE: values ≤ max_values_per_byte × input bytes + work_allowance (one allowance per operation; provisional)
+    max_values_per_byte::Int  = 16            # WORK RULE: values <= max_values_per_byte x input bytes + work_allowance (one allowance per operation)
         work_allowance::Int       = 65_536        #   input bytes = decompressed block bytes + block framing + raw datum bytes + JSON text bytes (never compressed size)
     max_compare_bytes_per_byte::Int = 64      # COMPARISON RULE: key bytes compared by duplicate-key detection and map construction/lookup ≤ 64 × input bytes + work_allowance
         max_resolution_work::Int  = 1_000_000     # match attempts + memo entries + resolving-plan nodes per resolve()

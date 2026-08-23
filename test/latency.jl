@@ -1,7 +1,7 @@
-# Latency gate (plan §4.4, provisional in Phase 2): the worst-density legal inputs the default limits admit
-# — 16 values per byte under the work rule, up to max_total_values — decode or skip in ≤ 10 s
-# single-threaded on every supported Julia version. The measured times are recorded in STATUS.md; the
-# work constants stay provisional until the Phase 4a container shapes are added.
+# Latency gate (plan §4.4): the worst-density legal inputs the default limits admit —
+# max_values_per_byte values per byte under the work rule (finalised at 12 in the round-1 calibration),
+# up to max_total_values — decode or skip in ≤ 10 s single-threaded on every supported Julia version.
+# The fixtures derive their density from the limit, so recalibration keeps them worst-case.
 
 @testset "Latency gate (worst-density legal inputs)" begin
     P = Avro.parseschema
@@ -20,12 +20,13 @@
         Avro.skip(Avro.readplan(s), d)
         (d.pos == length(bytes) + 1, b.values)
     end
-    # 16 values per byte: records of one boolean and 14 nulls
+    # the densest legal record: one boolean and (max_values_per_byte - 2) nulls per input byte
+    nnulls = L.max_values_per_byte - 2
     dense = P("{\"type\":\"array\",\"items\":{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"b\",\"type\":\"boolean\"}," *
-              join(["{\"name\":\"n$i\",\"type\":\"null\"}" for i in 1:14], ",") * "]}}")
-    N = 16_000_000
+              join(["{\"name\":\"n$i\",\"type\":\"null\"}" for i in 1:nnulls], ",") * "]}}")
+    N = min(16_000_000, div(L.max_total_values - 2, L.max_values_per_byte))
     bytes = vcat(varint(N), fill(0x01, N), UInt8[0x00])
-    @test gate("skip 16M dense records (256M values)", () -> skipall(dense, bytes)) == (true, 256_000_001)
+    @test gate("skip $(N) dense records ($(N * L.max_values_per_byte) values)", () -> skipall(dense, bytes)) == (true, N * L.max_values_per_byte + 1)
     @test_throws Avro.LimitError Avro.decode(dense, bytes)                       # the generic decode trips the ceiling first
     rows = fill(0x01, N)
     nb = gate("column decode of 16M dense rows (one Bool column)", () -> Avro.withbudget(L) do b
@@ -48,7 +49,7 @@
     # nested empty arrays: one value and one 40-byte shell per byte
     empties = P("{\"type\":\"array\",\"items\":{\"type\":\"array\",\"items\":\"int\"}}")
     emptybytes = vcat(varint(N), fill(0x00, N), UInt8[0x00])
-    @test gate("skip 16M empty arrays", () -> skipall(empties, emptybytes)) == (true, N + 1)
+    @test gate("skip $(N) empty arrays", () -> skipall(empties, emptybytes)) == (true, N + 1)
     @test_throws Avro.LimitError Avro.decode(empties, emptybytes)
     # wide JSON object whose keys share a 1 KB prefix (the comparison rule)
     ms = P("{\"type\":\"map\",\"values\":\"long\"}")

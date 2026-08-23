@@ -65,11 +65,11 @@ end
 A record into a `NamedTuple` or plain struct: `plans` are the per-schema-field plans in schema order and
 `MAP[k]` is the schema field feeding target field `k` (0 → `defaults[k]`).
 """
-struct RecordTarget{T,PS<:Tuple,MAP} <: TypedPlan
-    schema::RecordSchema
-    plans::PS
-    defaults::Vector{Any}
-    shell::Int          # measured per `T` from an empty probe (plan §4.4, R10)
+mutable struct RecordTarget{T,PS<:Tuple,MAP} <: TypedPlan   # heap identity: an inline immutable would
+    const schema::RecordSchema                                # re-box on every `plan` field load (§10.2)
+    const plans::PS
+    const defaults::Vector{Any}
+    const shell::Int    # measured per `T` from an empty probe (plan §4.4, R10)
 end
 
 "Recursion through the user's own recursive types (filled after construction; a function barrier)."
@@ -364,11 +364,11 @@ function typedvalue(p::ResolvedNullableTarget{N}, d::Decoder, names) where {N}
 end
 
 "A resolved record decoded stepwise (writer order) directly into `T` (plan §4.8, R18)."
-struct ResolvedRecordTarget{T,PS<:Tuple,SLOTMAP} <: TypedPlan
-    schema::RecordSchema
-    plans::PS            # one target per writer step, writer order (SkipTarget when unmapped)
-    defaults::Vector{Any}
-    shell::Int
+mutable struct ResolvedRecordTarget{T,PS<:Tuple,SLOTMAP} <: TypedPlan
+    const schema::RecordSchema
+    const plans::PS      # one target per writer step, writer order (SkipTarget when unmapped)
+    const defaults::Vector{Any}
+    const shell::Int
 end
 
 function buildresolvedrecord(::Type{T}, s::RecordSchema, p::ResolvedRecordPlan, memo::TypedMemo) where {T}

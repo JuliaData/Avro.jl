@@ -42,40 +42,50 @@ end
 Decode one datum (the byte form rejects trailing bytes; the `IO` form reads at most
 `max_datum_bytes + 1` bytes and errors if bytes remain).
 """
-function (r::DatumReader{T,P})(bytes::AbstractVector{UInt8}) where {T,P}
+const EMPTY_BYTES = UInt8[]                            # shared, never written: decoders only read `buf`
+
+@inline function (r::DatumReader{T,P})(bytes::AbstractVector{UInt8}) where {T,P}
     v, next = r(bytes, 1)
     next == length(bytes) + 1 || throw(DataError("trailing bytes after the datum", next))
     return v
 end
 
-function (r::DatumReader{T,P})(bytes::AbstractVector{UInt8}, pos::Integer) where {T,P}
-    if bytes isa Vector{UInt8} && length(bytes) <= r.limits.max_datum_bytes
-        sc = @atomicswap(r.scratch = nothing)          # pooled per-call state: ≤ 1 allocation per decode (§10.2)
-        d = sc isa Decoder{Vector{UInt8}} ? sc : Decoder(UInt8[], Budget(r.limits); validate=r.validate)
-        recycle = false
-        try
-            resetbudget!(d.budget)
-            d.buf = bytes
-            d.pos = Int(pos)
-            d.stop = length(bytes)
-            d.depth = 0
-            1 <= pos <= length(bytes) + 1 || throw(ArgumentError("position $pos out of range"))
-            addinput!(d.budget, length(bytes) - Int(pos) + 1)
-            v = decodetyped(T, r.plan, d, r.names)
-            next = d.pos
-            recycle = true
-        finally
-            d.buf = UInt8[]                            # never pin the caller's bytes from the pool
-            close!(d.budget)
-            recycle && @atomicswap(r.scratch = d)     # a failed call drops its scratch instead
-        end
-        return (finishtyped(r.plan, v, r.names), next)
+@inline function (r::DatumReader{T,P})(bytes::AbstractVector{UInt8}, pos::Integer) where {T,P}
+    bytes isa Vector{UInt8} && length(bytes) <= r.limits.max_datum_bytes && return pooledcall(r, bytes, Int(pos))
+    return slowcall(r, bytes, Int(pos))
+end
+
+"The pooled per-call path: ≤ 1 payload allocation per decode (§10.2; its own scope, so nothing boxes)."
+@inline function pooledcall(r::DatumReader{T,P}, bytes::Vector{UInt8}, pos::Int) where {T,P}
+    sc = @atomicswap(r.scratch = nothing)
+    d = sc isa Decoder{Vector{UInt8}} ? sc : Decoder(UInt8[], Budget(r.limits); validate=r.validate)
+    recycle = false
+    local v, next
+    try
+        resetbudget!(d.budget)
+        d.buf = bytes
+        d.pos = pos
+        d.stop = length(bytes)
+        d.depth = 0
+        1 <= pos <= length(bytes) + 1 || throw(ArgumentError("position $pos out of range"))
+        addinput!(d.budget, length(bytes) - pos + 1)
+        v = decodetyped(T, r.plan, d, r.names)
+        next = d.pos
+        recycle = true
+    finally
+        d.buf = EMPTY_BYTES                            # never pin the caller's bytes from the pool
+        close!(d.budget)
+        recycle && @atomicswap(r.scratch = d)          # a failed call drops its scratch instead
     end
+    return (finishtyped(r.plan, v, r.names), next)
+end
+
+function slowcall(r::DatumReader{T,P}, bytes::AbstractVector{UInt8}, pos::Int) where {T,P}
     v, next = withbudget(r.limits) do budget
         buf = sourcebytes(bytes, r.limits.max_datum_bytes, budget, DataError)
         1 <= pos <= length(buf) + 1 || throw(ArgumentError("position $pos out of range"))
         addinput!(budget, length(buf) - pos + 1)
-        d = Decoder(buf, budget; pos=Int(pos), validate=r.validate)
+        d = Decoder(buf, budget; pos=pos, validate=r.validate)
         return (decodetyped(T, r.plan, d, r.names), d.pos)
     end
     return (finishtyped(r.plan, v, r.names), next)     # semantic conversion runs in caller space

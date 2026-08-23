@@ -18,7 +18,7 @@ on every side that processes the data (writers enforce every limit readers enfor
 Fields (defaults): `max_depth` (1024), `max_bytes` (64 MiB), `max_datum_bytes` (64 MiB),
 `max_json_depth` (1024), `max_block_bytes` (16 MiB), `max_block_count` (2^24),
 `max_block_output_bytes` (64 MiB), `max_blocks` (2^28), `max_codec_memory` (32 MiB),
-`max_total_bytes` (256 MiB), `max_total_values` (2^28), `max_rows` (2^28), `max_values_per_byte` (16),
+`max_total_bytes` (256 MiB), `max_total_values` (3*2^26), `max_rows` (2^28), `max_values_per_byte` (16),
 `work_allowance` (65,536), `max_compare_bytes_per_byte` (64), `max_resolution_work` (1,000,000),
 `max_schema_bytes` (16 MiB), `max_schema_depth` (256), `max_schema_nodes` (1,000,000), `max_fields`
 (65,535), `max_union_branches` (1,024), `max_enum_symbols` (65,535), `max_name_bytes` (1,024),
@@ -66,7 +66,7 @@ const LIMIT_DEFAULTS = (
     max_blocks = 1 << 28,
     max_codec_memory = 32 * MiB,
     max_total_bytes = 256 * MiB,
-    max_total_values = 1 << 28,
+    max_total_values = 3 << 26,
     max_rows = 1 << 28,
     max_values_per_byte = 16,
     work_allowance = 65_536,
