@@ -116,6 +116,18 @@ function carry_unlocked!(a::SymbolAdmission)
     return nothing
 end
 
+"The merge scratch that `schedule_unlocked!` will need after appending a `RUN_BASE` carry."
+function carrymergescratch(a::SymbolAdmission)
+    a.merge === nothing || return 0
+    right = RUN_BASE
+    for i in length(a.runs):-1:1
+        left = length(a.runs[i])
+        left == right && return checked_mul(8, checked_add(left, right))
+        right = left
+    end
+    return 0
+end
+
 """
     admit!(admission, s::AbstractString) -> Symbol
 
@@ -130,9 +142,8 @@ function admit!(a::SymbolAdmission, s::AbstractString)
         ncount <= a.max_names || throw(LimitError(:max_names, ncount, a.max_names, :max_names, :decode))
         nbytes = checked_add(a.bytes, sizeof(str) + 8)
         nbytes <= a.max_bytes || throw(LimitError(:max_bytes, nbytes, a.max_bytes, :max_bytes, :decode))
-        if length(a.recent) + 1 == RUN_BASE && a.merge === nothing &&
-           !isempty(a.runs) && length(a.runs[end]) == RUN_BASE
-            need = checked_add(nbytes, 8 * 2 * RUN_BASE)     # the carry would stage a (RUN_BASE, RUN_BASE) merge
+        if length(a.recent) + 1 == RUN_BASE
+            need = checked_add(nbytes, carrymergescratch(a))
             need <= a.max_bytes || throw(LimitError(:max_bytes, need, a.max_bytes, :max_bytes, :decode))
         end
         push!(a.recent, str)
