@@ -1075,9 +1075,15 @@ end
 # ---- public constructors ---------------------------------------------------------------------------
 
 function build(::Type{T}, propsin; logical=nothing, limits::Limits=Limits()) where {T<:PrimitiveSchema}
-    p = makeprops(propsin, ("type",), T === IntSchema || T === LongSchema || T === BytesSchema || T === StringSchema ? logical : nothing)
+    haslogical = T === IntSchema || T === LongSchema || T === BytesSchema || T === StringSchema
+    p = makeprops(propsin, ("type",), haslogical ? logical : nothing)
     meta = NodeMeta()
-    s = T <: Union{IntSchema,LongSchema,BytesSchema,StringSchema} ? T(logical, p, meta) : T(p, meta)
+    if haslogical
+        k = T === IntSchema ? :int : T === LongSchema ? :long : T === BytesSchema ? :bytes : :string
+        s = T(evaluatelogical(k, 0, p), p, meta)
+        return finalizepublic!(s, limits, 1, 0)
+    end
+    s = T(p, meta)
     return finalizepublic!(s, limits, 1, 0)
 end
 

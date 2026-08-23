@@ -322,6 +322,12 @@
         @test i.logical isa Avro.DateLogical && i.props["logicalType"] == "date" && Avro.json(i) == "{\"type\":\"int\",\"logicalType\":\"date\"}"
         b = Avro.BytesSchema(; logical=Avro.DecimalLogical(9, 2), props=(doc="x",))
         @test b.logical == Avro.DecimalLogical(9, 2) && b.props["precision"] == 9 && b == P(Avro.json(b))
+        for invalid in (Avro.IntSchema(; logical=Avro.UUIDLogical()),
+                        Avro.BytesSchema(; logical=Avro.DateLogical()),
+                        Avro.StringSchema(; logical=Avro.TimestampMillis()))
+            @test invalid.logical === nothing
+            @test invalid == P(Avro.json(invalid))
+        end
         @test_throws ArgumentError Avro.IntSchema(; props=(type="x",))
         @test_throws ArgumentError Avro.IntSchema(; logical=Avro.DateLogical(), props=(logicalType="y",))
         @test Avro.NullSchema() == P("\"null\"") && Avro.StringSchema() == P("\"string\"")
