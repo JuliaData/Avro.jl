@@ -116,14 +116,41 @@ function carry_unlocked!(a::SymbolAdmission)
     return nothing
 end
 
-"The merge scratch that `schedule_unlocked!` will need after appending a `RUN_BASE` carry."
-function carrymergescratch(a::SymbolAdmission)
-    a.merge === nothing || return 0
-    right = RUN_BASE
-    for i in length(a.runs):-1:1
-        left = length(a.runs[i])
-        left == right && return checked_mul(8, checked_add(left, right))
-        right = left
+"The run length at `i` after the active merge completes, without mutating the run table."
+function completedrunlength(a::SymbolAdmission, i::Int, at::Int, merged::Int)
+    if i < at
+        return length(a.runs[i])
+    elseif i == at
+        return merged
+    end
+    return length(a.runs[i + 1])
+end
+
+"Scratch needed by the next schedule after one maintenance step and an optional carry."
+function nextmergescratch(a::SymbolAdmission, carry::Bool)
+    active = a.merge
+    completed = false
+    at = 0
+    merged = 0
+    nruns = length(a.runs)
+    if active !== nothing
+        k = active.i + active.j - 1
+        remaining = length(active.out) - k + 1
+        remaining > MERGE_STEP && return 0             # the current merge still owns the scheduler
+        completed = true
+        at = a.mergeat
+        merged = checked_add(length(active.x), length(active.y))
+        nruns -= 1
+    end
+    for i in nruns - 1:-1:1
+        left = completed ? completedrunlength(a, i, at, merged) : length(a.runs[i])
+        right = completed ? completedrunlength(a, i + 1, at, merged) : length(a.runs[i + 1])
+        left == right || continue
+        return checked_mul(8, checked_add(left, right))
+    end
+    if carry && nruns > 0
+        right = completed ? completedrunlength(a, nruns, at, merged) : length(a.runs[nruns])
+        right == RUN_BASE && return checked_mul(16, RUN_BASE)
     end
     return 0
 end
@@ -141,17 +168,20 @@ function admit!(a::SymbolAdmission, s::AbstractString; budget::Union{Nothing,Bud
             a.merge === nothing || addcompare!(budget, 8 * MERGE_STEP)
         end
         if contains_unlocked(a, s)
-            step_unlocked!(a)                          # a successful repeat admission still advances maintenance
+            # A repeat may advance maintenance, but it must remain admissible after the table reaches
+            # its byte ceiling. Defer a cascade that has no scratch headroom; source runs remain live
+            # and searchable until a later admission can complete it.
+            scratch = nextmergescratch(a, false)
+            checked_add(a.bytes, scratch) <= a.max_bytes && step_unlocked!(a)
             return nothing
         end
         ncount = a.count + 1                           # every admission check precedes any mutation —
         ncount <= a.max_names || throw(LimitError(:max_names, ncount, a.max_names, :max_names, :decode))
         nbytes = checked_add(a.bytes, nbytes0 + 8)     # a rejected admission advances no maintenance
         nbytes <= a.max_bytes || throw(LimitError(:max_bytes, nbytes, a.max_bytes, :max_bytes, :decode))
-        if length(a.recent) + 1 == RUN_BASE
-            need = checked_add(nbytes, carrymergescratch(a))
-            need <= a.max_bytes || throw(LimitError(:max_bytes, need, a.max_bytes, :max_bytes, :decode))
-        end
+        carry = length(a.recent) + 1 == RUN_BASE
+        need = checked_add(nbytes, nextmergescratch(a, carry))
+        need <= a.max_bytes || throw(LimitError(:max_bytes, need, a.max_bytes, :max_bytes, :decode))
         step_unlocked!(a)                              # maintenance advances only for accepted admissions
         push!(a.recent, String(s))
         a.count = ncount
