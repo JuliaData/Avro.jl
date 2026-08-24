@@ -32,8 +32,8 @@ function prescanblocks(r::Reader)
     src = r.source::BytesSource
     tablecap = 64
     reserve!(r.budget, blocktablecharge(tablecap))     # the block table grows by reserved exact-capacity replacement (§4.4)
-    entries = BlockEntry[]
-    sizehint!(entries, tablecap)
+    entries = Vector{BlockEntry}(undef, tablecap)
+    nentries = 0
     rows = 0
     pending = nothing
     startpos = src.pos
@@ -47,26 +47,29 @@ function prescanblocks(r::Reader)
             (0 <= size <= r.limits.max_block_bytes) ||
                 (size < 0 ? throw(DataError("negative block size $size", position(src))) :
                  throw(LimitError(:max_block_bytes, Int(size), r.limits.max_block_bytes, :max_block_bytes, :decode)))
-            length(entries) < r.limits.max_blocks ||
-                throw(LimitError(:max_blocks, length(entries) + 1, r.limits.max_blocks, :max_blocks, :decode))
+            nentries < r.limits.max_blocks ||
+                throw(LimitError(:max_blocks, nentries + 1, r.limits.max_blocks, :max_blocks, :decode))
             off = src.pos
             Int(size) <= src.stop - off + 1 || throw(DataError("truncated file", off))
             src.pos = off + Int(size)
             for i in 1:16
                 (sourceeof(src) ? throw(DataError("truncated file", src.pos)) : sourcebyte(src)) == r.sync[i] ||
-                    throw(DataError("sync marker mismatch after block $(length(entries) + 1)", src.pos))
+                    throw(DataError("sync marker mismatch after block $(nentries + 1)", src.pos))
             end
             newrows = checked_add(rows, Int(count))
             newrows <= r.limits.max_rows ||
                 throw(LimitError(:max_rows, newrows, r.limits.max_rows, :max_rows, :decode))
-            if length(entries) == tablecap
-                newcap = 2 * tablecap
+            if nentries == tablecap
+                newcap = checked_mul(2, tablecap)
                 reserve!(r.budget, blocktablecharge(newcap))
+                replacement = Vector{BlockEntry}(undef, newcap)
+                copyto!(replacement, 1, entries, 1, nentries)
                 release!(r.budget, blocktablecharge(tablecap))
+                entries = replacement
                 tablecap = newcap
-                sizehint!(entries, tablecap)
             end
-            push!(entries, BlockEntry(length(entries) + 1, off, Int(size), Int(count), rows + 1))
+            nentries += 1
+            entries[nentries] = BlockEntry(nentries, off, Int(size), Int(count), rows + 1)
             rows = newrows
         end
     catch e
@@ -74,6 +77,7 @@ function prescanblocks(r::Reader)
         pending = e
     end
     src.pos = startpos
+    resize!(entries, nentries)
     return PrescanResult(entries, rows, pending)
 end
 

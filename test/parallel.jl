@@ -18,6 +18,20 @@
     entriesof(bs) = Avro.Reader(IOBuffer(bs)) do r
         Avro.prescanblocks(r).entries
     end
+    @testset "block-table growth retains only the charged capacity" begin
+        tinyrows = [(a=Int64(i), b="", c=missing, e="X") for i in 1:65]
+        tinybytes = take!(Avro.tobuffer(tinyrows; schema=s, codec=:null, block_bytes=1))
+        reader = Avro.Reader(IOBuffer(tinybytes))
+        baseline = reader.budget.reserved
+        pre = Avro.prescanblocks(reader)
+        @test length(pre.entries) == 65
+        @static if VERSION >= v"1.11"
+            @test Avro.capacity(pre.entries) == 128
+        end
+        @test reader.budget.reserved - baseline == Avro.blocktablecharge(128)
+        Avro.release!(reader.budget, Avro.blocktablecharge(128))
+        close(reader)
+    end
     for nt in (0, -1, big(typemax(Int)) + 1)
         @test_throws ArgumentError Avro.Table(IOBuffer(bytes); ntasks=nt)
     end
