@@ -168,6 +168,64 @@ function Tables.getcolumn(t::Table, nm::Symbol)
 end
 Tables.partitions(t::Table) = (subtable(t, r) for r in getfield(t, :blockranges))
 
+# Tables' generic column-to-row fallback derives the row count from the first column, so it yields no
+# rows for a zero-column table. Keep Table's column-access contract, but provide a row view that uses
+# the authoritative `nrows` field. This preserves row counts when `select=()` is written again.
+struct _TableRows
+    table::Table
+end
+
+struct _TableRow <: Tables.AbstractRow
+    table::Table
+    index::Int
+end
+
+function Tables.rows(t::Table)
+    return _TableRows(t)
+end
+
+function Tables.isrowtable(::Type{_TableRows})
+    return true
+end
+
+function Tables.schema(rows::_TableRows)
+    return Tables.schema(getfield(rows, :table))
+end
+
+function Tables.columnnames(rows::_TableRows)
+    return Tables.columnnames(getfield(rows, :table))
+end
+
+function Base.IteratorSize(::Type{_TableRows})
+    return Base.HasLength()
+end
+
+function Base.eltype(::Type{_TableRows})
+    return _TableRow
+end
+
+function Base.length(rows::_TableRows)
+    return length(getfield(rows, :table))
+end
+
+function Base.iterate(rows::_TableRows, index::Int=1)
+    table = getfield(rows, :table)
+    index > length(table) && return nothing
+    return (_TableRow(table, index), index + 1)
+end
+
+function Tables.columnnames(row::_TableRow)
+    return Tables.columnnames(getfield(row, :table))
+end
+
+function Tables.getcolumn(row::_TableRow, column::Int)
+    return Tables.getcolumn(getfield(row, :table), column)[getfield(row, :index)]
+end
+
+function Tables.getcolumn(row::_TableRow, name::Symbol)
+    return Tables.getcolumn(getfield(row, :table), name)[getfield(row, :index)]
+end
+
 function subtable(t::Table, range::UnitRange{Int})
     return Table(getfield(t, :schema), getfield(t, :writerschema), getfield(t, :names),
                  AbstractVector[view(c, range) for c in getfield(t, :columns)], length(range), [1:length(range)],

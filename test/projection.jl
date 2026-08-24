@@ -60,8 +60,7 @@
                 # recursive root the projection is graph-wide, so nested records re-encode projected and
                 # only the schema and row count round-trip value-independently
                 names = collect(Tables.columnnames(full))
-                isempty(names) && continue
-                sel = [names[end]]
+                sel = isempty(names) ? Symbol[] : [names[end]]
                 pt = Avro.Table(IOBuffer(bytes); select=Tuple(sel), validate=val, limits=raised)
                 io = IOBuffer()
                 Avro.write(io, pt; limits=raised)
@@ -70,7 +69,7 @@
                 @test Avro.json(Avro.schema(t2)) == Avro.json(Avro.schema(pt))
                 @test length(t2) == length(pt)
                 recursive = occursin("recursive", label)
-                recursive || @test isequal(Tables.getcolumn(t2, 1), Tables.getcolumn(pt, 1))
+                recursive || @test isequal(Tables.columntable(t2), Tables.columntable(pt))
             end
         end
     end
