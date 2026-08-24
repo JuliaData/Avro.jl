@@ -31,10 +31,10 @@ const OBJECT_HEADER = 8   # the type-tag word of every heap object (not counted 
 function measurestorage()
     ss = Base.summarysize
     vector = ss(UInt8[])
-    slot = ss(Any[Int64(1)]) - ss(Any[]) - sizeof(Int64)
+    slot = ss(Any[Int64(1)]) - ss([]) - sizeof(Int64)
     tag = (ss(Vector{Union{Missing,Int64}}(undef, 8)) - vector) ÷ 8 - sizeof(Int64)
     emptyrecord = Record(RecordSchema(FullName("Probe", ""), freeze!(FrozenVector{String}()), freeze!(FrozenVector{String}()), nothing, false,
-                                      Props(), freeze!(FrozenVector{Field}()), freeze!(FrozenDict{String,Int}()), NodeMeta()), Any[], Val(:unchecked))
+                                      Props(), freeze!(FrozenVector{Field}()), freeze!(FrozenDict{String,Int}()), NodeMeta()), [], Val(:unchecked))
     fixedschema = FixedSchema(FullName("Probe", ""), freeze!(FrozenVector{String}()), freeze!(FrozenVector{String}()), 0, nothing, Props(), NodeMeta())
     enumschema = EnumSchema(FullName("Probe", ""), freeze!(FrozenVector{String}()), freeze!(FrozenVector{String}()), nothing,
                             freeze!(FrozenVector{String}(["a"], false)), nodefault, freeze!(FrozenDict{String,Int}()), Props(), NodeMeta())

@@ -42,7 +42,7 @@ end
 # Copy `key => value` pairs into owned key and `Any` value vectors (one method instance for every input type).
 function collectpairs(@nospecialize(pairs))
     ks = String[]
-    vs = Any[]
+    vs = []
     for (k, v) in pairs
         push!(ks, mapkey(k))
         push!(vs, v)

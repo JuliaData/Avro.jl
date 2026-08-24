@@ -351,7 +351,7 @@ function decodestring(buf::AbstractVector{UInt8}, i::Int, j::Int)
         end
     end
     hasescape || return String(buf[i + 1:j - 1])
-    out = Vector{UInt8}()
+    out = UInt8[]
     sizehint!(out, j - i)
     k = i + 1
     while k < j
@@ -542,7 +542,7 @@ function parseobject!(r::JSONReader)
     enter!(r)
     r.pos += 1
     keys = String[]
-    vals = Any[]
+    vals = []
     spans = UnitRange{Int}[]
     charge!(r, 128)
     skipws!(r)

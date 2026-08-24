@@ -170,7 +170,7 @@ function resolvenode(ctx::ResolveContext, w::Schema, r::Schema, wp::String, rp::
     addresolution!(ctx.budget, 1)
     cached = memolookup(ctx, w, r)
     cached === nothing || return cached
-    schemaequal(w, r, Vector{Vector{Int32}}(), ctx.budget) && return memostore!(ctx, w, r, readerplan(ctx, r))   # identical subtree: the plain reader plan
+    schemaequal(w, r, Vector{Int32}[], ctx.budget) && return memostore!(ctx, w, r, readerplan(ctx, r))   # identical subtree: the plain reader plan
     return memostore!(ctx, w, r, resolvekinds(ctx, w, r, wp, rp))
 end
 

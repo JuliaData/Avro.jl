@@ -373,7 +373,7 @@ function decodevalue(p::ArrayPlan, d::Decoder)
         first = false
     end
     leave!(d)
-    g === nothing && (reserve!(d.budget, STORAGE[].vector); return p.eltype === Any ? Any[] : Vector{p.eltype}(undef, 0))
+    g === nothing && (reserve!(d.budget, STORAGE[].vector); return p.eltype === Any ? [] : Vector{p.eltype}(undef, 0))
     return finish!(g, d)
 end
 

@@ -201,7 +201,7 @@ end
 "The streamed consumer: per-block exact chunk columns assembled once at the end (plan §4.4/§4.9)."
 function decodestreamed!(r::Reader, plan, sel::Union{Nothing,Vector{Int}}, colstypes::Vector{Type})
     counts = Int[]
-    chunkcols = Vector{Vector{AbstractVector}}()
+    chunkcols = Vector{AbstractVector}[]
     reserve!(r.budget, blocktablecharge(0))
     slotrow = sum(slotbytes, colstypes; init=0)
     while (blk = nextblock!(r; walk=false)) !== nothing

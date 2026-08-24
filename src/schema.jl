@@ -820,7 +820,7 @@ function Base.:(==)(a::Schema, b::Schema)
     typeof(a) === typeof(b) || return false
     limits = larger(graphinfo(a).limits, graphinfo(b).limits)
     budget = Budget(limits; available=typemax(Int) ÷ 4)
-    visited = Vector{Vector{Int32}}()   # per a-node sorted partner ids
+    visited = Vector{Int32}[]   # per a-node sorted partner ids
     return schemaequal(a, b, visited, budget)
 end
 

@@ -56,7 +56,7 @@ function register!(c::SchemaCache, s::Schema; limits::Limits=Limits())
         i = searchsortedfirst(c.fingerprints, fp)
         if i <= length(c.fingerprints) && c.fingerprints[i] == fp
             existing = c.schemas[i]
-            same = schemaequal(existing, s, Vector{Vector{Int32}}(), budget)
+            same = schemaequal(existing, s, Vector{Int32}[], budget)
             same || throw(AmbiguousSchemaError(fp, existing, s))
             return fp
         end
