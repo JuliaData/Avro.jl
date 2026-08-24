@@ -80,6 +80,44 @@
         @test length(Avro.Table(IOBuffer(emptybytes); limits=lim, ntasks=1)) == 60
         Threads.nthreads() > 1 && @test length(Avro.Table(emptybytes; limits=lim, ntasks=2)) == 60
     end
+    @testset "writer and reader use identical container work counters" begin
+        limits = Avro.Limits(max_total_values=16)
+        schema = Avro.StringSchema()
+        io = IOBuffer()
+        writer = Avro.Writer(io, schema; limits=limits)
+        push!(writer, "x")
+        close(writer)
+        bytes = take!(io)
+        writerstate = (values=writer.budget.values, input_bytes=writer.budget.input_bytes,
+                       rows=writer.budget.rows, blocks=writer.budget.blocks,
+                       members=writer.budget.members, compare_bytes=writer.budget.compare_bytes,
+                       allowance_used=Avro.allowanceused(writer.budget))
+        values, readerstate = Avro.Reader(IOBuffer(bytes); limits=limits) do reader
+            decoded = collect(Avro.eachdatum(reader))
+            state = (values=reader.budget.values, input_bytes=reader.budget.input_bytes,
+                     rows=reader.budget.rows, blocks=reader.budget.blocks,
+                     members=reader.budget.members, compare_bytes=reader.budget.compare_bytes,
+                     allowance_used=Avro.allowanceused(reader.budget))
+            return decoded, state
+        end
+        @test values == ["x"]
+        @test writerstate == readerstate
+
+        tight = Avro.Limits(max_total_values=3)
+        tightio = IOBuffer()
+        tightwriter = Avro.Writer(tightio, schema; limits=tight)
+        headersize = position(tightio)
+        err = try
+            push!(tightwriter, "x")
+            close(tightwriter)
+            nothing
+        catch e
+            close(tightwriter; abort=true)
+            e
+        end
+        @test err isa Avro.LimitError && err.limit === :max_total_values && err.observed == 4
+        @test position(tightio) == headersize                         # no unreadable data block was emitted
+    end
     @testset "schema printing does not subsidise datum work" begin
         dense = fill(nothing, 67_000)
         dense_schema = Avro.ArraySchema(Avro.NullSchema())

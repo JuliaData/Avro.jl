@@ -654,9 +654,19 @@ function Writer(dst::Union{AbstractString,IO}, schema::Schema; codec::Symbol=:nu
     wcodec = writercodec(codec, level, limits)
     w = try
         reserve!(budget, wcodec.workspace)
+        values0 = budget.values
+        input0 = budget.input_bytes
+        allowance0 = budget.allowance_used
+        workcap0 = budget.workcap
         jw = BoundedWriter(budget, limits.max_schema_bytes)       # the schema JSON is produced charged and bounded
         printschema(jw, schema, "", FrozenDict{String,Bool}(), false, 0)
         schemajson = String(take!(jw.io))
+        # Printing is bounded in this operation, but the container counters must start with the exact
+        # header work that its Reader performs. Keep all printer reservations and rebase only work.
+        budget.values = values0
+        budget.input_bytes = input0
+        budget.allowance_used = allowance0
+        budget.workcap = workcap0
         entries = Tuple{String,Vector{UInt8}}[]
         reserve!(budget, stringbytes(11) + bytesbytes(sizeof(schemajson)))
         push!(entries, ("avro.schema", Vector{UInt8}(codeunits(schemajson))))
@@ -671,6 +681,10 @@ function Writer(dst::Union{AbstractString,IO}, schema::Schema; codec::Symbol=:nu
         length(entries) <= limits.max_metadata_entries || throw(LimitError(:max_metadata_entries, length(entries), limits.max_metadata_entries, :max_metadata_entries, :encode))
         total = sum(e -> sizeof(e[1]) + length(e[2]), entries; init=0)
         total <= limits.max_metadata_bytes || throw(LimitError(:max_metadata_bytes, total, limits.max_metadata_bytes, :max_metadata_bytes, :encode))
+        for _ in entries
+            countvalues!(budget)                                  # the Reader counts each metadata entry
+        end
+        addinput!(budget, total)                                  # the Reader's metadata key/value denominator
         plan = writeplan(schema; budget=budget)
         # The reader's construction retention, preflighted under the writer's budget (plan §4.4): the
         # parsed schema graph a reader builds from the same JSON, the materialised metadata of a stream
@@ -855,6 +869,7 @@ function flushblock!(w::Writer)
             projected <= w.budget.ceiling ||
                 throw(LimitError(:max_total_bytes, projected, w.budget.ceiling, :max_total_bytes, :encode))
         end
+        uncreditedpayload = w.encoder.pos - w.encoder.credited
         reserve!(w.budget, bytesbytes(w.encoder.pos))              # the pending-block copy, before take! (R04)
         blockbytes = take!(w.encoder)
         cbound = compressbound(w.wcodec, length(blockbytes))
@@ -874,13 +889,16 @@ function flushblock!(w::Writer)
             pf.nblocks += 1
             pf.pendingpayload = 0
         end
+        framingbytes = varintlength(w.pendingcount) + varintlength(length(compressed)) + 16
+        addinput!(w.budget, framingbytes)
+        addinput!(w.budget, uncreditedpayload)                     # finish the exact decompressed payload denominator
+        addmembers!(w.budget)                                     # every Writer codec emits one member per block
         writevarint(w.sink, w.pendingcount)
         writevarint(w.sink, length(compressed))
         Base.write(w.sink, compressed)
         for b in w.syncmarker
             Base.write(w.sink, b)
         end
-        addinput!(w.budget, varintlength(w.pendingcount) + varintlength(length(compressed)) + 16)   # the reader's framing denominator (R08)
         release!(w.budget, checked_add(bytesbytes(length(blockbytes)), cbound))                     # the flush transients
         addblocks!(w.budget)
     catch e
