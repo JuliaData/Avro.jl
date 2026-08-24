@@ -127,4 +127,38 @@
             @test_throws Avro.DataError Avro.Table(IOBuffer(bad4); select=(:s,), validate=val)
         end
     end
+
+    @testset "corpus sweep: every generated record-root fixture, Table and Rows (R14)" begin
+        gen = joinpath(@__DIR__, "fixtures", "generated")
+        raised = Avro.Limits(max_total_bytes=2 << 30, max_block_bytes=16 << 20, max_block_output_bytes=256 << 20,
+                             max_codec_memory=32 << 20, max_bytes=64 << 20, max_datum_bytes=64 << 20)
+        for avsc in filter(f -> endswith(f, ".avsc"), readdir(joinpath(gen, "schemas"); join=true))
+            s = Avro.parseschema(read(avsc, String))
+            s isa Avro.RecordSchema || continue
+            data = joinpath(gen, "data", basename(avsc)[1:end - 5] * "-null.avro")
+            isfile(data) || continue
+            full = Avro.Table(data; limits=raised)
+            names = collect(Tables.columnnames(full))
+            isempty(names) && continue
+            fullct = Tables.columntable(full)
+            sels = Vector{Symbol}[[names[1]], [names[end], names[1]]]
+            length(names) > 2 && push!(sels, names[1:2:end])
+            for sel in sels, val in (:strict, :fast), nt in (1, 8)
+                pt = Avro.Table(data; select=Tuple(sel), validate=val, ntasks=nt, limits=raised)
+                @test Tables.columnnames(pt) == sel && length(pt) == length(full)
+                for (k, nm) in enumerate(sel)
+                    got = Tables.getcolumn(pt, k)
+                    want = fullct[nm]
+                    @test isequal(got, want) && typeof(got) == typeof(want)
+                end
+                rl = Avro.Rows(data; select=Tuple(sel), validate=val, limits=raised)
+                rows = collect(rl)
+                close(rl)
+                @test length(rows) == length(full)
+                for (k, nm) in enumerate(sel)
+                    @test isequal([Tables.getcolumn(r, k) for r in rows], collect(fullct[nm]))
+                end
+            end
+        end
+    end
 end

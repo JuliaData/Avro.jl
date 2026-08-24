@@ -4,6 +4,13 @@
 
 using PrecompileTools: @setup_workload, @compile_workload
 
+struct PrecompiledRow                                  # a representative plain struct for the workload
+    id::Int64
+    name::String
+    score::Float64
+    flag::Bool
+end
+
 @setup_workload begin
     prows = [(id=Int64(1), name="a", score=1.0, flag=true), (id=Int64(2), name="b", score=2.0, flag=false)]
     pjson = """{"type":"record","name":"PC","fields":[{"name":"id","type":"long"},{"name":"name","type":"string"},{"name":"score","type":"double"},{"name":"flag","type":"boolean"}]}"""
@@ -17,6 +24,9 @@ using PrecompileTools: @setup_workload, @compile_workload
         fromjson(s, tojson(s, v))
         dr = DatumReader(s, typeof(prows[1]))
         dr(b)
+        drs = DatumReader(s, PrecompiledRow)
+        drs(b)
+        DatumWriter(s, PrecompiledRow)(PrecompiledRow(1, "a", 1.0, true))
         dw = DatumWriter(s, typeof(prows[1]))
         dw(prows[1])
         store = SchemaCache()

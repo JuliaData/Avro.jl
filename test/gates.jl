@@ -85,16 +85,21 @@ end
     exercise(50)                                       # second warm-up: random shapes once
     GC.gc()
     before = avrospecializations()
-    exercise(1000)
+    # The agreed §10.2 protocol (review round 1, R14): the RSS baseline is taken after the `E` warm-up,
+    # and the single post-warm-up batch of 1,000 random schemas must grow the high-water mark by less
+    # than 50 MB. Full collections on both sides keep the collector's heap-sizing policy out of the
+    # delta; the measured number is compiled code plus retained caches.
+    GC.gc(true)
+    GC.gc(true)
+    rss0 = Sys.maxrss()
+    for _ in 1:20                                      # collect between slices so the high-water delta
+        exercise(50)                                   # measures retention, not the collector's heap sizing
+        GC.gc(false)
+    end
     after = avrospecializations()
     @test after == before
-    # `Sys.maxrss` is a high-water mark, so the first thousand schemas also bring the heap to its
-    # steady-state peak; the delta over a second thousand is retained growth (compiled code, caches), not
-    # the collector's heap-sizing policy.
-    rss0 = Sys.maxrss()
-    exercise(1000)
+    GC.gc(true)
     growth = (Sys.maxrss() - rss0) / 2^20
-    @test avrospecializations() == before
     @info "compile-cost gate" specializations=before new=after - before rss_growth_mb=round(growth; digits=1)
     @test growth < 50
 end
