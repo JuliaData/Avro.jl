@@ -22,7 +22,9 @@ end
 
 Row(record::Record; names=DEFAULT_ADMISSION) = Row(record, admission(names))
 
-admitnames(s::RecordSchema, adm, budget::Union{Nothing,Budget}=nothing) = Symbol[admit!(adm, f.name; budget=budget) for f in s.fields]
+function admitnames(s::RecordSchema, adm, budget::Union{Nothing,Budget}=nothing)
+    return Symbol[admit!(adm, f.name; budget=budget) for f in s.fields]
+end
 
 Tables.columnnames(r::Row) = admitnames(getfield(getfield(r, :record), :schema), getfield(r, :admission))
 Tables.getcolumn(r::Row, i::Int) = getfield(getfield(r, :record), :values)[i]
@@ -354,10 +356,21 @@ function nextpow2rows(n::Int)
     return cap
 end
 
-Base.IteratorSize(::Type{<:Rows}) = Base.SizeUnknown()
-Base.IteratorSize(::Type{Rows{true}}) = Base.HasLength()
-Base.length(rows::Rows{true}) = getfield(rows, :nrows)
-Base.IteratorEltype(::Type{<:Rows}) = Base.EltypeUnknown()
+function Base.IteratorSize(::Type{<:Rows})
+    return Base.SizeUnknown()
+end
+
+function Base.IteratorSize(::Type{Rows{true}})
+    return Base.HasLength()
+end
+
+function Base.length(rows::Rows{true})
+    return getfield(rows, :nrows)
+end
+
+function Base.IteratorEltype(::Type{<:Rows})
+    return Base.EltypeUnknown()
+end
 
 function Base.iterate(rows::Rows, ::Nothing=nothing)
     r = rows.reader

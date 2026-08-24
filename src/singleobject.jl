@@ -48,7 +48,7 @@ Register `schema` and return its CRC-64-AVRO fingerprint.
 function register!(c::SchemaCache, s::Schema; limits::Limits=Limits())
     pcf = canonical(s; limits=limits)
     fp = crc64avro(pcf)
-    lock(c.lock) do
+    return lock(c.lock) do
         i = searchsortedfirst(c.fingerprints, fp)
         if i <= length(c.fingerprints) && c.fingerprints[i] == fp
             existing = c.schemas[i]

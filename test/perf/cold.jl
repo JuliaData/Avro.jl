@@ -24,11 +24,18 @@ const S4 = Avro.parseschema("""{"type":"record","name":"Bench","fields":[
     {"name":"id","type":"long"},{"name":"x","type":"double"},
     {"name":"name","type":"string"},{"name":"flag","type":"boolean"}]}""")
 const N = 1_000_000
-rows() = [(id=Int64(i), x=i / 7, name="name-$(i % 1000)", flag=isodd(i)) for i in 1:N]
-raisedlimits() = Avro.Limits(max_total_bytes=4 << 30, max_block_bytes=16 << 20, max_block_output_bytes=256 << 20,
-                             max_codec_memory=32 << 20, max_bytes=64 << 20, max_datum_bytes=64 << 20)
+function rows()
+    return [(id=Int64(i), x=i / 7, name="name-$(i % 1000)", flag=isodd(i)) for i in 1:N]
+end
 
-bestof3(f) = minimum((f(); GC.gc(); t0 = time(); f(); time() - t0) for _ in 1:3)
+function raisedlimits()
+    return Avro.Limits(max_total_bytes=4 << 30, max_block_bytes=16 << 20, max_block_output_bytes=256 << 20,
+                       max_codec_memory=32 << 20, max_bytes=64 << 20, max_datum_bytes=64 << 20)
+end
+
+function bestof3(f)
+    return minimum((f(); GC.gc(); t0 = time(); f(); time() - t0) for _ in 1:3)
+end
 
 if metric == "write"
     data = rows()
@@ -57,9 +64,12 @@ elseif startswith(metric, "codec-")
     r = Avro.Reader(codecf)
     entries = Avro.prescanblocks(r).entries
     src = r.source
-    transcode1() = for e in entries
-        Avro.decompressblock(r.codecname, r.codec, view(src.buf, e.offset:e.offset + e.size - 1), r.limits, r.budget)
-        Avro.release!(r.budget, r.budget.reserved)
+    function transcode1()
+        for e in entries
+            Avro.decompressblock(r.codecname, r.codec, view(src.buf, e.offset:e.offset + e.size - 1), r.limits, r.budget)
+            Avro.release!(r.budget, r.budget.reserved)
+        end
+        return nothing
     end
     ttrans = bestof3(transcode1)
     close(r)
