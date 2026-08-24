@@ -21,6 +21,11 @@ function javatool(args...)
     return read(outpath)
 end
 
+"Read one container metadata value with avro-tools' positional input before its option."
+function javameta(file::AbstractString, key::AbstractString)
+    return strip(String(javatool("getmeta", file, "--key", key)))
+end
+
 function deterministic(s::Avro.Schema, seen=Set{UInt}())
     s isa Union{Avro.ArraySchema,Avro.MapSchema} && return false
     s isa Avro.UnionSchema && return all(b -> deterministic(b, seen), s.branches)
@@ -297,9 +302,9 @@ if metadata.get("interop.suite") != suite or metadata.get("interop.case") != cas
                 @test isequal(back, vs)                                     # Java reads every codec semantically
                 jschema = Avro.parseschema(String(javatool("getschema", file)))
                 @test jschema == s                                          # defaults, props and logical attributes survive
-                @test strip(String(javatool("getmeta", "--key", "avro.codec", file))) == String(codec)
-                @test strip(String(javatool("getmeta", "--key", "interop.suite", file))) == suiteid
-                @test strip(String(javatool("getmeta", "--key", "interop.case", file))) == caseid
+                @test javameta(file, "avro.codec") == String(codec)
+                @test javameta(file, "interop.suite") == suiteid
+                @test javameta(file, "interop.case") == caseid
                 expected = joinpath(dir, "expected.jsonl")
                 open(expected, "w") do expectedio
                     for v in vs
