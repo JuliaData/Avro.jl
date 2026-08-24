@@ -70,6 +70,13 @@
         Avro.release!(b, 1000 + Avro.GUARD_CHUNK)
         @test b.reserved == 0 && b.pending == 0
         @test (@atomic Avro.GUARD.pending) == pending0                              # a full drain republishes
+        Avro.reserve!(b, 10)
+        pending_underflow = @atomic Avro.GUARD.pending
+        underflow_state = (b.reserved, b.pending, pending_underflow)
+        @test_throws ArgumentError Avro.release!(b, 11)
+        pending_after_underflow = @atomic Avro.GUARD.pending
+        @test (b.reserved, b.pending, pending_after_underflow) == underflow_state
+        Avro.release!(b, 10)
         @test_throws Avro.LimitError Avro.reserve!(b, b.ceiling + 1)
         Avro.reserve!(b, b.ceiling)   # exactly the ceiling is admitted
         @test_throws Avro.LimitError Avro.reserve!(b, 1)
