@@ -84,6 +84,33 @@ end
 # ---- the complete §8.5 matrix (Phase 5 / review round 1, R12) ---------------------------------------
 
 const AVRO_PYTHON = get(ENV, "AVRO_PYTHON", "")
+const INTEROP_FIXTURES = joinpath(FIXTURES, "interop")
+
+"Read a whitespace-separated hexadecimal fixture."
+function fixturebytes(path::AbstractString)
+    return hex2bytes(filter(c -> !isspace(c), read(path, String)))
+end
+
+function fixtureverdict(x::AbstractString)
+    x == "accept" && return true
+    x == "reject" && return false
+    return error("invalid verdict $x")
+end
+
+"The recorded live-oracle verdicts keyed by `(category, case)`."
+function negativeverdicts()
+    out = Dict{Tuple{String,String},NamedTuple{(:julia, :java, :fastavro, :note),Tuple{Bool,Bool,Bool,String}}}()
+    path = joinpath(INTEROP_FIXTURES, "negative", "verdicts.tsv")
+    for line in readlines(path)
+        (isempty(line) || startswith(line, "#")) && continue
+        fields = split(line, '\t'; limit=6)
+        length(fields) == 6 || error("invalid negative-verdict row: $line")
+        category, name, julia, java, fastavro, note = fields
+        out[(category, name)] = (julia=fixtureverdict(julia), java=fixtureverdict(java),
+                                 fastavro=fixtureverdict(fastavro), note=note)
+    end
+    return out
+end
 
 "Compile the Java harness once (classpath = the pinned jar); `nothing` when javac is unavailable."
 function harnessdir()
@@ -115,10 +142,16 @@ end
 
 @testset "§8.5 matrix: containers, canonical, resolution, single-object, sort order, negatives" begin
     gen = joinpath(FIXTURES, "generated")
-    hd = harnessdir()
+    hd0 = harnessdir()
+    @test hd0 !== nothing
+    hd0 === nothing && error("javac is required for the complete §8.5 matrix")
+    hd = hd0::String
     py = AVRO_PYTHON
-    haspy = !isempty(py) && success(run(pipeline(`$py -c "import fastavro"`; stdout=devnull, stderr=devnull)))
-    haspy || @info "fastavro oracle not available (set AVRO_PYTHON); the Python halves are skipped"
+    @test isfile(py)
+    isfile(py) || error("AVRO_PYTHON must name the pinned fastavro environment")
+    haspy = success(run(pipeline(`$py -c "import fastavro"`; stdout=devnull, stderr=devnull)))
+    @test haspy
+    haspy || error("AVRO_PYTHON cannot import fastavro")
     schemacases = String[]
     for d in ("roots", "schemas", "evolution")
         for f in readdir(joinpath(gen, d); join=true)
@@ -205,21 +238,23 @@ end
     end
 
     @testset "(1) Julia-written containers read by both oracles, every codec" begin
-        availablecodecs = Set(Avro.codecs())
-        requiredcodecs = (:null, :deflate, :snappy, :zstandard)
-        @test all(in(availablecodecs), requiredcodecs)
-        containercodecs = filter(in(availablecodecs), (:null, :deflate, :snappy, :zstandard, :bzip2, :xz))
+        containercodecs = (:null, :deflate, :snappy, :zstandard, :bzip2, :xz)
+        @test all(in(Set(Avro.codecs())), containercodecs)
         testedcodecs = Set{Symbol}()
         pycheck = tempname() * ".py"
         write(pycheck, """
 import json, struct, sys, fastavro
 fastavro.read.LOGICAL_READERS.clear()
-inp, expectedp = sys.argv[1], sys.argv[2]
+inp, expectedp, schemap, codec, suite, caseid = sys.argv[1:]
 with open(inp, "rb") as f:
     r = fastavro.reader(f)
     records = list(r)
+    metadata = r.metadata
+    actual_codec = r.codec
 with open(expectedp, "r", encoding="utf-8") as f:
     expected = [json.loads(line) for line in f if line.strip()]
+with open(schemap, "r", encoding="utf-8") as f:
+    expected_schema = json.load(f)
 def normalise(value):
     if value is None or isinstance(value, (bool, str)): return value
     if isinstance(value, int): return {"\$integer": str(value)}
@@ -228,8 +263,16 @@ def normalise(value):
     if isinstance(value, dict): return {key: normalise(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)): return [normalise(item) for item in value]
     raise TypeError(f"unsupported fastavro value {type(value)!r}")
+if len(records) != len(expected):
+    raise AssertionError(f"fastavro datum count {len(records)} != {len(expected)}")
 if normalise(records) != expected:
     raise AssertionError("fastavro container values differ from Julia's Avro JSON values")
+if json.loads(metadata["avro.schema"]) != expected_schema:
+    raise AssertionError("fastavro header schema differs from Julia's schema")
+if metadata.get("avro.codec") != codec or actual_codec != codec:
+    raise AssertionError(f"fastavro codec metadata/read state differ: {metadata.get('avro.codec')!r}/{actual_codec!r}")
+if metadata.get("interop.suite") != suite or metadata.get("interop.case") != caseid:
+    raise AssertionError("fastavro user metadata differs")
 """)
         for avsc in schemacases
             s = Avro.parseschema(read(avsc, String))
@@ -238,10 +281,14 @@ if normalise(records) != expected:
             isfile(jsonl) || continue
             vs = [Avro.fromjson(s, line) for line in filter(!isempty, readlines(jsonl))]
             isempty(vs) && continue
+            caseid = splitext(basename(avsc))[1]
+            suiteid = "D08-category-1"
+            metadata = Dict("interop.suite" => Vector{UInt8}(suiteid),
+                            "interop.case" => Vector{UInt8}(caseid))
             for codec in containercodecs
                 dir = mktempdir()
                 file = joinpath(dir, "j.avro")
-                w = Avro.Writer(file, s; codec=codec)
+                w = Avro.Writer(file, s; codec=codec, metadata=metadata)
                 foreach(v -> push!(w, v), vs)
                 close(w)
                 jout = String(javatool("tojson", file))
@@ -249,23 +296,25 @@ if normalise(records) != expected:
                 @test length(back) == length(vs)                            # the datum count survives
                 @test isequal(back, vs)                                     # Java reads every codec semantically
                 jschema = Avro.parseschema(String(javatool("getschema", file)))
-                @test Avro.parsingequivalent(jschema, s)                    # the schema survives
-                jmeta = String(javatool("getmeta", file))
-                @test occursin(String(codec), jmeta)                        # the codec name survives in the metadata
-                if haspy
-                    expected = joinpath(dir, "expected.jsonl")
-                    open(expected, "w") do expectedio
-                        for v in vs
-                            println(expectedio, oraclejson(s, v))
-                        end
+                @test jschema == s                                          # defaults, props and logical attributes survive
+                @test strip(String(javatool("getmeta", "--key", "avro.codec", file))) == String(codec)
+                @test strip(String(javatool("getmeta", "--key", "interop.suite", file))) == suiteid
+                @test strip(String(javatool("getmeta", "--key", "interop.case", file))) == caseid
+                expected = joinpath(dir, "expected.jsonl")
+                open(expected, "w") do expectedio
+                    for v in vs
+                        println(expectedio, oraclejson(s, v))
                     end
-                    pyerr = joinpath(dir, "fastavro.err")
-                    pyproc = run(pipeline(`$py $pycheck $file $expected`; stdout=devnull, stderr=pyerr); wait=false)
-                    wait(pyproc)
-                    ok = success(pyproc)
-                    ok || @info "fastavro semantic comparison failed" schema=basename(avsc) codec stderr=read(pyerr, String)
-                    @test ok
                 end
+                expectedschema = joinpath(dir, "expected.avsc")
+                write(expectedschema, Avro.json(s))
+                pyerr = joinpath(dir, "fastavro.err")
+                pyproc = run(pipeline(`$py $pycheck $file $expected $expectedschema $(String(codec)) $suiteid $caseid`;
+                                      stdout=devnull, stderr=pyerr); wait=false)
+                wait(pyproc)
+                ok = success(pyproc)
+                ok || @info "fastavro complete container comparison failed" schema=basename(avsc) codec stderr=read(pyerr, String)
+                @test ok
                 push!(testedcodecs, codec)
             end
         end
@@ -284,8 +333,7 @@ if normalise(records) != expected:
             end
         end
     end
-    if hd !== nothing
-        @testset "(4) schema resolution vs the Java reader" begin
+    @testset "(4) schema resolution vs the Java reader" begin
             pairsdir = joinpath(gen, "evolution")
             resolutionfixtures = [
                 (joinpath(gen, "data", "everything-null.avro"), joinpath(pairsdir, "everything_readerA.avsc")),
@@ -323,7 +371,7 @@ if normalise(records) != expected:
             Avro.register!(store, s)
             @test Avro.decodesingle(jbytes, store).a == 42                  # Java's framing decodes
         end
-        @testset "(6) sort-order verdicts, live" begin
+    @testset "(6) sort-order verdicts, live" begin
             s = Avro.parseschema("{\"type\":\"record\",\"name\":\"SS\",\"fields\":[{\"name\":\"k\",\"type\":\"long\"},{\"name\":\"s\",\"type\":\"string\"}]}")
             avsc = tempname() * ".avsc"
             write(avsc, Avro.json(s))
@@ -337,13 +385,10 @@ if normalise(records) != expected:
                 jv = parse(Int, strip(javaharnesstext(hd, "CompareBytes", avsc, fa, fb)))
                 @test sign(jv) == sign(Avro.comparebytes(s, Avro.encode(s, a), Avro.encode(s, b)))
             end
-        end
-    else
-        @info "javac unavailable; the harness categories (4)-(6) are skipped"
     end
     function samplesort(ss::Avro.Schema, rng)
         ss isa Avro.RecordSchema || error("record shapes only")
-        vals = Any[]
+        vals = []
         for f in ss.fields
             fs = f.schema
             push!(vals, fs isa Avro.DoubleSchema ? rand(rng, (-0.0, 0.0, 1.5, -2.5, Inf, -Inf, NaN)) :
@@ -358,20 +403,51 @@ if normalise(records) != expected:
     end
 
     @testset "(2b) positive and sized collection block forms as independent oracle cases" begin
-        arr = Avro.parseschema("{\"type\":\"array\",\"items\":\"long\"}")
-        avsc = tempname() * ".avsc"
-        write(avsc, Avro.json(arr))
-        positive = Avro.encode(arr, Int64[3, 4, 5])                       # the writer's positive-count form
-        items = reduce(vcat, [Avro.encode(Avro.parseschema("\"long\""), Int64(v)) for v in (3, 4, 5)])
-        sized = vcat(Avro.encode(Avro.parseschema("\"long\""), -3)[1:0], UInt8[0x05], UInt8[UInt8(2 * length(items))], items, UInt8[0x00])
-        # zigzag(-3) = 5 = 0x05; the sized form declares its byte size after the negative count
-        for (label, bytes) in (("positive", positive), ("sized", sized))
-            f = tempname()
-            write(f, bytes)
-            jout = strip(String(javatool("fragtojson", "--no-pretty", "--schema-file", avsc, f)))
-            @test Avro.fromjson(arr, jout) == Int64[3, 4, 5]              # Java decodes both wire forms
-            @test Avro.decode(arr, bytes) == Int64[3, 4, 5]               # and so does Julia
+        collections = joinpath(INTEROP_FIXTURES, "collections")
+        pycollection = tempname() * ".py"
+        write(pycollection, """
+import io, json, sys, fastavro
+schemaf, expectedf, hexf = sys.argv[1:]
+with open(schemaf, "r", encoding="utf-8") as f:
+    schema = json.load(f)
+with open(expectedf, "r", encoding="utf-8") as f:
+    expected = json.load(f)
+with open(hexf, "r", encoding="ascii") as f:
+    raw = bytes.fromhex(f.read())
+stream = io.BytesIO(raw)
+actual = fastavro.schemaless_reader(stream, schema)
+if stream.read() != b"":
+    raise AssertionError("fastavro did not consume the complete collection datum")
+if actual != expected:
+    raise AssertionError(f"fastavro collection value differs: {actual!r} != {expected!r}")
+""")
+        covered = Set{Tuple{String,String}}()
+        for line in readlines(joinpath(collections, "cases.tsv"))
+            (isempty(line) || startswith(line, "#")) && continue
+            name, schemafile, expectedfile, positivefile, sizedfile = split(line, '\t')
+            avsc = joinpath(collections, schemafile)
+            expectedpath = joinpath(collections, expectedfile)
+            s = Avro.parseschema(read(avsc, String))
+            expected = Avro.fromjson(s, read(expectedpath, String))
+            forms = (("positive", positivefile), ("sized", sizedfile))
+            @test fixturebytes(joinpath(collections, positivefile)) != fixturebytes(joinpath(collections, sizedfile))
+            for (form, hexfile) in forms
+                hexpath = joinpath(collections, hexfile)
+                bytes = fixturebytes(hexpath)
+                f = tempname()
+                write(f, bytes)
+                jout = strip(String(javatool("fragtojson", "--no-pretty", "--schema-file", avsc, f)))
+                @test looseeq(Avro.fromjson(s, jout), expected)            # Java reads this exact block form
+                @test looseeq(Avro.decode(s, bytes), expected)             # Julia reads this exact block form
+                pyproc = run(pipeline(`$py $pycollection $avsc $expectedpath $hexpath`;
+                                      stdout=devnull, stderr=devnull); wait=false)
+                wait(pyproc)
+                @test success(pyproc)                                      # fastavro reads this exact block form
+                push!(covered, (name, form))
+            end
         end
+        @test covered == Set((("array", "positive"), ("array", "sized"),
+                              ("map", "positive"), ("map", "sized")))
     end
     @testset "(4b) resolution: both policies, both oracles, constructed pairs" begin
         wsrc = "{\"type\":\"record\",\"name\":\"RP\",\"fields\":[{\"name\":\"a\",\"type\":\"int\"},{\"name\":\"old\",\"type\":\"string\"},{\"name\":\"u\",\"type\":[\"null\",\"long\"]}]}"
@@ -385,68 +461,79 @@ if normalise(records) != expected:
         close(wtr)
         rf = joinpath(dir, "rp-reader.avsc")
         write(rf, rsrc)
+        jout = javaharnesstext(hd, "ReadWithReader", data, rf)
+        jvals = [Avro.fromjson(rs, line) for line in filter(!isempty, split(jout, '\n'))]
+        pyres = tempname() * ".py"
+        write(pyres, """
+import sys, json, fastavro
+data, readerf = sys.argv[1], sys.argv[2]
+with open(readerf, "r", encoding="utf-8") as f:
+    reader_schema = json.load(f)
+with open(data, "rb") as f:
+    records = list(fastavro.reader(f, reader_schema=reader_schema))
+for rec in records:
+    rec["u"] = None if rec["u"] is None else {"long": rec["u"]}   # restore Avro JSON union wrapping
+    print(json.dumps(rec, sort_keys=True))
+""")
+        pyout = read(`$py $pyres $data $rf`, String)
+        pvals = [Avro.fromjson(rs, line) for line in filter(!isempty, split(pyout, '\n'))]
+        @test length(jvals) == length(rows) && length(pvals) == length(rows)
+        compared = Set{Tuple{Symbol,Symbol}}()
         for policy in (:spec, :java)
             resolved = Avro.Rows(data; reader_schema=rs, union_resolution=policy)
             vals = Any[Avro.record(row) for row in resolved]
             close(resolved)
-            @test length(vals) == 50 && vals[1].a === 1.0 && vals[1].renamed == "o1" && vals[1].z === Int32(5)
-            if policy === :java && hd !== nothing
-                jout = javaharnesstext(hd, "ReadWithReader", data, rf)
-                jvals = [Avro.fromjson(rs, line) for line in filter(!isempty, split(jout, '\n'))]
-                @test isequal([Avro.tojson(rs, v) for v in vals], [Avro.tojson(rs, v) for v in jvals])
+            @test length(vals) == length(rows)
+            for (i, value) in enumerate(vals)
+                @test value.a === Float64(rows[i].a)
+                @test value.renamed == rows[i].old
+                @test value.u === rows[i].u
+                @test value.z === Int32(5)
+            end
+            for (oracle, oraclevals) in ((:java, jvals), (:fastavro, pvals))
+                @test looseeq(vals, oraclevals)                            # compare every resolved datum
+                push!(compared, (policy, oracle))
             end
         end
-        if haspy
-            pyres = tempname() * ".py"
-            write(pyres, """
-import sys, json, fastavro
-data, readerf = sys.argv[1], sys.argv[2]
-reader_schema = json.load(open(readerf))
-with open(data, "rb") as f:
-    for rec in fastavro.reader(f, reader_schema=reader_schema):
-        rec["u"] = None if rec["u"] is None else {"long": rec["u"]}   # fastavro strips union wrapping; restore Avro JSON encoding
-        print(json.dumps(rec, sort_keys=True))
-""")
-            out = read(`$py $pyres $data $rf`, String)
-            plines = filter(!isempty, split(out, '\n'))
-            @test length(plines) == 50                                    # fastavro resolves the same pairs
-            first = Avro.fromjson(rs, plines[1])
-            @test first.a === 1.0 && first.renamed == "o1" && first.z === Int32(5)
-        end
+        @test compared == Set(((:spec, :java), (:spec, :fastavro),
+                               (:java, :java), (:java, :fastavro)))
     end
-    if hd !== nothing
-        @testset "(6b) sort order: committed Java vectors run live; diverse shapes" begin
+    @testset "(6b) sort order: committed Java vectors run live; diverse shapes" begin
+            function livecompare(class::String, av::String, fa::String, fb::String)
+                try
+                    return string(parse(Int, strip(javaharnesstext(hd, class, av, fa, fb))))
+                catch err
+                    message = sprint(showerror, err)
+                    matched = match(r"Exception in thread \"main\" ([A-Za-z0-9_.]+)", message)
+                    matched === nothing && rethrow()
+                    return "ERROR:" * String(matched.captures[1])
+                end
+            end
             sortdir = joinpath(gen, "sortorder")
             ran = 0
             for line in filter(!isempty, readlines(joinpath(sortdir, "verdicts.tsv")))
-                name, _, expectbytes = split(line, '\t')
+                name, expectobject, expectbytes = split(line, '\t')
                 av = joinpath(sortdir, "$name.avsc")
                 fa = joinpath(sortdir, "$name.a.json")
                 fb = joinpath(sortdir, "$name.b.json")
                 (isfile(av) && isfile(fa) && isfile(fb)) || continue
                 ss = Avro.parseschema(read(av, String))
+                @test livecompare("Compare", av, fa, fb) == expectobject       # object-level differences stay recorded
+                @test livecompare("CompareBytes", av, fa, fb) == expectbytes  # encoded comparator is the spec oracle
                 # compare the same wire bytes Java compared: fromjson/encode would canonicalise
                 # logical surface forms (non-minimal decimal, mixed-case uuid) and mask deviations
                 wa = Vector{UInt8}(javatool("jsontofrag", "--schema-file", av, fa))
                 wb = Vector{UInt8}(javatool("jsontofrag", "--schema-file", av, fb))
                 if startswith(expectbytes, "ERROR")
-                    jok = try
-                        javaharnesstext(hd, "CompareBytes", av, fa, fb)
-                        true
-                    catch
-                        false
-                    end
-                    @test !jok                                            # Java rejects live, as recorded (maps have no sort order)
                     @test_throws ArgumentError Avro.comparebytes(ss, wa, wb)
                     ran += 1
                     continue
                 end
-                jv = parse(Int, strip(javaharnesstext(hd, "CompareBytes", av, fa, fb)))
-                @test jv == parse(Int, expectbytes)                       # the committed vectors reproduce live
+                jv = parse(Int, expectbytes)
                 @test sign(jv) == sign(Avro.comparebytes(ss, wa, wb))
                 ran += 1
             end
-            @test ran >= 40
+            @test ran == 51                                               # full committed sort surface, both Java comparators
             shapes = ("{\"type\":\"record\",\"name\":\"S1\",\"fields\":[{\"name\":\"d\",\"type\":\"double\"}]}",
                       "{\"type\":\"record\",\"name\":\"S2\",\"fields\":[{\"name\":\"k\",\"type\":\"long\",\"order\":\"descending\"},{\"name\":\"s\",\"type\":\"string\"}]}",
                       "{\"type\":\"record\",\"name\":\"S3\",\"fields\":[{\"name\":\"e\",\"type\":{\"type\":\"enum\",\"name\":\"EE6\",\"symbols\":[\"z\",\"a\",\"m\"]}}]}",
@@ -465,12 +552,52 @@ with open(data, "rb") as f:
                     @test sign(jv) == sign(Avro.comparebytes(ss, Avro.encode(ss, va), Avro.encode(ss, vb)))
                 end
             end
-        end
     end
-    @testset "(7) negative oracles: consensus rejections" begin
-        s = Avro.parseschema("{\"type\":\"record\",\"name\":\"NG\",\"fields\":[{\"name\":\"a\",\"type\":\"long\"},{\"name\":\"b\",\"type\":\"boolean\"}]}")
-        good = take!(Avro.tobuffer([(a=Int64(1), b=true)]; schema=s))
-        function verdicts(bytes)
+    @testset "(7) recorded three-way verdicts for schemas, datums, blocks and JSON" begin
+        recorded = negativeverdicts()
+        seen = Set{Tuple{String,String}}()
+        negative = joinpath(INTEROP_FIXTURES, "negative")
+        pynegative = tempname() * ".py"
+        write(pynegative, """
+import fastavro, io, json, sys
+mode, path = sys.argv[1:3]
+schemaf = sys.argv[3] if len(sys.argv) > 3 else None
+if mode == "schema":
+    with open(path, "r", encoding="utf-8") as f:
+        fastavro.parse_schema(json.loads(f.read()))
+elif mode == "datum":
+    with open(schemaf, "r", encoding="utf-8") as f:
+        schema = json.load(f)
+    with open(path, "r", encoding="ascii") as f:
+        stream = io.BytesIO(bytes.fromhex(f.read()))
+    fastavro.schemaless_reader(stream, schema)
+    if stream.read() != b"":
+        raise AssertionError("trailing raw datum bytes")
+elif mode == "json":
+    with open(schemaf, "r", encoding="utf-8") as f:
+        schema = json.load(f)
+    with open(path, "r", encoding="utf-8") as f:
+        datum = json.loads(f.read())
+    fastavro.schemaless_writer(io.BytesIO(), schema, datum)
+elif mode == "block":
+    with open(path, "rb") as f:
+        list(fastavro.reader(f))
+else:
+    raise AssertionError(f"unknown negative-oracle mode {mode}")
+""")
+        function pythonverdict(mode::String, path::String, schema::Union{Nothing,String}=nothing)
+            cmd = schema === nothing ? `$py $pynegative $mode $path` : `$py $pynegative $mode $path $schema`
+            proc = run(pipeline(cmd; stdout=devnull, stderr=devnull); wait=false)
+            wait(proc)
+            return success(proc)
+        end
+        function expectedcase(category::String, name::String)
+            key = (category, name)
+            haskey(recorded, key) || error("no recorded verdict for $category/$name")
+            push!(seen, key)
+            return recorded[key]
+        end
+        function blockverdicts(bytes::Vector{UInt8})
             f = tempname()
             write(f, bytes)
             java = try
@@ -485,111 +612,86 @@ with open(data, "rb") as f:
             catch
                 false
             end
-            pyok = if haspy
-                p = run(pipeline(`$py -c "import fastavro, sys; list(fastavro.reader(open(sys.argv[1], 'rb')))" $f`; stdout=devnull, stderr=devnull); wait=false)
-                wait(p)
-                success(p)
-            else
-                nothing
-            end
-            return (java, julia, pyok)
+            return (julia=julia, java=java, fastavro=pythonverdict("block", f))
         end
-        entries = Avro.Reader(r -> Avro.prescanblocks(r).entries, IOBuffer(good))
-        cases = Vector{UInt8}[]
-        push!(cases, good[1:end - 3])                                       # truncated final sync
-        bad = copy(good)
-        bad[entries[1].offset + 1] = 0x07                                   # invalid boolean byte
-        push!(cases, bad)
-        badmagic = copy(good)
-        badmagic[1] = 0x58                                              # 'X': not the container magic
-        push!(cases, badmagic)
-        badsync = copy(good)
-        badsync[end] ⊻= 0x01
-        push!(cases, badsync)
-        # recorded oracle verdicts (spec-justified deviations, plan §8.5(7)): both oracles accept a
-        # truncated final sync (they stop at the datum count) and undomained bool bytes (framing-only
-        # skipping); Julia rejects all four per the strict container contract.
-        javatolerated = (1, 2)                                              # truncated final sync; undomained bool bytes
-        pytolerated = (2, 3)                                                # undomained bool bytes; the magic's first byte
-        for (i, c) in enumerate(cases)
-            jv, uv, pv = verdicts(c)
-            @test !uv                                                       # Julia rejects each malformed case
-            @test jv == (i in javatolerated)                                # each recorded tolerance occurs, exactly
-            pv === nothing || @test pv == (i in pytolerated)
+        s7 = Avro.parseschema("{\"type\":\"record\",\"name\":\"NG\",\"fields\":[{\"name\":\"a\",\"type\":\"long\"},{\"name\":\"b\",\"type\":\"boolean\"}]}")
+        good7 = take!(Avro.tobuffer([(a=Int64(1), b=true)]; schema=s7))
+        entries7 = Avro.Reader(r -> Avro.prescanblocks(r).entries, IOBuffer(good7))
+        invalidboolean = copy(good7)
+        invalidboolean[entries7[1].offset + 1] = 0x07
+        badmagic7 = copy(good7)
+        badmagic7[1] = 0x58
+        badsync7 = copy(good7)
+        badsync7[end] ⊻= 0x01
+        blockcases = (("truncated_sync", good7[1:end - 3]), ("invalid_boolean", invalidboolean),
+                      ("bad_magic", badmagic7), ("bad_sync", badsync7), ("valid", good7))
+        for (name, bytes) in blockcases
+            expected = expectedcase("block", name)
+            actual = blockverdicts(bytes)
+            @test actual == (julia=expected.julia, java=expected.java, fastavro=expected.fastavro)
         end
-        # malformed schemas: each oracle's parse verdict, two-way
-        badschemas = [
-            ("truncated json", "{\"type\":\"record\",\"name\":\"B\""),
-            ("duplicate field", "{\"type\":\"record\",\"name\":\"B\",\"fields\":[{\"name\":\"a\",\"type\":\"int\"},{\"name\":\"a\",\"type\":\"int\"}]}"),
-            ("invalid name", "{\"type\":\"record\",\"name\":\"9bad\",\"fields\":[]}"),
-            ("unknown type", "{\"type\":\"wibble\"}"),
-        ]
-        for (label, src) in badschemas
-            uok = try
-                Avro.parseschema(src)
+        schemanames = sort([name for ((category, name), _) in recorded if category == "schema"])
+        for name in schemanames
+            expected = expectedcase("schema", name)
+            path = joinpath(negative, "schema", "$name.avsc")
+            julia = try
+                Avro.parseschema(read(path, String))
                 true
             catch
                 false
             end
-            @test !uok
-            f = tempname() * ".avsc"
-            write(f, src)
-            jok = try
-                javatool("canonical", f, "-")
+            java = try
+                javatool("canonical", path, "-")
                 true
             catch
                 false
             end
-            @test !jok                                                      # Java rejects each malformed schema
+            @test (julia=julia, java=java, fastavro=pythonverdict("schema", path)) ==
+                  (julia=expected.julia, java=expected.java, fastavro=expected.fastavro)
         end
-        # malformed raw datums: fragtojson verdicts, two-way
-        ls = Avro.parseschema("\"string\"")
-        lavsc = tempname() * ".avsc"
-        write(lavsc, "\"string\"")
-        baddatums = [
-            ("negative length", UInt8[0x01]),
-            ("truncated payload", UInt8[0x06, 0x61]),
-            ("overlong length", vcat(UInt8[0xac, 0x02], fill(UInt8('a'), 3))),
-        ]
-        for (label, bytes) in baddatums
-            uok = try
-                Avro.decode(ls, bytes)
+        lavsc7 = joinpath(negative, "datum", "string.avsc")
+        ls7 = Avro.parseschema(read(lavsc7, String))
+        datumnames = sort([name for ((category, name), _) in recorded if category == "datum"])
+        for name in datumnames
+            expected = expectedcase("datum", name)
+            path = joinpath(negative, "datum", "$name.hex")
+            bytes = fixturebytes(path)
+            julia = try
+                Avro.decode(ls7, bytes)
                 true
             catch
                 false
             end
-            @test !uok
             f = tempname()
             write(f, bytes)
-            jok = try
-                javatool("fragtojson", "--schema-file", lavsc, f)
+            java = try
+                javatool("fragtojson", "--schema-file", lavsc7, f)
                 true
             catch
                 false
             end
-            @test !jok                                                      # Java rejects each malformed datum
+            @test (julia=julia, java=java, fastavro=pythonverdict("datum", path, lavsc7)) ==
+                  (julia=expected.julia, java=expected.java, fastavro=expected.fastavro)
         end
-        # malformed JSON datums: jsontofrag verdicts, two-way
-        badjson = [("bare word", "notjson"), ("wrong type", "{\"a\": 1}"), ("trailing", "\"x\" garbage")]
-        for (label, txt) in badjson
-            uok = try
-                Avro.fromjson(ls, txt)
+        jsonnames = sort([name for ((category, name), _) in recorded if category == "json"])
+        for name in jsonnames
+            expected = expectedcase("json", name)
+            path = joinpath(negative, "json", "$name.json")
+            julia = try
+                Avro.fromjson(ls7, read(path, String))
                 true
             catch
                 false
             end
-            @test !uok
-            f = tempname() * ".json"
-            write(f, txt)
-            jok = try
-                javatool("jsontofrag", "--schema-file", lavsc, f)
+            java = try
+                javatool("jsontofrag", "--schema-file", lavsc7, path)
                 true
             catch
                 false
             end
-            @test !jok                                                      # Java rejects each malformed JSON datum
+            @test (julia=julia, java=java, fastavro=pythonverdict("json", path, lavsc7)) ==
+                  (julia=expected.julia, java=expected.java, fastavro=expected.fastavro)
         end
-        jv, uv, pv = verdicts(good)
-        @test jv && uv && (pv === nothing || pv)                            # and all accept the valid file
+        @test seen == Set(keys(recorded))                                # every recorded case ran in both directions
     end
 end
