@@ -1254,12 +1254,16 @@ function finalizepublic!(s::Schema, limits::Limits, nodes::Int, named::Int)
     end
 end
 
+function checkgraphnamebytes(name::AbstractString, limits::Limits)
+    sizeof(name) <= limits.max_name_bytes ||
+        throw(LimitError(:max_name_bytes, sizeof(name), limits.max_name_bytes, :max_name_bytes, :decode))
+    return nothing
+end
+
 function checkgraphnames(s::NamedSchema, limits::Limits)
-    sizeof(fullname(s)) <= limits.max_name_bytes ||
-        throw(LimitError(:max_name_bytes, sizeof(fullname(s)), limits.max_name_bytes, :max_name_bytes, :decode))
+    checkgraphnamebytes(fullname(s), limits)
     for a in s.aliases
-        sizeof(a) <= limits.max_name_bytes ||
-            throw(LimitError(:max_name_bytes, sizeof(a), limits.max_name_bytes, :max_name_bytes, :decode))
+        checkgraphnamebytes(a, limits)
     end
     return nothing
 end
@@ -1296,13 +1300,18 @@ function collectmetas!(s::Schema, metas::Vector{NodeMeta}, namedtypes::FrozenDic
         length(s.fields) <= limits.max_fields ||
             throw(LimitError(:max_fields, length(s.fields), limits.max_fields, :max_fields, :decode))
         for f in s.fields
-            sizeof(f.name) <= limits.max_name_bytes ||
-                throw(LimitError(:max_name_bytes, sizeof(f.name), limits.max_name_bytes, :max_name_bytes, :decode))
+            checkgraphnamebytes(f.name, limits)
+            for a in f.aliases
+                checkgraphnamebytes(a, limits)
+            end
             collectmetas!(f.schema, metas, namedtypes, visited, limits, budget, depth + 1)
         end
     elseif s isa EnumSchema
         length(s.symbols) <= limits.max_enum_symbols ||
             throw(LimitError(:max_enum_symbols, length(s.symbols), limits.max_enum_symbols, :max_enum_symbols, :decode))
+        for sym in s.symbols
+            checkgraphnamebytes(sym, limits)
+        end
     end
     return metas
 end

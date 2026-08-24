@@ -424,6 +424,9 @@ end
         @test_throws Avro.LimitError Avro.FixedSchema("F", 4; limits=Avro.Limits(max_named_types=0))
         @test_throws Avro.LimitError Avro.schema(NamedTuple{(:a,),Tuple{Int64}}; limits=Avro.Limits(max_schema_nodes=1))
         @test_throws Avro.LimitError Avro.EnumSchema("E", ["a", "b", "c"]; limits=Avro.Limits(max_enum_symbols=2))
+        @test_throws Avro.LimitError Avro.EnumSchema("E", ["ab"]; limits=Avro.Limits(max_name_bytes=1))
+        aliased = Avro.Field("a", Avro.IntSchema(); aliases=["bc"])
+        @test_throws Avro.LimitError Avro.RecordSchema("R"; fields=[aliased], limits=Avro.Limits(max_name_bytes=1))
         let s = Avro.LongSchema(), lim = Avro.Limits(max_schema_depth=4)
             e = try
                 for _ in 1:6
