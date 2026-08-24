@@ -120,9 +120,15 @@ function readheader(s::BlockSource, limits::Limits, budget::Budget; legacy, allo
             (0 <= klen <= limits.max_metadata_bytes) || throw(DataError("invalid metadata key length $klen", position(s)))
             kbytes = sourcepayload(s, Int(klen), budget)
             validutf8(kbytes, 1, length(kbytes)) || throw(DataError("metadata key is not valid UTF-8", position(s)))
-            reserve!(budget, stringbytes(Int(klen)))               # the retained key, before its copy
-            key = String(Vector{UInt8}(kbytes))
-            release!(budget, payloadcharge(s, Int(klen)))          # a stream key buffer is transient
+            keybuffer = if kbytes isa Vector{UInt8}
+                kbytes                                             # the streamed payload is already owned and charged
+            else
+                reserve!(budget, bytesbytes(Int(klen)))             # reserve the byte-source copy before allocation
+                Vector{UInt8}(kbytes)
+            end
+            reserve!(budget, stringbytes(0))                         # the String shell overlaps the owned byte buffer
+            key = String(keybuffer)                                 # takes ownership of the one key buffer
+            release!(budget, bytesbytes(0))                          # the emptied Vector shell is no longer live
             vlen = sourcevarint(s)
             (0 <= vlen <= limits.max_metadata_bytes) || throw(DataError("invalid metadata value length $vlen", position(s)))
             total = checked_add(total, Int(klen) + Int(vlen))

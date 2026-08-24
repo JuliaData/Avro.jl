@@ -12,6 +12,49 @@
         @test r.budget.reserved == w.preflightbase              # the same graph, metadata and read plan
         close(r)
     end
+    @testset "byte and stream headers have identical near-ceiling acceptance" begin
+        maxmetadata = (40 << 20) - 6
+        smallkeys = ["k$(lpad(i, 4, '0'))" for i in 1:1024]
+        largekeybytes = maxmetadata - sizeof("avro.schema") - sizeof("\"null\"") - sum(sizeof, smallkeys)
+        limits = Avro.Limits(max_total_bytes=80 << 20, max_codec_memory=16 << 20,
+                             max_block_bytes=1 << 20, max_block_output_bytes=1 << 20,
+                             max_bytes=1 << 20, max_datum_bytes=1 << 20,
+                             max_schema_bytes=6, max_metadata_bytes=maxmetadata)
+        long = Avro.LongSchema()
+        varint(n) = Avro.encode(long, Int64(n))
+        header = IOBuffer()
+        write(header, b"Obj\x01")
+        write(header, varint(length(smallkeys) + 2))
+        write(header, varint(sizeof("avro.schema")), codeunits("avro.schema"),
+              varint(sizeof("\"null\"")), codeunits("\"null\""))
+        for key in smallkeys
+            write(header, varint(sizeof(key)), codeunits(key), varint(0))
+        end
+        write(header, varint(largekeybytes))
+        chunk = fill(UInt8('z'), 1 << 20)
+        whole, remainder = divrem(largekeybytes, length(chunk))
+        for _ in 1:whole
+            write(header, chunk)
+        end
+        write(header, view(chunk, 1:remainder), varint(0), varint(0), zeros(UInt8, 16))
+        bytes = take!(header)
+        path = joinpath(dir, "header-source-equivalence.avro")
+        write(path, bytes)
+
+        function outcome(src; kw...)
+            try
+                r = Avro.Reader(src; limits=limits, kw...)
+                close(r)
+                return :accepted
+            catch e
+                return (typeof(e), e isa Avro.LimitError ? e.limit : nothing, sprint(showerror, e))
+            end
+        end
+        frombytes = outcome(bytes)
+        fromstream = outcome(path; mmap=false)
+        @test frombytes === :accepted
+        @test fromstream == frombytes
+    end
     @testset "strict consumers charge each datum once" begin
         lim = Avro.Limits(max_total_values=100, work_allowance=1000)
         nullio = IOBuffer()
