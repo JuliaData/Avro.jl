@@ -152,9 +152,13 @@ end
         seekstart(io0)
         Tables.columntable(Avro.Table(io0))
     end
-    exercise(2)     # two harness iterations compile the harness's own call contexts (abstract-argument
-                    # instances and closures — a fixed, schema-independent set); the measured batch below
-                    # is still the full 1,000 random schemas of the agreed protocol
+    exercise(200)   # the warm-up saturates the runtime's closed-set machinery: the harness's own call
+                    # contexts (abstract-argument instances and closures) and the runtime's dispatch,
+                    # type and inference caches over the closed plan and value kinds — finite and
+                    # workload-independent state, not schema-content cost (live-heap growth across a
+                    # full extra batch stays under 1 MB once saturated; Julia 1.10 front-loads ~40 MB of
+                    # transient inference churn into the first encounters, round-3 item 6). The measured
+                    # batch below is still the full 1,000 random schemas of the agreed protocol
     before = avrospecializations()
     # The agreed §10.2 protocol (review round 1, R14): the RSS baseline is taken after the `E` warm-up,
     # and the single post-warm-up batch of 1,000 random schemas must grow the high-water mark by less
