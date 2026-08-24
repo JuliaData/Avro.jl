@@ -435,6 +435,9 @@ end
         @test_throws Avro.LimitError Avro.EnumSchema("E", ["ab"]; limits=Avro.Limits(max_name_bytes=1))
         aliased = Avro.Field("a", Avro.IntSchema(); aliases=["bc"])
         @test_throws Avro.LimitError Avro.RecordSchema("R"; fields=[aliased], limits=Avro.Limits(max_name_bytes=1))
+        @test_throws Avro.LimitError Avro.RecordSchema("RecursiveDepth"; limits=Avro.Limits(max_schema_depth=1)) do ref
+            return [Avro.Field("next", ref)]
+        end
         let s = Avro.LongSchema(), lim = Avro.Limits(max_schema_depth=4)
             e = try
                 for _ in 1:6

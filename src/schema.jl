@@ -1272,9 +1272,9 @@ end
 
 function collectmetas!(s::Schema, metas::Vector{NodeMeta}, namedtypes::FrozenDict{String,Schema},
                        visited::IdDict{NodeMeta,Nothing}, limits::Limits, budget::Budget, depth::Int)
-    haskey(visited, s.meta) && return metas
     depth <= limits.max_schema_depth ||
         throw(LimitError(:max_schema_depth, depth, limits.max_schema_depth, :max_schema_depth, :decode))
+    haskey(visited, s.meta) && return metas
     length(metas) < limits.max_schema_nodes ||
         throw(LimitError(:max_schema_nodes, length(metas) + 1, limits.max_schema_nodes, :max_schema_nodes, :decode))
     reserve!(budget, 160)                              # the parser's per-node construction charge
