@@ -33,7 +33,7 @@ function deterministic(s::Avro.Schema, seen=Set{UInt}())
 end
 
 function decodeall(s::Avro.Schema, bytes::Vector{UInt8})
-    out = Any[]
+    out = []
     pos = 1
     while pos <= length(bytes)
         v, pos = Avro.decode(s, bytes, pos)
@@ -109,7 +109,9 @@ function javaharness(dir::String, class::String, args...)
     return read(outpath)
 end
 
-javaharnesstext(dir::String, class::String, args...) = String(javaharness(dir, class, args...))
+function javaharnesstext(dir::String, class::String, args...)
+    return String(javaharness(dir, class, args...))
+end
 
 @testset "§8.5 matrix: containers, canonical, resolution, single-object, sort order, negatives" begin
     gen = joinpath(FIXTURES, "generated")

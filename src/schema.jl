@@ -154,14 +154,37 @@ Base.hash(s::Schema, h::UInt) = hash(s.meta.hash[], h)
 Public constructors validate every §4.2 rule, reject `props` keys that collide with the structural keys
 the same constructor emits, deep-copy already-frozen children into the new graph, and freeze.
 """
-NullSchema(; props=(;), limits::Limits=Limits()) = build(NullSchema, props; limits=limits)
-BooleanSchema(; props=(;), limits::Limits=Limits()) = build(BooleanSchema, props; limits=limits)
-FloatSchema(; props=(;), limits::Limits=Limits()) = build(FloatSchema, props; limits=limits)
-DoubleSchema(; props=(;), limits::Limits=Limits()) = build(DoubleSchema, props; limits=limits)
-IntSchema(; logical=nothing, props=(;), limits::Limits=Limits()) = build(IntSchema, props; logical=logical, limits=limits)
-LongSchema(; logical=nothing, props=(;), limits::Limits=Limits()) = build(LongSchema, props; logical=logical, limits=limits)
-BytesSchema(; logical=nothing, props=(;), limits::Limits=Limits()) = build(BytesSchema, props; logical=logical, limits=limits)
-StringSchema(; logical=nothing, props=(;), limits::Limits=Limits()) = build(StringSchema, props; logical=logical, limits=limits)
+function NullSchema(; props=(;), limits::Limits=Limits())
+    return build(NullSchema, props; limits=limits)
+end
+
+function BooleanSchema(; props=(;), limits::Limits=Limits())
+    return build(BooleanSchema, props; limits=limits)
+end
+
+function FloatSchema(; props=(;), limits::Limits=Limits())
+    return build(FloatSchema, props; limits=limits)
+end
+
+function DoubleSchema(; props=(;), limits::Limits=Limits())
+    return build(DoubleSchema, props; limits=limits)
+end
+
+function IntSchema(; logical=nothing, props=(;), limits::Limits=Limits())
+    return build(IntSchema, props; logical=logical, limits=limits)
+end
+
+function LongSchema(; logical=nothing, props=(;), limits::Limits=Limits())
+    return build(LongSchema, props; logical=logical, limits=limits)
+end
+
+function BytesSchema(; logical=nothing, props=(;), limits::Limits=Limits())
+    return build(BytesSchema, props; logical=logical, limits=limits)
+end
+
+function StringSchema(; logical=nothing, props=(;), limits::Limits=Limits())
+    return build(StringSchema, props; logical=logical, limits=limits)
+end
 
 # ---- parse context -----------------------------------------------------------------------------
 
@@ -866,7 +889,9 @@ mutable struct BoundedWriter <: IO
     charged::Int
 end
 
-BoundedWriter(budget::Budget, maxbytes::Int) = BoundedWriter(IOBuffer(), budget, maxbytes, 0, 0)
+function BoundedWriter(budget::Budget, maxbytes::Int)
+    return BoundedWriter(IOBuffer(), budget, maxbytes, 0, 0)
+end
 
 const PRINT_CHUNK = 4096
 
@@ -894,14 +919,28 @@ function Base.unsafe_write(w::BoundedWriter, p::Ptr{UInt8}, n::UInt)
     return Base.unsafe_write(w.io, p, n)
 end
 
-chargeseen!(::IO, ::Int) = nothing
-chargeseen!(w::BoundedWriter, n::Int) = (reserve!(w.budget, n); nothing)
+function chargeseen!(::IO, ::Int)
+    return nothing
+end
 
-countnode!(::IO) = nothing
-countnode!(w::BoundedWriter) = (countvalues!(w.budget); nothing)
+function chargeseen!(w::BoundedWriter, n::Int)
+    reserve!(w.budget, n)
+    return nothing
+end
+
+function countnode!(::IO)
+    return nothing
+end
+
+function countnode!(w::BoundedWriter)
+    countvalues!(w.budget)
+    return nothing
+end
 
 "The schema's recorded construction/parse limits (every root stores them in its `GraphInfo`)."
-graphlimits(s::Schema) = graphinfo(s).limits
+function graphlimits(s::Schema)
+    return graphinfo(s).limits
+end
 
 """
     Avro.json(schema; pretty=false) -> String

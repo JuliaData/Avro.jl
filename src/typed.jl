@@ -601,7 +601,9 @@ typedvalue(p::GenericTarget, d::Decoder, names) = decodevalue(p.plan, d)
 typedvalue(p::SemanticTarget{T}, d::Decoder, names) where {T} = semanticvalue(T, decodevalue(p.plan, d), names)
 typedvalue(p::LeafTarget{T}, d::Decoder, names) where {T} = convertleaf(T, decodevalue(p.plan, d))::T
 typedvalue(p::LeafTarget{String,EnumPlan}, d::Decoder, names) = p.plan.schema.symbols[readindex(d, length(p.plan.schema.symbols))]
-typedvalue(p::SymbolTarget{StringPlan}, d::Decoder, names) = admit!(names, readstring(d); budget=d.budget)
+function typedvalue(p::SymbolTarget{StringPlan}, d::Decoder, names)
+    return admit!(names, readstring(d); budget=d.budget)
+end
 typedvalue(p::RefTarget{T}, d::Decoder, names) where {T} = typedvalue(p.plan::TypedPlan, d, names)::T
 
 function typedvalue(p::SymbolTarget{EnumPlan}, d::Decoder, names)
@@ -734,7 +736,9 @@ fields: reference fields stay undefined, so `Base.summarysize` reports exactly t
 inline layout — including nested inline structs — and no referenced payload; plan §4.4, R10). The
 checked fallback bound covers types `:new` cannot probe.
 """
-@generated emptyprobe(::Type{T}) where {T} = Expr(:new, T)
+@generated function emptyprobe(::Type{T}) where {T}
+    return Expr(:new, T)
+end
 
 function measuredshell(::Type{T}) where {T}
     isbitstype(T) && return 0
@@ -759,7 +763,7 @@ shellbytes(::Type{T}) where {T} = isbitstype(T) ? 0 : 16 + sizeof(T)
             push!(body.args, :($(Symbol("f", j)) = decodetyped(p.plans[$j], d, names)))
         end
     end
-    args = Any[]
+    args = []
     for k in 1:fieldcount(T)
         ft = fieldtype(T, k)
         j = MAP[k]

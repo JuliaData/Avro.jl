@@ -79,7 +79,9 @@ struct ResolvedDTO
     a::Float64
     b::Union{Missing,Int64}
     z::Int32
-    ResolvedDTO() = error("the positional constructor must not run on the fast route")
+    function ResolvedDTO()
+        return error("the positional constructor must not run on the fast route")
+    end
 end
 
 struct Hooked
@@ -87,7 +89,9 @@ struct Hooked
     b::Union{Missing,Int64}
     z::Int32
 end
-StructUtils.lift(::Avro.AvroStyle, ::Type{Hooked}, x) = Hooked(1.0, missing, Int32(0))
+function StructUtils.lift(::Avro.AvroStyle, ::Type{Hooked}, x)
+    return Hooked(1.0, missing, Int32(0))
+end
 
 @testset "Typed decoding" begin
     using .TypedTestTypes: Plain, Mut, Empty, MutEmpty, Bits, Guarded, Colour, red, green, blue, Tagged, WithDefault, NoDefault, Optional, LL, Node, Shape, Circle, Lifted, Wrapper, HasWrapper, SymField, Nested

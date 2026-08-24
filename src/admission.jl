@@ -159,7 +159,9 @@ function admit!(a::SymbolAdmission, s::AbstractString; budget::Union{Nothing,Bud
     return Symbol(str)
 end
 
-admit!(::Symbol, s::AbstractString; budget::Union{Nothing,Budget}=nothing) = Symbol(s)   # `:trusted` bypass (validated by callers)
+function admit!(::Symbol, s::AbstractString; budget::Union{Nothing,Budget}=nothing)
+    return Symbol(s)                                      # `:trusted` bypass (validated by callers)
+end
 
 """
     admission(names) -> SymbolAdmission | Symbol

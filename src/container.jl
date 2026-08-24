@@ -515,7 +515,9 @@ end
 # ---- the writer's reader preflight (plan §4.4) -------------------------------------------------------
 
 "The reader-retained charge of the block table: one entry per block (offset, size, count, cumulative rows)."
-blocktablecharge(nblocks::Int) = checked_add(STORAGE[].vector, checked_mul(40, nblocks))   # a 5-Int BlockEntry (R06)
+function blocktablecharge(nblocks::Int)
+    return checked_add(STORAGE[].vector, checked_mul(40, nblocks))   # a 5-Int BlockEntry (R06)
+end
 
 """
 One block's transient reader-side peak (plan §4.4): the compressed and decompressed buffers, the codec's
