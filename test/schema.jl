@@ -416,6 +416,14 @@ end
     @test Avro.minsize(huge) == typemax(Int)
     @test Avro.varintlength(0) == 1 && Avro.varintlength(63) == 1 && Avro.varintlength(64) == 2
 
+    legacy_fixed = Avro.parseschema("""{"type":"record","name":"LegacyFixedOrdinals","fields":[
+        {"name":"plain","type":"long"},
+        {"name":"first","type":{"type":"fixed","size":1}},
+        {"name":"nested","type":{"type":"array","items":{"type":"fixed","size":2}}}]}
+        """; legacy_fixed_names=true)
+    @test Avro.fullname(legacy_fixed.fields[2].schema) == "_avrojl1_fixed_1"
+    @test Avro.fullname(legacy_fixed.fields[3].schema.items) == "_avrojl1_fixed_2"
+
     @testset "construction scope enforces graph limits (plan §4.4, amendment round 1)" begin
         tight = Avro.Limits(max_schema_nodes=1)
         @test_throws Avro.LimitError Avro.ArraySchema(Avro.LongSchema(); limits=tight)
