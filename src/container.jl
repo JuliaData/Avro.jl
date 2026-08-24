@@ -786,6 +786,7 @@ function Writer(dst::Union{AbstractString,IO}, schema::Schema; codec::Symbol=:nu
         base0 = budget.reserved
         pfschema = parseschema(schemajson; allow_invalid_names=allow_invalid_names, allow_invalid_defaults=allow_invalid_defaults,
                                limits=limits, budget=budget)
+        reserve!(budget, stringbytes(length(entries[2][2])))             # the reader's retained codec name
         reserve!(budget, 2 * STORAGE[].vector + 16 * length(entries))   # the mirror key/value vectors, exact capacity
         pfkeys = Vector{String}(undef, length(entries))
         pfvals = Vector{Vector{UInt8}}(undef, length(entries))
