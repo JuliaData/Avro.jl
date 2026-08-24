@@ -90,7 +90,13 @@ end
 
 # ---- construction -----------------------------------------------------------------------------------
 
-const TypedMemo = Vector{Vector{Pair{Any,TypedPlan}}}   # per node id: (target type => plan), no hashing
+"Per-node (target type => plan) entries, no hashing, plus the construction budget (round-2 D06)."
+struct TypedMemo
+    entries::Vector{Vector{Pair{Any,TypedPlan}}}
+    budget::Budget
+end
+
+Base.getindex(m::TypedMemo, i::Int) = m.entries[i]
 
 """
     typedplan(T, reader_schema, plan, limits) -> TypedPlan
@@ -98,11 +104,15 @@ const TypedMemo = Vector{Vector{Pair{Any,TypedPlan}}}   # per node id: (target t
 The typed plan decoding `plan` (the generic or resolving plan of `reader_schema`) into `T`.
 """
 function typedplan(::Type{T}, reader::Schema, plan::ReadPlan, limits::Limits) where {T}
-    memo = TypedMemo(undef, graphinfo(reader).nodes)
-    for i in eachindex(memo)
-        memo[i] = Pair{Any,TypedPlan}[]
+    return withbudget(limits) do budget                # one construction budget (§4.4, round-2 D06)
+        nodes = graphinfo(reader).nodes
+        reserve!(budget, STORAGE[].vector + nodes * (8 + STORAGE[].vector))   # the memo skeleton
+        entries = Vector{Vector{Pair{Any,TypedPlan}}}(undef, nodes)
+        for i in eachindex(entries)
+            entries[i] = Pair{Any,TypedPlan}[]
+        end
+        return buildtyped(T, reader, plan, TypedMemo(entries, budget))
     end
-    return buildtyped(T, reader, plan, memo)
 end
 
 function memolookup(memo::TypedMemo, s::Schema, ::Type{T}) where {T}
@@ -113,6 +123,7 @@ function memolookup(memo::TypedMemo, s::Schema, ::Type{T}) where {T}
 end
 
 function memostore!(memo::TypedMemo, s::Schema, ::Type{T}, p::TypedPlan) where {T}
+    reserve!(memo.budget, 32)                          # each memo entry is charged before it is stored
     entries = memo[Int(nodeid(s)) + 1]
     for i in eachindex(entries)
         entries[i].first === T || continue
@@ -319,7 +330,7 @@ function buildrecordplan(::Type{T}, s::RecordSchema, p::RecordPlan, memo::TypedM
         end
     end
     ps = (plans...,)
-    return RecordTarget{T,typeof(ps),(map...,)}(s, ps, defaults, measuredshell(T))
+    return RecordTarget{T,typeof(ps),(map...,)}(s, ps, defaults, measuredshell(T, memo.budget))
 end
 
 """
@@ -522,7 +533,7 @@ function buildresolvedrecordplan(::Type{T}, s::RecordSchema, p::ResolvedRecordPl
     resolvedreaderdefaults!(T, defaults, covered, slotfor, p, s) || return nothing
     resolvedstaticdefaults!(T, defaults, covered, names) || return nothing
     ps = (plans...,)
-    return ResolvedRecordTarget{T,typeof(ps),(stepslot...,)}(s, ps, defaults, measuredshell(T))
+    return ResolvedRecordTarget{T,typeof(ps),(stepslot...,)}(s, ps, defaults, measuredshell(T, memo.budget))
 end
 
 function resolveddefault(::Type{T}, x::ResolvedReaderDefault{T}, d::Decoder) where {T}
@@ -740,15 +751,35 @@ checked fallback bound covers types `:new` cannot probe.
     return Expr(:new, T)
 end
 
-function measuredshell(::Type{T}) where {T}
+"A field type whose instances live inline in their parent and charge their own target shell."
+function inlinestruct(::Type{F}) where {F}
+    return isconcretetype(F) && isstructtype(F) && !ismutabletype(F) && !isbitstype(F) &&
+           !(F <: AbstractArray) && !(F <: AbstractString) && !(F <: AbstractDict)
+end
+
+function measuredshell(::Type{T}, budget::Union{Nothing,Budget}=nothing) where {T}
     isbitstype(T) && return 0
-    ismutabletype(T) || isstructtype(T) || return 16 + sizeof(T)
-    probe = try
-        emptyprobe(T)
-    catch
-        return sizeof(T) + 8 * fieldcount(T) + 64      # the §4.4 checked bound
+    bound = sizeof(T) + 8 * fieldcount(T) + 64         # the §4.4 checked bound, reserved before the probe
+    budget === nothing || reserve!(budget, bound)
+    shell = if ismutabletype(T) || isstructtype(T)
+        try
+            probe = emptyprobe(T)
+            marginal = Int(Base.summarysize(probe))
+            for i in 1:fieldcount(T)                   # inline nested structs charge their own shells
+                F = fieldtype(T, i)
+                if inlinestruct(F)
+                    marginal -= measuredshell(F, nothing)
+                end
+            end
+            max(marginal, 8)
+        catch
+            bound
+        end
+    else
+        16 + sizeof(T)
     end
-    return max(Int(Base.summarysize(probe)), 8)
+    budget === nothing || release!(budget, bound)      # the probe is transient: the bound trues up to zero
+    return shell
 end
 
 shellbytes(::Type{T}) where {T} = isbitstype(T) ? 0 : 16 + sizeof(T)
