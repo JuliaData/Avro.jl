@@ -525,10 +525,10 @@ for rec in records:
                 ss = Avro.parseschema(read(av, String))
                 @test livecompare("Compare", av, fa, fb) == expectobject       # object-level differences stay recorded
                 @test livecompare("CompareBytes", av, fa, fb) == expectbytes  # encoded comparator is the spec oracle
-                # compare the same wire bytes Java compared: fromjson/encode would canonicalise
-                # logical surface forms (non-minimal decimal, mixed-case uuid) and mask deviations
-                wa = Vector{UInt8}(javatool("jsontofrag", "--schema-file", av, fa))
-                wb = Vector{UInt8}(javatool("jsontofrag", "--schema-file", av, fb))
+                # Compare the same wire bytes as CompareBytes. Avro's jsontofrag tool waits on some
+                # complete JSON strings, and Julia would canonicalise logical surface forms.
+                wa = hex2bytes(strip(javaharnesstext(hd, "Encode", av, fa)))
+                wb = hex2bytes(strip(javaharnesstext(hd, "Encode", av, fb)))
                 if startswith(expectbytes, "ERROR")
                     @test_throws ArgumentError Avro.comparebytes(ss, wa, wb)
                     ran += 1
