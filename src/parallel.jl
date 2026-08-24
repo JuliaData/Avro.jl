@@ -242,7 +242,13 @@ function decodedirect!(r::Reader, e::BlockEntry, plan, builders::Vector{ColumnBu
         decoderow!(cells, d, plan)
         checkblockoutput(b, outputbase, done, slotrow, cap)
     end
-    d.pos == length(out) + 1 || throw(DataError("block datums did not consume the block exactly", d.pos))
+    if d.pos != length(out) + 1
+        if r.legacy === :avrojl1 && r.codecname === :null
+            r.warned || (@warn "accepting trailing bytes after $(n) datums in a null-codec block (legacy=:avrojl1; Avro.jl ≤ 1.1.2 sizing cushion)" source = 1; r.warned = true)
+        else
+            throw(DataError("block datums did not consume the block exactly", d.pos))
+        end
+    end
     addrows!(b, n)
     release!(b, bytesbytes(length(out)))
     return nothing
