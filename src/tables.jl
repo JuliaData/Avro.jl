@@ -20,19 +20,34 @@ struct Row <: Tables.AbstractRow
     admission::Union{SymbolAdmission,Symbol}
 end
 
-Row(record::Record; names=DEFAULT_ADMISSION) = Row(record, admission(names))
+function Row(record::Record; names=DEFAULT_ADMISSION)
+    return Row(record, admission(names))
+end
 
 function admitnames(s::RecordSchema, adm, budget::Union{Nothing,Budget}=nothing)
     return Symbol[admit!(adm, f.name; budget=budget) for f in s.fields]
 end
 
-Tables.columnnames(r::Row) = admitnames(getfield(getfield(r, :record), :schema), getfield(r, :admission))
-Tables.getcolumn(r::Row, i::Int) = getfield(getfield(r, :record), :values)[i]
-Tables.getcolumn(r::Row, nm::Symbol) = getfield(r, :record)[String(nm)]
-Base.show(io::IO, r::Row) = (print(io, "Avro.Row"); show(io, getfield(r, :record)))
+function Tables.columnnames(r::Row)
+    return admitnames(getfield(getfield(r, :record), :schema), getfield(r, :admission))
+end
+
+function Tables.getcolumn(r::Row, i::Int)
+    return getfield(getfield(r, :record), :values)[i]
+end
+
+function Tables.getcolumn(r::Row, nm::Symbol)
+    return getfield(r, :record)[String(nm)]
+end
+
+function Base.show(io::IO, r::Row)
+    return (print(io, "Avro.Row"); show(io, getfield(r, :record)))
+end
 
 "The wrapped `Avro.Record` of a row."
-record(r::Row) = getfield(r, :record)
+function record(r::Row)
+    return getfield(r, :record)
+end
 
 # ---- projection -------------------------------------------------------------------------------------
 
@@ -151,24 +166,51 @@ function Table(src; reader_schema::Union{Nothing,Schema}=nothing, union_resoluti
     end
 end
 
-Base.length(t::Table) = getfield(t, :nrows)
-Base.show(io::IO, t::Table) = print(io, "Avro.Table(", getfield(t, :nrows), " rows × ", length(getfield(t, :names)), " columns: ", join(getfield(t, :names), ", "), ")")
+function Base.length(t::Table)
+    return getfield(t, :nrows)
+end
 
-Tables.istable(::Type{Table}) = true
-Tables.columnaccess(::Type{Table}) = true
-Tables.columns(t::Table) = t
+function Base.show(io::IO, t::Table)
+    return print(io, "Avro.Table(", getfield(t, :nrows), " rows × ", length(getfield(t, :names)), " columns: ", join(getfield(t, :names), ", "), ")")
+end
+
+function Tables.istable(::Type{Table})
+    return true
+end
+
+function Tables.columnaccess(::Type{Table})
+    return true
+end
+
+function Tables.columns(t::Table)
+    return t
+end
+
 "A stored `Tables.Schema{nothing,nothing}`: file-derived names and eltypes never become type parameters."
-storedschema(names::Vector{Symbol}, s::RecordSchema) = Tables.Schema(names, Type[juliatype(f.schema) for f in s.fields]; stored=true)
+function storedschema(names::Vector{Symbol}, s::RecordSchema)
+    return Tables.Schema(names, Type[juliatype(f.schema) for f in s.fields]; stored=true)
+end
 
-Tables.schema(t::Table) = storedschema(getfield(t, :names), getfield(t, :schema))
-Tables.columnnames(t::Table) = getfield(t, :names)
-Tables.getcolumn(t::Table, i::Int) = getfield(t, :columns)[i]
+function Tables.schema(t::Table)
+    return storedschema(getfield(t, :names), getfield(t, :schema))
+end
+
+function Tables.columnnames(t::Table)
+    return getfield(t, :names)
+end
+
+function Tables.getcolumn(t::Table, i::Int)
+    return getfield(t, :columns)[i]
+end
+
 function Tables.getcolumn(t::Table, nm::Symbol)
     i = findfirst(==(nm), getfield(t, :names))
     i === nothing && throw(ArgumentError("no column $nm"))
     return getfield(t, :columns)[i]
 end
-Tables.partitions(t::Table) = (subtable(t, r) for r in getfield(t, :blockranges))
+function Tables.partitions(t::Table)
+    return (subtable(t, r) for r in getfield(t, :blockranges))
+end
 
 # Tables' generic column-to-row fallback derives the row count from the first column, so it yields no
 # rows for a zero-column table. Keep Table's column-access contract, but provide a row view that uses
@@ -234,14 +276,33 @@ function subtable(t::Table, range::UnitRange{Int})
                  getfield(t, :metadata), getfield(t, :codecname), getfield(t, :syncmarker))
 end
 
-schema(t::Table) = getfield(t, :schema)
-writerschema(t::Table) = getfield(t, :writerschema)
-metadata(t::Table) = getfield(t, :metadata)
-codec(t::Table) = getfield(t, :codecname)
-sync(t::Table) = getfield(t, :syncmarker)
+function schema(t::Table)
+    return getfield(t, :schema)
+end
 
-DataAPI.metadatasupport(::Type{Table}) = (read=true, write=false)
-DataAPI.metadatakeys(t::Table) = (k for k in getfield(t, :metadata).keys)
+function writerschema(t::Table)
+    return getfield(t, :writerschema)
+end
+
+function metadata(t::Table)
+    return getfield(t, :metadata)
+end
+
+function codec(t::Table)
+    return getfield(t, :codecname)
+end
+
+function sync(t::Table)
+    return getfield(t, :syncmarker)
+end
+
+function DataAPI.metadatasupport(::Type{Table})
+    return (read=true, write=false)
+end
+
+function DataAPI.metadatakeys(t::Table)
+    return (k for k in getfield(t, :metadata).keys)
+end
 
 function metadatavalue(v::Vector{UInt8})
     return validutf8(v, 1, length(v)) ? String(copy(v)) : copy(v)
@@ -384,13 +445,29 @@ function Rows(f::Function, src; kw...)
     end
 end
 
-Base.close(rows::Rows) = close(getfield(rows, :reader))
+function Base.close(rows::Rows)
+    return close(getfield(rows, :reader))
+end
 
-schema(rows::Rows) = something(getfield(rows, :outschema), getfield(rows, :effective))
-writerschema(rows::Rows) = getfield(rows, :reader).schema
-metadata(rows::Rows) = getfield(rows, :reader).metadata
-codec(rows::Rows) = getfield(rows, :reader).codecname
-sync(rows::Rows) = getfield(rows, :reader).sync
+function schema(rows::Rows)
+    return something(getfield(rows, :outschema), getfield(rows, :effective))
+end
+
+function writerschema(rows::Rows)
+    return getfield(rows, :reader).schema
+end
+
+function metadata(rows::Rows)
+    return getfield(rows, :reader).metadata
+end
+
+function codec(rows::Rows)
+    return getfield(rows, :reader).codecname
+end
+
+function sync(rows::Rows)
+    return getfield(rows, :reader).sync
+end
 
 function rowsymbols(rows::Rows)
     getfield(rows, :mode) === :generic || throw(ArgumentError("only the generic record mode has columns"))
@@ -401,11 +478,25 @@ function rowsymbols(rows::Rows)
     return s
 end
 
-Tables.istable(rows::Rows) = getfield(rows, :mode) === :generic
-Tables.rowaccess(rows::Rows) = getfield(rows, :mode) === :generic
-Tables.rows(rows::Rows) = rows
-Tables.schema(rows::Rows) = storedschema(rowsymbols(rows), getfield(rows, :outschema))
-Tables.columnnames(rows::Rows) = rowsymbols(rows)
+function Tables.istable(rows::Rows)
+    return getfield(rows, :mode) === :generic
+end
+
+function Tables.rowaccess(rows::Rows)
+    return getfield(rows, :mode) === :generic
+end
+
+function Tables.rows(rows::Rows)
+    return rows
+end
+
+function Tables.schema(rows::Rows)
+    return storedschema(rowsymbols(rows), getfield(rows, :outschema))
+end
+
+function Tables.columnnames(rows::Rows)
+    return rowsymbols(rows)
+end
 
 "The block-table capacity the pre-scan grew to for `n` entries (its growth doubles from 64)."
 function nextpow2rows(n::Int)
@@ -547,8 +638,13 @@ function Tables.partitions(rows::Rows)
     return RowsPartitions(rows)
 end
 
-Base.IteratorSize(::Type{RowsPartitions}) = Base.SizeUnknown()
-Base.eltype(::Type{RowsPartitions}) = Table
+function Base.IteratorSize(::Type{RowsPartitions})
+    return Base.SizeUnknown()
+end
+
+function Base.eltype(::Type{RowsPartitions})
+    return Table
+end
 
 function Base.iterate(it::RowsPartitions, ::Nothing=nothing)
     rows = it.rows
@@ -615,7 +711,18 @@ function Tables.columns(rows::Rows)
     end
 end
 
-retainedschema(x) = nothing
-retainedschema(t::Table) = getfield(t, :schema)
-retainedschema(rows::Rows) = schema(rows)
-retainedschema(r::Reader) = r.schema
+function retainedschema(x)
+    return nothing
+end
+
+function retainedschema(t::Table)
+    return getfield(t, :schema)
+end
+
+function retainedschema(rows::Rows)
+    return schema(rows)
+end
+
+function retainedschema(r::Reader)
+    return r.schema
+end

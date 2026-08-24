@@ -38,7 +38,9 @@ function SchemaCache(; max_entries::Integer=10_000, max_bytes::Integer=64 << 20)
     return SchemaCache(ReentrantLock(), Int(max_entries), Int(max_bytes), UInt64[], Schema[], 0)
 end
 
-Base.length(c::SchemaCache) = lock(() -> length(c.fingerprints), c.lock)
+function Base.length(c::SchemaCache)
+    return lock(() -> length(c.fingerprints), c.lock)
+end
 
 """
     Avro.register!(store, schema; limits=Limits()) -> UInt64
@@ -104,7 +106,9 @@ The shared-budget route `decodesingle` uses: the lookup's work is charged to the
 budget instead of opening a second one. The fallback calls the two-argument form (its own budget);
 custom stores may extend this method to share the operation budget (D03).
 """
-lookup(store::SchemaStore, fp::UInt64, budget::Budget) = lookup(store, fp; limits=budget.limits)
+function lookup(store::SchemaStore, fp::UInt64, budget::Budget)
+    return lookup(store, fp; limits=budget.limits)
+end
 
 function lookup(c::SchemaCache, fp::UInt64, budget::Budget)
     lock(c.lock) do

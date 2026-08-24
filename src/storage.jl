@@ -51,18 +51,50 @@ function slotbytes(@nospecialize(T::Type))
     return Base.elsize(Vector{T})
 end
 
-vectorbytes(@nospecialize(T::Type), n::Int) = STORAGE[].vector + n * slotbytes(T)
-bytesbytes(n::Int) = STORAGE[].vector + n
-stringbytes(n::Int) = STORAGE[].string + STORAGE[].slot + n
-boxbytes(@nospecialize(T::Type)) = STORAGE[].slot + OBJECT_HEADER + sizeof(T)
-recordbytes(nfields::Int) = STORAGE[].record + vectorbytes(Any, nfields)
-fixedbytes(n::Int) = STORAGE[].fixed + bytesbytes(n)
-enumvaluebytes() = STORAGE[].enumvalue
-unionvaluebytes() = STORAGE[].unionvalue
-widedecimalbytes(nbytes::Int) = 16 + STORAGE[].bigint + 8 * (cld(nbytes, 8) + 2)   # struct, BigInt, limbs and two limbs of GMP slack (the negative path over-allocates)
+function vectorbytes(@nospecialize(T::Type), n::Int)
+    return STORAGE[].vector + n * slotbytes(T)
+end
+
+function bytesbytes(n::Int)
+    return STORAGE[].vector + n
+end
+
+function stringbytes(n::Int)
+    return STORAGE[].string + STORAGE[].slot + n
+end
+
+function boxbytes(@nospecialize(T::Type))
+    return STORAGE[].slot + OBJECT_HEADER + sizeof(T)
+end
+
+function recordbytes(nfields::Int)
+    return STORAGE[].record + vectorbytes(Any, nfields)
+end
+
+function fixedbytes(n::Int)
+    return STORAGE[].fixed + bytesbytes(n)
+end
+
+function enumvaluebytes()
+    return STORAGE[].enumvalue
+end
+
+function unionvaluebytes()
+    return STORAGE[].unionvalue
+end
+
+function widedecimalbytes(nbytes::Int)
+    return 16 + STORAGE[].bigint + 8 * (cld(nbytes, 8) + 2)   # struct, BigInt, limbs and two limbs of GMP slack (the negative path over-allocates)
+end
+
 "The `Avro.Map` parts `buildmap` allocates itself: the struct and the `npairs` permutation."
-mapshellbytes(npairs::Int) = STORAGE[].map + vectorbytes(Int32, npairs)
-mapbytes(@nospecialize(V::Type), npairs::Int) = mapshellbytes(npairs) + vectorbytes(String, npairs) + vectorbytes(V, npairs)
+function mapshellbytes(npairs::Int)
+    return STORAGE[].map + vectorbytes(Int32, npairs)
+end
+
+function mapbytes(@nospecialize(V::Type), npairs::Int)
+    return mapshellbytes(npairs) + vectorbytes(String, npairs) + vectorbytes(V, npairs)
+end
 
 "The boxed-value charge of a record field or `Any` slot of static type `T` (0 for reference types)."
 function boxcharge(@nospecialize(T::Type))
@@ -81,22 +113,53 @@ The package's formula for the Julia storage of the generic value `x` (its own ob
 references; schema references excluded). `heldbytes(x)` is the charge of `x` held in an `Any` slot
 (isbits values boxed).
 """
-storagebytes(x::String) = stringbytes(sizeof(x))
-storagebytes(x::Vector{UInt8}) = bytesbytes(length(x))
-storagebytes(x::Fixed) = fixedbytes(length(x.bytes))
-storagebytes(::EnumValue) = enumvaluebytes()
-storagebytes(x::UnionValue) = unionvaluebytes() + heldbytes(x.value)
-storagebytes(x::WideDecimal) = 16 + STORAGE[].bigint + 8 * max(Int(x.unscaled.alloc), 1)
-storagebytes(x::Record) = recordbytes(capacity(getfield(x, :values))) + sum(heldbytes, getfield(x, :values); init=0)
-storagebytes(x::Vector{T}) where {T} = vectorbytes(T, capacity(x)) + sum(v -> elementbytes(T, v), x; init=0)
+function storagebytes(x::String)
+    return stringbytes(sizeof(x))
+end
+
+function storagebytes(x::Vector{UInt8})
+    return bytesbytes(length(x))
+end
+
+function storagebytes(x::Fixed)
+    return fixedbytes(length(x.bytes))
+end
+
+function storagebytes(::EnumValue)
+    return enumvaluebytes()
+end
+
+function storagebytes(x::UnionValue)
+    return unionvaluebytes() + heldbytes(x.value)
+end
+
+function storagebytes(x::WideDecimal)
+    return 16 + STORAGE[].bigint + 8 * max(Int(x.unscaled.alloc), 1)
+end
+
+function storagebytes(x::Record)
+    return recordbytes(capacity(getfield(x, :values))) + sum(heldbytes, getfield(x, :values); init=0)
+end
+
+function storagebytes(x::Vector{T}) where {T}
+    return vectorbytes(T, capacity(x)) + sum(v -> elementbytes(T, v), x; init=0)
+end
+
 function storagebytes(x::Map{V}) where {V}
     shell = STORAGE[].map + vectorbytes(Int32, capacity(x.perm)) + vectorbytes(String, capacity(x.keys)) + vectorbytes(V, capacity(x.vals))
     return shell + sum(storagebytes, x.keys; init=0) + sum(v -> elementbytes(V, v), x.vals; init=0)
 end
-storagebytes(x) = isbits(x) ? 0 : throw(ArgumentError("no storage formula for $(typeof(x))"))
+function storagebytes(x)
+    return isbits(x) ? 0 : throw(ArgumentError("no storage formula for $(typeof(x))"))
+end
 
-heldbytes(::Missing) = 0
-heldbytes(x) = isbits(x) ? boxbytes(typeof(x)) : storagebytes(x)
+function heldbytes(::Missing)
+    return 0
+end
+
+function heldbytes(x)
+    return isbits(x) ? boxbytes(typeof(x)) : storagebytes(x)
+end
 
 # The storage an element `x` adds beyond its slot in a `Vector{T}` / `Map{T}`. Identity-bearing structs
 # stored inline are charged at production as well as for their slot (the decoder's charge model; also
@@ -109,7 +172,11 @@ end
 
 # The retained slots of a vector (compacted maps keep their `npairs` capacity, which stays charged).
 @static if VERSION >= v"1.11"
-    capacity(v::Vector) = length(v.ref.mem)
+    function capacity(v::Vector)
+        return length(v.ref.mem)
+    end
 else
-    capacity(v::Vector) = length(v)
+    function capacity(v::Vector)
+        return length(v)
+    end
 end

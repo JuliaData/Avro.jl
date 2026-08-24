@@ -17,7 +17,9 @@ struct ResolvedSchema
     plan::ReadPlan
 end
 
-Base.show(io::IO, r::ResolvedSchema) = print(io, "Avro.ResolvedSchema(", kind(r.writer), " → ", kind(r.reader), ", ", r.union_resolution, ")")
+function Base.show(io::IO, r::ResolvedSchema)
+    return print(io, "Avro.ResolvedSchema(", kind(r.writer), " → ", kind(r.reader), ", ", r.union_resolution, ")")
+end
 
 # ---- resolving plan nodes ---------------------------------------------------------------------------
 
@@ -74,8 +76,13 @@ mutable struct ResolvedRecordPlan <: ReadPlan
     const boxes::Vector{Int}
 end
 
-isresolving(::ReadPlan) = false
-isresolving(::Union{PromotePlan,DefaultPlan,EnumRemapPlan,UnresolvableBranch,UnionResolvePlan,WrapPlan,ResolvedRecordPlan}) = true
+function isresolving(::ReadPlan)
+    return false
+end
+
+function isresolving(::Union{PromotePlan,DefaultPlan,EnumRemapPlan,UnresolvableBranch,UnionResolvePlan,WrapPlan,ResolvedRecordPlan})
+    return true
+end
 
 # ---- the resolver -----------------------------------------------------------------------------------
 
@@ -120,10 +127,17 @@ function resolvingplan(writer::Schema, reader::Schema; union_resolution::Symbol=
     return resolve(writer, reader; union_resolution=union_resolution, limits=limits, budget=budget).plan
 end
 
-reserror(msg::AbstractString, wp::AbstractString, rp::AbstractString) = throw(ResolutionError(String(msg), String(wp), String(rp)))
+function reserror(msg::AbstractString, wp::AbstractString, rp::AbstractString)
+    throw(ResolutionError(String(msg), String(wp), String(rp)))
+end
 
-readerplan(ctx::ResolveContext, s::Schema) = readplan(s, ctx.readermemo, ctx.budget)
-writerplan(ctx::ResolveContext, s::Schema) = readplan(s, ctx.writermemo, ctx.budget)
+function readerplan(ctx::ResolveContext, s::Schema)
+    return readplan(s, ctx.readermemo, ctx.budget)
+end
+
+function writerplan(ctx::ResolveContext, s::Schema)
+    return readplan(s, ctx.writermemo, ctx.budget)
+end
 
 function memoslot(ctx::ResolveContext, w::Schema)
     iw = Int(nodeid(w)) + 1
@@ -174,11 +188,18 @@ function resolvenode(ctx::ResolveContext, w::Schema, r::Schema, wp::String, rp::
     return memostore!(ctx, w, r, resolvekinds(ctx, w, r, wp, rp))
 end
 
-describe(s::NamedSchema) = string(kind(s), " ", fullname(s))
-describe(s::Schema) = string(kind(s))
+function describe(s::NamedSchema)
+    return string(kind(s), " ", fullname(s))
+end
+
+function describe(s::Schema)
+    return string(kind(s))
+end
 
 "Named types match by normalised fullname, by a reader alias, or by the unqualified name (the spec's record rule)."
-namesmatch(w::NamedSchema, r::NamedSchema) = fullname(w) == fullname(r) || fullname(w) in r.aliases || w.name.name == r.name.name
+function namesmatch(w::NamedSchema, r::NamedSchema)
+    return fullname(w) == fullname(r) || fullname(w) in r.aliases || w.name.name == r.name.name
+end
 
 function resolvekinds(ctx::ResolveContext, w::Schema, r::Schema, wp::String, rp::String)
     w isa UnionSchema && return resolvewriterunion(ctx, w, r, wp, rp)
@@ -369,20 +390,40 @@ function skipraw(kind::Symbol, d::Decoder)
     return skiplen(d)
 end
 
-decodevalue(p::PromotePlan, d::Decoder) = fromraw(p.reader, d, readraw(p.writer, d))
-skipvalue(p::PromotePlan, d::Decoder) = skipraw(p.writer, d)
+function decodevalue(p::PromotePlan, d::Decoder)
+    return fromraw(p.reader, d, readraw(p.writer, d))
+end
+
+function skipvalue(p::PromotePlan, d::Decoder)
+    return skipraw(p.writer, d)
+end
 
 # The reader's interpretation of a promoted raw value.
-fromraw(::LongPlan, d::Decoder, raw::Int32) = Int64(raw)
-fromraw(::FloatPlan, d::Decoder, raw::Union{Int32,Int64}) = Float32(raw)
-fromraw(::DoublePlan, d::Decoder, raw::Union{Int32,Int64,Float32}) = Float64(raw)
+function fromraw(::LongPlan, d::Decoder, raw::Int32)
+    return Int64(raw)
+end
+
+function fromraw(::FloatPlan, d::Decoder, raw::Union{Int32,Int64})
+    return Float32(raw)
+end
+
+function fromraw(::DoublePlan, d::Decoder, raw::Union{Int32,Int64,Float32})
+    return Float64(raw)
+end
+
 function fromraw(::TimeMicrosPlan, d::Decoder, raw::Int32)
     v = Int64(raw)
     0 <= v < 86_400_000_000 || dataerror(d, "time-micros value $v out of range")
     return Time(Nanosecond(v * 1_000))
 end
-fromraw(::TimestampPlan{P}, d::Decoder, raw::Int32) where {P} = Timestamp{P}(Int64(raw))
-fromraw(::LocalTimestampPlan{P}, d::Decoder, raw::Int32) where {P} = LocalTimestamp{P}(Int64(raw))
+function fromraw(::TimestampPlan{P}, d::Decoder, raw::Int32) where {P}
+    return Timestamp{P}(Int64(raw))
+end
+
+function fromraw(::LocalTimestampPlan{P}, d::Decoder, raw::Int32) where {P}
+    return LocalTimestamp{P}(Int64(raw))
+end
+
 function fromraw(::StringPlan, d::Decoder, raw::Vector{UInt8})
     validutf8(raw, 1, length(raw)) || dataerror(d, "invalid UTF-8 in string")
     n = length(raw)
@@ -417,10 +458,17 @@ function fromraw(p::DecimalPlan, d::Decoder, raw::String)
     release!(d.budget, bytesbytes(n))                     # the transient copy dies with this frame
     return v
 end
-fromraw(p::ReadPlan, d::Decoder, raw) = dataerror(d, "internal error: no promotion of $(typeof(raw)) into $(typeof(p))")
+function fromraw(p::ReadPlan, d::Decoder, raw)
+    return dataerror(d, "internal error: no promotion of $(typeof(raw)) into $(typeof(p))")
+end
 
-decodevalue(p::DefaultPlan, d::Decoder) = jsonvalue(p.schema, p.json, d.budget)
-skipvalue(::DefaultPlan, d::Decoder) = nothing
+function decodevalue(p::DefaultPlan, d::Decoder)
+    return jsonvalue(p.schema, p.json, d.budget)
+end
+
+function skipvalue(::DefaultPlan, d::Decoder)
+    return nothing
+end
 
 function enumremapindex(p::EnumRemapPlan, d::Decoder)
     i = readindex(d, length(p.writer.symbols))
@@ -439,10 +487,17 @@ function decodevalue(p::EnumRemapPlan, d::Decoder)
     allocated!(d.budget, enumvaluebytes())
     return v
 end
-skipvalue(p::EnumRemapPlan, d::Decoder) = (readindex(d, length(p.writer.symbols)); nothing)
+function skipvalue(p::EnumRemapPlan, d::Decoder)
+    return (readindex(d, length(p.writer.symbols)); nothing)
+end
 
-decodevalue(p::UnresolvableBranch, d::Decoder) = throw(ResolutionError(p.msg, p.writerpath, p.readerpath))
-skipvalue(p::UnresolvableBranch, d::Decoder) = skipvalue(p.skipper, d)
+function decodevalue(p::UnresolvableBranch, d::Decoder)
+    throw(ResolutionError(p.msg, p.writerpath, p.readerpath))
+end
+
+function skipvalue(p::UnresolvableBranch, d::Decoder)
+    return skipvalue(p.skipper, d)
+end
 
 function wrapreader(d::Decoder, v, j::Int, nullable::Int)
     nullable != 0 && return j == nullable ? missing : v
@@ -468,8 +523,13 @@ function skipvalue(p::UnionResolvePlan, d::Decoder)
     return skipvalue(p.branches[readindex(d, n)], d)
 end
 
-decodevalue(p::WrapPlan, d::Decoder) = wrapreader(d, decodevalue(p.inner, d), p.readerindex, p.nullable)
-skipvalue(p::WrapPlan, d::Decoder) = skipvalue(p.inner, d)
+function decodevalue(p::WrapPlan, d::Decoder)
+    return wrapreader(d, decodevalue(p.inner, d), p.readerindex, p.nullable)
+end
+
+function skipvalue(p::WrapPlan, d::Decoder)
+    return skipvalue(p.inner, d)
+end
 
 function decodevalue(p::ResolvedRecordPlan, d::Decoder)
     enter!(d)
@@ -513,7 +573,9 @@ end
 
 # ---- column builders over resolved records (plan §6; used by Avro.Table and Rows partitions) ---------
 
-decoderow!(cols::Vector{ColumnBuilder}, d::Decoder, ::RecordPlan) = decoderow!(cols, d)
+function decoderow!(cols::Vector{ColumnBuilder}, d::Decoder, ::RecordPlan)
+    return decoderow!(cols, d)
+end
 
 "One resolved record row into reader-slot builders: writer-ordered steps, then the defaults."
 function decoderow!(cols::Vector{ColumnBuilder}, d::Decoder, p::ResolvedRecordPlan)

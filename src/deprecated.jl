@@ -66,4 +66,6 @@ function deprecateddecode(src::AbstractString, s::Schema, args...; kw...)
     end
 end
 
-deprecateddecode(src, s::Schema, args...; kw...) = decode(s, src, args...; kw...)
+function deprecateddecode(src, s::Schema, args...; kw...)
+    return decode(s, src, args...; kw...)
+end

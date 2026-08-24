@@ -75,8 +75,13 @@ function __init__()
 end
 
 "`JSON.json` prints an `Avro.Schema` as its schema JSON (parsing is Avro-owned; plan §11)."
-JSON.json(s::Schema) = json(s)
-JSON.json(io::IO, s::Schema) = (Base.write(io, json(s)); nothing)
+function JSON.json(s::Schema)
+    return json(s)
+end
+
+function JSON.json(io::IO, s::Schema)
+    return (Base.write(io, json(s)); nothing)
+end
 
 include("precompile.jl")
 end # module Avro

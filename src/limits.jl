@@ -119,13 +119,22 @@ function validate(l::Limits)
     return l
 end
 
-checked_add(a::Int, b::Int) = Base.Checked.checked_add(a, b)
-checked_mul(a::Int, b::Int) = Base.Checked.checked_mul(a, b)
+function checked_add(a::Int, b::Int)
+    return Base.Checked.checked_add(a, b)
+end
+
+function checked_mul(a::Int, b::Int)
+    return Base.Checked.checked_mul(a, b)
+end
 
 # clamped addition for counters that must never throw (guard state)
-clamped_add(a::Int, b::Int) = (r = a + b; (b > 0 && r < a) ? typemax(Int) : ((b < 0 && r > a) ? typemin(Int) : r))
+function clamped_add(a::Int, b::Int)
+    return (r = a + b; (b > 0 && r < a) ? typemax(Int) : ((b < 0 && r > a) ? typemin(Int) : r))
+end
 
-Base.show(io::IO, l::Limits) = print(io, "Avro.Limits(max_total_bytes=", l.max_total_bytes, ", …)")
+function Base.show(io::IO, l::Limits)
+    return print(io, "Avro.Limits(max_total_bytes=", l.max_total_bytes, ", …)")
+end
 
 function Base.show(io::IO, ::MIME"text/plain", l::Limits)
     println(io, "Avro.Limits:")
@@ -141,8 +150,9 @@ end
 The memory the first unit of progress of any operation may need: one compressed block, its decompressed
 buffer, the codec workspace plus 4 MiB of fixed overhead, and one datum (plan §4.4).
 """
-first_unit_bytes(l::Limits) =
-    checked_add(checked_add(checked_add(l.max_block_bytes, l.max_block_bytes), checked_add(l.max_codec_memory, 4 * MiB)), l.max_datum_bytes)
+function first_unit_bytes(l::Limits)
+    return checked_add(checked_add(checked_add(l.max_block_bytes, l.max_block_bytes), checked_add(l.max_codec_memory, 4 * MiB)), l.max_datum_bytes)
+end
 
 # ---- available-memory guard (best-effort; plan §4.4) ------------------------------------------------
 
@@ -223,7 +233,9 @@ end
 
 `min(limits.max_total_bytes, available ÷ 2)` — the ceiling an operation actually runs under (plan §4.4).
 """
-effective_ceiling(l::Limits; available::Int=available_memory()) = min(l.max_total_bytes, max(available, 0) ÷ 2)
+function effective_ceiling(l::Limits; available::Int=available_memory())
+    return min(l.max_total_bytes, max(available, 0) ÷ 2)
+end
 
 # ---- per-operation budget -------------------------------------------------------------------------
 
@@ -262,7 +274,9 @@ function Budget(limits::Limits; direction::Symbol=:decode, available::Int=availa
     return Budget(limits, ceiling, direction, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, min(limits.max_total_values, limits.work_allowance))
 end
 
-limiterror(b::Budget, limit::Symbol, observed::Int, value::Int) = LimitError(limit, observed, value, limit, b.direction)
+function limiterror(b::Budget, limit::Symbol, observed::Int, value::Int)
+    return LimitError(limit, observed, value, limit, b.direction)
+end
 
 """
     reserve!(budget, n)
@@ -331,7 +345,9 @@ Reserve `n` bytes and settle them immediately: the shorthand for storage allocat
 breath as its charge (amortized parser and construction charges). A bare `reserve!` without a
 matching `allocated!`/`unreserve!` is reserved for worst-case headroom that never materialises.
 """
-charge!(b::Budget, n::Int) = (reserve!(b, n); allocated!(b, n); b)
+function charge!(b::Budget, n::Int)
+    return (reserve!(b, n); allocated!(b, n); b)
+end
 
 """
     release!(budget, n)
@@ -434,7 +450,9 @@ end
 end
 
 "The largest draw on `work_allowance` so far (values beyond `max_values_per_byte × input_bytes`)."
-allowanceused(b::Budget) = max(b.allowance_used, b.values - checked_mul(b.limits.max_values_per_byte, b.input_bytes))
+function allowanceused(b::Budget)
+    return max(b.allowance_used, b.values - checked_mul(b.limits.max_values_per_byte, b.input_bytes))
+end
 
 """
     addcompare!(budget, n)

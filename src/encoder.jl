@@ -21,8 +21,13 @@ function Encoder(budget::Budget; capacity::Int=256)
     return e
 end
 
-Base.length(e::Encoder) = e.pos
-capacity(e::Encoder) = length(e.buf)
+function Base.length(e::Encoder)
+    return e.pos
+end
+
+function capacity(e::Encoder)
+    return length(e.buf)
+end
 
 """
     ensureroom!(e, n)
@@ -74,8 +79,13 @@ function writelong!(e::Encoder, x::Int64)
     return nothing
 end
 
-writeint!(e::Encoder, x::Int32) = writelong!(e, Int64(x))
-writebool!(e::Encoder, x::Bool) = writebyte!(e, x ? 0x01 : 0x00)
+function writeint!(e::Encoder, x::Int32)
+    return writelong!(e, Int64(x))
+end
+
+function writebool!(e::Encoder, x::Bool)
+    return writebyte!(e, x ? 0x01 : 0x00)
+end
 
 function writefloat!(e::Encoder, x::Float32)
     ensureroom!(e, 4)
@@ -152,4 +162,6 @@ function enter!(e::Encoder)
     return nothing
 end
 
-leave!(e::Encoder) = (e.depth -= 1; nothing)
+function leave!(e::Encoder)
+    return (e.depth -= 1; nothing)
+end

@@ -10,8 +10,14 @@ struct XzReader
     memlimit::UInt64
 end
 
-lzma_encoder_memusage(preset::Integer) = ccall((:lzma_easy_encoder_memusage, XZ_jll.liblzma), UInt64, (UInt32,), preset)
-lzma_decoder_memusage(preset::Integer) = ccall((:lzma_easy_decoder_memusage, XZ_jll.liblzma), UInt64, (UInt32,), preset)
+function lzma_encoder_memusage(preset::Integer)
+    return ccall((:lzma_easy_encoder_memusage, XZ_jll.liblzma), UInt64, (UInt32,), preset)
+end
+
+function lzma_decoder_memusage(preset::Integer)
+    return ccall((:lzma_easy_decoder_memusage, XZ_jll.liblzma), UInt64, (UInt32,), preset)
+end
+
 function Avro.compresscapacity(::Val{:xz}, n::Int)
     bound = ccall((:lzma_stream_buffer_bound, XZ_jll.liblzma), Csize_t, (Csize_t,), n)
     return Avro.boundint(:xz, bound)

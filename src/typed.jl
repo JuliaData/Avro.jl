@@ -98,7 +98,9 @@ struct TypedMemo
     budget::Budget
 end
 
-Base.getindex(m::TypedMemo, i::Int) = m.entries[i]
+function Base.getindex(m::TypedMemo, i::Int)
+    return m.entries[i]
+end
 
 "Allocate one exact-capacity typed-plan vector after charging it to the construction scope."
 function typedvector(::Type{E}, n::Int, memo::TypedMemo) where {E}
@@ -153,7 +155,9 @@ function memolookup(memo::TypedMemo, s::Schema, ::Type{T}) where {T}
     return nothing
 end
 
-memopairbytes() = shellbytes(Pair{Any,TypedPlan})
+function memopairbytes()
+    return shellbytes(Pair{Any,TypedPlan})
+end
 
 function memostore!(memo::TypedMemo, s::Schema, ::Type{T}, p::TypedPlan) where {T}
     slot = Int(nodeid(s)) + 1
@@ -196,13 +200,18 @@ end
 # the operation ends: they may be memo-referenced, so their boxes cannot be released individually.
 
 "The box charge of one typed-plan node of concrete type `P`, made before the node is built."
-nodebytes(::Type{P}) where {P} = isbitstype(P) ? boxbytes(P) : shellbytes(P)
+function nodebytes(::Type{P}) where {P}
+    return isbitstype(P) ? boxbytes(P) : shellbytes(P)
+end
 
-chargenode!(memo::TypedMemo, ::Type{P}) where {P} = (charge!(memo.budget, nodebytes(P)); nothing)
+function chargenode!(memo::TypedMemo, ::Type{P}) where {P}
+    return (charge!(memo.budget, nodebytes(P)); nothing)
+end
 
 "Release the transient box of a freshly built node its parent just captured inline (mutable: a reference, nothing to release)."
-releasecapture!(memo::TypedMemo, node) =
-    (ismutabletype(typeof(node)) || release!(memo.budget, nodebytes(typeof(node))); nothing)
+function releasecapture!(memo::TypedMemo, node)
+    return (ismutabletype(typeof(node)) || release!(memo.budget, nodebytes(typeof(node))); nothing)
+end
 
 """
 Build the tuple `(parts...,)` under the construction scope: a bound over the inline element sizes is
@@ -224,7 +233,9 @@ function chargedtuple(memo::TypedMemo, parts::Vector)
     return (ps, actual)
 end
 
-chargedgeneric(p::ReadPlan, memo::TypedMemo) = (chargenode!(memo, GenericTarget{typeof(p)}); GenericTarget(p))
+function chargedgeneric(p::ReadPlan, memo::TypedMemo)
+    return (chargenode!(memo, GenericTarget{typeof(p)}); GenericTarget(p))
+end
 
 function chargedsemantic(::Type{T}, p::ReadPlan, memo::TypedMemo) where {T}
     chargenode!(memo, SemanticTarget{T})
@@ -359,16 +370,41 @@ function enumtarget(::Type{T}, p::EnumPlan, memo::TypedMemo) where {T<:Base.Enum
     return EnumTarget{T}(p, members)
 end
 
-leafcompatible(::Type{T}, ::NullPlan) where {T} = T === Nothing
-leafcompatible(::Type{T}, ::Union{IntPlan,LongPlan}) where {T} = T <: Integer && T !== Bool && isbitstype(T)
-leafcompatible(::Type{T}, ::FloatPlan) where {T} = T === Float64 || T === Float16
-leafcompatible(::Type{T}, ::StringPlan) where {T} = T === Char
-leafcompatible(::Type{T}, ::EnumPlan) where {T} = T === String
-leafcompatible(::Type{T}, p::FixedPlan) where {T} = T === Vector{UInt8} || isbytetuple(T, p.schema.size)
-leafcompatible(::Type{T}, ::Union{TimestampPlan,LocalTimestampPlan}) where {T} = T === DateTime
-leafcompatible(::Type{T}, ::ReadPlan) where {T} = false
+function leafcompatible(::Type{T}, ::NullPlan) where {T}
+    return T === Nothing
+end
 
-isbytetuple(::Type{T}, n::Int) where {T} = T <: Tuple && length(T.parameters) == n && all(t -> t === UInt8, T.parameters)
+function leafcompatible(::Type{T}, ::Union{IntPlan,LongPlan}) where {T}
+    return T <: Integer && T !== Bool && isbitstype(T)
+end
+
+function leafcompatible(::Type{T}, ::FloatPlan) where {T}
+    return T === Float64 || T === Float16
+end
+
+function leafcompatible(::Type{T}, ::StringPlan) where {T}
+    return T === Char
+end
+
+function leafcompatible(::Type{T}, ::EnumPlan) where {T}
+    return T === String
+end
+
+function leafcompatible(::Type{T}, p::FixedPlan) where {T}
+    return T === Vector{UInt8} || isbytetuple(T, p.schema.size)
+end
+
+function leafcompatible(::Type{T}, ::Union{TimestampPlan,LocalTimestampPlan}) where {T}
+    return T === DateTime
+end
+
+function leafcompatible(::Type{T}, ::ReadPlan) where {T}
+    return false
+end
+
+function isbytetuple(::Type{T}, n::Int) where {T}
+    return T <: Tuple && length(T.parameters) == n && all(t -> t === UInt8, T.parameters)
+end
 
 function buildrecordtarget(::Type{T}, s::RecordSchema, p::RecordPlan, memo::TypedMemo) where {T}
     cached = memolookup(memo, s, T)
@@ -813,15 +849,28 @@ Decode one value of `plan` (counted like the generic `decode`); `names` is the a
     return typedvalue(p, d, names)
 end
 
-typedvalue(p::GenericTarget, d::Decoder, names) = decodevalue(p.plan, d)
+function typedvalue(p::GenericTarget, d::Decoder, names)
+    return decodevalue(p.plan, d)
+end
 # Reached only through a recursive reference whose record fell back: converts where it occurs.
-typedvalue(p::SemanticTarget{T}, d::Decoder, names) where {T} = semanticvalue(T, decodevalue(p.plan, d), names)
-typedvalue(p::LeafTarget{T}, d::Decoder, names) where {T} = convertleaf(T, decodevalue(p.plan, d))::T
-typedvalue(p::LeafTarget{String,EnumPlan}, d::Decoder, names) = p.plan.schema.symbols[readindex(d, length(p.plan.schema.symbols))]
+function typedvalue(p::SemanticTarget{T}, d::Decoder, names) where {T}
+    return semanticvalue(T, decodevalue(p.plan, d), names)
+end
+
+function typedvalue(p::LeafTarget{T}, d::Decoder, names) where {T}
+    return convertleaf(T, decodevalue(p.plan, d))::T
+end
+
+function typedvalue(p::LeafTarget{String,EnumPlan}, d::Decoder, names)
+    return p.plan.schema.symbols[readindex(d, length(p.plan.schema.symbols))]
+end
+
 function typedvalue(p::SymbolTarget{StringPlan}, d::Decoder, names)
     return admit!(names, readstring(d); budget=d.budget)
 end
-typedvalue(p::RefTarget{T}, d::Decoder, names) where {T} = typedvalue(p.plan::TypedPlan, d, names)::T
+function typedvalue(p::RefTarget{T}, d::Decoder, names) where {T}
+    return typedvalue(p.plan::TypedPlan, d, names)::T
+end
 
 function typedvalue(p::SymbolTarget{EnumPlan}, d::Decoder, names)
     syms = p.plan.schema.symbols
@@ -1023,7 +1072,9 @@ function measuredshell(::Type{T}, budget::Union{Nothing,Budget}=nothing) where {
     end
 end
 
-shellbytes(::Type{T}) where {T} = isbitstype(T) ? 0 : 16 + sizeof(T)
+function shellbytes(::Type{T}) where {T}
+    return isbitstype(T) ? 0 : 16 + sizeof(T)
+end
 
 @generated function recordvalue(p::RecordTarget{T,PS,MAP}, d::Decoder, names) where {T,PS,MAP}
     body = Expr(:block)
@@ -1048,11 +1099,25 @@ end
 
 # ---- leaf conversions (ConversionError on failure) -------------------------------------------------
 
-convertleaf(::Type{Nothing}, ::Missing) = nothing
-convertleaf(::Type{Float64}, v::Float32) = Float64(v)
-convertleaf(::Type{Float16}, v::Float32) = Float16(v)
-convertleaf(::Type{DateTime}, v::Union{Timestamp,LocalTimestamp}) = DateTime(v)
-convertleaf(::Type{Vector{UInt8}}, v::Fixed) = v.bytes
+function convertleaf(::Type{Nothing}, ::Missing)
+    return nothing
+end
+
+function convertleaf(::Type{Float64}, v::Float32)
+    return Float64(v)
+end
+
+function convertleaf(::Type{Float16}, v::Float32)
+    return Float16(v)
+end
+
+function convertleaf(::Type{DateTime}, v::Union{Timestamp,LocalTimestamp})
+    return DateTime(v)
+end
+
+function convertleaf(::Type{Vector{UInt8}}, v::Fixed)
+    return v.bytes
+end
 
 function convertleaf(::Type{T}, v::Union{Int32,Int64}) where {T<:Integer}
     fits = T <: Signed ? (typemin(T) <= Int64(v) <= typemax(T)) : (v >= 0 && UInt64(v) <= typemax(T))
@@ -1074,8 +1139,13 @@ end
 
 const ADMISSION_KEY = :avro_symbol_admission
 
-withadmission(f, names) = task_local_storage(f, ADMISSION_KEY, names)
-currentadmission() = get(task_local_storage(), ADMISSION_KEY, DEFAULT_ADMISSION)
+function withadmission(f, names)
+    return task_local_storage(f, ADMISSION_KEY, names)
+end
+
+function currentadmission()
+    return get(task_local_storage(), ADMISSION_KEY, DEFAULT_ADMISSION)
+end
 
 """
     semanticvalue(T, generic, names)
@@ -1094,12 +1164,22 @@ function semanticvalue(::Type{T}, v, names) where {T}
     end
 end
 
-finishtyped(p::SemanticTarget{T}, v, names) where {T} = semanticvalue(T, v, names)
-finishtyped(p, v, names) = v
+function finishtyped(p::SemanticTarget{T}, v, names) where {T}
+    return semanticvalue(T, v, names)
+end
+
+function finishtyped(p, v, names)
+    return v
+end
 
 # StructUtils integration: generic values as sources.
-StructUtils.applyeach(st::AvroStyle, f, r::Record) = applyeachrecord(st, f, r)
-StructUtils.applyeach(st::AvroStyle, f::StructUtils.StructStyle, r::Record) = applyeachrecord(st, f, r)   # disambiguates the (f, style, x) form
+function StructUtils.applyeach(st::AvroStyle, f, r::Record)
+    return applyeachrecord(st, f, r)
+end
+
+function StructUtils.applyeach(st::AvroStyle, f::StructUtils.StructStyle, r::Record)
+    return applyeachrecord(st, f, r)   # disambiguates the (f, style, x) form
+end
 
 function applyeachrecord(st::AvroStyle, f, r::Record)
     s = getfield(r, :schema)
@@ -1113,17 +1193,54 @@ end
 
 # StructUtils lowers non-struct-like sources at the root only: the identity-bearing generic values are
 # representations, not structs to traverse.
-StructUtils.structlike(::AvroStyle, ::Type{<:Union{Fixed,EnumValue,UnionValue}}) = false
-StructUtils.lower(::AvroStyle, x::EnumValue) = String(x)
-StructUtils.lower(::AvroStyle, x::Fixed) = x.bytes
-StructUtils.lower(::AvroStyle, x::UnionValue) = x.value
-StructUtils.lift(st::AvroStyle, ::Type{T}, x::UnionValue) where {T} = StructUtils.lift(st, T, x.value)
-StructUtils.lift(st::AvroStyle, ::Type{T}, x::EnumValue) where {T} = StructUtils.lift(st, T, String(x))
-StructUtils.lift(st::AvroStyle, ::Type{T}, x::Fixed) where {T} = StructUtils.lift(st, T, x.bytes)
+function StructUtils.structlike(::AvroStyle, ::Type{<:Union{Fixed,EnumValue,UnionValue}})
+    return false
+end
+
+function StructUtils.lower(::AvroStyle, x::EnumValue)
+    return String(x)
+end
+
+function StructUtils.lower(::AvroStyle, x::Fixed)
+    return x.bytes
+end
+
+function StructUtils.lower(::AvroStyle, x::UnionValue)
+    return x.value
+end
+
+function StructUtils.lift(st::AvroStyle, ::Type{T}, x::UnionValue) where {T}
+    return StructUtils.lift(st, T, x.value)
+end
+
+function StructUtils.lift(st::AvroStyle, ::Type{T}, x::EnumValue) where {T}
+    return StructUtils.lift(st, T, String(x))
+end
+
+function StructUtils.lift(st::AvroStyle, ::Type{T}, x::Fixed) where {T}
+    return StructUtils.lift(st, T, x.bytes)
+end
 # zero-dimensional array targets (StructUtils' own special case) unwrap the same way
-StructUtils.lift(st::AvroStyle, ::Type{A}, x::UnionValue) where {A<:AbstractArray{T,0}} where {T} = StructUtils.lift(st, A, x.value)
-StructUtils.lift(st::AvroStyle, ::Type{A}, x::EnumValue) where {A<:AbstractArray{T,0}} where {T} = StructUtils.lift(st, A, String(x))
-StructUtils.lift(st::AvroStyle, ::Type{A}, x::Fixed) where {A<:AbstractArray{T,0}} where {T} = StructUtils.lift(st, A, x.bytes)
-StructUtils.lift(::AvroStyle, ::Type{Symbol}, x::AbstractString) = (admit!(currentadmission(), x), nothing)
-StructUtils.lift(::Type{DateTime}, x::Union{Timestamp,LocalTimestamp}) = DateTime(x)
-StructUtils.lift(::Type{T}, x::Union{Timestamp,LocalTimestamp}) where {T<:Union{Timestamp,LocalTimestamp}} = T(x.ticks)
+function StructUtils.lift(st::AvroStyle, ::Type{A}, x::UnionValue) where {A<:AbstractArray{T,0}} where {T}
+    return StructUtils.lift(st, A, x.value)
+end
+
+function StructUtils.lift(st::AvroStyle, ::Type{A}, x::EnumValue) where {A<:AbstractArray{T,0}} where {T}
+    return StructUtils.lift(st, A, String(x))
+end
+
+function StructUtils.lift(st::AvroStyle, ::Type{A}, x::Fixed) where {A<:AbstractArray{T,0}} where {T}
+    return StructUtils.lift(st, A, x.bytes)
+end
+
+function StructUtils.lift(::AvroStyle, ::Type{Symbol}, x::AbstractString)
+    return (admit!(currentadmission(), x), nothing)
+end
+
+function StructUtils.lift(::Type{DateTime}, x::Union{Timestamp,LocalTimestamp})
+    return DateTime(x)
+end
+
+function StructUtils.lift(::Type{T}, x::Union{Timestamp,LocalTimestamp}) where {T<:Union{Timestamp,LocalTimestamp}}
+    return T(x.ticks)
+end

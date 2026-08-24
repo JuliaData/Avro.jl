@@ -66,8 +66,9 @@ struct LimitError <: AvroError
     direction::Symbol   # :decode | :encode
 end
 
-LimitError(limit::Symbol, observed::Integer, value::Integer; direction::Symbol=:decode) =
-    LimitError(limit, Int(observed), Int(value), limit, direction)
+function LimitError(limit::Symbol, observed::Integer, value::Integer; direction::Symbol=:decode)
+    return LimitError(limit, Int(observed), Int(value), limit, direction)
+end
 
 """
     Avro.CodecError(codec, direction, msg)
@@ -141,7 +142,9 @@ struct DataError <: DecodeError
     path::String
 end
 
-DataError(msg::AbstractString, pos::Integer=0) = DataError(String(msg), Int(pos), "")
+function DataError(msg::AbstractString, pos::Integer=0)
+    return DataError(String(msg), Int(pos), "")
+end
 
 function Base.showerror(io::IO, e::SchemaError)
     print(io, "SchemaError: ", e.msg)

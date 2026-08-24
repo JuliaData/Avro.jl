@@ -25,8 +25,13 @@ end
 
 const BlockSource = Union{BytesSource,StreamSource}
 
-sourceeof(s::BytesSource) = s.pos > s.stop
-sourceeof(s::StreamSource) = eof(s.io)
+function sourceeof(s::BytesSource)
+    return s.pos > s.stop
+end
+
+function sourceeof(s::StreamSource)
+    return eof(s.io)
+end
 
 function sourcebyte(s::BytesSource)
     s.pos <= s.stop || throw(DataError("truncated file", s.pos))
@@ -55,8 +60,13 @@ function sourcevarint(s::BlockSource)
     return reinterpret(Int64, (v >> 1) ⊻ (~(v & 1) + 1))
 end
 
-Base.position(s::BytesSource) = s.pos
-Base.position(s::StreamSource) = Int(position(s.io))
+function Base.position(s::BytesSource)
+    return s.pos
+end
+
+function Base.position(s::StreamSource)
+    return Int(position(s.io))
+end
 
 "Exactly `n` payload bytes: a view for byte sources (caller-owned), an owned charged buffer for streams."
 function sourcepayload(s::BytesSource, n::Int, budget::Budget)
@@ -74,15 +84,34 @@ function sourcepayload(s::StreamSource, n::Int, budget::Budget)
     return out
 end
 
-payloadcharge(::BytesSource, n::Int) = 0
-payloadcharge(::StreamSource, n::Int) = bytesbytes(n)
+function payloadcharge(::BytesSource, n::Int)
+    return 0
+end
 
-closesource(::BytesSource) = nothing
-closesource(s::StreamSource) = s.owned ? close(s.io) : nothing
+function payloadcharge(::StreamSource, n::Int)
+    return bytesbytes(n)
+end
 
-opensource(src::Vector{UInt8}; mmap::Bool=true) = BytesSource(src, 1)
-opensource(src::IOBuffer; mmap::Bool=true) = BytesSource(src.data, 1, src.size)
-opensource(src::IO; mmap::Bool=true) = StreamSource(src, false)
+function closesource(::BytesSource)
+    return nothing
+end
+
+function closesource(s::StreamSource)
+    return s.owned ? close(s.io) : nothing
+end
+
+function opensource(src::Vector{UInt8}; mmap::Bool=true)
+    return BytesSource(src, 1)
+end
+
+function opensource(src::IOBuffer; mmap::Bool=true)
+    return BytesSource(src.data, 1, src.size)
+end
+
+function opensource(src::IO; mmap::Bool=true)
+    return StreamSource(src, false)
+end
+
 function opensource(src::AbstractString; mmap::Bool=true)
     mmap || return StreamSource(open(src, "r"), true)
     return BytesSource(open(io -> Mmap.mmap(io, Vector{UInt8}), src, "r"), 1)
@@ -126,11 +155,54 @@ function metadataindexes(capacity::Int, budget::Budget)
     return (newkeys, newvals)
 end
 
-"The parsed container header: metadata (duplicates rejected), schema, codec name and sync marker."
-function readheader(s::BlockSource, limits::Limits, budget::Budget; legacy, allow_invalid_names::Bool, allow_invalid_defaults::Bool)
-    for m in MAGIC
-        (sourceeof(s) || sourcebyte(s) != m) && throw(DataError("not an Avro object container file (bad magic)", position(s)))
+"One owned, charged copy of a metadata payload (a stream buffer is already owned and charged)."
+function ownedmetadatabytes(payload, len::Int, budget::Budget)
+    payload isa Vector{UInt8} && return payload
+    charge = bytesbytes(len)
+    reserve!(budget, charge)                           # reserve the byte-source copy before allocation
+    try
+        buffer = Vector{UInt8}(payload)
+        allocated!(budget, charge)
+        return buffer
+    catch
+        unreserve!(budget, charge)
+        rethrow()
     end
+end
+
+"Read one metadata entry into an owned key string and value buffer, enforcing the running byte total."
+function readmetadataentry(s::BlockSource, limits::Limits, budget::Budget, total::Int)
+    klen = sourcevarint(s)
+    (0 <= klen <= limits.max_metadata_bytes) || throw(DataError("invalid metadata key length $klen", position(s)))
+    kbytes = sourcepayload(s, Int(klen), budget)
+    validutf8(kbytes, 1, length(kbytes)) || throw(DataError("metadata key is not valid UTF-8", position(s)))
+    keybuffer = ownedmetadatabytes(kbytes, Int(klen), budget)
+    keyshell = stringbytes(0)
+    reserve!(budget, keyshell)                         # the String shell overlaps the owned byte buffer
+    key = String(keybuffer)                            # takes ownership of the one key buffer
+    allocated!(budget, keyshell)
+    keybuffer = nothing
+    release!(budget, bytesbytes(0))                    # the emptied Vector shell is no longer live
+    vlen = sourcevarint(s)
+    (0 <= vlen <= limits.max_metadata_bytes) || throw(DataError("invalid metadata value length $vlen", position(s)))
+    total = checked_add(total, Int(klen) + Int(vlen))
+    total <= limits.max_metadata_bytes || throw(LimitError(:max_metadata_bytes, total, limits.max_metadata_bytes, :max_metadata_bytes, :decode))
+    value = ownedmetadatabytes(sourcepayload(s, Int(vlen), budget), Int(vlen), budget)
+    return (key, value, total)
+end
+
+"Replace the metadata index vectors at exact `newcap` (old storage released after the copy, §4.4)."
+function resizemetadata(keys::Vector{String}, vals::Vector{Vector{UInt8}}, oldcap::Int, newcap::Int,
+                        n::Int, budget::Budget)
+    newkeys, newvals = metadataindexes(newcap, budget)
+    copyto!(newkeys, 1, keys, 1, n)
+    copyto!(newvals, 1, vals, 1, n)
+    release!(budget, metadataindexbytes(oldcap))
+    return (newkeys, newvals)
+end
+
+"Every metadata entry as exact-length key/value index vectors (duplicates settle in `buildmap`)."
+function readmetadatapairs(s::BlockSource, limits::Limits, budget::Budget)
     keycap = min(8, limits.max_metadata_entries)
     keys, vals = metadataindexes(keycap, budget)
     nkeys = 0
@@ -150,58 +222,10 @@ function readheader(s::BlockSource, limits::Limits, budget::Budget; legacy, allo
         for _ in 1:count
             countvalues!(budget)
             nkeys < limits.max_metadata_entries || throw(LimitError(:max_metadata_entries, nkeys + 1, limits.max_metadata_entries, :max_metadata_entries, :decode))
-            klen = sourcevarint(s)
-            (0 <= klen <= limits.max_metadata_bytes) || throw(DataError("invalid metadata key length $klen", position(s)))
-            kbytes = sourcepayload(s, Int(klen), budget)
-            validutf8(kbytes, 1, length(kbytes)) || throw(DataError("metadata key is not valid UTF-8", position(s)))
-            keybuffer = if kbytes isa Vector{UInt8}
-                kbytes                                             # the streamed payload is already owned and charged
-            else
-                keycharge = bytesbytes(Int(klen))
-                reserve!(budget, keycharge)                         # reserve the byte-source copy before allocation
-                try
-                    buffer = Vector{UInt8}(kbytes)
-                    allocated!(budget, keycharge)
-                    buffer
-                catch
-                    unreserve!(budget, keycharge)
-                    rethrow()
-                end
-            end
-            keyshell = stringbytes(0)
-            reserve!(budget, keyshell)                               # the String shell overlaps the owned byte buffer
-            key = String(keybuffer)                                 # takes ownership of the one key buffer
-            allocated!(budget, keyshell)
-            keybuffer = nothing
-            release!(budget, bytesbytes(0))                          # the emptied Vector shell is no longer live
-            vlen = sourcevarint(s)
-            (0 <= vlen <= limits.max_metadata_bytes) || throw(DataError("invalid metadata value length $vlen", position(s)))
-            total = checked_add(total, Int(klen) + Int(vlen))
-            total <= limits.max_metadata_bytes || throw(LimitError(:max_metadata_bytes, total, limits.max_metadata_bytes, :max_metadata_bytes, :decode))
-            vpayload = sourcepayload(s, Int(vlen), budget)
-            value = if vpayload isa Vector{UInt8}
-                vpayload                                            # a stream buffer is owned and already charged
-            else
-                valuecharge = bytesbytes(Int(vlen))
-                reserve!(budget, valuecharge)                       # a byte-source view is copied, reserved first
-                try
-                    buffer = Vector{UInt8}(vpayload)
-                    allocated!(budget, valuecharge)
-                    buffer
-                catch
-                    unreserve!(budget, valuecharge)
-                    rethrow()
-                end
-            end
+            key, value, total = readmetadataentry(s, limits, budget, total)
             if nkeys == keycap
                 newcap = min(max(1, checked_mul(2, keycap)), limits.max_metadata_entries)
-                newkeys, newvals = metadataindexes(newcap, budget)
-                copyto!(newkeys, 1, keys, 1, nkeys)
-                copyto!(newvals, 1, vals, 1, nkeys)
-                oldcharge = metadataindexbytes(keycap)
-                keys = newkeys
-                vals = newvals
-                release!(budget, oldcharge)
+                keys, vals = resizemetadata(keys, vals, keycap, newcap, nkeys, budget)
                 keycap = newcap
             end
             nkeys += 1
@@ -214,42 +238,47 @@ function readheader(s::BlockSource, limits::Limits, budget::Budget; legacy, allo
         end
     end
     addinput!(budget, total)
-    if keycap != nkeys
-        newkeys, newvals = metadataindexes(nkeys, budget)
-        copyto!(newkeys, 1, keys, 1, nkeys)
-        copyto!(newvals, 1, vals, 1, nkeys)
-        oldcharge = metadataindexbytes(keycap)
-        keys = newkeys
-        vals = newvals
-        release!(budget, oldcharge)
+    keycap == nkeys || ((keys, vals) = resizemetadata(keys, vals, keycap, nkeys, nkeys, budget))
+    return (keys, vals)
+end
+
+"The owned `avro.codec` name of a parsed header (\"null\" when the entry is absent)."
+function headercodecname(metadata, budget::Budget, s::BlockSource)
+    codecbytes = get(metadata, "avro.codec", nothing)
+    codecbytes === nothing && return "null"
+    validutf8(codecbytes, 1, length(codecbytes)) || throw(DataError("avro.codec is not valid UTF-8", position(s)))
+    codecvectorsize = bytesbytes(length(codecbytes))
+    reserve!(budget, codecvectorsize)
+    codeccopy = try
+        bytes = copy(codecbytes)
+        allocated!(budget, codecvectorsize)
+        bytes
+    catch
+        unreserve!(budget, codecvectorsize)
+        rethrow()
     end
+    codecshell = stringbytes(0)
+    reserve!(budget, codecshell)
+    codecname = String(codeccopy)
+    allocated!(budget, codecshell)
+    codeccopy = nothing
+    release!(budget, bytesbytes(0))
+    return codecname
+end
+
+"The parsed container header: metadata (duplicates rejected), schema, codec name and sync marker."
+function readheader(s::BlockSource, limits::Limits, budget::Budget; legacy, allow_invalid_names::Bool, allow_invalid_defaults::Bool)
+    for m in MAGIC
+        (sourceeof(s) || sourcebyte(s) != m) && throw(DataError("not an Avro object container file (bad magic)", position(s)))
+    end
+    keys, vals = readmetadatapairs(s, limits, budget)
     metadata = buildmap(Vector{UInt8}, keys, vals, budget; duplicateposition=position(s))
     sync = ntuple(_ -> sourcebyte(s), 16)
     schemabytes = get(metadata, "avro.schema", nothing)
     schemabytes === nothing && throw(DataError("the container has no avro.schema", position(s)))
     schema = parseschemaimpl(schemabytes, legacy === :avrojl1; allow_invalid_names=allow_invalid_names,
                              allow_invalid_defaults=allow_invalid_defaults, limits=limits, budget=budget)
-    codecbytes = get(metadata, "avro.codec", nothing)
-    codecname = "null"
-    if codecbytes !== nothing
-        validutf8(codecbytes, 1, length(codecbytes)) || throw(DataError("avro.codec is not valid UTF-8", position(s)))
-        codecvectorsize = bytesbytes(length(codecbytes))
-        reserve!(budget, codecvectorsize)
-        codeccopy = try
-            bytes = copy(codecbytes)
-            allocated!(budget, codecvectorsize)
-            bytes
-        catch
-            unreserve!(budget, codecvectorsize)
-            rethrow()
-        end
-        codecshell = stringbytes(0)
-        reserve!(budget, codecshell)
-        codecname = String(codeccopy)
-        allocated!(budget, codecshell)
-        codeccopy = nothing
-        release!(budget, bytesbytes(0))
-    end
+    codecname = headercodecname(metadata, budget, s)
     return (metadata=metadata, schema=schema, codecname=codecname, sync=sync)
 end
 
@@ -309,7 +338,9 @@ function Reader(src; limits::Limits=Limits(), legacy::Union{Nothing,Symbol}=noth
     return r
 end
 
-withplanbudget(f, budget) = f()
+function withplanbudget(f, budget)
+    return f()
+end
 
 function Reader(f::Function, src; kw...)
     r = Reader(src; kw...)
@@ -328,17 +359,33 @@ function Base.close(r::Reader)
     return nothing
 end
 
-checkopen(r::Reader) = r.closed ? throw(ArgumentError("the reader is closed")) : nothing
+function checkopen(r::Reader)
+    return r.closed ? throw(ArgumentError("the reader is closed")) : nothing
+end
 
 """
     Avro.metadata(r) -> Avro.Map{Vector{UInt8}}; Avro.codec(r) -> Symbol; Avro.sync(r) -> NTuple{16,UInt8}
     Avro.writerschema(r) -> Schema; Avro.schema(r) -> Schema
 """
-metadata(r::Reader) = r.metadata
-codec(r::Reader) = r.codecname
-sync(r::Reader) = r.sync
-writerschema(r::Reader) = r.schema
-schema(r::Reader) = r.schema
+function metadata(r::Reader)
+    return r.metadata
+end
+
+function codec(r::Reader)
+    return r.codecname
+end
+
+function sync(r::Reader)
+    return r.sync
+end
+
+function writerschema(r::Reader)
+    return r.schema
+end
+
+function schema(r::Reader)
+    return r.schema
+end
 
 "Rewrite a plan tree so decimals decode little-endian (`decimal_byteorder=:little`, plan §4.9)."
 function littledecimals(p::ReadPlan, memo::IdDict{Any,Any}=IdDict{Any,Any}())
@@ -461,10 +508,21 @@ end
 Iterate `(count, bytes)` pairs, `bytes` being the owned decompressed block (valid after iteration
 advances). In `:strict` mode the block's datums are walked and exhaustion checked before it is yielded.
 """
-eachblock(r::Reader) = EachBlock(r)
-Base.IteratorSize(::Type{EachBlock}) = Base.SizeUnknown()
-Base.eltype(::Type{EachBlock}) = Tuple{Int,Vector{UInt8}}
-Base.iterate(it::EachBlock, ::Nothing=nothing) = (b = nextblock!(it.reader); b === nothing ? nothing : (b, nothing))
+function eachblock(r::Reader)
+    return EachBlock(r)
+end
+
+function Base.IteratorSize(::Type{EachBlock})
+    return Base.SizeUnknown()
+end
+
+function Base.eltype(::Type{EachBlock})
+    return Tuple{Int,Vector{UInt8}}
+end
+
+function Base.iterate(it::EachBlock, ::Nothing=nothing)
+    return (b = nextblock!(it.reader); b === nothing ? nothing : (b, nothing))
+end
 
 mutable struct EachDatum
     const reader::Reader
@@ -481,8 +539,13 @@ end
 Iterate the file's datums as the schema's generic values (any root schema). Each yielded value is the
 caller's at yield; its charge is released at the next iteration step.
 """
-eachdatum(r::Reader) = EachDatum(r, UInt8[], nothing, 0, 0, 0)
-Base.IteratorSize(::Type{EachDatum}) = Base.SizeUnknown()
+function eachdatum(r::Reader)
+    return EachDatum(r, UInt8[], nothing, 0, 0, 0)
+end
+
+function Base.IteratorSize(::Type{EachDatum})
+    return Base.SizeUnknown()
+end
 
 function Base.iterate(it::EachDatum, ::Nothing=nothing)
     b = it.reader.budget
@@ -587,8 +650,13 @@ function estimatevalue(p::WritePlan, x)::Tuple{Int,Int}
     return (0, 1)
 end
 
-valuesizeof(x) = x isa AbstractString ? sizeof(x) : x isa Symbol ? sizeof(String(x)) : 0
-valuelength(x) = x isa AbstractVector{UInt8} ? length(x) : 0
+function valuesizeof(x)
+    return x isa AbstractString ? sizeof(x) : x isa Symbol ? sizeof(String(x)) : 0
+end
+
+function valuelength(x)
+    return x isa AbstractVector{UInt8} ? length(x) : 0
+end
 
 function recordfieldvalue(p::WRecord, x, i::Int)
     x isa Record && return getfield(x, :values)[i]
@@ -727,6 +795,121 @@ mutable struct Writer
     poison::Union{Nothing,Exception}
 end
 
+"The writer's 16-byte sync marker: validated caller bytes, or fresh `RandomDevice` bytes."
+function writersyncmarker(sync)
+    sync === nothing && return ntuple(_ -> rand(RandomDevice(), UInt8), 16)
+    (sync isa AbstractVector{UInt8} && length(sync) == 16) || throw(ArgumentError("sync must be exactly 16 bytes"))
+    return ntuple(i -> sync[i], 16)
+end
+
+"""
+The charged header entries of a new writer: the bounded schema JSON print (work counters rebased to
+the Reader's exact header work), the exact-capacity entries vector, and each retained key/value copy
+reserved before it is made. Returns `(schemajson, entries)`.
+"""
+function writerheaderentries(schema::Schema, codec::Symbol, metadata, limits::Limits, budget::Budget)
+    values0 = budget.values
+    input0 = budget.input_bytes
+    allowance0 = budget.allowance_used
+    workcap0 = budget.workcap
+    jw = BoundedWriter(budget, limits.max_schema_bytes)       # the schema JSON is produced charged and bounded
+    printschema(jw, schema, "", schemaseen(schema, budget), false, 0)
+    schemajson = boundedtake!(jw)
+    # Printing is bounded in this operation, but the container counters must start with the exact
+    # header work that its Reader performs. Keep all printer reservations and rebase only work.
+    budget.values = values0
+    budget.input_bytes = input0
+    budget.allowance_used = allowance0
+    budget.workcap = workcap0
+    nentries = 2 + length(metadata)
+    nentries <= limits.max_metadata_entries || throw(LimitError(:max_metadata_entries, nentries, limits.max_metadata_entries, :max_metadata_entries, :encode))
+    reserve!(budget, STORAGE[].vector + 16 * nentries)        # the entries vector at exact capacity (§4.4 growth rule)
+    entries = Vector{Tuple{String,Vector{UInt8}}}(undef, nentries)
+    allocated!(budget, STORAGE[].vector + 16 * nentries)
+    reserve!(budget, stringbytes(11) + bytesbytes(sizeof(schemajson)))
+    entries[1] = ("avro.schema", Vector{UInt8}(codeunits(schemajson)))
+    allocated!(budget, stringbytes(11) + bytesbytes(sizeof(schemajson)))
+    reserve!(budget, stringbytes(10) + bytesbytes(sizeof(String(codec))))
+    entries[2] = ("avro.codec", Vector{UInt8}(codeunits(String(codec))))
+    allocated!(budget, stringbytes(10) + bytesbytes(sizeof(String(codec))))
+    i = 2
+    for (k, v) in metadata
+        startswith(k, "avro.") && throw(ArgumentError("metadata keys in the avro.* namespace are reserved (got \"$k\"); avro.schema and avro.codec come from the constructor"))
+        isstrictutf8(k) || throw(ArgumentError("metadata keys must be valid UTF-8"))
+        reserve!(budget, stringbytes(sizeof(k)) + bytesbytes(length(v)))   # each retained copy, before it is made
+        i += 1
+        entries[i] = (String(k), Vector{UInt8}(v))
+        allocated!(budget, stringbytes(sizeof(k)) + bytesbytes(length(v)))
+    end
+    total = sum(e -> sizeof(e[1]) + length(e[2]), entries; init=0)
+    total <= limits.max_metadata_bytes || throw(LimitError(:max_metadata_bytes, total, limits.max_metadata_bytes, :max_metadata_bytes, :encode))
+    for _ in entries
+        countvalues!(budget)                                  # the Reader counts each metadata entry
+    end
+    addinput!(budget, total)                                  # the Reader's metadata key/value denominator
+    return (schemajson, entries)
+end
+
+"""
+The reader's construction retention, preflighted under the writer's budget (plan §4.4): the parsed
+schema graph a reader builds from the same JSON, the materialised metadata of a stream reader (key
+and value buffers plus the retained entries and map), and the generic read plan. Returns
+`(preflightbase, preflight)`.
+"""
+function writerpreflight(schemajson::String, entries, plan, limits::Limits, budget::Budget;
+                         allow_invalid_names::Bool, allow_invalid_defaults::Bool)
+    base0 = budget.reserved
+    pfschema = parseschema(schemajson; allow_invalid_names=allow_invalid_names, allow_invalid_defaults=allow_invalid_defaults,
+                           limits=limits, budget=budget)
+    reserve!(budget, stringbytes(length(entries[2][2])))             # the reader's retained codec name
+    reserve!(budget, 2 * STORAGE[].vector + 16 * length(entries))   # the mirror key/value vectors, exact capacity
+    pfkeys = Vector{String}(undef, length(entries))
+    pfvals = Vector{Vector{UInt8}}(undef, length(entries))
+    allocated!(budget, 2 * STORAGE[].vector + 16 * length(entries))
+    for (j, (k, v)) in enumerate(entries)
+        reserve!(budget, checked_add(stringbytes(sizeof(k)), bytesbytes(length(v))))  # the retained metadata entry (byte and stream readers now charge identically)
+        pfkeys[j] = k
+        pfvals[j] = v
+    end
+    buildmap(Vector{UInt8}, pfkeys, pfvals, budget)
+    withplanbudget(budget) do
+        readplan(pfschema; budget=budget)
+    end
+    preflightbase = budget.reserved - base0
+    preflight = pfschema isa RecordSchema ? TablePreflight(pfschema, plan::WRecord) : nothing
+    return (preflightbase, preflight)
+end
+
+"Write the container magic, the metadata block and the sync marker to the sink."
+function writecontainerheader!(sink, entries, syncmarker)
+    for m in MAGIC
+        Base.write(sink, m)
+    end
+    writevarint(sink, length(entries))
+    for (k, v) in entries
+        writevarint(sink, sizeof(k))
+        Base.write(sink, codeunits(k))
+        writevarint(sink, length(v))
+        Base.write(sink, v)
+    end
+    Base.write(sink, 0x00)
+    for b in syncmarker
+        Base.write(sink, b)
+    end
+    return nothing
+end
+
+"The writer's destination: `(sink, temppath, ownsink)` — a temp file first when writing atomically."
+function openwritersink(dst::Union{AbstractString,IO}, atomic::Bool)
+    path = dst isa AbstractString ? String(dst) : nothing
+    path === nothing && return (dst, nothing, false)
+    if atomic
+        t, tio = mktemp(dirname(abspath(path)))
+        return (tio, t, true)
+    end
+    return (open(path, "w"), nothing, true)
+end
+
 function Writer(dst::Union{AbstractString,IO}, schema::Schema; codec::Symbol=:null, level=nothing,
                 metadata=Dict{String,Vector{UInt8}}(), sync=nothing, block_bytes::Integer=64 * 1024,
                 atomic::Bool=true, fsync::Bool=false, allow_invalid_names::Bool=false,
@@ -735,107 +918,25 @@ function Writer(dst::Union{AbstractString,IO}, schema::Schema; codec::Symbol=:nu
     gi = graphinfo(schema)
     gi.repaired_names && !allow_invalid_names && throw(ArgumentError("the schema contains invalid names; pass allow_invalid_names=true to write it"))
     gi.repaired_defaults && !allow_invalid_defaults && throw(ArgumentError("the schema contains invalid defaults; pass allow_invalid_defaults=true to write it"))
-    syncmarker = if sync === nothing
-        ntuple(_ -> rand(RandomDevice(), UInt8), 16)
-    else
-        (sync isa AbstractVector{UInt8} && length(sync) == 16) || throw(ArgumentError("sync must be exactly 16 bytes"))
-        ntuple(i -> sync[i], 16)
-    end
+    syncmarker = writersyncmarker(sync)
     metadata isa AbstractDict{<:AbstractString,<:AbstractVector{UInt8}} || throw(ArgumentError("metadata must map strings to byte vectors"))
     budget = Budget(limits; direction=:encode)                    # the budget exists before any header allocation (R04)
     wcodec = writercodec(codec, level, limits)
     w = try
         reserve!(budget, wcodec.workspace)
         allocated!(budget, wcodec.workspace)                      # the codec object and its native state exist with the writer
-        values0 = budget.values
-        input0 = budget.input_bytes
-        allowance0 = budget.allowance_used
-        workcap0 = budget.workcap
-        jw = BoundedWriter(budget, limits.max_schema_bytes)       # the schema JSON is produced charged and bounded
-        printschema(jw, schema, "", schemaseen(schema, budget), false, 0)
-        schemajson = boundedtake!(jw)
-        # Printing is bounded in this operation, but the container counters must start with the exact
-        # header work that its Reader performs. Keep all printer reservations and rebase only work.
-        budget.values = values0
-        budget.input_bytes = input0
-        budget.allowance_used = allowance0
-        budget.workcap = workcap0
-        nentries = 2 + length(metadata)
-        nentries <= limits.max_metadata_entries || throw(LimitError(:max_metadata_entries, nentries, limits.max_metadata_entries, :max_metadata_entries, :encode))
-        reserve!(budget, STORAGE[].vector + 16 * nentries)        # the entries vector at exact capacity (§4.4 growth rule)
-        entries = Vector{Tuple{String,Vector{UInt8}}}(undef, nentries)
-        allocated!(budget, STORAGE[].vector + 16 * nentries)
-        reserve!(budget, stringbytes(11) + bytesbytes(sizeof(schemajson)))
-        entries[1] = ("avro.schema", Vector{UInt8}(codeunits(schemajson)))
-        allocated!(budget, stringbytes(11) + bytesbytes(sizeof(schemajson)))
-        reserve!(budget, stringbytes(10) + bytesbytes(sizeof(String(codec))))
-        entries[2] = ("avro.codec", Vector{UInt8}(codeunits(String(codec))))
-        allocated!(budget, stringbytes(10) + bytesbytes(sizeof(String(codec))))
-        i = 2
-        for (k, v) in metadata
-            startswith(k, "avro.") && throw(ArgumentError("metadata keys in the avro.* namespace are reserved (got \"$k\"); avro.schema and avro.codec come from the constructor"))
-            isstrictutf8(k) || throw(ArgumentError("metadata keys must be valid UTF-8"))
-            reserve!(budget, stringbytes(sizeof(k)) + bytesbytes(length(v)))   # each retained copy, before it is made
-            i += 1
-            entries[i] = (String(k), Vector{UInt8}(v))
-            allocated!(budget, stringbytes(sizeof(k)) + bytesbytes(length(v)))
-        end
-        total = sum(e -> sizeof(e[1]) + length(e[2]), entries; init=0)
-        total <= limits.max_metadata_bytes || throw(LimitError(:max_metadata_bytes, total, limits.max_metadata_bytes, :max_metadata_bytes, :encode))
-        for _ in entries
-            countvalues!(budget)                                  # the Reader counts each metadata entry
-        end
-        addinput!(budget, total)                                  # the Reader's metadata key/value denominator
+        schemajson, entries = writerheaderentries(schema, codec, metadata, limits, budget)
         plan = writeplan(schema; budget=budget)
-        # The reader's construction retention, preflighted under the writer's budget (plan §4.4): the
-        # parsed schema graph a reader builds from the same JSON, the materialised metadata of a stream
-        # reader (key and value buffers plus the retained entries and map), and the generic read plan.
-        base0 = budget.reserved
-        pfschema = parseschema(schemajson; allow_invalid_names=allow_invalid_names, allow_invalid_defaults=allow_invalid_defaults,
-                               limits=limits, budget=budget)
-        reserve!(budget, stringbytes(length(entries[2][2])))             # the reader's retained codec name
-        reserve!(budget, 2 * STORAGE[].vector + 16 * length(entries))   # the mirror key/value vectors, exact capacity
-        pfkeys = Vector{String}(undef, length(entries))
-        pfvals = Vector{Vector{UInt8}}(undef, length(entries))
-        allocated!(budget, 2 * STORAGE[].vector + 16 * length(entries))
-        for (j, (k, v)) in enumerate(entries)
-            reserve!(budget, checked_add(stringbytes(sizeof(k)), bytesbytes(length(v))))  # the retained metadata entry (byte and stream readers now charge identically)
-            pfkeys[j] = k
-            pfvals[j] = v
-        end
-        buildmap(Vector{UInt8}, pfkeys, pfvals, budget)
-        withplanbudget(budget) do
-            readplan(pfschema; budget=budget)
-        end
-        preflightbase = budget.reserved - base0
-        preflight = pfschema isa RecordSchema ? TablePreflight(pfschema, plan::WRecord) : nothing
+        preflightbase, preflight = writerpreflight(schemajson, entries, plan, limits, budget;
+                                                   allow_invalid_names=allow_invalid_names,
+                                                   allow_invalid_defaults=allow_invalid_defaults)
         path = dst isa AbstractString ? String(dst) : nothing
-        sink, temppath, ownsink = if path === nothing
-            (dst, nothing, false)
-        elseif atomic
-            t, tio = mktemp(dirname(abspath(path)))
-            (tio, t, true)
-        else
-            (open(path, "w"), nothing, true)
-        end
+        sink, temppath, ownsink = openwritersink(dst, atomic)
         encoder = Encoder(budget)
         w = Writer(sink, path, atomic ? temppath : nothing, schema, plan, wcodec, syncmarker, limits, budget,
                    Int(block_bytes), atomic, fsync, ownsink, encoder, preflightbase, preflight, nothing, nothing, 0, 0, 0, false, nothing)
         try
-            for m in MAGIC
-                Base.write(sink, m)
-            end
-            writevarint(sink, length(entries))
-            for (k, v) in entries
-                writevarint(sink, sizeof(k))
-                Base.write(sink, codeunits(k))
-                writevarint(sink, length(v))
-                Base.write(sink, v)
-            end
-            Base.write(sink, 0x00)
-            for b in syncmarker
-                Base.write(sink, b)
-            end
+            writecontainerheader!(sink, entries, syncmarker)
         catch e
             poison!(w, e)
             abortcleanup(w)
@@ -864,7 +965,9 @@ function Writer(f::Function, dst, schema::Schema; kw...)
     end
 end
 
-poison!(w::Writer, e::Exception) = (w.poison === nothing && (w.poison = e); nothing)
+function poison!(w::Writer, e::Exception)
+    return (w.poison === nothing && (w.poison = e); nothing)
+end
 
 function checkwritable(w::Writer)
     w.closed && throw(WriterClosedError(w.poison))

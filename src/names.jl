@@ -11,18 +11,36 @@ struct FullName
     namespace::String
 end
 
-fullname(f::FullName) = isempty(f.namespace) ? f.name : string(f.namespace, ".", f.name)
+function fullname(f::FullName)
+    return isempty(f.namespace) ? f.name : string(f.namespace, ".", f.name)
+end
 
-Base.:(==)(a::FullName, b::FullName) = a.name == b.name && a.namespace == b.namespace
-Base.hash(a::FullName, h::UInt) = hash(a.namespace, hash(a.name, hash(:FullName, h)))
-Base.isless(a::FullName, b::FullName) = isless(fullname(a), fullname(b))
-Base.show(io::IO, f::FullName) = print(io, "FullName(\"", fullname(f), "\")")
+function Base.:(==)(a::FullName, b::FullName)
+    return a.name == b.name && a.namespace == b.namespace
+end
+
+function Base.hash(a::FullName, h::UInt)
+    return hash(a.namespace, hash(a.name, hash(:FullName, h)))
+end
+
+function Base.isless(a::FullName, b::FullName)
+    return isless(fullname(a), fullname(b))
+end
+
+function Base.show(io::IO, f::FullName)
+    return print(io, "FullName(\"", fullname(f), "\")")
+end
 
 const PRIMITIVE_NAMES = ("null", "boolean", "int", "long", "float", "double", "bytes", "string")
 const COMPLEX_KEYWORDS = ("record", "error", "enum", "array", "map", "fixed")
 
-isnamestart(b::UInt8) = (b == UInt8('_')) || (UInt8('A') <= b <= UInt8('Z')) || (UInt8('a') <= b <= UInt8('z'))
-isnamechar(b::UInt8) = isnamestart(b) || (UInt8('0') <= b <= UInt8('9'))
+function isnamestart(b::UInt8)
+    return (b == UInt8('_')) || (UInt8('A') <= b <= UInt8('Z')) || (UInt8('a') <= b <= UInt8('z'))
+end
+
+function isnamechar(b::UInt8)
+    return isnamestart(b) || (UInt8('0') <= b <= UInt8('9'))
+end
 
 """
     isvalidname(s) -> Bool
@@ -108,4 +126,6 @@ end
 
 Primitive type names are reserved in the null namespace only (`a.int` is a valid fullname).
 """
-isreservedfullname(f::FullName) = isempty(f.namespace) && f.name in PRIMITIVE_NAMES
+function isreservedfullname(f::FullName)
+    return isempty(f.namespace) && f.name in PRIMITIVE_NAMES
+end

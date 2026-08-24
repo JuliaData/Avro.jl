@@ -31,7 +31,10 @@ struct DecimalPlan <: ReadPlan
     little::Bool         # decimal_byteorder=:little — Avro.jl ≤ 1.1.2 wrote native-endian decimals
 end
 
-DecimalPlan(fixedsize::Int, precision::Int, scale::Int, wide::Bool) = DecimalPlan(fixedsize, precision, scale, wide, false)
+function DecimalPlan(fixedsize::Int, precision::Int, scale::Int, wide::Bool)
+    return DecimalPlan(fixedsize, precision, scale, wide, false)
+end
+
 struct UUIDStringPlan <: ReadPlan end
 struct UUIDFixedPlan <: ReadPlan end
 struct DurationPlan <: ReadPlan end
@@ -75,8 +78,14 @@ function readplan(s::Schema, memo::Vector{Union{Nothing,ReadPlan}}, budget)
     return p
 end
 
-buildreadplan(::NullSchema, memo, budget) = NullPlan()
-buildreadplan(::BooleanSchema, memo, budget) = BoolPlan()
+function buildreadplan(::NullSchema, memo, budget)
+    return NullPlan()
+end
+
+function buildreadplan(::BooleanSchema, memo, budget)
+    return BoolPlan()
+end
+
 function buildreadplan(s::IntSchema, memo, budget)
     s.logical isa DateLogical && return DatePlan()
     s.logical isa TimeMillis && return TimeMillisPlan()
@@ -93,8 +102,14 @@ function buildreadplan(s::LongSchema, memo, budget)
     l isa LocalTimestampNanos && return LocalTimestampPlan{Nanosecond}()
     return LongPlan()
 end
-buildreadplan(::FloatSchema, memo, budget) = FloatPlan()
-buildreadplan(::DoubleSchema, memo, budget) = DoublePlan()
+function buildreadplan(::FloatSchema, memo, budget)
+    return FloatPlan()
+end
+
+function buildreadplan(::DoubleSchema, memo, budget)
+    return DoublePlan()
+end
+
 function buildreadplan(s::BytesSchema, memo, budget)
     l = s.logical
     l isa DecimalLogical && return DecimalPlan(0, l.precision, l.scale, l.precision > 38)
@@ -111,9 +126,18 @@ function buildreadplan(s::FixedSchema, memo, budget)
     l isa DurationLogical && return DurationPlan()
     return FixedPlan(s)
 end
-buildreadplan(s::EnumSchema, memo, budget) = EnumPlan(s)
-buildreadplan(s::ArraySchema, memo, budget) = ArrayPlan(readplan(s.items, memo, budget), elementtype(s.items), minsize(s.items))
-buildreadplan(s::MapSchema, memo, budget) = MapPlan(readplan(s.values, memo, budget), elementtype(s.values), minsize(s.values))
+function buildreadplan(s::EnumSchema, memo, budget)
+    return EnumPlan(s)
+end
+
+function buildreadplan(s::ArraySchema, memo, budget)
+    return ArrayPlan(readplan(s.items, memo, budget), elementtype(s.items), minsize(s.items))
+end
+
+function buildreadplan(s::MapSchema, memo, budget)
+    return MapPlan(readplan(s.values, memo, budget), elementtype(s.values), minsize(s.values))
+end
+
 function buildreadplan(s::UnionSchema, memo, budget)
     return UnionPlan(ReadPlan[readplan(b, memo, budget) for b in s.branches], nullablebranch(s))
 end
@@ -140,14 +164,38 @@ function decode(p::ReadPlan, d::Decoder)
     return decodevalue(p, d)
 end
 
-decodevalue(::NullPlan, d::Decoder) = missing
-decodevalue(::BoolPlan, d::Decoder) = readbool(d)
-decodevalue(::IntPlan, d::Decoder) = readint(d)
-decodevalue(::LongPlan, d::Decoder) = readlong(d)
-decodevalue(::FloatPlan, d::Decoder) = readfloat(d)
-decodevalue(::DoublePlan, d::Decoder) = readdouble(d)
-decodevalue(::BytesPlan, d::Decoder) = readbytes(d)
-decodevalue(::StringPlan, d::Decoder) = readstring(d)
+function decodevalue(::NullPlan, d::Decoder)
+    return missing
+end
+
+function decodevalue(::BoolPlan, d::Decoder)
+    return readbool(d)
+end
+
+function decodevalue(::IntPlan, d::Decoder)
+    return readint(d)
+end
+
+function decodevalue(::LongPlan, d::Decoder)
+    return readlong(d)
+end
+
+function decodevalue(::FloatPlan, d::Decoder)
+    return readfloat(d)
+end
+
+function decodevalue(::DoublePlan, d::Decoder)
+    return readdouble(d)
+end
+
+function decodevalue(::BytesPlan, d::Decoder)
+    return readbytes(d)
+end
+
+function decodevalue(::StringPlan, d::Decoder)
+    return readstring(d)
+end
+
 function decodevalue(p::FixedPlan, d::Decoder)
     reserve!(d.budget, STORAGE[].fixed)
     v = Fixed(p.schema, readfixed(d, p.schema.size), Val(:unchecked))
@@ -163,7 +211,9 @@ function decodevalue(p::EnumPlan, d::Decoder)
 end
 
 const DATE_EPOCH = Date(1970, 1, 1)
-decodevalue(::DatePlan, d::Decoder) = DATE_EPOCH + Day(readint(d))
+function decodevalue(::DatePlan, d::Decoder)
+    return DATE_EPOCH + Day(readint(d))
+end
 
 function decodevalue(::TimeMillisPlan, d::Decoder)
     v = readint(d)
@@ -177,8 +227,13 @@ function decodevalue(::TimeMicrosPlan, d::Decoder)
     return Time(Nanosecond(v * 1_000))
 end
 
-decodevalue(::TimestampPlan{P}, d::Decoder) where {P} = Timestamp{P}(readlong(d))
-decodevalue(::LocalTimestampPlan{P}, d::Decoder) where {P} = LocalTimestamp{P}(readlong(d))
+function decodevalue(::TimestampPlan{P}, d::Decoder) where {P}
+    return Timestamp{P}(readlong(d))
+end
+
+function decodevalue(::LocalTimestampPlan{P}, d::Decoder) where {P}
+    return LocalTimestamp{P}(readlong(d))
+end
 
 function decodevalue(p::DecimalPlan, d::Decoder)
     if p.fixedsize == 0
@@ -269,7 +324,9 @@ function validuuid(buf::AbstractVector{UInt8}, from::Int, n::Int)
     return true
 end
 
-hexnibble(b::UInt8) = b <= UInt8('9') ? b - UInt8('0') : (b | 0x20) - UInt8('a') + 0x0a
+function hexnibble(b::UInt8)
+    return b <= UInt8('9') ? b - UInt8('0') : (b | 0x20) - UInt8('a') + 0x0a
+end
 
 function uuidfrombuffer(buf::AbstractVector{UInt8}, from::Int)
     v = UInt128(0)
@@ -310,7 +367,9 @@ end
 function decodevalue(::DurationPlan, d::Decoder)
     skipfixed(d, 12)
     p = d.pos - 12
-    le32(i) = UInt32(d.buf[p + i]) | (UInt32(d.buf[p + i + 1]) << 8) | (UInt32(d.buf[p + i + 2]) << 16) | (UInt32(d.buf[p + i + 3]) << 24)
+    function le32(i)
+        return UInt32(d.buf[p + i]) | (UInt32(d.buf[p + i + 1]) << 8) | (UInt32(d.buf[p + i + 2]) << 16) | (UInt32(d.buf[p + i + 3]) << 24)
+    end
     return Duration(le32(0), le32(4), le32(8))
 end
 
@@ -489,17 +548,43 @@ function skip(p::ReadPlan, d::Decoder)
     return skipvalue(p, d)
 end
 
-skipvalue(::NullPlan, d::Decoder) = nothing
-skipvalue(::BoolPlan, d::Decoder) = (readbool(d); nothing)
+function skipvalue(::NullPlan, d::Decoder)
+    return nothing
+end
+
+function skipvalue(::BoolPlan, d::Decoder)
+    return (readbool(d); nothing)
+end
 # Logical values are domain-checked when skipped exactly as when decoded (plan §4.3: only skipped
 # strings are not UTF-8-validated).
-skipvalue(::Union{IntPlan,DatePlan}, d::Decoder) = (readint(d); nothing)
-skipvalue(p::TimeMillisPlan, d::Decoder) = (decodevalue(p, d); nothing)
-skipvalue(::Union{LongPlan,TimestampPlan,LocalTimestampPlan}, d::Decoder) = (readlong(d); nothing)
-skipvalue(p::TimeMicrosPlan, d::Decoder) = (decodevalue(p, d); nothing)
-skipvalue(::FloatPlan, d::Decoder) = (readfloat(d); nothing)
-skipvalue(::DoublePlan, d::Decoder) = (readdouble(d); nothing)
-skipvalue(::Union{BytesPlan,StringPlan}, d::Decoder) = skiplen(d)
+function skipvalue(::Union{IntPlan,DatePlan}, d::Decoder)
+    return (readint(d); nothing)
+end
+
+function skipvalue(p::TimeMillisPlan, d::Decoder)
+    return (decodevalue(p, d); nothing)
+end
+
+function skipvalue(::Union{LongPlan,TimestampPlan,LocalTimestampPlan}, d::Decoder)
+    return (readlong(d); nothing)
+end
+
+function skipvalue(p::TimeMicrosPlan, d::Decoder)
+    return (decodevalue(p, d); nothing)
+end
+
+function skipvalue(::FloatPlan, d::Decoder)
+    return (readfloat(d); nothing)
+end
+
+function skipvalue(::DoublePlan, d::Decoder)
+    return (readdouble(d); nothing)
+end
+
+function skipvalue(::Union{BytesPlan,StringPlan}, d::Decoder)
+    return skiplen(d)
+end
+
 function skipvalue(::UUIDStringPlan, d::Decoder)
     n = readlen(d, d.budget.limits.max_bytes, :max_bytes)
     validuuid(d.buf, d.pos, n) || dataerror(d, "invalid uuid string \"$(escapename(unsafe_substring(d.buf, d.pos, n)))\"")
@@ -518,10 +603,21 @@ function skipvalue(p::DecimalPlan, d::Decoder)
     d.pos += n
     return nothing
 end
-skipvalue(p::FixedPlan, d::Decoder) = skipfixed(d, p.schema.size)
-skipvalue(::UUIDFixedPlan, d::Decoder) = skipfixed(d, 16)
-skipvalue(::DurationPlan, d::Decoder) = skipfixed(d, 12)
-skipvalue(p::EnumPlan, d::Decoder) = (readindex(d, length(p.schema.symbols)); nothing)
+function skipvalue(p::FixedPlan, d::Decoder)
+    return skipfixed(d, p.schema.size)
+end
+
+function skipvalue(::UUIDFixedPlan, d::Decoder)
+    return skipfixed(d, 16)
+end
+
+function skipvalue(::DurationPlan, d::Decoder)
+    return skipfixed(d, 12)
+end
+
+function skipvalue(p::EnumPlan, d::Decoder)
+    return (readindex(d, length(p.schema.symbols)); nothing)
+end
 
 function skipvalue(p::ArrayPlan, d::Decoder)
     enter!(d)

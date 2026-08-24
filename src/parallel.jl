@@ -163,7 +163,9 @@ mutable struct ParallelStats
     blocks::Int
 end
 
-ParallelStats() = ParallelStats(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+function ParallelStats()
+    return ParallelStats(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+end
 
 "The last operation's parallel counters (test and gate introspection only)."
 const LAST_PARALLEL_STATS = Ref{Any}(nothing)
@@ -171,11 +173,15 @@ const LAST_PARALLEL_STATS = Ref{Any}(nothing)
 "Test-only schedule forcing: `PARALLEL_HOOK[] = (event, index) -> ...` (`:admitted`, `:headdone`, `:workerstart`, `:workerdone`, `:commit`)."
 const PARALLEL_HOOK = Ref{Any}(nothing)
 
-phook(event::Symbol, index::Int) = (h = PARALLEL_HOOK[]; h === nothing || h(event, index); nothing)
+function phook(event::Symbol, index::Int)
+    return (h = PARALLEL_HOOK[]; h === nothing || h(event, index); nothing)
+end
 
 # ---- direct decode (the sequential rule, head task and ntasks = 1) -----------------------------------
 
-maketyped(plan::P, data::Vector{E}, base::Int) where {P<:ReadPlan,E} = TypedColumn{E,P}(plan, data, base)
+function maketyped(plan::P, data::Vector{E}, base::Int) where {P<:ReadPlan,E}
+    return TypedColumn{E,P}(plan, data, base)
+end
 
 "Builders that decode a block directly into the final columns at its prefix-sum offset (no chunks)."
 function directbuilders(p::RecordPlan, sel::Union{Nothing,Vector{Int}}, finals::Vector{AbstractVector}, keptidx::Vector{Int}, base::Int)
@@ -396,53 +402,41 @@ function finalcounters!(stats::ParallelStats, b::Budget)
     return nothing
 end
 
-"""
-Decode a pre-scanned byte source into the preallocated finals: the direct head under the sequential
-rule, higher blocks in order into headroom, ordered cumulative commits, lowest failing index wins.
-"""
-function decodeblocks!(r::Reader, plan, sel::Union{Nothing,Vector{Int}}, finals::Vector{AbstractVector},
-                       keptidx::Vector{Int}, cols::Vector{Type}, pre::PrescanResult, ntasks::Int)
-    entries = pre.entries
-    nblocks = length(entries)
-    stats = ParallelStats()
-    LAST_PARALLEL_STATS[] = stats
+"The pool plan: per-row slot bytes, in-flight cap, the worker count the ceiling admits, and the pool-state charge."
+function poolplan(r::Reader, cols::Vector{Type}, entries::BlockTable, ntasks::Int)
     slotrow = 0
     for E in cols
         slotrow = checked_add(slotrow, slotbytes(E))
     end
     b = r.budget
     inflightcap = r.limits.max_inflight_blocks == 0 ? ntasks - 1 : min(r.limits.max_inflight_blocks, ntasks - 1)
-    nworkers = min(ntasks - 1, Threads.nthreads() - 1, inflightcap, max(nblocks - 1, 0))
+    nworkers = min(ntasks - 1, Threads.nthreads() - 1, inflightcap, max(length(entries) - 1, 0))
     poolstate = 0
     if nworkers > 0 && r.legacy === nothing          # legacy tolerance mutates reader state: direct path only
         Whead = blockworstcase(r.limits, entries[1], cols)
         W2 = blockworstcase(r.limits, entries[2], cols)
         workersstate = checked_mul(WORKER_STATE, nworkers)
-        jobsstate = vectorbytes(Union{Nothing,BlockJob}, nblocks)
+        jobsstate = vectorbytes(Union{Nothing,BlockJob}, length(entries))
         channelstate = vectorbytes(BlockJob, inflightcap)
         poolstate = checked_add(workersstate, checked_add(jobsstate, channelstate))
         checked_add(checked_add(b.reserved, Whead), checked_add(W2, poolstate)) <= b.ceiling || (nworkers = 0)
     else
         nworkers = 0
     end
-    stats.nworkers = nworkers
-    if nworkers == 0
-        for e in entries                             # the ntasks = 1 direct path
-            builders = directbuilders(plan, sel, finals, keptidx, e.rowstart - 1)
-            decodedirect!(r, e, plan, builders, slotrow)
-        end
-        pre.pending === nothing || throw(pre.pending)
-        finalcounters!(stats, b)
-        return stats
-    end
-    # Reserve the complete pool before its first package-owned object. Locals become `nothing`
-    # before the reservation is released, so no job index, channel, task, or fail box outlives it.
+    return (slotrow, inflightcap, nworkers, poolstate)
+end
+
+"""
+Reserve the complete pool before its first package-owned object, then start the workers. A partial
+startup drains started workers and returns the never-resident reservation through `unreserve!`.
+Returns `(fail, jobs, ch, workers)` with the pool-state charge settled resident.
+"""
+function startpool(r::Reader, plan, sel::Union{Nothing,Vector{Int}}, slotrow::Int, nblocks::Int,
+                   inflightcap::Int, nworkers::Int, poolstate::Int)
+    b = r.budget
     reserve!(b, poolstate)
-    poolalive = false
-    fail::Union{Nothing,FailBox} = nothing
-    jobs::Union{Nothing,Vector{Union{Nothing,BlockJob}}} = nothing
-    ch::Union{Nothing,Channel{BlockJob}} = nothing
-    workers::Union{Nothing,Vector{Task}} = nothing
+    ch = nothing
+    workers = nothing
     nstarted = 0
     try
         fail = FailBox(typemax(Int))
@@ -456,18 +450,90 @@ function decodeblocks!(r::Reader, plan, sel::Union{Nothing,Vector{Int}}, finals:
             nstarted = i
         end
         allocated!(b, poolstate)
-        poolalive = true
+        return (fail, jobs, ch, workers)
     catch
         if ch !== nothing
             workers === nothing ? close(ch) : settleworkers!(ch, workers, nstarted)
         end
-        fail = nothing
-        jobs = nothing
         ch = nothing
         workers = nothing
-        release!(b, poolstate)
+        unreserve!(b, poolstate)                     # never settled: the pool objects die with this frame
         rethrow()
     end
+end
+
+"Admit higher blocks in order into ceiling headroom with complete worst-case reservations."
+function admitjobs!(r::Reader, entries::BlockTable, cols::Vector{Type},
+                    jobs::Vector{Union{Nothing,BlockJob}}, ch::Channel{BlockJob}, stats::ParallelStats,
+                    Whead::Int, next::Int, inflight::Int, inflightcap::Int)
+    b = r.budget
+    while next <= length(entries) && inflight < inflightcap
+        e2 = entries[next]
+        Wi = blockworstcase(r.limits, e2, cols)
+        checked_add(checked_add(b.reserved, Whead), Wi) <= b.ceiling || break
+        reserve!(b, Wi)
+        job = BlockJob(e2, Wi, blockbudget(r.limits, Wi), Threads.Event(), nothing, 0, nothing, :pending)
+        jobs[next] = job
+        put!(ch, job)
+        inflight += 1
+        stats.inflight_highwater = max(stats.inflight_highwater, inflight + 1)
+        phook(:admitted, e2.index)
+        next += 1
+    end
+    return (next, inflight)
+end
+
+"Commit completed jobs in block order from `tocommit`; the lowest failing index propagates."
+function commitwave!(r::Reader, jobs::Vector{Union{Nothing,BlockJob}}, finals::Vector{AbstractVector},
+                     keptidx::Vector{Int}, stats::ParallelStats, fail::FailBox, tocommit::Int, inflight::Int)
+    while tocommit <= length(jobs) && jobs[tocommit] !== nothing
+        job = jobs[tocommit]::BlockJob
+        wait(job.done)
+        inflight -= 1
+        st = @atomic job.state
+        st === :done || throw(job.err::Exception)              # the lowest uncommitted block's own failure
+        jobs[tocommit] = nothing
+        try
+            commitjob!(r, job, finals, keptidx, stats)
+        catch
+            recordfailure!(fail, job.entry.index)
+            rethrow()
+        end
+        tocommit += 1
+    end
+    return (tocommit, inflight)
+end
+
+"""
+Decode a pre-scanned byte source into the preallocated finals: the direct head under the sequential
+rule, higher blocks in order into headroom, ordered cumulative commits, lowest failing index wins.
+"""
+function decodeblocks!(r::Reader, plan, sel::Union{Nothing,Vector{Int}}, finals::Vector{AbstractVector},
+                       keptidx::Vector{Int}, cols::Vector{Type}, pre::PrescanResult, ntasks::Int)
+    entries = pre.entries
+    nblocks = length(entries)
+    stats = ParallelStats()
+    LAST_PARALLEL_STATS[] = stats
+    b = r.budget
+    slotrow, inflightcap, nworkers, poolstate = poolplan(r, cols, entries, ntasks)
+    stats.nworkers = nworkers
+    if nworkers == 0
+        for e in entries                             # the ntasks = 1 direct path
+            builders = directbuilders(plan, sel, finals, keptidx, e.rowstart - 1)
+            decodedirect!(r, e, plan, builders, slotrow)
+        end
+        pre.pending === nothing || throw(pre.pending)
+        finalcounters!(stats, b)
+        return stats
+    end
+    # Locals become `nothing` before the pool reservation is released, so no job index, channel,
+    # task, or fail box outlives it.
+    fail::Union{Nothing,FailBox} = nothing
+    jobs::Union{Nothing,Vector{Union{Nothing,BlockJob}}} = nothing
+    ch::Union{Nothing,Channel{BlockJob}} = nothing
+    workers::Union{Nothing,Vector{Task}} = nothing
+    fail, jobs, ch, workers = startpool(r, plan, sel, slotrow, nblocks, inflightcap, nworkers, poolstate)
+    poolalive = true
     inflight = 0
     next = 1
     tocommit = 1
@@ -486,18 +552,9 @@ function decodeblocks!(r::Reader, plan, sel::Union{Nothing,Vector{Int}}, finals:
                 release!(b, poolstate)
                 poolalive = false
             end
-            while poolalive && next <= nblocks && inflight < inflightcap
-                e2 = entries[next]
-                Wi = blockworstcase(r.limits, e2, cols)
-                checked_add(checked_add(b.reserved, Whead), Wi) <= b.ceiling || break
-                reserve!(b, Wi)
-                job = BlockJob(e2, Wi, blockbudget(r.limits, Wi), Threads.Event(), nothing, 0, nothing, :pending)
-                (jobs::Vector{Union{Nothing,BlockJob}})[next] = job
-                put!(ch::Channel{BlockJob}, job)
-                inflight += 1
-                stats.inflight_highwater = max(stats.inflight_highwater, inflight + 1)
-                phook(:admitted, e2.index)
-                next += 1
+            if poolalive
+                next, inflight = admitjobs!(r, entries, cols, jobs::Vector{Union{Nothing,BlockJob}},
+                                            ch::Channel{BlockJob}, stats, Whead, next, inflight, inflightcap)
             end
             builders = directbuilders(plan, sel, finals, keptidx, head.rowstart - 1)
             try
@@ -508,21 +565,9 @@ function decodeblocks!(r::Reader, plan, sel::Union{Nothing,Vector{Int}}, finals:
             end
             tocommit = headidx + 1
             phook(:headdone, headidx)
-            while poolalive && tocommit <= nblocks &&
-                  (jobs::Vector{Union{Nothing,BlockJob}})[tocommit] !== nothing
-                job = (jobs::Vector{Union{Nothing,BlockJob}})[tocommit]::BlockJob
-                wait(job.done)
-                inflight -= 1
-                st = @atomic job.state
-                st === :done || throw(job.err::Exception)              # the lowest uncommitted block's own failure
-                (jobs::Vector{Union{Nothing,BlockJob}})[tocommit] = nothing
-                try
-                    commitjob!(r, job, finals, keptidx, stats)
-                catch
-                    recordfailure!(fail::FailBox, job.entry.index)
-                    rethrow()
-                end
-                tocommit += 1
+            if poolalive
+                tocommit, inflight = commitwave!(r, jobs::Vector{Union{Nothing,BlockJob}}, finals, keptidx,
+                                                 stats, fail::FailBox, tocommit, inflight)
             end
             next = tocommit
         end

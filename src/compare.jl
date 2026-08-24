@@ -35,7 +35,9 @@ end
 Order two Julia values under `schema` by comparing their canonical encodings (`comparebytes` of
 `encode(schema, x)`); cyclic or over-limit values fail with `LimitError`.
 """
-compare(s::Schema, a, b; limits::Limits=Limits()) = comparebytes(s, encode(s, a; limits=limits), encode(s, b; limits=limits); limits=limits)
+function compare(s::Schema, a, b; limits::Limits=Limits())
+    return comparebytes(s, encode(s, a; limits=limits), encode(s, b; limits=limits); limits=limits)
+end
 
 function checkorderable(s::Schema, visited::Vector{Int32}=Int32[])
     s isa MapSchema && throw(ArgumentError("maps have no sort order (plan §4.12); a map field must be marked order=\"ignore\""))
@@ -70,13 +72,33 @@ function comparefloat(a::AbstractFloat, b::AbstractFloat)
     return sa == sb ? 0 : (sa ? -1 : 1)
 end
 
-comparekind(::NullSchema, p, da::Decoder, db::Decoder) = 0
-comparekind(::BooleanSchema, p, da::Decoder, db::Decoder) = cmp(readbool(da), readbool(db))
-comparekind(::IntSchema, p, da::Decoder, db::Decoder) = cmp(readint(da), readint(db))
-comparekind(::LongSchema, p, da::Decoder, db::Decoder) = cmp(readlong(da), readlong(db))
-comparekind(::FloatSchema, p, da::Decoder, db::Decoder) = comparefloat(readfloat(da), readfloat(db))
-comparekind(::DoubleSchema, p, da::Decoder, db::Decoder) = comparefloat(readdouble(da), readdouble(db))
-comparekind(s::EnumSchema, p, da::Decoder, db::Decoder) = cmp(readindex(da, length(s.symbols)), readindex(db, length(s.symbols)))
+function comparekind(::NullSchema, p, da::Decoder, db::Decoder)
+    return 0
+end
+
+function comparekind(::BooleanSchema, p, da::Decoder, db::Decoder)
+    return cmp(readbool(da), readbool(db))
+end
+
+function comparekind(::IntSchema, p, da::Decoder, db::Decoder)
+    return cmp(readint(da), readint(db))
+end
+
+function comparekind(::LongSchema, p, da::Decoder, db::Decoder)
+    return cmp(readlong(da), readlong(db))
+end
+
+function comparekind(::FloatSchema, p, da::Decoder, db::Decoder)
+    return comparefloat(readfloat(da), readfloat(db))
+end
+
+function comparekind(::DoubleSchema, p, da::Decoder, db::Decoder)
+    return comparefloat(readdouble(da), readdouble(db))
+end
+
+function comparekind(s::EnumSchema, p, da::Decoder, db::Decoder)
+    return cmp(readindex(da, length(s.symbols)), readindex(db, length(s.symbols)))
+end
 
 function comparekind(s::Union{BytesSchema,StringSchema}, p, da::Decoder, db::Decoder)
     na = readlen(da, da.budget.limits.max_bytes, :max_bytes)
@@ -153,7 +175,9 @@ mutable struct ItemCursor
     done::Bool
 end
 
-ItemCursor() = ItemCursor(0, -1, false, false)
+function ItemCursor()
+    return ItemCursor(0, -1, false, false)
+end
 
 "Position `d` at the next item; `false` once the terminating block has been consumed."
 function advance!(c::ItemCursor, d::Decoder, minsize::Int)
@@ -210,4 +234,6 @@ function comparekind(s::ArraySchema, p::ArrayPlan, da::Decoder, db::Decoder)
     return result
 end
 
-comparekind(s::MapSchema, p, da::Decoder, db::Decoder) = throw(ArgumentError("maps have no sort order (plan §4.12)"))
+function comparekind(s::MapSchema, p, da::Decoder, db::Decoder)
+    throw(ArgumentError("maps have no sort order (plan §4.12)"))
+end

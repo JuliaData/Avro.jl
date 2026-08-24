@@ -24,10 +24,21 @@ struct WideDecimal
     scale::Int
 end
 
-Base.:(==)(a::Decimal, b::Decimal) = a.unscaled == b.unscaled && a.scale == b.scale
-Base.hash(a::Decimal, h::UInt) = hash(a.scale, hash(a.unscaled, hash(:Decimal, h)))
-Base.:(==)(a::WideDecimal, b::WideDecimal) = a.unscaled == b.unscaled && a.scale == b.scale
-Base.hash(a::WideDecimal, h::UInt) = hash(a.scale, hash(a.unscaled, hash(:WideDecimal, h)))
+function Base.:(==)(a::Decimal, b::Decimal)
+    return a.unscaled == b.unscaled && a.scale == b.scale
+end
+
+function Base.hash(a::Decimal, h::UInt)
+    return hash(a.scale, hash(a.unscaled, hash(:Decimal, h)))
+end
+
+function Base.:(==)(a::WideDecimal, b::WideDecimal)
+    return a.unscaled == b.unscaled && a.scale == b.scale
+end
+
+function Base.hash(a::WideDecimal, h::UInt)
+    return hash(a.scale, hash(a.unscaled, hash(:WideDecimal, h)))
+end
 
 """
     Avro.Timestamp{P}(ticks::Int64)
@@ -62,9 +73,17 @@ end
 
 const UNIX_EPOCH_MS = Dates.value(DateTime(1970, 1, 1)) # Rata Die milliseconds of the Unix epoch
 
-tickscale(::Type{Millisecond}) = 1
-tickscale(::Type{Microsecond}) = 1_000
-tickscale(::Type{Nanosecond}) = 1_000_000
+function tickscale(::Type{Millisecond})
+    return 1
+end
+
+function tickscale(::Type{Microsecond})
+    return 1_000
+end
+
+function tickscale(::Type{Nanosecond})
+    return 1_000_000
+end
 
 """
     DateTime(x::Avro.Timestamp{P}) / DateTime(x::Avro.LocalTimestamp{P})
@@ -88,8 +107,13 @@ function fromdatetime(::Type{T}, dt::DateTime) where {T<:Union{Timestamp,LocalTi
     return T(r[1])
 end
 
-Timestamp{P}(dt::DateTime) where {P<:Dates.TimePeriod} = fromdatetime(Timestamp{P}, dt)
-LocalTimestamp{P}(dt::DateTime) where {P<:Dates.TimePeriod} = fromdatetime(LocalTimestamp{P}, dt)
+function Timestamp{P}(dt::DateTime) where {P<:Dates.TimePeriod}
+    return fromdatetime(Timestamp{P}, dt)
+end
+
+function LocalTimestamp{P}(dt::DateTime) where {P<:Dates.TimePeriod}
+    return fromdatetime(LocalTimestamp{P}, dt)
+end
 
 function Base.show(io::IO, x::Timestamp{P}) where {P}
     print(io, "Avro.Timestamp{", nameof(P), "}(", x.ticks, ")")

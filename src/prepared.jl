@@ -118,8 +118,13 @@ function (r::DatumReader{T,P})(io::IO) where {T,P}
     return finishtyped(r.plan, v, r.names)
 end
 
-decodetyped(::Type{Nothing}, plan::ReadPlan, d::Decoder, names) = decode(plan, d)
-decodetyped(::Type{T}, plan::TypedPlan, d::Decoder, names) where {T} = decodetyped(plan, d, names)
+function decodetyped(::Type{Nothing}, plan::ReadPlan, d::Decoder, names)
+    return decode(plan, d)
+end
+
+function decodetyped(::Type{T}, plan::TypedPlan, d::Decoder, names) where {T}
+    return decodetyped(plan, d, names)
+end
 
 """
     Avro.DatumWriter(schema; limits=Limits())
@@ -209,8 +214,13 @@ end
 
 One-shot encoding (builds a writer per call; use `DatumWriter` for repeated use).
 """
-encode(schema::Schema, x; limits::Limits=Limits()) = DatumWriter(schema; limits=limits)(x)
-encode(x; limits::Limits=Limits()) = encode(schema(x; limits=limits), x; limits=limits)
+function encode(schema::Schema, x; limits::Limits=Limits())
+    return DatumWriter(schema; limits=limits)(x)
+end
+
+function encode(x; limits::Limits=Limits())
+    return encode(schema(x; limits=limits), x; limits=limits)
+end
 
 """
     Avro.encode!(enc_or_io, schema, x; limits=Limits())
@@ -218,8 +228,13 @@ encode(x; limits::Limits=Limits()) = encode(schema(x; limits=limits), x; limits=
 One-shot encoding that appends one datum to the caller's encoder or stream. Use `DatumWriter` for
 repeated work.
 """
-encode!(io::IO, schema::Schema, x; limits::Limits=Limits()) = DatumWriter(schema; limits=limits)(io, x)
-encode!(e::Encoder, schema::Schema, x; limits::Limits=Limits()) = DatumWriter(schema; limits=limits)(e, x)
+function encode!(io::IO, schema::Schema, x; limits::Limits=Limits())
+    return DatumWriter(schema; limits=limits)(io, x)
+end
+
+function encode!(e::Encoder, schema::Schema, x; limits::Limits=Limits())
+    return DatumWriter(schema; limits=limits)(e, x)
+end
 
 """
     Avro.decode(writer_schema, src; reader_schema=nothing, union_resolution=:spec, limits=Limits(), validate=:strict, names=…)
@@ -229,9 +244,26 @@ encode!(e::Encoder, schema::Schema, x; limits::Limits=Limits()) = DatumWriter(sc
 One-shot decoding of one datum from bytes (trailing bytes rejected), from `bytes` at `pos`, or from an
 `IO`.
 """
-decode(writer::Schema, src::AbstractVector{UInt8}; kw...) = DatumReader(writer; kw...)(src)
-decode(writer::Schema, src::IO; kw...) = DatumReader(writer; kw...)(src)
-decode(writer::Schema, src::AbstractVector{UInt8}, pos::Integer; kw...) = DatumReader(writer; kw...)(src, pos)
-decode(writer::Schema, src::AbstractVector{UInt8}, ::Type{T}; kw...) where {T} = DatumReader(writer, T; kw...)(src)
-decode(writer::Schema, src::IO, ::Type{T}; kw...) where {T} = DatumReader(writer, T; kw...)(src)
-decode(writer::Schema, src::AbstractVector{UInt8}, pos::Integer, ::Type{T}; kw...) where {T} = DatumReader(writer, T; kw...)(src, pos)
+function decode(writer::Schema, src::AbstractVector{UInt8}; kw...)
+    return DatumReader(writer; kw...)(src)
+end
+
+function decode(writer::Schema, src::IO; kw...)
+    return DatumReader(writer; kw...)(src)
+end
+
+function decode(writer::Schema, src::AbstractVector{UInt8}, pos::Integer; kw...)
+    return DatumReader(writer; kw...)(src, pos)
+end
+
+function decode(writer::Schema, src::AbstractVector{UInt8}, ::Type{T}; kw...) where {T}
+    return DatumReader(writer, T; kw...)(src)
+end
+
+function decode(writer::Schema, src::IO, ::Type{T}; kw...) where {T}
+    return DatumReader(writer, T; kw...)(src)
+end
+
+function decode(writer::Schema, src::AbstractVector{UInt8}, pos::Integer, ::Type{T}; kw...) where {T}
+    return DatumReader(writer, T; kw...)(src, pos)
+end

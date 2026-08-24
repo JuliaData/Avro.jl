@@ -14,7 +14,9 @@ struct DecimalLogical <: LogicalType
     scale::Int
 end
 
-DecimalLogical(precision::Integer) = DecimalLogical(Int(precision), 0)
+function DecimalLogical(precision::Integer)
+    return DecimalLogical(Int(precision), 0)
+end
 
 struct UUIDLogical <: LogicalType end
 struct DateLogical <: LogicalType end
@@ -38,19 +40,57 @@ struct UnknownLogical <: LogicalType
     name::String
 end
 
-logicalname(::DecimalLogical) = "decimal"
-logicalname(::UUIDLogical) = "uuid"
-logicalname(::DateLogical) = "date"
-logicalname(::TimeMillis) = "time-millis"
-logicalname(::TimeMicros) = "time-micros"
-logicalname(::TimestampMillis) = "timestamp-millis"
-logicalname(::TimestampMicros) = "timestamp-micros"
-logicalname(::TimestampNanos) = "timestamp-nanos"
-logicalname(::LocalTimestampMillis) = "local-timestamp-millis"
-logicalname(::LocalTimestampMicros) = "local-timestamp-micros"
-logicalname(::LocalTimestampNanos) = "local-timestamp-nanos"
-logicalname(::DurationLogical) = "duration"
-logicalname(l::UnknownLogical) = l.name
+function logicalname(::DecimalLogical)
+    return "decimal"
+end
+
+function logicalname(::UUIDLogical)
+    return "uuid"
+end
+
+function logicalname(::DateLogical)
+    return "date"
+end
+
+function logicalname(::TimeMillis)
+    return "time-millis"
+end
+
+function logicalname(::TimeMicros)
+    return "time-micros"
+end
+
+function logicalname(::TimestampMillis)
+    return "timestamp-millis"
+end
+
+function logicalname(::TimestampMicros)
+    return "timestamp-micros"
+end
+
+function logicalname(::TimestampNanos)
+    return "timestamp-nanos"
+end
+
+function logicalname(::LocalTimestampMillis)
+    return "local-timestamp-millis"
+end
+
+function logicalname(::LocalTimestampMicros)
+    return "local-timestamp-micros"
+end
+
+function logicalname(::LocalTimestampNanos)
+    return "local-timestamp-nanos"
+end
+
+function logicalname(::DurationLogical)
+    return "duration"
+end
+
+function logicalname(l::UnknownLogical)
+    return l.name
+end
 
 const SIMPLE_LOGICALS = Dict{String,Tuple{LogicalType,Tuple{Vararg{Symbol}}}}(
     "uuid" => (UUIDLogical(), (:string, :fixed)),
@@ -107,8 +147,13 @@ function maxdecimalprecision(size::Int)
     return Int(lower)
 end
 
-jsonint(x::Int64) = x
-jsonint(x) = nothing   # raw (overflowing) tokens and non-integers are not JSON integers that fit Int64
+function jsonint(x::Int64)
+    return x
+end
+
+function jsonint(x)
+    return nothing   # raw (overflowing) tokens and non-integers are not JSON integers that fit Int64
+end
 
 """
     evaluatelogical(kind, size, props) -> Union{Nothing,LogicalType}

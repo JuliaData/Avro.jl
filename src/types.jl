@@ -57,14 +57,18 @@ function sanitize(s::String)
     return out
 end
 
-modulepath(m::Module) = join(string.(Base.fullname(m)), ".")
+function modulepath(m::Module)
+    return join(string.(Base.fullname(m)), ".")
+end
 
 """
     Avro.avrosymbol(::Type{E}, x::E) -> String
 
 The enum symbol emitted for the `Base.Enum` instance `x` (overridable; default `string(x)`).
 """
-avrosymbol(::Type{E}, x::E) where {E<:Base.Enum} = string(x)
+function avrosymbol(::Type{E}, x::E) where {E<:Base.Enum}
+    return string(x)
+end
 
 struct DeriveContext
     limits::Limits
@@ -74,7 +78,9 @@ struct DeriveContext
     anonymous::Base.RefValue{Int}             # counter for nested NamedTuple records
 end
 
-nameerror(what, julia, remedy) = throw(ArgumentError("invalid Avro $what derived from $julia; $remedy"))
+function nameerror(what, julia, remedy)
+    throw(ArgumentError("invalid Avro $what derived from $julia; $remedy"))
+end
 
 function checkderivedname(name::AbstractString, what::String, julia::String, remedy::String)
     isvalidname(name) || nameerror(what, julia, remedy)
@@ -266,13 +272,15 @@ function derivenamedtuple(ctx::DeriveContext, ::Type{T}, name, namespace) where 
     return rec
 end
 
-fieldtag(tags, field::Symbol, key::Symbol) = begin
-    t = get(tags, field, nothing)
-    t === nothing && return nothing
-    a = get(t, :avro, nothing)
-    a !== nothing && haskey(a, key) && return a[key]
-    key === :name && haskey(t, :name) && return t[:name]
-    return nothing
+function fieldtag(tags, field::Symbol, key::Symbol)
+    return begin
+        t = get(tags, field, nothing)
+        t === nothing && return nothing
+        a = get(t, :avro, nothing)
+        a !== nothing && haskey(a, key) && return a[key]
+        key === :name && haskey(t, :name) && return t[:name]
+        return nothing
+        end
 end
 
 function derivestruct(ctx::DeriveContext, ::Type{T}, name, namespace) where {T}
@@ -382,8 +390,13 @@ end
 function schema(x::Fixed; limits::Limits=Limits())
     return identityschema(x.schema, limits)
 end
-schema(::UnionValue; limits::Limits=Limits()) = throw(ArgumentError("a bare Avro.UnionValue has no schema of its own: use `Avro.encode(schema, x)`"))
-schema(::Union{Decimal,WideDecimal}; limits::Limits=Limits()) = throw(ArgumentError("a decimal needs a precision and scale: use `Avro.encode(schema, x)`"))
+function schema(::UnionValue; limits::Limits=Limits())
+    throw(ArgumentError("a bare Avro.UnionValue has no schema of its own: use `Avro.encode(schema, x)`"))
+end
+
+function schema(::Union{Decimal,WideDecimal}; limits::Limits=Limits())
+    throw(ArgumentError("a decimal needs a precision and scale: use `Avro.encode(schema, x)`"))
+end
 
 const IDENTITY_VALUES = Union{Record,EnumValue,Fixed}
 
@@ -417,4 +430,6 @@ function uniformschema(xs, limits::Limits)
     return first
 end
 
-schema(x; limits::Limits=Limits()) = schema(typeof(x); limits=limits)
+function schema(x; limits::Limits=Limits())
+    return schema(typeof(x); limits=limits)
+end

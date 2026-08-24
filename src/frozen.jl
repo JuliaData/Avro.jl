@@ -8,19 +8,34 @@ struct FrozenError <: Exception
     what::String
 end
 
-Base.showerror(io::IO, e::FrozenError) = print(io, "FrozenError: cannot mutate a frozen ", e.what)
+function Base.showerror(io::IO, e::FrozenError)
+    return print(io, "FrozenError: cannot mutate a frozen ", e.what)
+end
 
 mutable struct FrozenVector{T} <: AbstractVector{T}
     const data::Vector{T}
     frozen::Bool
 end
 
-FrozenVector{T}() where {T} = FrozenVector{T}(T[], false)
-FrozenVector(v::Vector{T}) where {T} = FrozenVector{T}(v, false)
+function FrozenVector{T}() where {T}
+    return FrozenVector{T}(T[], false)
+end
 
-Base.size(v::FrozenVector) = size(v.data)
-Base.IndexStyle(::Type{<:FrozenVector}) = IndexLinear()
-Base.@propagate_inbounds Base.getindex(v::FrozenVector, i::Int) = v.data[i]
+function FrozenVector(v::Vector{T}) where {T}
+    return FrozenVector{T}(v, false)
+end
+
+function Base.size(v::FrozenVector)
+    return size(v.data)
+end
+
+function Base.IndexStyle(::Type{<:FrozenVector})
+    return IndexLinear()
+end
+
+Base.@propagate_inbounds function Base.getindex(v::FrozenVector, i::Int)
+    return v.data[i]
+end
 
 function Base.setindex!(v::FrozenVector, x, i::Int)
     v.frozen && throw(FrozenError("vector"))
@@ -40,14 +55,33 @@ function Base.empty!(v::FrozenVector)
     return v
 end
 
-Base.resize!(v::FrozenVector, n::Integer) = (v.frozen && throw(FrozenError("vector")); resize!(v.data, n); v)
-Base.pop!(v::FrozenVector) = (v.frozen && throw(FrozenError("vector")); pop!(v.data))
-Base.append!(v::FrozenVector, xs) = (v.frozen && throw(FrozenError("vector")); append!(v.data, xs); v)
-Base.insert!(v::FrozenVector, i::Integer, x) = (v.frozen && throw(FrozenError("vector")); insert!(v.data, i, x); v)
-Base.deleteat!(v::FrozenVector, i) = (v.frozen && throw(FrozenError("vector")); deleteat!(v.data, i); v)
-Base.copy(v::FrozenVector{T}) where {T} = FrozenVector{T}(copy(v.data), false)
+function Base.resize!(v::FrozenVector, n::Integer)
+    return (v.frozen && throw(FrozenError("vector")); resize!(v.data, n); v)
+end
 
-isfrozen(v::FrozenVector) = v.frozen
+function Base.pop!(v::FrozenVector)
+    return (v.frozen && throw(FrozenError("vector")); pop!(v.data))
+end
+
+function Base.append!(v::FrozenVector, xs)
+    return (v.frozen && throw(FrozenError("vector")); append!(v.data, xs); v)
+end
+
+function Base.insert!(v::FrozenVector, i::Integer, x)
+    return (v.frozen && throw(FrozenError("vector")); insert!(v.data, i, x); v)
+end
+
+function Base.deleteat!(v::FrozenVector, i)
+    return (v.frozen && throw(FrozenError("vector")); deleteat!(v.data, i); v)
+end
+
+function Base.copy(v::FrozenVector{T}) where {T}
+    return FrozenVector{T}(copy(v.data), false)
+end
+
+function isfrozen(v::FrozenVector)
+    return v.frozen
+end
 
 """
     FrozenDict{K,V}
@@ -61,7 +95,9 @@ mutable struct FrozenDict{K,V} <: AbstractDict{K,V}
     frozen::Bool
 end
 
-FrozenDict{K,V}() where {K,V} = FrozenDict{K,V}(K[], V[], false)
+function FrozenDict{K,V}() where {K,V}
+    return FrozenDict{K,V}(K[], V[], false)
+end
 
 function FrozenDict{K,V}(pairs) where {K,V}
     d = FrozenDict{K,V}()
@@ -71,9 +107,17 @@ function FrozenDict{K,V}(pairs) where {K,V}
     return d
 end
 
-Base.length(d::FrozenDict) = length(d.keys)
-Base.isempty(d::FrozenDict) = isempty(d.keys)
-isfrozen(d::FrozenDict) = d.frozen
+function Base.length(d::FrozenDict)
+    return length(d.keys)
+end
+
+function Base.isempty(d::FrozenDict)
+    return isempty(d.keys)
+end
+
+function isfrozen(d::FrozenDict)
+    return d.frozen
+end
 
 function keyindex(d::FrozenDict{K}, k) where {K}
     i = searchsortedfirst(d.keys, k)
@@ -81,7 +125,9 @@ function keyindex(d::FrozenDict{K}, k) where {K}
     return 0
 end
 
-Base.haskey(d::FrozenDict, k) = keyindex(d, k) != 0
+function Base.haskey(d::FrozenDict, k)
+    return keyindex(d, k) != 0
+end
 
 function Base.getindex(d::FrozenDict, k)
     i = keyindex(d, k)
@@ -128,9 +174,17 @@ function Base.iterate(d::FrozenDict, i::Int=1)
     return (d.keys[i] => d.vals[i], i + 1)
 end
 
-Base.keys(d::FrozenDict) = d.keys
-Base.values(d::FrozenDict) = d.vals
-Base.copy(d::FrozenDict{K,V}) where {K,V} = FrozenDict{K,V}(copy(d.keys), copy(d.vals), false)
+function Base.keys(d::FrozenDict)
+    return d.keys
+end
+
+function Base.values(d::FrozenDict)
+    return d.vals
+end
+
+function Base.copy(d::FrozenDict{K,V}) where {K,V}
+    return FrozenDict{K,V}(copy(d.keys), copy(d.vals), false)
+end
 
 """
     FrozenRef{T}
@@ -141,10 +195,17 @@ mutable struct FrozenRef{T}
     value::Union{Nothing,Some{T}}
 end
 
-FrozenRef{T}() where {T} = FrozenRef{T}(nothing)
-FrozenRef(x::T) where {T} = FrozenRef{T}(Some(x))
+function FrozenRef{T}() where {T}
+    return FrozenRef{T}(nothing)
+end
 
-isfilled(r::FrozenRef) = r.value !== nothing
+function FrozenRef(x::T) where {T}
+    return FrozenRef{T}(Some(x))
+end
+
+function isfilled(r::FrozenRef)
+    return r.value !== nothing
+end
 
 function Base.getindex(r::FrozenRef)
     v = r.value
@@ -170,8 +231,13 @@ struct JSONNumber
     text::String
 end
 
-Base.:(==)(a::JSONNumber, b::JSONNumber) = a.text == b.text
-Base.hash(a::JSONNumber, h::UInt) = hash(a.text, hash(:JSONNumber, h))
+function Base.:(==)(a::JSONNumber, b::JSONNumber)
+    return a.text == b.text
+end
+
+function Base.hash(a::JSONNumber, h::UInt)
+    return hash(a.text, hash(:JSONNumber, h))
+end
 
 """
     JSONArray(items)
@@ -194,29 +260,68 @@ struct JSONObject
     spans::FrozenVector{UnitRange{Int}}   # source byte span of each member value, in source order (empty when unknown)
 end
 
-JSONObject(members::FrozenDict{String,Any}, order::FrozenVector{String}) = JSONObject(members, order, FrozenVector{UnitRange{Int}}())
+function JSONObject(members::FrozenDict{String,Any}, order::FrozenVector{String})
+    return JSONObject(members, order, FrozenVector{UnitRange{Int}}())
+end
 
 const FrozenJSON = Union{Nothing,Bool,Int64,Float64,String,JSONNumber,JSONArray,JSONObject}
 
-Base.:(==)(a::JSONArray, b::JSONArray) = a.items.data == b.items.data
-Base.hash(a::JSONArray, h::UInt) = hash(a.items.data, hash(:JSONArray, h))
-Base.:(==)(a::JSONObject, b::JSONObject) = a.members.keys == b.members.keys && a.members.vals == b.members.vals
-Base.hash(a::JSONObject, h::UInt) = hash(a.members.vals, hash(a.members.keys, hash(:JSONObject, h)))
-Base.length(a::JSONArray) = length(a.items)
-Base.getindex(a::JSONArray, i::Int) = a.items[i]
-Base.iterate(a::JSONArray, i::Int=1) = i > length(a.items) ? nothing : (a.items[i], i + 1)
-Base.length(o::JSONObject) = length(o.members)
-Base.haskey(o::JSONObject, k::AbstractString) = haskey(o.members, String(k))
-Base.getindex(o::JSONObject, k::AbstractString) = o.members[String(k)]
-Base.get(o::JSONObject, k::AbstractString, default) = get(o.members, String(k), default)
-Base.keys(o::JSONObject) = o.order.data
+function Base.:(==)(a::JSONArray, b::JSONArray)
+    return a.items.data == b.items.data
+end
+
+function Base.hash(a::JSONArray, h::UInt)
+    return hash(a.items.data, hash(:JSONArray, h))
+end
+
+function Base.:(==)(a::JSONObject, b::JSONObject)
+    return a.members.keys == b.members.keys && a.members.vals == b.members.vals
+end
+
+function Base.hash(a::JSONObject, h::UInt)
+    return hash(a.members.vals, hash(a.members.keys, hash(:JSONObject, h)))
+end
+
+function Base.length(a::JSONArray)
+    return length(a.items)
+end
+
+function Base.getindex(a::JSONArray, i::Int)
+    return a.items[i]
+end
+
+function Base.iterate(a::JSONArray, i::Int=1)
+    return i > length(a.items) ? nothing : (a.items[i], i + 1)
+end
+
+function Base.length(o::JSONObject)
+    return length(o.members)
+end
+
+function Base.haskey(o::JSONObject, k::AbstractString)
+    return haskey(o.members, String(k))
+end
+
+function Base.getindex(o::JSONObject, k::AbstractString)
+    return o.members[String(k)]
+end
+
+function Base.get(o::JSONObject, k::AbstractString, default)
+    return get(o.members, String(k), default)
+end
+
+function Base.keys(o::JSONObject)
+    return o.order.data
+end
 
 """
     freeze!(x)
 
 Freeze a frozen container and, recursively, every frozen container reachable from it. Returns `x`.
 """
-freeze!(x) = x
+function freeze!(x)
+    return x
+end
 
 function freeze!(v::FrozenVector)
     v.frozen && return v

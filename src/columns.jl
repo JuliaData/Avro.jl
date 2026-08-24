@@ -35,13 +35,15 @@ struct SkipRun <: ColumnBuilder
 end
 
 "The fixed encoded width of a skipped leaf, or -1 (varints, length-prefixed and nested values)."
-skipwidth(@nospecialize(p::ReadPlan)) = p isa NullPlan ? 0 :
-    p isa BoolPlan ? 1 :
-    p isa FloatPlan ? 4 :
-    p isa DoublePlan ? 8 :
-    p isa DurationPlan ? 12 :
-    p isa UUIDFixedPlan ? 16 :
-    p isa FixedPlan ? p.schema.size : -1
+function skipwidth(@nospecialize(p::ReadPlan))
+    return p isa NullPlan ? 0 :
+        p isa BoolPlan ? 1 :
+        p isa FloatPlan ? 4 :
+        p isa DoublePlan ? 8 :
+        p isa DurationPlan ? 12 :
+        p isa UUIDFixedPlan ? 16 :
+        p isa FixedPlan ? p.schema.size : -1
+end
 
 "Fuse consecutive `SkipColumn`s of `cols` into `SkipRun`s (the per-field vector stays untouched)."
 function fuseskips(cols::Vector{ColumnBuilder})
@@ -107,7 +109,9 @@ function decoderow!(cols::Vector{ColumnBuilder}, d::Decoder)
     leave!(d)
     return nothing
 end
-decodecell!(c::SkipColumn, d::Decoder) = skip(c.plan, d)
+function decodecell!(c::SkipColumn, d::Decoder)
+    return skip(c.plan, d)
+end
 
 function decodecell!(c::SkipRun, d::Decoder)
     if d.validate === :fast
@@ -194,7 +198,9 @@ function finishcolumn!(c::TypedColumn{E}, budget::Budget) where {E}
     return out
 end
 
-rowcount(c::TypedColumn) = c.len
+function rowcount(c::TypedColumn)
+    return c.len
+end
 
 """
     decodecolumns(plan::RecordPlan, d::Decoder, nrows; selected=nothing) -> Vector{ColumnBuilder}

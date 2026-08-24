@@ -53,7 +53,9 @@ end
 
 const DEFAULT_ADMISSION = SymbolAdmission()
 
-Base.length(a::SymbolAdmission) = lock(() -> a.count, a.lock)
+function Base.length(a::SymbolAdmission)
+    return lock(() -> a.count, a.lock)
+end
 
 function contains_unlocked(a::SymbolAdmission, s::AbstractString)
     for r in a.recent
@@ -243,9 +245,14 @@ end
 
 Normalise the `names=` keyword: a `SymbolAdmission` object, or `:trusted`.
 """
-admission(a::SymbolAdmission) = a
+function admission(a::SymbolAdmission)
+    return a
+end
+
 function admission(s::Symbol)
     s === :trusted || throw(ArgumentError("`names` must be an Avro.SymbolAdmission or :trusted, got :$s"))
     return s
 end
-admission(x) = throw(ArgumentError("`names` must be an Avro.SymbolAdmission or :trusted"))
+function admission(x)
+    throw(ArgumentError("`names` must be an Avro.SymbolAdmission or :trusted"))
+end

@@ -30,7 +30,9 @@ struct NodeMeta
     hash::FrozenRef{UInt64}
 end
 
-NodeMeta() = NodeMeta(FrozenRef{Int32}(), FrozenRef{GraphInfo}(), FrozenRef{UInt64}())
+function NodeMeta()
+    return NodeMeta(FrozenRef{Int32}(), FrozenRef{GraphInfo}(), FrozenRef{UInt64}())
+end
 
 abstract type Schema end
 
@@ -119,34 +121,96 @@ end
 const NamedSchema = Union{RecordSchema,EnumSchema,FixedSchema}
 const PrimitiveSchema = Union{NullSchema,BooleanSchema,IntSchema,LongSchema,FloatSchema,DoubleSchema,BytesSchema,StringSchema}
 
-kind(::NullSchema) = :null
-kind(::BooleanSchema) = :boolean
-kind(::IntSchema) = :int
-kind(::LongSchema) = :long
-kind(::FloatSchema) = :float
-kind(::DoubleSchema) = :double
-kind(::BytesSchema) = :bytes
-kind(::StringSchema) = :string
-kind(::ArraySchema) = :array
-kind(::MapSchema) = :map
-kind(::UnionSchema) = :union
-kind(::FixedSchema) = :fixed
-kind(::EnumSchema) = :enum
-kind(s::RecordSchema) = s.iserror ? :error : :record
+function kind(::NullSchema)
+    return :null
+end
 
-logical(s::Union{IntSchema,LongSchema,BytesSchema,StringSchema,FixedSchema}) = s.logical
-logical(::Schema) = nothing
-props(s::UnionSchema) = Props()
-props(s::Schema) = s.props
+function kind(::BooleanSchema)
+    return :boolean
+end
+
+function kind(::IntSchema)
+    return :int
+end
+
+function kind(::LongSchema)
+    return :long
+end
+
+function kind(::FloatSchema)
+    return :float
+end
+
+function kind(::DoubleSchema)
+    return :double
+end
+
+function kind(::BytesSchema)
+    return :bytes
+end
+
+function kind(::StringSchema)
+    return :string
+end
+
+function kind(::ArraySchema)
+    return :array
+end
+
+function kind(::MapSchema)
+    return :map
+end
+
+function kind(::UnionSchema)
+    return :union
+end
+
+function kind(::FixedSchema)
+    return :fixed
+end
+
+function kind(::EnumSchema)
+    return :enum
+end
+
+function kind(s::RecordSchema)
+    return s.iserror ? :error : :record
+end
+
+function logical(s::Union{IntSchema,LongSchema,BytesSchema,StringSchema,FixedSchema})
+    return s.logical
+end
+
+function logical(::Schema)
+    return nothing
+end
+
+function props(s::UnionSchema)
+    return Props()
+end
+
+function props(s::Schema)
+    return s.props
+end
 
 """
     Avro.fullname(schema::NamedSchema) -> String
 """
-fullname(s::NamedSchema) = fullname(s.name)
+function fullname(s::NamedSchema)
+    return fullname(s.name)
+end
 
-nodeid(s::Schema) = s.meta.id[]
-graphinfo(s::Schema) = s.meta.graph[]
-Base.hash(s::Schema, h::UInt) = hash(s.meta.hash[], h)
+function nodeid(s::Schema)
+    return s.meta.id[]
+end
+
+function graphinfo(s::Schema)
+    return s.meta.graph[]
+end
+
+function Base.hash(s::Schema, h::UInt)
+    return hash(s.meta.hash[], h)
+end
 
 """
     Avro.Schema constructors: Avro.NullSchema(; props), …, Avro.RecordSchema(name; …), Avro.Field(name, schema; …)
@@ -209,7 +273,9 @@ function ParseContext(limits::Limits, budget::Budget, allow_invalid_names::Bool,
         RecordSchema[], NodeMeta[], Ref(0), legacyfixednames, 0, false, false, 0)
 end
 
-schemaerror(msg::AbstractString, path::AbstractString) = throw(SchemaError(String(msg), String(path)))
+function schemaerror(msg::AbstractString, path::AbstractString)
+    throw(SchemaError(String(msg), String(path)))
+end
 
 function newmeta!(ctx::ParseContext, path::AbstractString)
     length(ctx.metas) < ctx.limits.max_schema_nodes ||
@@ -284,7 +350,9 @@ function checknamespace(ctx::ParseContext, s::AbstractString, path::AbstractStri
     return nothing
 end
 
-escapename(s::AbstractString) = String(chop(sprint(escapejson, s); head=1, tail=1))   # character-wise: the quoted text may end in a multi-byte character
+function escapename(s::AbstractString)
+    return String(chop(sprint(escapejson, s); head=1, tail=1))   # character-wise: the quoted text may end in a multi-byte character
+end
 
 # ---- parsing ------------------------------------------------------------------------------------
 
@@ -331,7 +399,10 @@ stops after `maxbytes + 1` bytes.
 function sourcebytes(src::Union{String,SubString{String}}, maxbytes::Int, budget::Budget, ::Type{E}) where {E}
     return codeunits(src)
 end
-sourcebytes(src::Vector{UInt8}, maxbytes::Int, budget::Budget, ::Type{E}) where {E} = src
+function sourcebytes(src::Vector{UInt8}, maxbytes::Int, budget::Budget, ::Type{E}) where {E}
+    return src
+end
+
 function sourcebytes(src::AbstractString, maxbytes::Int, budget::Budget, ::Type{E}) where {E}
     charge!(budget, sizeof(src) + 40)
     return Vector{UInt8}(codeunits(String(src)))
@@ -449,8 +520,13 @@ function parseunion(ctx::ParseContext, arr::JSONArray, enclosing::String, path::
     return UnionSchema(freeze!(branches), newmeta!(ctx, path))
 end
 
-branchidentity(s::NamedSchema) = string("name:", fullname(s))
-branchidentity(s::Schema) = string("kind:", kind(s))
+function branchidentity(s::NamedSchema)
+    return string("name:", fullname(s))
+end
+
+function branchidentity(s::Schema)
+    return string("kind:", kind(s))
+end
 
 function parseobjectschema(ctx::ParseContext, obj::JSONObject, enclosing::String, path::String, buf)
     haskey(obj, "type") || schemaerror("schema object without a \"type\" attribute", path)
@@ -678,16 +754,42 @@ function validatedefault(schema::UnionSchema, json, maxdepth::Int, depth::Int=1)
     return (false, 0)
 end
 
-defaultmatches(::NullSchema, json, maxdepth, depth) = json === nothing
-defaultmatches(::BooleanSchema, json, maxdepth, depth) = json isa Bool
-defaultmatches(::IntSchema, json, maxdepth, depth) = json isa Int64 && typemin(Int32) <= json <= typemax(Int32)
-defaultmatches(::LongSchema, json, maxdepth, depth) = json isa Int64
-defaultmatches(::Union{FloatSchema,DoubleSchema}, json, maxdepth, depth) =
-    json isa Int64 || json isa Float64 || json isa JSONNumber || (json isa String && json in ("NaN", "Infinity", "-Infinity"))
-defaultmatches(::BytesSchema, json, maxdepth, depth) = json isa String && isbytestring(json)
-defaultmatches(s::FixedSchema, json, maxdepth, depth) = json isa String && isbytestring(json) && bytestringlength(json) == s.size
-defaultmatches(::StringSchema, json, maxdepth, depth) = json isa String && isstrictutf8(json)
-defaultmatches(s::EnumSchema, json, maxdepth, depth) = json isa String && haskey(s.symbolindex, json)
+function defaultmatches(::NullSchema, json, maxdepth, depth)
+    return json === nothing
+end
+
+function defaultmatches(::BooleanSchema, json, maxdepth, depth)
+    return json isa Bool
+end
+
+function defaultmatches(::IntSchema, json, maxdepth, depth)
+    return json isa Int64 && typemin(Int32) <= json <= typemax(Int32)
+end
+
+function defaultmatches(::LongSchema, json, maxdepth, depth)
+    return json isa Int64
+end
+
+function defaultmatches(::Union{FloatSchema,DoubleSchema}, json, maxdepth, depth)
+    return json isa Int64 || json isa Float64 || json isa JSONNumber || (json isa String && json in ("NaN", "Infinity", "-Infinity"))
+end
+
+function defaultmatches(::BytesSchema, json, maxdepth, depth)
+    return json isa String && isbytestring(json)
+end
+
+function defaultmatches(s::FixedSchema, json, maxdepth, depth)
+    return json isa String && isbytestring(json) && bytestringlength(json) == s.size
+end
+
+function defaultmatches(::StringSchema, json, maxdepth, depth)
+    return json isa String && isstrictutf8(json)
+end
+
+function defaultmatches(s::EnumSchema, json, maxdepth, depth)
+    return json isa String && haskey(s.symbolindex, json)
+end
+
 function defaultmatches(s::ArraySchema, json, maxdepth, depth)
     json isa JSONArray || return false
     depth < maxdepth || return false
@@ -734,7 +836,9 @@ function isbytestring(s::AbstractString)
     return true
 end
 
-bytestringlength(s::AbstractString) = length(s)
+function bytestringlength(s::AbstractString)
+    return length(s)
+end
 
 # ---- finalisation: ids, graph info, hashes -----------------------------------------------------------
 
@@ -767,16 +871,33 @@ function schemahash(s::Schema, inprogress::BitVector)
     return UInt64(h)
 end
 
-propshash(p::Props, h::UInt) = hash(p.vals, hash(p.keys, h))
-logicalhash(::Nothing, h::UInt) = h
-logicalhash(l::DecimalLogical, h::UInt) = hash(l.scale, hash(l.precision, hash(:decimal, h)))
-logicalhash(l::LogicalType, h::UInt) = hash(logicalname(l), h)
+function propshash(p::Props, h::UInt)
+    return hash(p.vals, hash(p.keys, h))
+end
+
+function logicalhash(::Nothing, h::UInt)
+    return h
+end
+
+function logicalhash(l::DecimalLogical, h::UInt)
+    return hash(l.scale, hash(l.precision, hash(:decimal, h)))
+end
+
+function logicalhash(l::LogicalType, h::UInt)
+    return hash(logicalname(l), h)
+end
 
 function structuralhash(s::PrimitiveSchema, inprogress)
     return propshash(s.props, logicalhash(logical(s), hash(kind(s), UInt(0xa7))))
 end
-structuralhash(s::ArraySchema, inprogress) = propshash(s.props, hash(schemahash(s.items, inprogress), hash(:array, UInt(0xa7))))
-structuralhash(s::MapSchema, inprogress) = propshash(s.props, hash(schemahash(s.values, inprogress), hash(:map, UInt(0xa7))))
+function structuralhash(s::ArraySchema, inprogress)
+    return propshash(s.props, hash(schemahash(s.items, inprogress), hash(:array, UInt(0xa7))))
+end
+
+function structuralhash(s::MapSchema, inprogress)
+    return propshash(s.props, hash(schemahash(s.values, inprogress), hash(:map, UInt(0xa7))))
+end
+
 function structuralhash(s::UnionSchema, inprogress)
     h = hash(:union, UInt(0xa7))
     for b in s.branches
@@ -789,8 +910,14 @@ function structuralhash(s::FixedSchema, inprogress)
     h = hash(s.aliases.data, hash(s.size, h))
     return propshash(s.props, logicalhash(s.logical, h))
 end
-defaulthash(::NoDefault, h::UInt) = hash(:nodefault, h)
-defaulthash(d::DefaultValue, h::UInt) = d.valid ? hash(d.branch, hash(d.json, h)) : hash(d.span, hash(:invalid, h))
+function defaulthash(::NoDefault, h::UInt)
+    return hash(:nodefault, h)
+end
+
+function defaulthash(d::DefaultValue, h::UInt)
+    return d.valid ? hash(d.branch, hash(d.json, h)) : hash(d.span, hash(:invalid, h))
+end
+
 function structuralhash(s::EnumSchema, inprogress)
     h = hash(fullname(s), hash(:enum, UInt(0xa7)))
     h = hash(s.symbols.data, hash(s.aliases.data, hash(s.doc, h)))
@@ -828,7 +955,9 @@ function Base.:(==)(a::Schema, b::Schema)
     return schemaequal(a, b, visited, budget)
 end
 
-larger(a::Limits, b::Limits) = a.max_resolution_work >= b.max_resolution_work ? a : b
+function larger(a::Limits, b::Limits)
+    return a.max_resolution_work >= b.max_resolution_work ? a : b
+end
 
 function visitpair!(visited::Vector{Vector{Int32}}, a::Schema, b::Schema, budget::Budget)
     ia = Int(nodeid(a)) + 1
@@ -852,10 +981,22 @@ function schemaequal(a::Schema, b::Schema, visited, budget)
     return structuralequal(a, b, visited, budget)
 end
 
-propsequal(a::Props, b::Props) = a.keys == b.keys && a.vals == b.vals
-structuralequal(a::PrimitiveSchema, b::PrimitiveSchema, visited, budget) = logical(a) == logical(b) && propsequal(a.props, b.props)
-structuralequal(a::ArraySchema, b::ArraySchema, visited, budget) = propsequal(a.props, b.props) && schemaequal(a.items, b.items, visited, budget)
-structuralequal(a::MapSchema, b::MapSchema, visited, budget) = propsequal(a.props, b.props) && schemaequal(a.values, b.values, visited, budget)
+function propsequal(a::Props, b::Props)
+    return a.keys == b.keys && a.vals == b.vals
+end
+
+function structuralequal(a::PrimitiveSchema, b::PrimitiveSchema, visited, budget)
+    return logical(a) == logical(b) && propsequal(a.props, b.props)
+end
+
+function structuralequal(a::ArraySchema, b::ArraySchema, visited, budget)
+    return propsequal(a.props, b.props) && schemaequal(a.items, b.items, visited, budget)
+end
+
+function structuralequal(a::MapSchema, b::MapSchema, visited, budget)
+    return propsequal(a.props, b.props) && schemaequal(a.values, b.values, visited, budget)
+end
+
 function structuralequal(a::UnionSchema, b::UnionSchema, visited, budget)
     length(a.branches) == length(b.branches) || return false
     for (x, y) in zip(a.branches, b.branches)
@@ -863,14 +1004,27 @@ function structuralequal(a::UnionSchema, b::UnionSchema, visited, budget)
     end
     return true
 end
-structuralequal(a::FixedSchema, b::FixedSchema, visited, budget) =
-    a.name == b.name && a.size == b.size && a.aliases.data == b.aliases.data && a.logical == b.logical && propsequal(a.props, b.props)
-defaultequal(a::NoDefault, b::NoDefault) = true
-defaultequal(a::DefaultValue, b::DefaultValue) = a.valid == b.valid && (a.valid ? (a.branch == b.branch && a.json == b.json) : a.span == b.span)
-defaultequal(a::Default, b::Default) = false
-structuralequal(a::EnumSchema, b::EnumSchema, visited, budget) =
-    a.name == b.name && a.symbols.data == b.symbols.data && a.aliases.data == b.aliases.data && a.doc == b.doc &&
-    defaultequal(a.default, b.default) && propsequal(a.props, b.props)
+function structuralequal(a::FixedSchema, b::FixedSchema, visited, budget)
+    return a.name == b.name && a.size == b.size && a.aliases.data == b.aliases.data && a.logical == b.logical && propsequal(a.props, b.props)
+end
+
+function defaultequal(a::NoDefault, b::NoDefault)
+    return true
+end
+
+function defaultequal(a::DefaultValue, b::DefaultValue)
+    return a.valid == b.valid && (a.valid ? (a.branch == b.branch && a.json == b.json) : a.span == b.span)
+end
+
+function defaultequal(a::Default, b::Default)
+    return false
+end
+
+function structuralequal(a::EnumSchema, b::EnumSchema, visited, budget)
+    return a.name == b.name && a.symbols.data == b.symbols.data && a.aliases.data == b.aliases.data && a.doc == b.doc &&
+        defaultequal(a.default, b.default) && propsequal(a.props, b.props)
+end
+
 function structuralequal(a::RecordSchema, b::RecordSchema, visited, budget)
     a.name == b.name && a.iserror == b.iserror && a.aliases.data == b.aliases.data && a.doc == b.doc && propsequal(a.props, b.props) || return false
     length(a.fields) == length(b.fields) || return false
@@ -882,8 +1036,13 @@ function structuralequal(a::RecordSchema, b::RecordSchema, visited, budget)
     return true
 end
 
-Base.:(==)(a::DecimalLogical, b::DecimalLogical) = a.precision == b.precision && a.scale == b.scale
-Base.:(==)(a::UnknownLogical, b::UnknownLogical) = a.name == b.name
+function Base.:(==)(a::DecimalLogical, b::DecimalLogical)
+    return a.precision == b.precision && a.scale == b.scale
+end
+
+function Base.:(==)(a::UnknownLogical, b::UnknownLogical)
+    return a.name == b.name
+end
 
 # ---- printing ---------------------------------------------------------------------------------------
 
@@ -1232,7 +1391,9 @@ function printnamed(io::IO, s::EnumSchema, enclosing::String, seen, pretty::Bool
     return nothing
 end
 
-printdefault(io::IO, d::DefaultValue) = isempty(d.span) ? printjson(io, d.json, false, 0) : print(io, d.span)
+function printdefault(io::IO, d::DefaultValue)
+    return isempty(d.span) ? printjson(io, d.json, false, 0) : print(io, d.span)
+end
 
 function printnamed(io::IO, s::RecordSchema, enclosing::String, seen, pretty::Bool, level::Int)
     printnamedheader(io, s, enclosing, pretty, level)
@@ -1290,7 +1451,9 @@ function printnamed(io::IO, s::RecordSchema, enclosing::String, seen, pretty::Bo
     return nothing
 end
 
-Base.show(io::IO, s::Schema) = print(io, "Avro.Schema(", json(s), ")")
+function Base.show(io::IO, s::Schema)
+    return print(io, "Avro.Schema(", json(s), ")")
+end
 
 function Base.show(io::IO, ::MIME"text/plain", s::Schema)
     print(io, "Avro.Schema ", json(s; pretty=true))
@@ -1318,11 +1481,18 @@ function build_(::Type{T}, propsin; logical=nothing, limits::Limits=Limits()) wh
     return finalizepublic!(s, limits, 1, 0)
 end
 
-makeprops(propsin, structural, logical) = makeprops(propsin, structural, logical, constructionbudget())
+function makeprops(propsin, structural, logical)
+    return makeprops(propsin, structural, logical, constructionbudget())
+end
 
 # The frozen-dictionary shell (struct plus two empty backing vectors) and one key/value slot pair.
-frozendictshell() = 2 * STORAGE[].vector + 48
-frozenvectorshell() = STORAGE[].vector + 24
+function frozendictshell()
+    return 2 * STORAGE[].vector + 48
+end
+
+function frozenvectorshell()
+    return STORAGE[].vector + 24
+end
 
 function makeprops(propsin, structural, logical, budget::Budget)
     sized = Base.IteratorSize(propsin) isa Union{Base.HasLength,Base.HasShape}
@@ -1355,11 +1525,26 @@ function makeprops(propsin, structural, logical, budget::Budget)
     return freeze!(p)
 end
 
-tojsonvalue(x::Union{Nothing,Bool,Int64,String,JSONNumber,JSONArray,JSONObject}, ::Budget) = x
-tojsonvalue(x::Integer, ::Budget) = Int64(x)
-tojsonvalue(x::AbstractFloat, b::Budget) = isfinite(x) ? (charge!(b, 32); JSONNumber(repr(Float64(x)))) : (isnan(x) ? "NaN" : (x > 0 ? "Infinity" : "-Infinity"))
-tojsonvalue(x::AbstractString, b::Budget) = (charge!(b, stringbytes(sizeof(x))); String(x))
-tojsonvalue(x::Symbol, b::Budget) = (charge!(b, stringbytes(sizeof(String(x)))); String(x))
+function tojsonvalue(x::Union{Nothing,Bool,Int64,String,JSONNumber,JSONArray,JSONObject}, ::Budget)
+    return x
+end
+
+function tojsonvalue(x::Integer, ::Budget)
+    return Int64(x)
+end
+
+function tojsonvalue(x::AbstractFloat, b::Budget)
+    return isfinite(x) ? (charge!(b, 32); JSONNumber(repr(Float64(x)))) : (isnan(x) ? "NaN" : (x > 0 ? "Infinity" : "-Infinity"))
+end
+
+function tojsonvalue(x::AbstractString, b::Budget)
+    return (charge!(b, stringbytes(sizeof(x))); String(x))
+end
+
+function tojsonvalue(x::Symbol, b::Budget)
+    return (charge!(b, stringbytes(sizeof(String(x)))); String(x))
+end
+
 function tojsonvalue(x::AbstractVector, b::Budget)
     n = length(x)
     charge!(b, frozenvectorshell() + vectorbytes(Any, n) + 16)   # shell, exact capacity and wrapper, before construction (D01)
@@ -1392,8 +1577,13 @@ end
 # under construction is still unfilled); the outermost builder finalises everything. Every outermost
 # constructor call owns one import memo, so the same finalised child passed twice is one definition
 # plus references.
-builderdepth() = get(task_local_storage(), :avro_builder_depth, 0)::Int
-importmemo() = get(task_local_storage(), :avro_import_memo, nothing)
+function builderdepth()
+    return get(task_local_storage(), :avro_builder_depth, 0)::Int
+end
+
+function importmemo()
+    return get(task_local_storage(), :avro_import_memo, nothing)
+end
 
 """
 One construction budget per outermost public constructor call (plan §4.4, round-2 D01): the first
@@ -1855,15 +2045,42 @@ function minsize(s::Schema, memo::Vector{Int}, active::BitVector)
     return r
 end
 
-minsizeof(::NullSchema, memo, active) = 0
-minsizeof(::BooleanSchema, memo, active) = 1
-minsizeof(::Union{IntSchema,LongSchema}, memo, active) = 1
-minsizeof(::FloatSchema, memo, active) = 4
-minsizeof(::DoubleSchema, memo, active) = 8
-minsizeof(::Union{BytesSchema,StringSchema}, memo, active) = 1
-minsizeof(::Union{ArraySchema,MapSchema}, memo, active) = 1
-minsizeof(s::FixedSchema, memo, active) = s.size
-minsizeof(s::EnumSchema, memo, active) = isempty(s.symbols) ? INFINITE : 1
+function minsizeof(::NullSchema, memo, active)
+    return 0
+end
+
+function minsizeof(::BooleanSchema, memo, active)
+    return 1
+end
+
+function minsizeof(::Union{IntSchema,LongSchema}, memo, active)
+    return 1
+end
+
+function minsizeof(::FloatSchema, memo, active)
+    return 4
+end
+
+function minsizeof(::DoubleSchema, memo, active)
+    return 8
+end
+
+function minsizeof(::Union{BytesSchema,StringSchema}, memo, active)
+    return 1
+end
+
+function minsizeof(::Union{ArraySchema,MapSchema}, memo, active)
+    return 1
+end
+
+function minsizeof(s::FixedSchema, memo, active)
+    return s.size
+end
+
+function minsizeof(s::EnumSchema, memo, active)
+    return isempty(s.symbols) ? INFINITE : 1
+end
+
 function minsizeof(s::UnionSchema, memo, active)
     best = INFINITE
     for (i, b) in enumerate(s.branches)

@@ -15,7 +15,9 @@ struct Map{V} <: AbstractDict{String,V}
     perm::Vector{Int32}     # sorted by keys[perm[i]]; length == length(keys)
 end
 
-Map{V}() where {V} = Map{V}(String[], V[], Int32[])
+function Map{V}() where {V}
+    return Map{V}(String[], V[], Int32[])
+end
 
 """
     Avro.Map(pairs; limits=Limits())
@@ -50,7 +52,9 @@ function collectpairs(@nospecialize(pairs))
     return ks, vs
 end
 
-convertmap(::Type{V}, ks::Vector{String}, vs::Vector{Any}, budget::Budget) where {V} = buildmap(V, ks, Vector{V}(vs), budget)
+function convertmap(::Type{V}, ks::Vector{String}, vs::Vector{Any}, budget::Budget) where {V}
+    return buildmap(V, ks, Vector{V}(vs), budget)
+end
 
 # The value type of an inferred map: the promoted join of the value types (`Union{Missing,T}` for
 # `missing` and `T`), narrowed to the generic model's element types so the result is a member of `E`.
@@ -59,11 +63,21 @@ function valuetype(vs::Vector{Any})
     return narrowelement(mapreduce(typeof, Base.promote_typejoin, vs))
 end
 
-inputbytes(ks::Vector{String}) = sum(k -> sizeof(k) + 8, ks; init=0)
+function inputbytes(ks::Vector{String})
+    return sum(k -> sizeof(k) + 8, ks; init=0)
+end
 
-mapkey(k::AbstractString) = String(k)
-mapkey(k::Symbol) = String(k)
-mapkey(k) = throw(ArgumentError("map keys must be strings or symbols, got $(typeof(k))"))
+function mapkey(k::AbstractString)
+    return String(k)
+end
+
+function mapkey(k::Symbol)
+    return String(k)
+end
+
+function mapkey(k)
+    throw(ArgumentError("map keys must be strings or symbols, got $(typeof(k))"))
+end
 
 """
     buildmap(V, keys, vals, budget) -> Map{V}
@@ -197,16 +211,26 @@ function msort!(v::Vector{Int32}, lo::Int, hi::Int, t::Vector{Int32}, keys::Vect
     return v
 end
 
-Base.length(m::Map) = length(m.keys)
-Base.isempty(m::Map) = isempty(m.keys)
+function Base.length(m::Map)
+    return length(m.keys)
+end
+
+function Base.isempty(m::Map)
+    return isempty(m.keys)
+end
 
 function Base.iterate(m::Map, i::Int=1)
     i > length(m.keys) && return nothing
     return (m.keys[i] => m.vals[i], i + 1)
 end
 
-Base.keys(m::Map) = m.keys
-Base.values(m::Map) = m.vals
+function Base.keys(m::Map)
+    return m.keys
+end
+
+function Base.values(m::Map)
+    return m.vals
+end
 
 function keyposition(m::Map, k::AbstractString)
     lo = 1; hi = length(m.perm)
@@ -220,22 +244,31 @@ function keyposition(m::Map, k::AbstractString)
     return 0
 end
 
-Base.haskey(m::Map, k::AbstractString) = keyposition(m, k) != 0
-Base.haskey(m::Map, k::Symbol) = haskey(m, String(k))
+function Base.haskey(m::Map, k::AbstractString)
+    return keyposition(m, k) != 0
+end
+
+function Base.haskey(m::Map, k::Symbol)
+    return haskey(m, String(k))
+end
 
 function Base.getindex(m::Map, k::AbstractString)
     i = keyposition(m, k)
     i == 0 && throw(KeyError(k))
     return m.vals[i]
 end
-Base.getindex(m::Map, k::Symbol) = m[String(k)]
+function Base.getindex(m::Map, k::Symbol)
+    return m[String(k)]
+end
 
 function Base.get(m::Map, k::AbstractString, default)
     i = keyposition(m, k)
     i == 0 && return default
     return m.vals[i]
 end
-Base.get(m::Map, k::Symbol, default) = get(m, String(k), default)
+function Base.get(m::Map, k::Symbol, default)
+    return get(m, String(k), default)
+end
 
 # Equality and hashing follow the sorted key order (insertion order is not part of the value).
 function Base.:(==)(a::Map, b::Map)
@@ -288,7 +321,10 @@ provided by `Avro.Row`. Equality is structural.
 struct Record
     schema::RecordSchema
     values::Vector{Any}
-    Record(schema::RecordSchema, values::Vector{Any}, ::Val{:unchecked}) = new(schema, values)
+    function Record(schema::RecordSchema, values::Vector{Any}, ::Val{:unchecked})
+        return new(schema, values)
+    end
+
     function Record(schema::RecordSchema, values; limits::Limits=Limits())
         nf = length(schema.fields)
         return withbudget(limits; direction=:encode) do budget
@@ -314,23 +350,58 @@ function fieldposition(r::Record, name::AbstractString)
     return i
 end
 
-Base.getindex(r::Record, name::AbstractString) = getfield(r, :values)[fieldposition(r, name)]
-Base.getindex(r::Record, name::Symbol) = r[String(name)]
-Base.getindex(r::Record, i::Integer) = getfield(r, :values)[i]
+function Base.getindex(r::Record, name::AbstractString)
+    return getfield(r, :values)[fieldposition(r, name)]
+end
+
+function Base.getindex(r::Record, name::Symbol)
+    return r[String(name)]
+end
+
+function Base.getindex(r::Record, i::Integer)
+    return getfield(r, :values)[i]
+end
+
 function Base.getproperty(r::Record, name::Symbol)
     name === :schema && return getfield(r, :schema)
     name === :values && return getfield(r, :values)
     return r[String(name)]
 end
-Base.propertynames(r::Record, private::Bool=false) = (:schema, :values)
-Base.keys(r::Record) = [f.name for f in getfield(r, :schema).fields]
-Base.length(r::Record) = length(getfield(r, :values))
-Base.haskey(r::Record, name::AbstractString) = haskey(getfield(r, :schema).fieldindex, String(name))
-Base.haskey(r::Record, name::Symbol) = haskey(r, String(name))
-Base.get(r::Record, name, default) = haskey(r, name) ? r[name] : default
-Base.:(==)(a::Record, b::Record) = fullname(getfield(a, :schema)) == fullname(getfield(b, :schema)) && getfield(a, :values) == getfield(b, :values)
-Base.isequal(a::Record, b::Record) = fullname(getfield(a, :schema)) == fullname(getfield(b, :schema)) && isequal(getfield(a, :values), getfield(b, :values))
-Base.hash(a::Record, h::UInt) = hash(getfield(a, :values), hash(fullname(getfield(a, :schema)), hash(:AvroRecord, h)))
+function Base.propertynames(r::Record, private::Bool=false)
+    return (:schema, :values)
+end
+
+function Base.keys(r::Record)
+    return [f.name for f in getfield(r, :schema).fields]
+end
+
+function Base.length(r::Record)
+    return length(getfield(r, :values))
+end
+
+function Base.haskey(r::Record, name::AbstractString)
+    return haskey(getfield(r, :schema).fieldindex, String(name))
+end
+
+function Base.haskey(r::Record, name::Symbol)
+    return haskey(r, String(name))
+end
+
+function Base.get(r::Record, name, default)
+    return haskey(r, name) ? r[name] : default
+end
+
+function Base.:(==)(a::Record, b::Record)
+    return fullname(getfield(a, :schema)) == fullname(getfield(b, :schema)) && getfield(a, :values) == getfield(b, :values)
+end
+
+function Base.isequal(a::Record, b::Record)
+    return fullname(getfield(a, :schema)) == fullname(getfield(b, :schema)) && isequal(getfield(a, :values), getfield(b, :values))
+end
+
+function Base.hash(a::Record, h::UInt)
+    return hash(getfield(a, :values), hash(fullname(getfield(a, :schema)), hash(:AvroRecord, h)))
+end
 
 function Base.show(io::IO, r::Record)
     print(io, "Avro.Record(", fullname(getfield(r, :schema)), ": ")
@@ -353,7 +424,10 @@ Equality is by fullname and symbol string.
 struct EnumValue
     schema::EnumSchema
     index::Int32
-    EnumValue(schema::EnumSchema, index::Int32, ::Val{:unchecked}) = new(schema, index)
+    function EnumValue(schema::EnumSchema, index::Int32, ::Val{:unchecked})
+        return new(schema, index)
+    end
+
     function EnumValue(schema::EnumSchema, index::Integer; limits::Limits=Limits())
         1 <= index <= length(schema.symbols) || throw(ArgumentError("enum \"$(fullname(schema))\" has $(length(schema.symbols)) symbols; index $index is out of range"))
         return new(schema, Int32(index))
@@ -366,11 +440,25 @@ function EnumValue(schema::EnumSchema, symbol::AbstractString; limits::Limits=Li
     return EnumValue(schema, Int32(i))
 end
 
-Base.String(x::EnumValue) = x.schema.symbols[x.index]
-Base.Symbol(x::EnumValue) = Symbol(String(x))
-Base.:(==)(a::EnumValue, b::EnumValue) = fullname(a.schema) == fullname(b.schema) && String(a) == String(b)
-Base.hash(a::EnumValue, h::UInt) = hash(String(a), hash(fullname(a.schema), hash(:AvroEnum, h)))
-Base.show(io::IO, x::EnumValue) = print(io, "Avro.EnumValue(", fullname(x.schema), ".", String(x), ")")
+function Base.String(x::EnumValue)
+    return x.schema.symbols[x.index]
+end
+
+function Base.Symbol(x::EnumValue)
+    return Symbol(String(x))
+end
+
+function Base.:(==)(a::EnumValue, b::EnumValue)
+    return fullname(a.schema) == fullname(b.schema) && String(a) == String(b)
+end
+
+function Base.hash(a::EnumValue, h::UInt)
+    return hash(String(a), hash(fullname(a.schema), hash(:AvroEnum, h)))
+end
+
+function Base.show(io::IO, x::EnumValue)
+    return print(io, "Avro.EnumValue(", fullname(x.schema), ".", String(x), ")")
+end
 
 """
     Avro.Fixed(schema::FixedSchema, bytes)
@@ -380,7 +468,10 @@ A generic fixed value (copied bytes of exactly `schema.size`). Equality is by fu
 struct Fixed
     schema::FixedSchema
     bytes::Vector{UInt8}
-    Fixed(schema::FixedSchema, bytes::Vector{UInt8}, ::Val{:unchecked}) = new(schema, bytes)
+    function Fixed(schema::FixedSchema, bytes::Vector{UInt8}, ::Val{:unchecked})
+        return new(schema, bytes)
+    end
+
     function Fixed(schema::FixedSchema, bytes::AbstractVector{UInt8}; limits::Limits=Limits())
         length(bytes) == schema.size || throw(ArgumentError("fixed \"$(fullname(schema))\" has size $(schema.size), got $(length(bytes)) bytes"))
         return withbudget(limits; direction=:encode) do budget
@@ -392,9 +483,17 @@ struct Fixed
     end
 end
 
-Base.:(==)(a::Fixed, b::Fixed) = fullname(a.schema) == fullname(b.schema) && a.schema.size == b.schema.size && a.bytes == b.bytes
-Base.hash(a::Fixed, h::UInt) = hash(a.bytes, hash(fullname(a.schema), hash(:AvroFixed, h)))
-Base.show(io::IO, x::Fixed) = print(io, "Avro.Fixed(", fullname(x.schema), ": 0x", bytes2hex(x.bytes), ")")
+function Base.:(==)(a::Fixed, b::Fixed)
+    return fullname(a.schema) == fullname(b.schema) && a.schema.size == b.schema.size && a.bytes == b.bytes
+end
+
+function Base.hash(a::Fixed, h::UInt)
+    return hash(a.bytes, hash(fullname(a.schema), hash(:AvroFixed, h)))
+end
+
+function Base.show(io::IO, x::Fixed)
+    return print(io, "Avro.Fixed(", fullname(x.schema), ": 0x", bytes2hex(x.bytes), ")")
+end
 
 """
     Avro.UnionValue(index::Integer, value)
@@ -412,24 +511,49 @@ struct UnionValue
     end
 end
 
-Base.:(==)(a::UnionValue, b::UnionValue) = a.index == b.index && a.value == b.value
-Base.isequal(a::UnionValue, b::UnionValue) = a.index == b.index && isequal(a.value, b.value)
-Base.hash(a::UnionValue, h::UInt) = hash(a.value, hash(a.index, hash(:AvroUnion, h)))
-Base.show(io::IO, x::UnionValue) = (print(io, "Avro.UnionValue(", x.index, ", "); show(io, x.value); print(io, ")"))
+function Base.:(==)(a::UnionValue, b::UnionValue)
+    return a.index == b.index && a.value == b.value
+end
+
+function Base.isequal(a::UnionValue, b::UnionValue)
+    return a.index == b.index && isequal(a.value, b.value)
+end
+
+function Base.hash(a::UnionValue, h::UInt)
+    return hash(a.value, hash(a.index, hash(:AvroUnion, h)))
+end
+
+function Base.show(io::IO, x::UnionValue)
+    return (print(io, "Avro.UnionValue(", x.index, ", "); show(io, x.value); print(io, ")"))
+end
 
 """
     Avro.ordinal(x::EnumValue) / Avro.ordinal(x::UnionValue) -> Int
 
 The zero-based wire ordinal of an enum symbol or union branch.
 """
-ordinal(x::EnumValue) = Int(x.index) - 1
-ordinal(x::UnionValue) = x.index - 1
+function ordinal(x::EnumValue)
+    return Int(x.index) - 1
+end
+
+function ordinal(x::UnionValue)
+    return x.index - 1
+end
 
 # ---- the generic Julia type of a schema (plan §4.6) --------------------------------------------------
 
-juliatype(::NullSchema) = Missing
-juliatype(::BooleanSchema) = Bool
-juliatype(s::IntSchema) = s.logical isa DateLogical ? Date : (s.logical isa TimeMillis ? Time : Int32)
+function juliatype(::NullSchema)
+    return Missing
+end
+
+function juliatype(::BooleanSchema)
+    return Bool
+end
+
+function juliatype(s::IntSchema)
+    return s.logical isa DateLogical ? Date : (s.logical isa TimeMillis ? Time : Int32)
+end
+
 function juliatype(s::LongSchema)
     l = s.logical
     l isa TimeMicros && return Time
@@ -441,19 +565,39 @@ function juliatype(s::LongSchema)
     l isa LocalTimestampNanos && return LocalTimestamp{Nanosecond}
     return Int64
 end
-juliatype(::FloatSchema) = Float32
-juliatype(::DoubleSchema) = Float64
-juliatype(s::BytesSchema) = s.logical isa DecimalLogical ? decimaltype(s.logical) : Vector{UInt8}
-juliatype(s::StringSchema) = s.logical isa UUIDLogical ? UUID : String
+function juliatype(::FloatSchema)
+    return Float32
+end
+
+function juliatype(::DoubleSchema)
+    return Float64
+end
+
+function juliatype(s::BytesSchema)
+    return s.logical isa DecimalLogical ? decimaltype(s.logical) : Vector{UInt8}
+end
+
+function juliatype(s::StringSchema)
+    return s.logical isa UUIDLogical ? UUID : String
+end
+
 function juliatype(s::FixedSchema)
     s.logical isa DecimalLogical && return decimaltype(s.logical)
     s.logical isa UUIDLogical && return UUID
     s.logical isa DurationLogical && return Duration
     return Fixed
 end
-juliatype(::EnumSchema) = EnumValue
-juliatype(::RecordSchema) = Record
-decimaltype(l::DecimalLogical) = l.precision <= 38 ? Decimal : WideDecimal
+function juliatype(::EnumSchema)
+    return EnumValue
+end
+
+function juliatype(::RecordSchema)
+    return Record
+end
+
+function decimaltype(l::DecimalLogical)
+    return l.precision <= 38 ? Decimal : WideDecimal
+end
 
 # ---- the closed value set E (plan §4.6) --------------------------------------------------------------
 
@@ -503,10 +647,17 @@ function narrowelement(@nospecialize(t::Type))
     return (t === Union{Missing,u} && ((u in LEAF_TYPES && u !== Missing) || u === Record)) ? t : Any
 end
 
-elementtype(s::Schema) = narrowelement(juliatype(s))
+function elementtype(s::Schema)
+    return narrowelement(juliatype(s))
+end
 
-juliatype(s::ArraySchema) = Vector{elementtype(s.items)}
-juliatype(s::MapSchema) = Map{elementtype(s.values)}
+function juliatype(s::ArraySchema)
+    return Vector{elementtype(s.items)}
+end
+
+function juliatype(s::MapSchema)
+    return Map{elementtype(s.values)}
+end
 
 function juliatype(s::UnionSchema)
     nullable = nullablebranch(s)

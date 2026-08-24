@@ -8,13 +8,23 @@ struct JSONSyntaxError <: Exception
     pos::Int
 end
 
-Base.showerror(io::IO, e::JSONSyntaxError) = print(io, "JSON syntax error at byte ", e.pos, ": ", e.msg)
+function Base.showerror(io::IO, e::JSONSyntaxError)
+    return print(io, "JSON syntax error at byte ", e.pos, ": ", e.msg)
+end
 
 const WS = (UInt8(' '), UInt8('\t'), UInt8('\n'), UInt8('\r'))
 
-isws(b::UInt8) = b == UInt8(' ') || b == UInt8('\t') || b == UInt8('\n') || b == UInt8('\r')
-isdigit8(b::UInt8) = UInt8('0') <= b <= UInt8('9')
-ishex8(b::UInt8) = isdigit8(b) || (UInt8('a') <= b <= UInt8('f')) || (UInt8('A') <= b <= UInt8('F'))
+function isws(b::UInt8)
+    return b == UInt8(' ') || b == UInt8('\t') || b == UInt8('\n') || b == UInt8('\r')
+end
+
+function isdigit8(b::UInt8)
+    return UInt8('0') <= b <= UInt8('9')
+end
+
+function ishex8(b::UInt8)
+    return isdigit8(b) || (UInt8('a') <= b <= UInt8('f')) || (UInt8('A') <= b <= UInt8('F'))
+end
 
 """
     utf8_valid_length(buf, i, n) -> Int
@@ -61,7 +71,9 @@ function isstrictutf8(buf::AbstractVector{UInt8})
     return true
 end
 
-isstrictutf8(s::AbstractString) = isstrictutf8(codeunits(s))
+function isstrictutf8(s::AbstractString)
+    return isstrictutf8(codeunits(s))
+end
 
 # ---- lexical pre-scan -------------------------------------------------------------------------
 
@@ -314,7 +326,9 @@ end
 
 # ---- WTF-8 string decoding ---------------------------------------------------------------------
 
-hexval(b::UInt8) = isdigit8(b) ? b - UInt8('0') : (b >= UInt8('a') ? b - UInt8('a') + 0x0a : b - UInt8('A') + 0x0a)
+function hexval(b::UInt8)
+    return isdigit8(b) ? b - UInt8('0') : (b >= UInt8('a') ? b - UInt8('a') + 0x0a : b - UInt8('A') + 0x0a)
+end
 
 function hex4(buf, i)
     return (UInt32(hexval(buf[i])) << 12) | (UInt32(hexval(buf[i + 1])) << 8) | (UInt32(hexval(buf[i + 2])) << 4) | UInt32(hexval(buf[i + 3]))
@@ -466,7 +480,9 @@ function parsejson(buf::AbstractVector{UInt8}; maxbytes::Int, maxdepth::Int, err
     return v
 end
 
-parsejson(s::AbstractString; kw...) = parsejson(Vector{UInt8}(codeunits(s)); kw...)
+function parsejson(s::AbstractString; kw...)
+    return parsejson(Vector{UInt8}(codeunits(s)); kw...)
+end
 
 function parsevalue!(r::JSONReader)
     r.pos <= r.n || r.errfn("unexpected end of input", r.pos)

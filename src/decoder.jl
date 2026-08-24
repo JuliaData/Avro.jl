@@ -24,8 +24,13 @@ function Decoder(buf::AbstractVector{UInt8}, budget::Budget; pos::Int=1, stop::I
     return Decoder{typeof(buf)}(buf, pos, stop, 0, budget, validate)
 end
 
-remaining(d::Decoder) = d.stop - d.pos + 1
-dataerror(d::Decoder, msg::AbstractString) = throw(DataError(msg, d.pos))
+function remaining(d::Decoder)
+    return d.stop - d.pos + 1
+end
+
+function dataerror(d::Decoder, msg::AbstractString)
+    throw(DataError(msg, d.pos))
+end
 
 @inline function readbyte(d::Decoder)
     d.pos <= d.stop || dataerror(d, "unexpected end of data")
@@ -168,7 +173,9 @@ function unsafe_substring(buf::AbstractVector{UInt8}, p::Int, n::Int)
     return String(buf[p:p + n - 1])
 end
 
-unsafe_substring(buf::Vector{UInt8}, p::Int, n::Int) = n == 0 ? "" : unsafe_string(pointer(buf, p), n)
+function unsafe_substring(buf::Vector{UInt8}, p::Int, n::Int)
+    return n == 0 ? "" : unsafe_string(pointer(buf, p), n)
+end
 
 function readfixed(d::Decoder, n::Int)
     n <= remaining(d) || dataerror(d, "fixed of $n bytes exceeds the remaining $(remaining(d)) bytes")
@@ -220,7 +227,9 @@ function enter!(d::Decoder)
     return nothing
 end
 
-leave!(d::Decoder) = (d.depth -= 1; nothing)
+function leave!(d::Decoder)
+    return (d.depth -= 1; nothing)
+end
 
 function skiplong(d::Decoder)
     readlong(d)

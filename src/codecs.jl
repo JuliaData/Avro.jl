@@ -17,7 +17,9 @@ const EXTENSION_PACKAGES = Dict{Symbol,String}(:bzip2 => "CodecBzip2", :xz => "C
 const EXTENSION_CODECS = Dict{Symbol,Any}()   # name => (; reader=limits -> state, writer=(level, limits) -> WriterCodec)
 
 "Register an extension codec's factories (called from the extension module's `__init__`)."
-registercodec!(name::Symbol, factories) = (EXTENSION_CODECS[name] = factories; nothing)
+function registercodec!(name::Symbol, factories)
+    return (EXTENSION_CODECS[name] = factories; nothing)
+end
 
 """
     Avro.codecs() -> Vector{Symbol}
@@ -25,7 +27,9 @@ registercodec!(name::Symbol, factories) = (EXTENSION_CODECS[name] = factories; n
 The container codecs this process can read and write (`:bzip2` and `:xz` appear once their extension
 packages are loaded).
 """
-codecs() = Symbol[BUILTIN_CODECS..., sort!(collect(keys(EXTENSION_CODECS)))...]
+function codecs()
+    return Symbol[BUILTIN_CODECS..., sort!(collect(keys(EXTENSION_CODECS)))...]
+end
 
 struct NullCodec end
 struct DeflateReader end
@@ -51,9 +55,17 @@ const DEFLATE_ENCODER_BYTES = 320 * 1024    # zlib deflate state at any level
 
 # ---- zstandard library calls (Zstd_jll; the sizing functions are required symbols, plan §11) ---------
 
-zstd_iserror(code::Csize_t) = ccall((:ZSTD_isError, Zstd_jll.libzstd), Cuint, (Csize_t,), code) != 0
-zstd_dstreamsize(windowsize::Integer) = Int(ccall((:ZSTD_estimateDStreamSize, Zstd_jll.libzstd), Csize_t, (Csize_t,), windowsize))
-zstd_cstreamsize(level::Integer) = Int(ccall((:ZSTD_estimateCStreamSize, Zstd_jll.libzstd), Csize_t, (Cint,), level))
+function zstd_iserror(code::Csize_t)
+    return ccall((:ZSTD_isError, Zstd_jll.libzstd), Cuint, (Csize_t,), code) != 0
+end
+
+function zstd_dstreamsize(windowsize::Integer)
+    return Int(ccall((:ZSTD_estimateDStreamSize, Zstd_jll.libzstd), Csize_t, (Csize_t,), windowsize))
+end
+
+function zstd_cstreamsize(level::Integer)
+    return Int(ccall((:ZSTD_estimateCStreamSize, Zstd_jll.libzstd), Csize_t, (Cint,), level))
+end
 
 struct ZstdCParams
     windowLog::Cuint
@@ -65,7 +77,9 @@ struct ZstdCParams
     strategy::Cint
 end
 
-zstd_cparams(level::Integer) = ccall((:ZSTD_getCParams, Zstd_jll.libzstd), ZstdCParams, (Cint, Culonglong, Csize_t), level, 0, 0)
+function zstd_cparams(level::Integer)
+    return ccall((:ZSTD_getCParams, Zstd_jll.libzstd), ZstdCParams, (Cint, Culonglong, Csize_t), level, 0, 0)
+end
 
 function zstd_framesize(buf::AbstractVector{UInt8}, from::Int, len::Int)
     code = GC.@preserve buf ccall((:ZSTD_findFrameCompressedSize, Zstd_jll.libzstd), Csize_t, (Ptr{Cvoid}, Csize_t), pointer(buf, from), len)
@@ -79,8 +93,9 @@ function zstd_frameestimate(buf::AbstractVector{UInt8}, from::Int, len::Int)
     return Int(code)
 end
 
-zstd_skippable(buf::AbstractVector{UInt8}, from::Int, len::Int) =
-    GC.@preserve buf ccall((:ZSTD_isSkippableFrame, Zstd_jll.libzstd), Cuint, (Ptr{Cvoid}, Csize_t), pointer(buf, from), len) != 0
+function zstd_skippable(buf::AbstractVector{UInt8}, from::Int, len::Int)
+    return GC.@preserve buf ccall((:ZSTD_isSkippableFrame, Zstd_jll.libzstd), Cuint, (Ptr{Cvoid}, Csize_t), pointer(buf, from), len) != 0
+end
 
 "The largest windowLog in 10…31 whose reported decoder estimate fits `cap` (the 16 MiB floor admits ≥ 23)."
 function zstdwindowlogmax(cap::Int)
@@ -127,7 +142,9 @@ function shrinkexact(budget::Budget, buf::Vector{UInt8}, len::Int)
 end
 
 "Capture the counters `rollbackreservations!` needs to unwind an operation exactly."
-budgetcheckpoint(b::Budget) = (b.reserved, b.pending)
+function budgetcheckpoint(b::Budget)
+    return (b.reserved, b.pending)
+end
 
 """
 Unwind every reservation acquired after `checkpoint` (a `budgetcheckpoint`) on a failed ownership
@@ -147,7 +164,9 @@ function rollbackreservations!(budget::Budget, checkpoint::NTuple{2,Int})
     return nothing
 end
 
-codecmessage(err::TranscodingStreams.Error) = TranscodingStreams.haserror(err) ? sprint(showerror, err.error) : "codec failure"
+function codecmessage(err::TranscodingStreams.Error)
+    return TranscodingStreams.haserror(err) ? sprint(showerror, err.error) : "codec failure"
+end
 
 """
     transcodemember!(name, codec, input, from, to, out, outlen, maxout, budget) -> (consumed, out, outlen)
@@ -299,8 +318,9 @@ function decompressblock(name::Symbol, z::ZstdReader, payload::AbstractVector{UI
     end
 end
 
-decompressblock(name::Symbol, state, payload::AbstractVector{UInt8}, limits::Limits, budget::Budget) =
+function decompressblock(name::Symbol, state, payload::AbstractVector{UInt8}, limits::Limits, budget::Budget)
     throw(UnsupportedCodecError(String(name), get(EXTENSION_PACKAGES, name, nothing)))
+end
 
 # ---- the writing side --------------------------------------------------------------------------------
 

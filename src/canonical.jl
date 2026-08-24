@@ -101,7 +101,9 @@ function crc64avro(bytes::AbstractVector{UInt8})
     return fp
 end
 
-crc64avro(s::AbstractString) = crc64avro(codeunits(s))
+function crc64avro(s::AbstractString)
+    return crc64avro(codeunits(s))
+end
 
 "Hash canonical bytes after reserving the exact retained digest and pinned-library workspace."
 function hashfingerprint(pcf::AbstractVector{UInt8}, algorithm::Symbol, budget::Budget)

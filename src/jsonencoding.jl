@@ -45,14 +45,37 @@ function printvalue(out::JSONOut, s::Schema, v, depth::Int, budget::Budget)
     return nothing
 end
 
-printkind(out::JSONOut, ::NullSchema, v, depth, budget) = print(out.io, "null")
-printkind(out::JSONOut, ::BooleanSchema, v::Bool, depth, budget) = print(out.io, v ? "true" : "false")
-printkind(out::JSONOut, ::Union{FloatSchema,DoubleSchema}, v::AbstractFloat, depth, budget) = printfloat(out.io, v)
-printkind(out::JSONOut, ::StringSchema, v::String, depth, budget) = escapejson(out.io, v)
-printkind(out::JSONOut, ::StringSchema, v::UUID, depth, budget) = escapejson(out.io, string(v))
-printkind(out::JSONOut, ::EnumSchema, v::EnumValue, depth, budget) = escapejson(out.io, String(v))
-printkind(out::JSONOut, ::BytesSchema, v::Vector{UInt8}, depth, budget) = printbytestring(out.io, v)
-printkind(out::JSONOut, ::BytesSchema, v::Union{Decimal,WideDecimal}, depth, budget) = printbytestring(out.io, twoscomplement(BigInt(v.unscaled)))
+function printkind(out::JSONOut, ::NullSchema, v, depth, budget)
+    return print(out.io, "null")
+end
+
+function printkind(out::JSONOut, ::BooleanSchema, v::Bool, depth, budget)
+    return print(out.io, v ? "true" : "false")
+end
+
+function printkind(out::JSONOut, ::Union{FloatSchema,DoubleSchema}, v::AbstractFloat, depth, budget)
+    return printfloat(out.io, v)
+end
+
+function printkind(out::JSONOut, ::StringSchema, v::String, depth, budget)
+    return escapejson(out.io, v)
+end
+
+function printkind(out::JSONOut, ::StringSchema, v::UUID, depth, budget)
+    return escapejson(out.io, string(v))
+end
+
+function printkind(out::JSONOut, ::EnumSchema, v::EnumValue, depth, budget)
+    return escapejson(out.io, String(v))
+end
+
+function printkind(out::JSONOut, ::BytesSchema, v::Vector{UInt8}, depth, budget)
+    return printbytestring(out.io, v)
+end
+
+function printkind(out::JSONOut, ::BytesSchema, v::Union{Decimal,WideDecimal}, depth, budget)
+    return printbytestring(out.io, twoscomplement(BigInt(v.unscaled)))
+end
 
 function printkind(out::JSONOut, s::IntSchema, v, depth, budget)
     l = s.logical
@@ -146,10 +169,17 @@ function printmember(out::JSONOut, s::UnionSchema, i::Int, v, depth, budget)
     return nothing
 end
 
-unionlabel(s::NamedSchema) = fullname(s)
-unionlabel(s::Schema) = string(kind(s))
+function unionlabel(s::NamedSchema)
+    return fullname(s)
+end
 
-ambiguouslabel(s::UnionSchema, label::String) = count(b -> unionlabel(b) == label, s.branches) > 1
+function unionlabel(s::Schema)
+    return string(kind(s))
+end
+
+function ambiguouslabel(s::UnionSchema, label::String)
+    return count(b -> unionlabel(b) == label, s.branches) > 1
+end
 
 function branchbylabel(s::UnionSchema, label::String)
     found = 0
@@ -250,17 +280,26 @@ end
 Convert a frozen JSON tree parsed in *default* context (bare unions, the recursive record rule) into the
 generic value model — used for field defaults under resolution.
 """
-jsonvalue(s::Schema, j, budget::Budget) = jsontovalue(s, j, JSONContext(budget, true, false, true), 1)
+function jsonvalue(s::Schema, j, budget::Budget)
+    return jsontovalue(s, j, JSONContext(budget, true, false, true), 1)
+end
 
-jsonerror(msg::AbstractString) = throw(DataError(msg, 0))
+function jsonerror(msg::AbstractString)
+    throw(DataError(msg, 0))
+end
 
 function jsontovalue(s::Schema, j, ctx::JSONContext, depth::Int)
     countvalues!(ctx.budget)
     return jsonkind(s, j, ctx, depth)
 end
 
-jsonkind(::NullSchema, j, ctx, depth) = j === nothing ? missing : jsonerror("expected null, got $(describejson(j))")
-jsonkind(::BooleanSchema, j, ctx, depth) = j isa Bool ? j : jsonerror("expected a boolean, got $(describejson(j))")
+function jsonkind(::NullSchema, j, ctx, depth)
+    return j === nothing ? missing : jsonerror("expected null, got $(describejson(j))")
+end
+
+function jsonkind(::BooleanSchema, j, ctx, depth)
+    return j isa Bool ? j : jsonerror("expected a boolean, got $(describejson(j))")
+end
 
 function jsonkind(s::IntSchema, j, ctx, depth)
     j isa Int64 || jsonerror("expected an integer, got $(describejson(j))")
@@ -290,8 +329,13 @@ function jsonkind(s::LongSchema, j, ctx, depth)
     return j
 end
 
-jsonkind(::FloatSchema, j, ctx, depth) = jsonfloat(Float32, j)
-jsonkind(::DoubleSchema, j, ctx, depth) = jsonfloat(Float64, j)
+function jsonkind(::FloatSchema, j, ctx, depth)
+    return jsonfloat(Float32, j)
+end
+
+function jsonkind(::DoubleSchema, j, ctx, depth)
+    return jsonfloat(Float64, j)
+end
 
 function jsonfloat(::Type{T}, j) where {T}
     j isa Int64 && return T(j)
@@ -444,8 +488,10 @@ function jsonkind(s::UnionSchema, j, ctx, depth)
     return nb != 0 ? v : chargedunion(i, v, ctx)
 end
 
-describejson(j) = j === nothing ? "null" : j isa Bool ? "a boolean" : j isa Int64 ? "an integer" : j isa Union{JSONNumber,Float64} ? "a number" :
-                  j isa String ? "a string" : j isa JSONArray ? "an array" : "an object"
+function describejson(j)
+    return j === nothing ? "null" : j isa Bool ? "a boolean" : j isa Int64 ? "an integer" : j isa Union{JSONNumber,Float64} ? "a number" :
+           j isa String ? "a string" : j isa JSONArray ? "an array" : "an object"
+end
 
 function bytesfromjson(j, size::Int, ctx::JSONContext)
     j isa String || jsonerror("expected a byte string, got $(describejson(j))")
@@ -475,4 +521,6 @@ function uuidfrombytes(bytes::Vector{UInt8})
     return UUID(v)
 end
 
-le32(bytes::Vector{UInt8}, i::Int) = UInt32(bytes[i]) | (UInt32(bytes[i + 1]) << 8) | (UInt32(bytes[i + 2]) << 16) | (UInt32(bytes[i + 3]) << 24)
+function le32(bytes::Vector{UInt8}, i::Int)
+    return UInt32(bytes[i]) | (UInt32(bytes[i + 1]) << 8) | (UInt32(bytes[i + 2]) << 16) | (UInt32(bytes[i + 3]) << 24)
+end

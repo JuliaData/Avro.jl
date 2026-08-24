@@ -64,8 +64,14 @@ function writeplan(s::Schema, memo, budget)
     return p
 end
 
-buildwriteplan(::NullSchema, memo, budget) = WNull()
-buildwriteplan(::BooleanSchema, memo, budget) = WBool()
+function buildwriteplan(::NullSchema, memo, budget)
+    return WNull()
+end
+
+function buildwriteplan(::BooleanSchema, memo, budget)
+    return WBool()
+end
+
 function buildwriteplan(s::IntSchema, memo, budget)
     s.logical isa DateLogical && return WDate()
     s.logical isa TimeMillis && return WTimeMillis()
@@ -82,8 +88,14 @@ function buildwriteplan(s::LongSchema, memo, budget)
     l isa LocalTimestampNanos && return WLocalTimestamp{Nanosecond}()
     return WLong()
 end
-buildwriteplan(::FloatSchema, memo, budget) = WFloat()
-buildwriteplan(::DoubleSchema, memo, budget) = WDouble()
+function buildwriteplan(::FloatSchema, memo, budget)
+    return WFloat()
+end
+
+function buildwriteplan(::DoubleSchema, memo, budget)
+    return WDouble()
+end
+
 function buildwriteplan(s::BytesSchema, memo, budget)
     s.logical isa DecimalLogical && return WDecimal(0, s.logical.precision, s.logical.scale)
     return WBytes()
@@ -99,9 +111,18 @@ function buildwriteplan(s::FixedSchema, memo, budget)
     l isa DurationLogical && return WDuration()
     return WFixed(s)
 end
-buildwriteplan(s::EnumSchema, memo, budget) = WEnum(s)
-buildwriteplan(s::ArraySchema, memo, budget) = WArray(writeplan(s.items, memo, budget))
-buildwriteplan(s::MapSchema, memo, budget) = WMap(writeplan(s.values, memo, budget))
+function buildwriteplan(s::EnumSchema, memo, budget)
+    return WEnum(s)
+end
+
+function buildwriteplan(s::ArraySchema, memo, budget)
+    return WArray(writeplan(s.items, memo, budget))
+end
+
+function buildwriteplan(s::MapSchema, memo, budget)
+    return WMap(writeplan(s.values, memo, budget))
+end
+
 function buildwriteplan(s::UnionSchema, memo, budget)
     return WUnion(s, WritePlan[writeplan(b, memo, budget) for b in s.branches], nullablebranch(s), Any[juliatype(b) for b in s.branches])
 end
@@ -116,7 +137,9 @@ end
 
 # ---- errors ---------------------------------------------------------------------------------------------
 
-encodeerror(msg::AbstractString, x) = throw(EncodeError(string(msg, " (got ", typeof(x), ")"), "", nothing))
+function encodeerror(msg::AbstractString, x)
+    throw(EncodeError(string(msg, " (got ", typeof(x), ")"), "", nothing))
+end
 
 # ---- encoding --------------------------------------------------------------------------------------------
 
@@ -136,36 +159,79 @@ function encode(p::WritePlan, e::Encoder, x)
     return nothing
 end
 
-encodevalue(::WNull, e::Encoder, x::Union{Missing,Nothing}) = nothing
-encodevalue(::WNull, e::Encoder, x) = encodeerror("expected null (missing or nothing)", x)
-encodevalue(::WBool, e::Encoder, x::Bool) = writebool!(e, x)
-encodevalue(::WBool, e::Encoder, x) = encodeerror("expected a Bool", x)
+function encodevalue(::WNull, e::Encoder, x::Union{Missing,Nothing})
+    return nothing
+end
+
+function encodevalue(::WNull, e::Encoder, x)
+    return encodeerror("expected null (missing or nothing)", x)
+end
+
+function encodevalue(::WBool, e::Encoder, x::Bool)
+    return writebool!(e, x)
+end
+
+function encodevalue(::WBool, e::Encoder, x)
+    return encodeerror("expected a Bool", x)
+end
 
 function encodevalue(::WInt, e::Encoder, x::Integer)
     typemin(Int32) <= x <= typemax(Int32) || encodeerror("integer $x does not fit an Avro int", x)
     writeint!(e, Int32(x))
     return nothing
 end
-encodevalue(::WInt, e::Encoder, x::Bool) = encodeerror("expected an integer", x)
-encodevalue(::WInt, e::Encoder, x) = encodeerror("expected an integer", x)
+function encodevalue(::WInt, e::Encoder, x::Bool)
+    return encodeerror("expected an integer", x)
+end
+
+function encodevalue(::WInt, e::Encoder, x)
+    return encodeerror("expected an integer", x)
+end
 
 function encodevalue(::WLong, e::Encoder, x::Integer)
     typemin(Int64) <= x <= typemax(Int64) || encodeerror("integer $x does not fit an Avro long", x)
     writelong!(e, Int64(x))
     return nothing
 end
-encodevalue(::WLong, e::Encoder, x::Bool) = encodeerror("expected an integer", x)
-encodevalue(::WLong, e::Encoder, x) = encodeerror("expected an integer", x)
+function encodevalue(::WLong, e::Encoder, x::Bool)
+    return encodeerror("expected an integer", x)
+end
 
-encodevalue(::WFloat, e::Encoder, x::Union{Float32,Float16}) = writefloat!(e, Float32(x))
-encodevalue(::WFloat, e::Encoder, x::Integer) = x isa Bool ? encodeerror("expected a Float32", x) : writefloat!(e, Float32(x))
-encodevalue(::WFloat, e::Encoder, x) = encodeerror("expected a Float32 (a Float64 is not accepted for an Avro float)", x)
-encodevalue(::WDouble, e::Encoder, x::AbstractFloat) = writedouble!(e, Float64(x))
-encodevalue(::WDouble, e::Encoder, x::Integer) = x isa Bool ? encodeerror("expected a Float64", x) : writedouble!(e, Float64(x))
-encodevalue(::WDouble, e::Encoder, x) = encodeerror("expected a Float64", x)
+function encodevalue(::WLong, e::Encoder, x)
+    return encodeerror("expected an integer", x)
+end
 
-encodevalue(::WBytes, e::Encoder, x::AbstractVector{UInt8}) = writebytes!(e, x)
-encodevalue(::WBytes, e::Encoder, x) = encodeerror("expected bytes (an AbstractVector{UInt8})", x)
+function encodevalue(::WFloat, e::Encoder, x::Union{Float32,Float16})
+    return writefloat!(e, Float32(x))
+end
+
+function encodevalue(::WFloat, e::Encoder, x::Integer)
+    return x isa Bool ? encodeerror("expected a Float32", x) : writefloat!(e, Float32(x))
+end
+
+function encodevalue(::WFloat, e::Encoder, x)
+    return encodeerror("expected a Float32 (a Float64 is not accepted for an Avro float)", x)
+end
+
+function encodevalue(::WDouble, e::Encoder, x::AbstractFloat)
+    return writedouble!(e, Float64(x))
+end
+
+function encodevalue(::WDouble, e::Encoder, x::Integer)
+    return x isa Bool ? encodeerror("expected a Float64", x) : writedouble!(e, Float64(x))
+end
+
+function encodevalue(::WDouble, e::Encoder, x)
+    return encodeerror("expected a Float64", x)
+end
+
+function encodevalue(::WBytes, e::Encoder, x::AbstractVector{UInt8})
+    return writebytes!(e, x)
+end
+
+function encodevalue(::WBytes, e::Encoder, x)
+    return encodeerror("expected bytes (an AbstractVector{UInt8})", x)
+end
 
 function encodevalue(::WString, e::Encoder, x::AbstractString)
     s = x isa String ? x : String(x)
@@ -173,9 +239,17 @@ function encodevalue(::WString, e::Encoder, x::AbstractString)
     writestring!(e, s)
     return nothing
 end
-encodevalue(p::WString, e::Encoder, x::Symbol) = encodevalue(p, e, String(x))
-encodevalue(p::WString, e::Encoder, x::Char) = encodevalue(p, e, string(x))
-encodevalue(::WString, e::Encoder, x) = encodeerror("expected a string", x)
+function encodevalue(p::WString, e::Encoder, x::Symbol)
+    return encodevalue(p, e, String(x))
+end
+
+function encodevalue(p::WString, e::Encoder, x::Char)
+    return encodevalue(p, e, string(x))
+end
+
+function encodevalue(::WString, e::Encoder, x)
+    return encodeerror("expected a string", x)
+end
 
 function encodevalue(p::WFixed, e::Encoder, x::Fixed)
     (fullname(x.schema) == fullname(p.schema) && x.schema.size == p.schema.size) || encodeerror("fixed value of $(fullname(x.schema)) does not match $(fullname(p.schema))", x)
@@ -196,7 +270,9 @@ function encodevalue(p::WFixed, e::Encoder, x::NTuple{N,UInt8}) where {N}
     end
     return nothing
 end
-encodevalue(p::WFixed, e::Encoder, x) = encodeerror("expected $(p.schema.size) fixed bytes", x)
+function encodevalue(p::WFixed, e::Encoder, x)
+    return encodeerror("expected $(p.schema.size) fixed bytes", x)
+end
 
 function encodevalue(p::WEnum, e::Encoder, x::EnumValue)
     if x.schema === p.schema || (fullname(x.schema) == fullname(p.schema) && x.schema.symbols.data == p.schema.symbols.data)
@@ -205,10 +281,21 @@ function encodevalue(p::WEnum, e::Encoder, x::EnumValue)
     end
     return encodesymbol(p, e, String(x))
 end
-encodevalue(p::WEnum, e::Encoder, x::AbstractString) = encodesymbol(p, e, String(x))
-encodevalue(p::WEnum, e::Encoder, x::Symbol) = encodesymbol(p, e, String(x))
-encodevalue(p::WEnum, e::Encoder, x::Base.Enum) = encodesymbol(p, e, avrosymbol(typeof(x), x))
-encodevalue(p::WEnum, e::Encoder, x) = encodeerror("expected an enum symbol of $(fullname(p.schema))", x)
+function encodevalue(p::WEnum, e::Encoder, x::AbstractString)
+    return encodesymbol(p, e, String(x))
+end
+
+function encodevalue(p::WEnum, e::Encoder, x::Symbol)
+    return encodesymbol(p, e, String(x))
+end
+
+function encodevalue(p::WEnum, e::Encoder, x::Base.Enum)
+    return encodesymbol(p, e, avrosymbol(typeof(x), x))
+end
+
+function encodevalue(p::WEnum, e::Encoder, x)
+    return encodeerror("expected an enum symbol of $(fullname(p.schema))", x)
+end
 
 function encodesymbol(p::WEnum, e::Encoder, sym::String)
     i = get(p.schema.symbolindex, sym, 0)
@@ -217,8 +304,13 @@ function encodesymbol(p::WEnum, e::Encoder, sym::String)
     return nothing
 end
 
-encodevalue(::WDate, e::Encoder, x::Date) = writeint!(e, Int32(Dates.value(x - DATE_EPOCH)))
-encodevalue(::WDate, e::Encoder, x) = encodeerror("expected a Date", x)
+function encodevalue(::WDate, e::Encoder, x::Date)
+    return writeint!(e, Int32(Dates.value(x - DATE_EPOCH)))
+end
+
+function encodevalue(::WDate, e::Encoder, x)
+    return encodeerror("expected a Date", x)
+end
 
 function encodevalue(::WTimeMillis, e::Encoder, x::Time)
     ns = Dates.value(x)
@@ -226,7 +318,9 @@ function encodevalue(::WTimeMillis, e::Encoder, x::Time)
     writeint!(e, Int32(ns ÷ 1_000_000))
     return nothing
 end
-encodevalue(::WTimeMillis, e::Encoder, x) = encodeerror("expected a Time", x)
+function encodevalue(::WTimeMillis, e::Encoder, x)
+    return encodeerror("expected a Time", x)
+end
 
 function encodevalue(::WTimeMicros, e::Encoder, x::Time)
     ns = Dates.value(x)
@@ -234,14 +328,33 @@ function encodevalue(::WTimeMicros, e::Encoder, x::Time)
     writelong!(e, ns ÷ 1_000)
     return nothing
 end
-encodevalue(::WTimeMicros, e::Encoder, x) = encodeerror("expected a Time", x)
+function encodevalue(::WTimeMicros, e::Encoder, x)
+    return encodeerror("expected a Time", x)
+end
 
-encodevalue(::WTimestamp{P}, e::Encoder, x::Timestamp{P}) where {P} = writelong!(e, x.ticks)
-encodevalue(::WTimestamp{P}, e::Encoder, x::DateTime) where {P} = writelong!(e, Timestamp{P}(x).ticks)
-encodevalue(::WTimestamp{P}, e::Encoder, x) where {P} = encodeerror("expected an Avro.Timestamp{$(nameof(P))} or a DateTime", x)
-encodevalue(::WLocalTimestamp{P}, e::Encoder, x::LocalTimestamp{P}) where {P} = writelong!(e, x.ticks)
-encodevalue(::WLocalTimestamp{P}, e::Encoder, x::DateTime) where {P} = writelong!(e, LocalTimestamp{P}(x).ticks)
-encodevalue(::WLocalTimestamp{P}, e::Encoder, x) where {P} = encodeerror("expected an Avro.LocalTimestamp{$(nameof(P))} or a DateTime", x)
+function encodevalue(::WTimestamp{P}, e::Encoder, x::Timestamp{P}) where {P}
+    return writelong!(e, x.ticks)
+end
+
+function encodevalue(::WTimestamp{P}, e::Encoder, x::DateTime) where {P}
+    return writelong!(e, Timestamp{P}(x).ticks)
+end
+
+function encodevalue(::WTimestamp{P}, e::Encoder, x) where {P}
+    return encodeerror("expected an Avro.Timestamp{$(nameof(P))} or a DateTime", x)
+end
+
+function encodevalue(::WLocalTimestamp{P}, e::Encoder, x::LocalTimestamp{P}) where {P}
+    return writelong!(e, x.ticks)
+end
+
+function encodevalue(::WLocalTimestamp{P}, e::Encoder, x::DateTime) where {P}
+    return writelong!(e, LocalTimestamp{P}(x).ticks)
+end
+
+function encodevalue(::WLocalTimestamp{P}, e::Encoder, x) where {P}
+    return encodeerror("expected an Avro.LocalTimestamp{$(nameof(P))} or a DateTime", x)
+end
 
 function encodevalue(p::WDecimal, e::Encoder, x::Decimal)
     x.scale == p.scale || encodeerror("decimal scale $(x.scale) does not equal the schema scale $(p.scale) (rescale first)", x)
@@ -253,7 +366,9 @@ function encodevalue(p::WDecimal, e::Encoder, x::WideDecimal)
     ndigits(abs(x.unscaled)) <= p.precision || encodeerror("decimal exceeds precision $(p.precision)", x)
     return writetwoscomplement!(e, p, x.unscaled)
 end
-encodevalue(p::WDecimal, e::Encoder, x) = encodeerror("expected an Avro.Decimal/WideDecimal with scale $(p.scale)", x)
+function encodevalue(p::WDecimal, e::Encoder, x)
+    return encodeerror("expected an Avro.Decimal/WideDecimal with scale $(p.scale)", x)
+end
 
 """
     twoscomplement(v::BigInt) -> Vector{UInt8}
@@ -306,15 +421,26 @@ function uuidbytes(u::UUID)
     return out
 end
 
-encodevalue(::WUUIDString, e::Encoder, x::UUID) = writestring!(e, string(x))
+function encodevalue(::WUUIDString, e::Encoder, x::UUID)
+    return writestring!(e, string(x))
+end
+
 function encodevalue(::WUUIDString, e::Encoder, x::AbstractString)
     tryparseuuid(x) === nothing && encodeerror("not an RFC 4122 uuid string", x)
     writestring!(e, x)
     return nothing
 end
-encodevalue(::WUUIDString, e::Encoder, x) = encodeerror("expected a UUID", x)
-encodevalue(::WUUIDFixed, e::Encoder, x::UUID) = writeraw!(e, uuidbytes(x))
-encodevalue(::WUUIDFixed, e::Encoder, x) = encodeerror("expected a UUID", x)
+function encodevalue(::WUUIDString, e::Encoder, x)
+    return encodeerror("expected a UUID", x)
+end
+
+function encodevalue(::WUUIDFixed, e::Encoder, x::UUID)
+    return writeraw!(e, uuidbytes(x))
+end
+
+function encodevalue(::WUUIDFixed, e::Encoder, x)
+    return encodeerror("expected a UUID", x)
+end
 
 function encodevalue(::WDuration, e::Encoder, x::Duration)
     ensureroom!(e, 12)
@@ -325,7 +451,9 @@ function encodevalue(::WDuration, e::Encoder, x::Duration)
     end
     return nothing
 end
-encodevalue(::WDuration, e::Encoder, x) = encodeerror("expected an Avro.Duration", x)
+function encodevalue(::WDuration, e::Encoder, x)
+    return encodeerror("expected an Avro.Duration", x)
+end
 
 # arrays: positive-count blocks (one block per array)
 function encodevalue(p::WArray, e::Encoder, x)
@@ -344,11 +472,26 @@ function encodevalue(p::WArray, e::Encoder, x)
     return nothing
 end
 
-arrayitems(x::AbstractVector) = x
-arrayitems(x::Tuple) = x
-arrayitems(x::AbstractSet) = x
-arrayitems(x::AbstractString) = encodeerror("expected an array, not a string", x)
-arrayitems(x::AbstractDict) = encodeerror("expected an array, not a dictionary", x)
+function arrayitems(x::AbstractVector)
+    return x
+end
+
+function arrayitems(x::Tuple)
+    return x
+end
+
+function arrayitems(x::AbstractSet)
+    return x
+end
+
+function arrayitems(x::AbstractString)
+    return encodeerror("expected an array, not a string", x)
+end
+
+function arrayitems(x::AbstractDict)
+    return encodeerror("expected an array, not a dictionary", x)
+end
+
 function arrayitems(x)
     Base.IteratorSize(x) isa Union{Base.HasLength,Base.HasShape} && return x
     if applicable(iterate, x)
@@ -384,13 +527,33 @@ function checkblockcount(e::Encoder, n::Int)
     return nothing
 end
 
-mappairs(x::Map) = x
-mappairs(x::AbstractDict) = (keytype(x) <: Union{AbstractString,Symbol} || keytype(x) === Any) ? x : encodeerror("map keys must be strings or symbols", x)
-mappairs(x::NamedTuple) = pairs(x)
-mappairs(x) = encodeerror("expected a map (an AbstractDict or NamedTuple)", x)
-mapkeystring(k::AbstractString) = String(k)
-mapkeystring(k::Symbol) = String(k)
-mapkeystring(k) = encodeerror("map keys must be strings or symbols", k)
+function mappairs(x::Map)
+    return x
+end
+
+function mappairs(x::AbstractDict)
+    return (keytype(x) <: Union{AbstractString,Symbol} || keytype(x) === Any) ? x : encodeerror("map keys must be strings or symbols", x)
+end
+
+function mappairs(x::NamedTuple)
+    return pairs(x)
+end
+
+function mappairs(x)
+    return encodeerror("expected a map (an AbstractDict or NamedTuple)", x)
+end
+
+function mapkeystring(k::AbstractString)
+    return String(k)
+end
+
+function mapkeystring(k::Symbol)
+    return String(k)
+end
+
+function mapkeystring(k)
+    return encodeerror("map keys must be strings or symbols", k)
+end
 
 function admitmapkey!(seen::Vector{String}, key::String, budget::Budget, source)
     for prior in seen
@@ -440,33 +603,100 @@ function selectbranch(p::WUnion, x)
     encodeerror("no union branch accepts the value", x)
 end
 
-accepts(::WNull, x) = x === missing || x === nothing
-accepts(::WBool, x) = x isa Bool
-accepts(::WInt, x) = x isa Integer && !(x isa Bool) && typemin(Int32) <= x <= typemax(Int32)
-accepts(::WLong, x) = x isa Integer && !(x isa Bool) && typemin(Int64) <= x <= typemax(Int64)
-accepts(::WFloat, x) = x isa Union{Float32,Float16} || (x isa Integer && !(x isa Bool))
-accepts(::WDouble, x) = x isa AbstractFloat || (x isa Integer && !(x isa Bool))
-accepts(::WBytes, x) = x isa AbstractVector{UInt8}
-accepts(::WString, x) = x isa AbstractString || x isa Symbol || x isa Char
-accepts(p::WFixed, x) = (x isa Fixed && fullname(x.schema) == fullname(p.schema)) || ((x isa AbstractVector{UInt8} || x isa NTuple{N,UInt8} where {N}) && length(x) == p.schema.size)
-accepts(p::WEnum, x) = (x isa EnumValue && fullname(x.schema) == fullname(p.schema)) || ((x isa AbstractString || x isa Symbol) && haskey(p.schema.symbolindex, String(x))) || x isa Base.Enum
-accepts(::WDate, x) = x isa Date
-accepts(::Union{WTimeMillis,WTimeMicros}, x) = x isa Time
-accepts(::WTimestamp{P}, x) where {P} = x isa Timestamp{P} || x isa DateTime
-accepts(::WLocalTimestamp{P}, x) where {P} = x isa LocalTimestamp{P} || x isa DateTime
-accepts(p::WDecimal, x) = (x isa Decimal || x isa WideDecimal) && x.scale == p.scale
-accepts(::WUUIDString, x) = x isa UUID || (x isa AbstractString && tryparseuuid(x) !== nothing)
-accepts(::WUUIDFixed, x) = x isa UUID
-accepts(::WDuration, x) = x isa Duration
-accepts(::WArray, x) = (x isa AbstractVector && !(x isa AbstractVector{UInt8})) || x isa Tuple || x isa AbstractSet
-accepts(::WMap, x) = x isa Map || x isa AbstractDict || x isa NamedTuple
-accepts(::WUnion, x) = false
-accepts(p::WRecord, x) = x isa Record ? fullname(getfield(x, :schema)) == fullname(p.schema) : (x isa NamedTuple || x isa AbstractDict || isrecordlike(x))
+function accepts(::WNull, x)
+    return x === missing || x === nothing
+end
+
+function accepts(::WBool, x)
+    return x isa Bool
+end
+
+function accepts(::WInt, x)
+    return x isa Integer && !(x isa Bool) && typemin(Int32) <= x <= typemax(Int32)
+end
+
+function accepts(::WLong, x)
+    return x isa Integer && !(x isa Bool) && typemin(Int64) <= x <= typemax(Int64)
+end
+
+function accepts(::WFloat, x)
+    return x isa Union{Float32,Float16} || (x isa Integer && !(x isa Bool))
+end
+
+function accepts(::WDouble, x)
+    return x isa AbstractFloat || (x isa Integer && !(x isa Bool))
+end
+
+function accepts(::WBytes, x)
+    return x isa AbstractVector{UInt8}
+end
+
+function accepts(::WString, x)
+    return x isa AbstractString || x isa Symbol || x isa Char
+end
+
+function accepts(p::WFixed, x)
+    return (x isa Fixed && fullname(x.schema) == fullname(p.schema)) || ((x isa AbstractVector{UInt8} || x isa NTuple{N,UInt8} where {N}) && length(x) == p.schema.size)
+end
+
+function accepts(p::WEnum, x)
+    return (x isa EnumValue && fullname(x.schema) == fullname(p.schema)) || ((x isa AbstractString || x isa Symbol) && haskey(p.schema.symbolindex, String(x))) || x isa Base.Enum
+end
+
+function accepts(::WDate, x)
+    return x isa Date
+end
+
+function accepts(::Union{WTimeMillis,WTimeMicros}, x)
+    return x isa Time
+end
+
+function accepts(::WTimestamp{P}, x) where {P}
+    return x isa Timestamp{P} || x isa DateTime
+end
+
+function accepts(::WLocalTimestamp{P}, x) where {P}
+    return x isa LocalTimestamp{P} || x isa DateTime
+end
+
+function accepts(p::WDecimal, x)
+    return (x isa Decimal || x isa WideDecimal) && x.scale == p.scale
+end
+
+function accepts(::WUUIDString, x)
+    return x isa UUID || (x isa AbstractString && tryparseuuid(x) !== nothing)
+end
+
+function accepts(::WUUIDFixed, x)
+    return x isa UUID
+end
+
+function accepts(::WDuration, x)
+    return x isa Duration
+end
+
+function accepts(::WArray, x)
+    return (x isa AbstractVector && !(x isa AbstractVector{UInt8})) || x isa Tuple || x isa AbstractSet
+end
+
+function accepts(::WMap, x)
+    return x isa Map || x isa AbstractDict || x isa NamedTuple
+end
+
+function accepts(::WUnion, x)
+    return false
+end
+
+function accepts(p::WRecord, x)
+    return x isa Record ? fullname(getfield(x, :schema)) == fullname(p.schema) : (x isa NamedTuple || x isa AbstractDict || isrecordlike(x))
+end
 
 # Plain structs are record-like unless they are one of the scalar/container kinds the other branches own.
 const NOT_RECORDLIKE = Union{Missing,Nothing,Number,AbstractString,Symbol,Char,AbstractArray,Tuple,AbstractSet,Type,Function,
                              Date,Time,DateTime,UUID,Decimal,WideDecimal,Timestamp,LocalTimestamp,Duration,Fixed,EnumValue,Map,UnionValue,Base.Enum}
-isrecordlike(x) = isstructtype(typeof(x)) && !(x isa NOT_RECORDLIKE)
+function isrecordlike(x)
+    return isstructtype(typeof(x)) && !(x isa NOT_RECORDLIKE)
+end
 
 # records: value extraction by Avro field name without interning untrusted names
 function encodevalue(p::WRecord, e::Encoder, x)
@@ -600,7 +830,10 @@ function alignedplans(p::WritePlan, ::Type{T}) where {T}
     return Tuple(p.fields)
 end
 
-@inline estfields(::Tuple{}, ::Tuple{}, slack::Union{Nothing,Vector{Int}}, i::Int) = (0, 0, 0)
+@inline function estfields(::Tuple{}, ::Tuple{}, slack::Union{Nothing,Vector{Int}}, i::Int)
+    return (0, 0, 0)
+end
+
 @inline function estfields(plans::Tuple, vals::Tuple, slack::Union{Nothing,Vector{Int}}, i::Int)
     eb, ev = estimatevalue(first(plans), first(vals))
     pb = slack === nothing ? 0 : max(eb - slack[i], 0)
@@ -614,7 +847,10 @@ function estimatealigned(plans::Tuple, x::NamedTuple, slack::Union{Nothing,Vecto
     return (checked_add(recordbytes(length(plans)), eb), 1 + ev, pb)
 end
 
-@inline encfields(e::Encoder, ::Tuple{}, ::Tuple{}) = nothing
+@inline function encfields(e::Encoder, ::Tuple{}, ::Tuple{})
+    return nothing
+end
+
 @inline function encfields(e::Encoder, plans::Tuple, vals::Tuple)
     encode(first(plans), e, first(vals))
     return encfields(e, Base.tail(plans), Base.tail(vals))
