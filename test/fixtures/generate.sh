@@ -3,6 +3,7 @@
 # (AVRO_TOOLS_JAR, sha256 6220e8bc089aaf917cdad4cd358bd651fc0394c0e5ddb8b36da402012c294a68), a Python with fastavro==1.12.2 + cramjam (PYTHON).
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
+fixtures="$here"
 gen="$here/generated"
 JAR="${AVRO_TOOLS_JAR:?set AVRO_TOOLS_JAR}"; PY="${PYTHON:-python3}"
 J() { java -jar "$JAR" "$@"; }
@@ -40,11 +41,11 @@ for f in sorted(glob.glob(os.path.join(here, "data", "*-null.avro"))):
             print(f"fastavro {codec}: {e}", file=sys.stderr)
 PYEOF
 for r in everything_readerA everything_readerB; do java -cp "$CP" ReadWithReader "$here/data/everything-null.avro" "$here/evolution/$r.avsc" > "$here/evolution/$r.jsonl"; done
-java -cp "$CP" ReadWithReader "$here/apache/weather.avro" "$here/evolution/weather_reader.avsc" > "$here/evolution/weather_reader.jsonl"
+java -cp "$CP" ReadWithReader "$fixtures/apache/weather.avro" "$here/evolution/weather_reader.avsc" > "$here/evolution/weather_reader.jsonl"
 java -cp "$CP" SingleObject encode "$here/singleobject/weather.avsc" "$here/singleobject/weather1.json" > "$here/singleobject/weather1.bin"
 for bs in 32 64 1024; do java -cp "$CP" BlockingEncode "$here/blocking/arrmap.avsc" "$here/blocking/arrmap.json" $bs > "$here/blocking/arrmap-$bs.bin"; done
 : > "$here/fingerprints.tsv"
-for f in "$here"/schemas/*.avsc "$here"/evolution/*.avsc "$here"/apache/*.avsc; do b=$(basename "$f")
+for f in "$here"/schemas/*.avsc "$here"/evolution/*.avsc "$fixtures"/apache/*.avsc; do b=$(basename "$f")
   J canonical "$f" "$here/canonical/$b.canonical"
   for alg in CRC-64-AVRO MD5 SHA-256; do printf '%s\t%s\t%s\n' "$b" "$alg" "$(J fingerprint --fingerprint $alg "$f" | tail -1 | awk '{print $1}')" >> "$here/fingerprints.tsv"; done
 done
