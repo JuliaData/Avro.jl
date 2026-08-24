@@ -128,37 +128,60 @@
         end
     end
 
-    @testset "corpus sweep: every generated record-root fixture, Table and Rows (R14)" begin
+    @testset "corpus sweep: every generated fixture file and selection shape, Table and Rows (R14, D09)" begin
         gen = joinpath(@__DIR__, "fixtures", "generated")
         raised = Avro.Limits(max_total_bytes=2 << 30, max_block_bytes=16 << 20, max_block_output_bytes=256 << 20,
                              max_codec_memory=32 << 20, max_bytes=64 << 20, max_datum_bytes=64 << 20)
+        datafiles = readdir(joinpath(gen, "data"); join=true)
+        swept = 0
         for avsc in filter(f -> endswith(f, ".avsc"), readdir(joinpath(gen, "schemas"); join=true))
             s = Avro.parseschema(read(avsc, String))
             s isa Avro.RecordSchema || continue
-            data = joinpath(gen, "data", basename(avsc)[1:end - 5] * "-null.avro")
-            isfile(data) || continue
-            full = Avro.Table(data; limits=raised)
-            names = collect(Tables.columnnames(full))
-            isempty(names) && continue
-            fullct = Tables.columntable(full)
-            sels = Vector{Symbol}[[names[1]], [names[end], names[1]]]
-            length(names) > 2 && push!(sels, names[1:2:end])
-            for sel in sels, val in (:strict, :fast), nt in (1, 2, 8)
-                pt = Avro.Table(data; select=Tuple(sel), validate=val, ntasks=nt, limits=raised)
-                @test Tables.columnnames(pt) == sel && length(pt) == length(full)
-                for (k, nm) in enumerate(sel)
-                    got = Tables.getcolumn(pt, k)
-                    want = fullct[nm]
-                    @test isequal(got, want) && typeof(got) == typeof(want)
+            stem = basename(avsc)[1:end - 5]
+            pat = Regex("^" * stem * "(-fastavro)?-[a-z0-9]+\\.avro\$")
+            for data in filter(f -> occursin(pat, basename(f)), datafiles)
+                if endswith(basename(data), "-fastavro-deflate.avro")
+                    # documented divergence (plan §4.9/§8.4): fastavro emits suffix bytes after the
+                    # final deflate block, which Avro.jl rejects; classified like test/container.jl
+                    err = try
+                        Avro.Table(data; limits=raised)
+                        nothing
+                    catch e
+                        e
+                    end
+                    @test err isa Avro.CodecError && occursin("bytes after the final deflate block", err.msg)
+                    swept += 1
+                    continue
                 end
-                rl = Avro.Rows(data; select=Tuple(sel), validate=val, limits=raised)
-                rows = collect(rl)
-                close(rl)
-                @test length(rows) == length(full)
-                for (k, nm) in enumerate(sel)
-                    @test isequal([Tables.getcolumn(r, k) for r in rows], collect(fullct[nm]))
+                full = Avro.Table(data; limits=raised)
+                names = collect(Tables.columnnames(full))
+                fullct = Tables.columntable(full)
+                sels = Vector{Symbol}[Symbol[]]                              # select=() on every fixture
+                if !isempty(names)
+                    push!(sels, [names[1]], reverse(names), copy(names))     # single, reverse, full in order
+                    length(names) > 1 && push!(sels, [names[end], names[1]])
+                    length(names) > 2 && push!(sels, names[1:2:end])
                 end
+                unique!(sels)
+                for sel in sels, val in (:strict, :fast), nt in (1, 2, 8)
+                    pt = Avro.Table(data; select=Tuple(sel), validate=val, ntasks=nt, limits=raised)
+                    @test collect(Tables.columnnames(pt)) == sel && length(pt) == length(full)
+                    for (k, nm) in enumerate(sel)
+                        got = Tables.getcolumn(pt, k)
+                        want = fullct[nm]
+                        @test isequal(got, want) && typeof(got) == typeof(want)
+                    end
+                    rl = Avro.Rows(data; select=Tuple(sel), validate=val, limits=raised)
+                    rows = collect(rl)
+                    close(rl)
+                    @test length(rows) == length(full)
+                    for (k, nm) in enumerate(sel)
+                        @test isequal([Tables.getcolumn(r, k) for r in rows], collect(fullct[nm]))
+                    end
+                end
+                swept += 1
             end
         end
+        @test swept >= 70                                                    # every stem x writer x codec fixture opened
     end
 end
