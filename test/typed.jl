@@ -341,6 +341,17 @@ StructUtils.lift(::Avro.AvroStyle, ::Type{Hooked}, x) = Hooked(1.0, missing, Int
             @test Avro.DatumReader(wnull, Union{Nothing,Int64}; reader_schema=rnull)(UInt8[]) === nothing
             @test Avro.DatumReader(wnull, Union{Missing,Int64}; reader_schema=rnull)(UInt8[]) === missing
         end
+        # enum remaps stay direct for all supported typed enum representations
+        wenum = P("{\"type\":\"enum\",\"name\":\"RemappedColour\",\"symbols\":[\"red\",\"green\",\"blue\"]}")
+        renum = P("{\"type\":\"enum\",\"name\":\"RemappedColour\",\"symbols\":[\"blue\",\"green\",\"red\"]}")
+        enumbytes = Avro.encode(wenum, "green")
+        for (TEnum, expected) in ((String, "green"), (Symbol, :green), (Colour, green))
+            enumreader = Avro.DatumReader(wenum, TEnum; reader_schema=renum)
+            @test !(enumreader.plan isa Avro.SemanticTarget)
+            @test enumreader(enumbytes) === expected
+        end
+        @test_throws Avro.LimitError Avro.DatumReader(wenum, Symbol; reader_schema=renum,
+            names=Avro.SymbolAdmission(max_names=0))(enumbytes)
         # a custom-hooked target still takes the semantic route
         drh = Avro.DatumReader(w, Hooked; reader_schema=r)
         @test drh.plan isa Avro.SemanticTarget || !(drh.plan isa Avro.ResolvedRecordTarget)

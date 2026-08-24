@@ -408,13 +408,18 @@ fromraw(p::ReadPlan, d::Decoder, raw) = dataerror(d, "internal error: no promoti
 decodevalue(p::DefaultPlan, d::Decoder) = jsonvalue(p.schema, p.json, d.budget)
 skipvalue(::DefaultPlan, d::Decoder) = nothing
 
-function decodevalue(p::EnumRemapPlan, d::Decoder)
+function enumremapindex(p::EnumRemapPlan, d::Decoder)
     i = readindex(d, length(p.writer.symbols))
     j = p.map[i]
     if j == 0
         j = p.default
         j == 0 && throw(ResolutionError("writer enum symbol \"$(escapename(p.writer.symbols[i]))\" is not a symbol of reader $(describe(p.reader)), which has no default", p.writerpath, p.readerpath))
     end
+    return j
+end
+
+function decodevalue(p::EnumRemapPlan, d::Decoder)
+    j = enumremapindex(p, d)
     reserve!(d.budget, enumvaluebytes())
     return EnumValue(p.reader, j, Val(:unchecked))
 end

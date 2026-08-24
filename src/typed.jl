@@ -33,6 +33,17 @@ struct EnumTarget{T} <: TypedPlan
     members::Vector{Union{Nothing,T}}    # by symbol position; `nothing` → ConversionError
 end
 
+"A resolving enum remap decoded directly to `String` or `Symbol`."
+struct EnumRemapTarget{T} <: TypedPlan
+    plan::EnumRemapPlan
+end
+
+"A resolving enum remap decoded to a `Base.Enum` by reader symbol."
+struct EnumRemapNativeTarget{T} <: TypedPlan
+    plan::EnumRemapPlan
+    members::Vector{Union{Nothing,T}}
+end
+
 struct ArrayTarget{E,P<:TypedPlan} <: TypedPlan
     items::P
     minsize::Int
@@ -318,7 +329,8 @@ wrapped or per-writer-branch target; resolved records decode writer-ordered step
 fields with reader-only defaults materialised once at plan time. Returns `nothing` when ineligible.
 """
 function buildresolvedtyped(::Type{T}, s::Schema, p::ReadPlan, memo::TypedMemo) where {T}
-    p isa Union{PromotePlan,EnumRemapPlan} && return buildleaftarget(T, p)
+    p isa PromotePlan && return buildleaftarget(T, p)
+    p isa EnumRemapPlan && return buildenumremaptarget(T, p)
     if p isa WrapPlan && p.nullable != 0 && s isa UnionSchema
         N, inner = T isa Union ? splitoptional(T) : (Union{}, T)
         inner === nothing && return nothing
@@ -350,6 +362,19 @@ function buildresolvedtyped(::Type{T}, s::Schema, p::ReadPlan, memo::TypedMemo) 
     end
     p isa ResolvedRecordPlan && s isa RecordSchema && return buildresolvedrecord(T, s, p, memo)
     return nothing
+end
+
+function buildenumremaptarget(::Type{T}, p::EnumRemapPlan) where {T}
+    T === String && return EnumRemapTarget{String}(p)
+    T === Symbol && return EnumRemapTarget{Symbol}(p)
+    T <: Base.Enum || return nothing
+    members = Vector{Union{Nothing,T}}(nothing, length(p.reader.symbols))
+    for e in instances(T)
+        name = avrosymbol(T, e)
+        haskey(p.reader.symbolindex, name) || continue
+        members[p.reader.symbolindex[name]] = e
+    end
+    return EnumRemapNativeTarget{T}(p, members)
 end
 
 "A non-union null writer resolved to the target's nullable convention."
@@ -589,6 +614,22 @@ function typedvalue(p::EnumTarget{T}, d::Decoder, names) where {T}
     i = readindex(d, length(syms))
     m = p.members[i]
     m === nothing && throw(ConversionError("enum symbol \"$(syms[i])\" of $(fullname(p.plan.schema)) has no $T member"))
+    return m
+end
+
+function typedvalue(p::EnumRemapTarget{String}, d::Decoder, names)
+    return p.plan.reader.symbols[enumremapindex(p.plan, d)]
+end
+
+function typedvalue(p::EnumRemapTarget{Symbol}, d::Decoder, names)
+    sym = p.plan.reader.symbols[enumremapindex(p.plan, d)]
+    return admit!(names, sym; budget=d.budget)
+end
+
+function typedvalue(p::EnumRemapNativeTarget{T}, d::Decoder, names) where {T}
+    i = enumremapindex(p.plan, d)
+    m = p.members[i]
+    m === nothing && throw(ConversionError("enum symbol \"$(p.plan.reader.symbols[i])\" of $(fullname(p.plan.reader)) has no $T member"))
     return m
 end
 
