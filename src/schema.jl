@@ -1251,9 +1251,17 @@ function finalizepublic!(s::Schema, limits::Limits, nodes::Int, named::Int)
             fillonce!(m.id, Int32(i - 1))
             fillonce!(m.graph, info)
         end
+        checkpublicprint!(s, limits, budget)
         computehashes!(s, metas)
         return s
     end
+end
+
+"Charge and bound the exact schema text retained properties and defaults will produce."
+function checkpublicprint!(s::Schema, limits::Limits, budget::Budget)
+    writer = BoundedWriter(budget, limits.max_schema_bytes)
+    printschema(writer, s, "", FrozenDict{String,Bool}(), false, 0)
+    return nothing
 end
 
 function checkgraphnamebytes(name::AbstractString, limits::Limits)
