@@ -51,7 +51,7 @@ const DEFAULT_ADMISSION = SymbolAdmission()
 
 Base.length(a::SymbolAdmission) = lock(() -> a.count, a.lock)
 
-function contains_unlocked(a::SymbolAdmission, s::String)
+function contains_unlocked(a::SymbolAdmission, s::AbstractString)
     for r in a.recent
         r == s && return true
     end
@@ -134,29 +134,32 @@ end
 Admit `s` (if new, counting it against the table's budgets) and return `Symbol(s)`.
 """
 function admit!(a::SymbolAdmission, s::AbstractString; budget::Union{Nothing,Budget}=nothing)
-    str = String(s)
+    nbytes0 = sizeof(s)                                # charged before any copy is made (round-2 D10)
     lock(a.lock) do
         if budget !== nothing                          # charge the state that this locked lookup will search (§4.4, R07)
-            addcompare!(budget, checked_mul(max(sizeof(str), 1), length(a.recent) + 34 * (length(a.runs) + 1)))
+            addcompare!(budget, checked_mul(max(nbytes0, 1), length(a.recent) + 34 * (length(a.runs) + 1)))
             a.merge === nothing || addcompare!(budget, 8 * MERGE_STEP)
         end
-        step_unlocked!(a)                 # maintenance first: a failure below leaves the table unchanged
-        contains_unlocked(a, str) && return nothing
-        ncount = a.count + 1
+        if contains_unlocked(a, s)
+            step_unlocked!(a)                          # a successful repeat admission still advances maintenance
+            return nothing
+        end
+        ncount = a.count + 1                           # every admission check precedes any mutation —
         ncount <= a.max_names || throw(LimitError(:max_names, ncount, a.max_names, :max_names, :decode))
-        nbytes = checked_add(a.bytes, sizeof(str) + 8)
+        nbytes = checked_add(a.bytes, nbytes0 + 8)     # a rejected admission advances no maintenance
         nbytes <= a.max_bytes || throw(LimitError(:max_bytes, nbytes, a.max_bytes, :max_bytes, :decode))
         if length(a.recent) + 1 == RUN_BASE
             need = checked_add(nbytes, carrymergescratch(a))
             need <= a.max_bytes || throw(LimitError(:max_bytes, need, a.max_bytes, :max_bytes, :decode))
         end
-        push!(a.recent, str)
+        step_unlocked!(a)                              # maintenance advances only for accepted admissions
+        push!(a.recent, String(s))
         a.count = ncount
         a.bytes = nbytes
         carry_unlocked!(a)
         return nothing
     end
-    return Symbol(str)
+    return Symbol(s)
 end
 
 function admit!(::Symbol, s::AbstractString; budget::Union{Nothing,Budget}=nothing)

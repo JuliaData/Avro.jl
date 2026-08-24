@@ -403,30 +403,37 @@ function decodeblocks!(r::Reader, plan, sel::Union{Nothing,Vector{Int}}, finals:
         return stats
     end
     fail = FailBox(typemax(Int))
-    poolstate = checked_add(poolstate, STORAGE[].vector + 8 * nblocks)   # jobs vector rides the wave charge
+    poolstate = checked_add(poolstate, STORAGE[].vector + 8 * nblocks)   # the jobs vector is pool state
+    reserve!(b, poolstate)                             # the pool is charged once, before it exists, for
+    poolalive = true                                   # its whole lifetime (§4.4 (d), round-2 D05)
     jobs = Vector{Union{Nothing,BlockJob}}(nothing, nblocks)
     ch = Channel{BlockJob}(nblocks)
     workers = Task[Threads.@spawn workerloop(ch, r, plan, sel, fail, slotrow) for _ in 1:nworkers]
     foreach(errormonitor, workers)
+    retirepool! = function ()                          # the barrier drains every wave, so in-flight is
+        poolalive || return nothing                    # always zero here: the pool can retire without
+        close(ch)                                      # reordering commits, and the sequential tail runs
+        for t in workers                               # with the pool's memory genuinely released
+            wait(t)
+        end
+        release!(b, poolstate)
+        poolalive = false
+        return nothing
+    end
     inflight = 0
-    wavecharged = false                                # the settled 16 KiB per-worker state, charged per
-    next = 1                                           # admission wave and released at drain, so the
-    tocommit = 1                                       # sequential-tail arithmetic stays identical (R06)
+    next = 1
+    tocommit = 1
     try
         while tocommit <= nblocks
             head = entries[next]
             headidx = next
             next += 1
             Whead = blockworstcase(r.limits, head, cols)
-            while next <= nblocks && inflight < inflightcap
+            poolalive && checked_add(b.reserved, Whead) > b.ceiling && retirepool!()   # never crowd the head
+            while poolalive && next <= nblocks && inflight < inflightcap
                 e2 = entries[next]
                 Wi = blockworstcase(r.limits, e2, cols)
-                need = wavecharged ? Wi : checked_add(Wi, poolstate)
-                checked_add(checked_add(b.reserved, Whead), need) <= b.ceiling || break
-                if !wavecharged
-                    reserve!(b, poolstate)
-                    wavecharged = true
-                end
+                checked_add(checked_add(b.reserved, Whead), Wi) <= b.ceiling || break
                 reserve!(b, Wi)
                 job = BlockJob(e2, Wi, blockbudget(r.limits, Wi), Threads.Event(), nothing, 0, nothing, :pending)
                 jobs[next] = job
@@ -460,10 +467,6 @@ function decodeblocks!(r::Reader, plan, sel::Union{Nothing,Vector{Int}}, finals:
                 end
                 tocommit += 1
             end
-            if inflight == 0 && wavecharged
-                release!(b, poolstate)
-                wavecharged = false
-            end
             next = tocommit
         end
         pre.pending === nothing || throw(pre.pending)
@@ -473,9 +476,11 @@ function decodeblocks!(r::Reader, plan, sel::Union{Nothing,Vector{Int}}, finals:
         recordfailure!(fail, nblocks + 1)                              # abandon everything still queued
         rethrow()
     finally
-        close(ch)
-        for t in workers
-            wait(t)
+        if poolalive
+            close(ch)
+            for t in workers
+                wait(t)
+            end
         end
         for job in jobs                                                # uncommitted reservations
             job === nothing && continue
@@ -484,6 +489,9 @@ function decodeblocks!(r::Reader, plan, sel::Union{Nothing,Vector{Int}}, finals:
             release!(b, job.W)
             close!(job.budget)
         end
-        wavecharged && release!(b, poolstate)
+        if poolalive
+            release!(b, poolstate)
+            poolalive = false
+        end
     end
 end

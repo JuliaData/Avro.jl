@@ -150,4 +150,27 @@
     @test raceerror isa Avro.LimitError && raceerror.limit === :max_compare_bytes_per_byte
     @test length(raced) == 1000
     Avro.close!(racebudget)
+
+    # a rejected admission advances no maintenance state (round-2 D10)
+    tr = Avro.SymbolAdmission(max_names=Avro.RUN_BASE * 4, max_bytes=1 << 24)
+    for i in 1:(2 * Avro.RUN_BASE + 100)              # leave a merge in progress
+        Avro.admit!(tr, "t$(lpad(i, 6, '0'))")
+    end
+    full = Avro.SymbolAdmission(max_names=1, max_bytes=1 << 20)
+    Avro.admit!(full, "only")
+    mstate(x) = (x.merge === nothing ? (0, 0) : (x.merge.i, x.merge.j), length(x.recent), length(x.runs), x.count, x.bytes)
+    before = mstate(tr)
+    @test_throws Avro.LimitError Avro.admit!(full, "rejected")       # rejected on its own table
+    @test mstate(tr) == before                                        # unrelated table untouched (sanity)
+    beforefull = mstate(full)
+    @test_throws Avro.LimitError Avro.admit!(full, "rejected2")
+    @test mstate(full) == beforefull                                  # the rejected admission mutated nothing
+    tb = mstate(tr)
+    e = try
+        Avro.admit!(tr, "x"^(1 << 25))                                # over max_bytes with a live merge
+        nothing
+    catch err
+        err
+    end
+    @test e isa Avro.LimitError && mstate(tr) == tb                   # merge state, runs and counters unchanged
 end

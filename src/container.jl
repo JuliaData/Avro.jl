@@ -98,8 +98,12 @@ function readheader(s::BlockSource, limits::Limits, budget::Budget; legacy, allo
     for m in MAGIC
         (sourceeof(s) || sourcebyte(s) != m) && throw(DataError("not an Avro object container file (bad magic)", position(s)))
     end
+    keycap = 8
+    reserve!(budget, 2 * STORAGE[].vector + 16 * keycap)   # charged exact-replacement growth (§4.4, round-2 D04)
     keys = String[]
     vals = Vector{UInt8}[]
+    sizehint!(keys, keycap)
+    sizehint!(vals, keycap)
     total = 0
     while true
         count = sourcevarint(s)
@@ -140,6 +144,14 @@ function readheader(s::BlockSource, limits::Limits, budget::Budget; legacy, allo
                 reserve!(budget, bytesbytes(Int(vlen)))             # a byte-source view is copied, reserved first
                 Vector{UInt8}(vpayload)
             end
+            if length(keys) == keycap
+                newcap = 2 * keycap
+                reserve!(budget, 2 * STORAGE[].vector + 16 * newcap)
+                release!(budget, 2 * STORAGE[].vector + 16 * keycap)
+                keycap = newcap
+                sizehint!(keys, keycap)
+                sizehint!(vals, keycap)
+            end
             push!(keys, key)
             push!(vals, value)
         end
@@ -149,6 +161,12 @@ function readheader(s::BlockSource, limits::Limits, budget::Budget; legacy, allo
         end
     end
     addinput!(budget, total)
+    if keycap != length(keys)                              # compact to exact capacity: retained is 16 per entry
+        reserve!(budget, 2 * STORAGE[].vector + 16 * length(keys))
+        keys = Vector{String}(keys)
+        vals = Vector{Vector{UInt8}}(vals)
+        release!(budget, 2 * STORAGE[].vector + 16 * keycap)
+    end
     metadata = buildmap(Vector{UInt8}, keys, vals, budget; duplicateposition=position(s))
     sync = ntuple(_ -> sourcebyte(s), 16)
     schemabytes = get(metadata, "avro.schema", nothing)
@@ -669,18 +687,22 @@ function Writer(dst::Union{AbstractString,IO}, schema::Schema; codec::Symbol=:nu
         budget.input_bytes = input0
         budget.allowance_used = allowance0
         budget.workcap = workcap0
-        entries = Tuple{String,Vector{UInt8}}[]
+        nentries = 2 + length(metadata)
+        nentries <= limits.max_metadata_entries || throw(LimitError(:max_metadata_entries, nentries, limits.max_metadata_entries, :max_metadata_entries, :encode))
+        reserve!(budget, STORAGE[].vector + 16 * nentries)        # the entries vector at exact capacity (§4.4 growth rule)
+        entries = Vector{Tuple{String,Vector{UInt8}}}(undef, nentries)
         reserve!(budget, stringbytes(11) + bytesbytes(sizeof(schemajson)))
-        push!(entries, ("avro.schema", Vector{UInt8}(codeunits(schemajson))))
+        entries[1] = ("avro.schema", Vector{UInt8}(codeunits(schemajson)))
         reserve!(budget, stringbytes(10) + bytesbytes(sizeof(String(codec))))
-        push!(entries, ("avro.codec", Vector{UInt8}(codeunits(String(codec)))))
+        entries[2] = ("avro.codec", Vector{UInt8}(codeunits(String(codec))))
+        i = 2
         for (k, v) in metadata
             startswith(k, "avro.") && throw(ArgumentError("metadata keys in the avro.* namespace are reserved (got \"$k\"); avro.schema and avro.codec come from the constructor"))
             isstrictutf8(k) || throw(ArgumentError("metadata keys must be valid UTF-8"))
             reserve!(budget, stringbytes(sizeof(k)) + bytesbytes(length(v)))   # each retained copy, before it is made
-            push!(entries, (String(k), Vector{UInt8}(v)))
+            i += 1
+            entries[i] = (String(k), Vector{UInt8}(v))
         end
-        length(entries) <= limits.max_metadata_entries || throw(LimitError(:max_metadata_entries, length(entries), limits.max_metadata_entries, :max_metadata_entries, :encode))
         total = sum(e -> sizeof(e[1]) + length(e[2]), entries; init=0)
         total <= limits.max_metadata_bytes || throw(LimitError(:max_metadata_bytes, total, limits.max_metadata_bytes, :max_metadata_bytes, :encode))
         for _ in entries
@@ -694,12 +716,13 @@ function Writer(dst::Union{AbstractString,IO}, schema::Schema; codec::Symbol=:nu
         base0 = budget.reserved
         pfschema = parseschema(schemajson; allow_invalid_names=allow_invalid_names, allow_invalid_defaults=allow_invalid_defaults,
                                limits=limits, budget=budget)
-        pfkeys = String[]
-        pfvals = Vector{UInt8}[]
-        for (k, v) in entries
+        reserve!(budget, 2 * STORAGE[].vector + 16 * length(entries))   # the mirror key/value vectors, exact capacity
+        pfkeys = Vector{String}(undef, length(entries))
+        pfvals = Vector{Vector{UInt8}}(undef, length(entries))
+        for (j, (k, v)) in enumerate(entries)
             reserve!(budget, checked_add(stringbytes(sizeof(k)), bytesbytes(length(v))))  # the retained metadata entry (byte and stream readers now charge identically)
-            push!(pfkeys, k)
-            push!(pfvals, v)
+            pfkeys[j] = k
+            pfvals[j] = v
         end
         buildmap(Vector{UInt8}, pfkeys, pfvals, budget)
         withplanbudget(budget) do
