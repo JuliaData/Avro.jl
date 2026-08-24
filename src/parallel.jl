@@ -15,6 +15,29 @@ struct BlockEntry
     rowstart::Int        # 1-based row offset of the block's first datum
 end
 
+"A logical view of an exact-capacity block-table allocation."
+struct BlockTable <: AbstractVector{BlockEntry}
+    storage::Vector{BlockEntry}
+    count::Int
+end
+
+function Base.size(table::BlockTable)
+    return (table.count,)
+end
+
+function Base.IndexStyle(::Type{BlockTable})
+    return IndexLinear()
+end
+
+function Base.getindex(table::BlockTable, i::Int)
+    @boundscheck checkbounds(table, i)
+    return @inbounds table.storage[i]
+end
+
+function capacity(table::BlockTable)
+    return capacity(table.storage)
+end
+
 "Per-block worst-case scratch-and-state allowance of `W` (plan §4.9; job peaks are gated against `W`)."
 const SCRATCH_STATE_MAX = 8 * MiB
 
@@ -22,7 +45,7 @@ const SCRATCH_STATE_MAX = 8 * MiB
 const WORKER_STATE = 16 * 1024
 
 struct PrescanResult
-    entries::Vector{BlockEntry}
+    entries::BlockTable
     totalrows::Int
     pending::Union{Nothing,Exception}   # a stage-1 structural failure, pending at index nblocks + 1
 end
@@ -77,8 +100,7 @@ function prescanblocks(r::Reader)
         pending = e
     end
     src.pos = startpos
-    resize!(entries, nentries)
-    return PrescanResult(entries, rows, pending)
+    return PrescanResult(BlockTable(entries, nentries), rows, pending)
 end
 
 """

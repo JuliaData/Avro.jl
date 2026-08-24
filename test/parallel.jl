@@ -25,9 +25,8 @@
         baseline = reader.budget.reserved
         pre = Avro.prescanblocks(reader)
         @test length(pre.entries) == 65
-        @static if VERSION >= v"1.11"
-            @test Avro.capacity(pre.entries) == 128
-        end
+        @test Avro.capacity(pre.entries) == 128
+        @test length(getfield(pre.entries, :storage)) == 128
         @test reader.budget.reserved - baseline == Avro.blocktablecharge(128)
         Avro.release!(reader.budget, Avro.blocktablecharge(128))
         close(reader)
