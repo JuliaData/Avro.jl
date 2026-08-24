@@ -131,11 +131,11 @@ function buildreadplan(s::EnumSchema, memo, budget)
 end
 
 function buildreadplan(s::ArraySchema, memo, budget)
-    return ArrayPlan(readplan(s.items, memo, budget), elementtype(s.items), minsize(s.items))
+    return ArrayPlan(readplan(s.items, memo, budget), elementtype(s.items), budget === nothing ? minsize(s.items) : minsize(s.items, budget))
 end
 
 function buildreadplan(s::MapSchema, memo, budget)
-    return MapPlan(readplan(s.values, memo, budget), elementtype(s.values), minsize(s.values))
+    return MapPlan(readplan(s.values, memo, budget), elementtype(s.values), budget === nothing ? minsize(s.values) : minsize(s.values, budget))
 end
 
 function buildreadplan(s::UnionSchema, memo, budget)

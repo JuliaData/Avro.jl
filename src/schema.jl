@@ -1179,6 +1179,12 @@ function schemaseen(s::Schema, budget::Budget)
     return seen
 end
 
+"Release a printer's dead seen table in exact order: its print has finished (round-3 item 1)."
+function releaseseen!(budget::Budget, seen::Vector{Bool})
+    release!(budget, vectorbytes(Bool, length(seen)))
+    return nothing
+end
+
 "Write a named schema's escaped fullname without constructing a joined String."
 function escapefullname(io::IO, s::NamedSchema)
     print(io, '"')
@@ -1215,7 +1221,9 @@ verbatim, strings re-escaped), and defaults by their exact source text.
 function json(s::Schema; pretty::Bool=false, limits::Limits=graphlimits(s))
     return withbudget(limits) do budget
         w = BoundedWriter(budget, limits.max_schema_bytes)
-        printschema(w, s, "", schemaseen(s, budget), pretty, 0)
+        seen = schemaseen(s, budget)
+        printschema(w, s, "", seen, pretty, 0)
+        releaseseen!(budget, seen)
         return boundedtake!(w)
     end
 end
@@ -1653,7 +1661,9 @@ end
 "Charge and bound the exact schema text retained properties and defaults will produce."
 function checkpublicprint!(s::Schema, limits::Limits, budget::Budget)
     writer = BoundedWriter(budget, limits.max_schema_bytes)
-    printschema(writer, s, "", schemaseen(s, budget), false, 0)
+    seen = schemaseen(s, budget)
+    printschema(writer, s, "", seen, false, 0)
+    releaseseen!(budget, seen)
     return nothing
 end
 
@@ -2023,6 +2033,18 @@ function minsize(s::Schema)
     memo = Vector{Int}(undef, graphinfo(s).nodes)
     fill!(memo, -1)
     return minsize(s, memo, falses(length(memo)))
+end
+
+"The budgeted form plan construction uses: the transient memo and active set are charged and released."
+function minsize(s::Schema, budget::Budget)
+    n = graphinfo(s).nodes
+    scratch = vectorbytes(Int, n) + vectorbytes(UInt64, cld(n, 64)) + 32   # the memo, BitVector chunks and shell
+    charge!(budget, scratch)
+    memo = Vector{Int}(undef, n)
+    fill!(memo, -1)
+    r = minsize(s, memo, falses(n))
+    release!(budget, scratch)                          # construction-only scratch dies here (round-3 item 3)
+    return r
 end
 
 const INFINITE = typemax(Int)

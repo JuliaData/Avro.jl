@@ -223,11 +223,11 @@ function resolvekinds(ctx::ResolveContext, w::Schema, r::Schema, wp::String, rp:
     end
     if r isa ArraySchema
         w isa ArraySchema || reserror("writer $(describe(w)) does not resolve to reader array", wp, rp)
-        return ArrayPlan(resolvenode(ctx, w.items, r.items, wp * "[items]", rp * "[items]"), elementtype(r.items), minsize(w.items))
+        return ArrayPlan(resolvenode(ctx, w.items, r.items, wp * "[items]", rp * "[items]"), elementtype(r.items), minsize(w.items, ctx.budget))
     end
     if r isa MapSchema
         w isa MapSchema || reserror("writer $(describe(w)) does not resolve to reader map", wp, rp)
-        return MapPlan(resolvenode(ctx, w.values, r.values, wp * "[values]", rp * "[values]"), elementtype(r.values), minsize(w.values))
+        return MapPlan(resolvenode(ctx, w.values, r.values, wp * "[values]", rp * "[values]"), elementtype(r.values), minsize(w.values, ctx.budget))
     end
     return resolveleaf(ctx, w, r, wp, rp)
 end

@@ -813,7 +813,9 @@ function writerheaderentries(schema::Schema, codec::Symbol, metadata, limits::Li
     allowance0 = budget.allowance_used
     workcap0 = budget.workcap
     jw = BoundedWriter(budget, limits.max_schema_bytes)       # the schema JSON is produced charged and bounded
-    printschema(jw, schema, "", schemaseen(schema, budget), false, 0)
+    seen = schemaseen(schema, budget)
+    printschema(jw, schema, "", seen, false, 0)
+    releaseseen!(budget, seen)
     schemajson = boundedtake!(jw)
     # Printing is bounded in this operation, but the container counters must start with the exact
     # header work that its Reader performs. Keep all printer reservations and rebase only work.

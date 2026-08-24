@@ -12,7 +12,9 @@ function canonical(s::Schema; limits::Limits=graphlimits(s))
     graphinfo(s).repaired_names && throw(ArgumentError("a schema with repaired invalid names has no Parsing Canonical Form"))
     return withbudget(limits) do budget
         w = BoundedWriter(budget, limits.max_schema_bytes)
-        canonicalprint(w, s, schemaseen(s, budget))
+        seen = schemaseen(s, budget)
+        canonicalprint(w, s, seen)
+        releaseseen!(budget, seen)
         return boundedtake!(w)
     end
 end
@@ -137,7 +139,9 @@ function fingerprint(s::Schema; algorithm::Symbol=:crc64avro, limits::Limits=gra
         throw(ArgumentError("unknown fingerprint algorithm :$algorithm (use :crc64avro, :md5 or :sha256)"))
     return withbudget(limits) do budget                # one operation: print and hash in the same scope (D02)
         w = BoundedWriter(budget, limits.max_schema_bytes)
-        canonicalprint(w, s, schemaseen(s, budget))
+        seen = schemaseen(s, budget)
+        canonicalprint(w, s, seen)
+        releaseseen!(budget, seen)                     # the seen table dies before hashing (round-3 item 1)
         pcf = boundedview(w)
         algorithm === :crc64avro && return crc64avro(pcf)
         return hashfingerprint(pcf, algorithm, budget)
@@ -155,9 +159,13 @@ function parsingequivalent(a::Schema, b::Schema; limits::Limits=Limits())
     end
     return withbudget(limits) do budget                # one operation for both canonical forms (D02)
         wa = BoundedWriter(budget, limits.max_schema_bytes)
-        canonicalprint(wa, a, schemaseen(a, budget))
+        seena = schemaseen(a, budget)
+        canonicalprint(wa, a, seena)
+        releaseseen!(budget, seena)                    # dead before the second print (round-3 item 1)
         wb = BoundedWriter(budget, limits.max_schema_bytes)
-        canonicalprint(wb, b, schemaseen(b, budget))
+        seenb = schemaseen(b, budget)
+        canonicalprint(wb, b, seenb)
+        releaseseen!(budget, seenb)
         return boundedview(wa) == boundedview(wb)
     end
 end
