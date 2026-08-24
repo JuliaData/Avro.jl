@@ -13,7 +13,7 @@ function canonical(s::Schema; limits::Limits=graphlimits(s))
     return withbudget(limits) do budget
         w = BoundedWriter(budget, limits.max_schema_bytes)
         canonicalprint(w, s, FrozenDict{String,Bool}())
-        return String(take!(w.io))
+        return boundedtake!(w)
     end
 end
 
@@ -42,8 +42,8 @@ function canonicalprint(io::IO, s::Schema, seen::FrozenDict{String,Bool})
             countnode!(io)
             return nothing
         end
-        seen[full] = true
         chargeseen!(io, 32 + sizeof(full))
+        seen[full] = true
         print(io, "{\"name\":")
         escapejson(io, full)
         if s isa FixedSchema
@@ -110,11 +110,17 @@ crc64avro(s::AbstractString) = crc64avro(codeunits(s))
 A fingerprint of the Parsing Canonical Form: `:crc64avro` (`UInt64`), `:md5` or `:sha256` (bytes).
 """
 function fingerprint(s::Schema; algorithm::Symbol=:crc64avro, limits::Limits=graphlimits(s))
-    pcf = canonical(s; limits=limits)
-    algorithm === :crc64avro && return crc64avro(pcf)
-    algorithm === :md5 && return MD5.md5(pcf)
-    algorithm === :sha256 && return SHA.sha256(pcf)
-    throw(ArgumentError("unknown fingerprint algorithm :$algorithm (use :crc64avro, :md5 or :sha256)"))
+    graphinfo(s).repaired_names && throw(ArgumentError("a schema with repaired invalid names has no Parsing Canonical Form"))
+    algorithm in (:crc64avro, :md5, :sha256) ||
+        throw(ArgumentError("unknown fingerprint algorithm :$algorithm (use :crc64avro, :md5 or :sha256)"))
+    return withbudget(limits) do budget                # one operation: print and hash in the same scope (D02)
+        w = BoundedWriter(budget, limits.max_schema_bytes)
+        canonicalprint(w, s, FrozenDict{String,Bool}())
+        pcf = boundedview(w)
+        algorithm === :crc64avro && return crc64avro(pcf)
+        algorithm === :md5 && return MD5.md5(pcf)
+        return SHA.sha256(pcf)
+    end
 end
 
 """
@@ -122,4 +128,15 @@ end
 
 `true` when the two schemas have the same Parsing Canonical Form.
 """
-parsingequivalent(a::Schema, b::Schema; limits::Limits=Limits()) = canonical(a; limits=limits) == canonical(b; limits=limits)
+function parsingequivalent(a::Schema, b::Schema; limits::Limits=Limits())
+    for s in (a, b)
+        graphinfo(s).repaired_names && throw(ArgumentError("a schema with repaired invalid names has no Parsing Canonical Form"))
+    end
+    return withbudget(limits) do budget                # one operation for both canonical forms (D02)
+        wa = BoundedWriter(budget, limits.max_schema_bytes)
+        canonicalprint(wa, a, FrozenDict{String,Bool}())
+        wb = BoundedWriter(budget, limits.max_schema_bytes)
+        canonicalprint(wb, b, FrozenDict{String,Bool}())
+        return boundedview(wa) == boundedview(wb)
+    end
+end

@@ -99,7 +99,7 @@ The conventional schema of a Julia type (plan §4.8): `Missing`/`Nothing → nul
 be a valid Avro name (no transliteration); `name=`/`namespace=` override the root.
 """
 function schema(::Type{T}; name=nothing, namespace=nothing, limits::Limits=Limits()) where {T}
-    return withbudget(limits; direction=:encode) do budget
+    return withconstruction(limits; direction=:encode) do budget   # finalize and defaults share this scope (D01)
         ctx = DeriveContext(limits, budget, FrozenDict{String,Schema}(), FrozenDict{String,Type}(), Ref(0))
         s = withbuilder(() -> derive(ctx, T, name === nothing ? nothing : String(name), namespace === nothing ? nothing : String(namespace)))
         finalizepublic!(s, limits, 0, 0)
@@ -279,14 +279,14 @@ function derivestruct(ctx::DeriveContext, ::Type{T}, name, namespace) where {T}
         d = nodefault
         tagdefault = fieldtag(tags, fname, :default)
         if tagdefault !== nothing
-            j = tojsonvalue(tagdefault)
+            j = tojsonvalue(tagdefault, ctx.budget)
             ok, branch = validatedefault(fs, j, ctx.limits.max_depth)
             ok || throw(ArgumentError("the `avro=(default=…,)` tag of $T.$fname is not a valid default for its schema"))
             d = DefaultValue(j, branch, sprint(printjson, j, false, 0), 0, true)
         elseif haskey(defaults, fname)
             dv = defaults[fname]
             j = try
-                tojsonvalue(dv === missing ? nothing : dv)
+                tojsonvalue(dv === missing ? nothing : dv, ctx.budget)
             catch
                 throw(ArgumentError("the default of $T.$fname is not JSON-encodable under its schema; supply one with the `&(avro=(default=…,),)` tag"))
             end
@@ -308,7 +308,7 @@ end
 A record schema from a `Tables.Schema` (column names and types); `names` renames columns.
 """
 function schema(ts::Tables.Schema; name::AbstractString="Record", namespace::AbstractString="", names=Dict{Symbol,String}(), limits::Limits=Limits())
-    return withbudget(limits; direction=:encode) do budget
+    return withconstruction(limits; direction=:encode) do budget   # finalize and defaults share this scope (D01)
         ctx = DeriveContext(limits, budget, FrozenDict{String,Schema}(), FrozenDict{String,Type}(), Ref(1))
         s = withbuilder() do
             full = FullName(checkderivedname(name, "name \"$name\"", "Tables.Schema", "pass a valid `name=`"), checkderivednamespace(namespace, "Tables.Schema"))

@@ -98,14 +98,15 @@ writer field), reader-only fields from valid defaults, enum symbols by name with
 unions under `union_resolution=:spec` (first reader branch matching with promotion) or `:java`
 (exact match first). Values follow the reader schema. Bounded by `max_resolution_work`.
 """
-function resolve(writer::Schema, reader::Schema; union_resolution::Symbol=:spec, limits::Limits=Limits())
+function resolve(writer::Schema, reader::Schema; union_resolution::Symbol=:spec, limits::Limits=Limits(),
+                 budget::Union{Nothing,Budget}=nothing)
     union_resolution in (:spec, :java) || throw(ArgumentError("union_resolution must be :spec or :java"))
-    plan = withbudget(limits) do budget
-        ctx = ResolveContext(budget, union_resolution, Vector{Int32}[], Vector{ReadPlan}[],
-                             Vector{Union{Nothing,ReadPlan}}(nothing, graphinfo(reader).nodes),
-                             Vector{Union{Nothing,ReadPlan}}(nothing, graphinfo(writer).nodes))
-        resolvenode(ctx, writer, reader, "\$", "\$")
-    end
+    budget === nothing &&
+        return withbudget(b -> resolve(writer, reader; union_resolution=union_resolution, limits=limits, budget=b), limits)
+    ctx = ResolveContext(budget, union_resolution, Vector{Int32}[], Vector{ReadPlan}[],
+                         Vector{Union{Nothing,ReadPlan}}(nothing, graphinfo(reader).nodes),
+                         Vector{Union{Nothing,ReadPlan}}(nothing, graphinfo(writer).nodes))
+    plan = resolvenode(ctx, writer, reader, "\$", "\$")
     return ResolvedSchema(writer, reader, union_resolution, plan)
 end
 
@@ -114,8 +115,10 @@ end
 
 The read plan decoding data written with `writer` into values of `reader`.
 """
-resolvingplan(writer::Schema, reader::Schema; union_resolution::Symbol=:spec, limits::Limits=Limits()) =
-    resolve(writer, reader; union_resolution=union_resolution, limits=limits).plan
+function resolvingplan(writer::Schema, reader::Schema; union_resolution::Symbol=:spec, limits::Limits=Limits(),
+                       budget::Union{Nothing,Budget}=nothing)
+    return resolve(writer, reader; union_resolution=union_resolution, limits=limits, budget=budget).plan
+end
 
 reserror(msg::AbstractString, wp::AbstractString, rp::AbstractString) = throw(ResolutionError(String(msg), String(wp), String(rp)))
 

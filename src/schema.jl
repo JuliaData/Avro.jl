@@ -890,42 +890,61 @@ work-rule input, growth is reserved in chunks before it is written, and the text
 schema always succeeds; callers may pass stricter ones.
 """
 mutable struct BoundedWriter <: IO
-    const io::IOBuffer
+    buf::Vector{UInt8}      # a package-owned charged buffer grown by reserved exact replacement (D02)
+    len::Int
     const budget::Budget
     const maxbytes::Int
-    written::Int
-    charged::Int
 end
 
 function BoundedWriter(budget::Budget, maxbytes::Int)
-    return BoundedWriter(IOBuffer(), budget, maxbytes, 0, 0)
+    cap = min(256, max(maxbytes, 1))
+    reserve!(budget, bytesbytes(cap))
+    return BoundedWriter(Vector{UInt8}(undef, cap), 0, budget, maxbytes)
 end
 
-const PRINT_CHUNK = 4096
-
 function boundedgrow!(w::BoundedWriter, n::Int)
-    written = checked_add(w.written, n)
+    written = checked_add(w.len, n)
     written <= w.maxbytes ||
         throw(LimitError(:max_schema_bytes, written, w.maxbytes, :max_schema_bytes, :encode))
-    if written > w.charged
-        step = max(PRINT_CHUNK, written - w.charged)
-        reserve!(w.budget, step)
-        w.charged = checked_add(w.charged, step)
+    cap = length(w.buf)
+    if written > cap
+        newcap = max(2 * cap, written)
+        reserve!(w.budget, bytesbytes(newcap))         # reserved exact-capacity replacement (§4.4)
+        nb = Vector{UInt8}(undef, newcap)
+        copyto!(nb, 1, w.buf, 1, w.len)
+        release!(w.budget, bytesbytes(cap))
+        w.buf = nb
     end
-    w.written = written
     addinput!(w.budget, n)                             # produced text, not reserved capacity, is the denominator
     return nothing
 end
 
 function Base.write(w::BoundedWriter, b::UInt8)
     boundedgrow!(w, 1)
-    return Base.write(w.io, b)
+    w.len += 1
+    @inbounds w.buf[w.len] = b
+    return 1
 end
 
 function Base.unsafe_write(w::BoundedWriter, p::Ptr{UInt8}, n::UInt)
     boundedgrow!(w, Int(n))
-    return Base.unsafe_write(w.io, p, n)
+    GC.@preserve w unsafe_copyto!(pointer(w.buf, w.len + 1), p, Int(n))
+    w.len += Int(n)
+    return n
 end
+
+"The finished text: charged as its String before the buffer's charge is released."
+function boundedtake!(w::BoundedWriter)
+    reserve!(w.budget, stringbytes(w.len))
+    out = unsafe_string(pointer(w.buf), w.len)
+    release!(w.budget, bytesbytes(length(w.buf)))
+    w.buf = UInt8[]
+    w.len = 0
+    return out
+end
+
+"The finished bytes without a String copy (single-object fingerprinting hashes these directly)."
+boundedview(w::BoundedWriter) = view(w.buf, 1:w.len)
 
 function chargeseen!(::IO, ::Int)
     return nothing
@@ -961,7 +980,7 @@ function json(s::Schema; pretty::Bool=false, limits::Limits=graphlimits(s))
     return withbudget(limits) do budget
         w = BoundedWriter(budget, limits.max_schema_bytes)
         printschema(w, s, "", FrozenDict{String,Bool}(), pretty, 0)
-        return String(take!(w.io))
+        return boundedtake!(w)
     end
 end
 
@@ -1201,6 +1220,12 @@ end
 # ---- public constructors ---------------------------------------------------------------------------
 
 function build(::Type{T}, propsin; logical=nothing, limits::Limits=Limits()) where {T<:PrimitiveSchema}
+    return withconstruction(limits) do _                # the budget opens before any copy (D01)
+        build_(T, propsin; logical=logical, limits=limits)
+    end
+end
+
+function build_(::Type{T}, propsin; logical=nothing, limits::Limits=Limits()) where {T<:PrimitiveSchema}
     haslogical = T === IntSchema || T === LongSchema || T === BytesSchema || T === StringSchema
     p = makeprops(propsin, ("type",), haslogical ? logical : nothing)
     meta = NodeMeta()
@@ -1213,16 +1238,19 @@ function build(::Type{T}, propsin; logical=nothing, limits::Limits=Limits()) whe
     return finalizepublic!(s, limits, 1, 0)
 end
 
-function makeprops(propsin, structural, logical)
+makeprops(propsin, structural, logical) = makeprops(propsin, structural, logical, constructionbudget())
+
+function makeprops(propsin, structural, logical, budget::Budget)
     p = Props()
     kvs = propsin isa NamedTuple ? (String(k) => v for (k, v) in pairs(propsin)) : propsin
     for (k, v) in kvs
         ks = String(k)
+        reserve!(budget, 32 + sizeof(ks))              # the retained key, before it is stored (D01)
         ks in structural && throw(ArgumentError("`props` key \"$ks\" collides with a structural attribute emitted by this constructor"))
         logical !== nothing && ks in ("logicalType", "precision", "scale") &&
             throw(ArgumentError("`props` key \"$ks\" is synthesised by `logical=`"))
         haskey(p, ks) && throw(ArgumentError("duplicate `props` key \"$ks\""))
-        p[ks] = tojsonvalue(v)
+        p[ks] = tojsonvalue(v, budget)
     end
     if logical !== nothing
         p["logicalType"] = logicalname(logical)
@@ -1234,25 +1262,27 @@ function makeprops(propsin, structural, logical)
     return freeze!(p)
 end
 
-tojsonvalue(x::Union{Nothing,Bool,Int64,String,JSONNumber,JSONArray,JSONObject}) = x
-tojsonvalue(x::Integer) = Int64(x)
-tojsonvalue(x::AbstractFloat) = isfinite(x) ? JSONNumber(repr(Float64(x))) : (isnan(x) ? "NaN" : (x > 0 ? "Infinity" : "-Infinity"))
-tojsonvalue(x::AbstractString) = String(x)
-tojsonvalue(x::Symbol) = String(x)
-function tojsonvalue(x::AbstractVector)
+tojsonvalue(x::Union{Nothing,Bool,Int64,String,JSONNumber,JSONArray,JSONObject}, ::Budget) = x
+tojsonvalue(x::Integer, ::Budget) = Int64(x)
+tojsonvalue(x::AbstractFloat, b::Budget) = isfinite(x) ? (reserve!(b, 32); JSONNumber(repr(Float64(x)))) : (isnan(x) ? "NaN" : (x > 0 ? "Infinity" : "-Infinity"))
+tojsonvalue(x::AbstractString, b::Budget) = (reserve!(b, stringbytes(sizeof(x))); String(x))
+tojsonvalue(x::Symbol, b::Budget) = (reserve!(b, stringbytes(sizeof(String(x)))); String(x))
+function tojsonvalue(x::AbstractVector, b::Budget)
+    reserve!(b, 48 + 16 * length(x))                   # the frozen array shell, before it is built (D01)
     v = FrozenVector{Any}()
     for e in x
-        push!(v, tojsonvalue(e))
+        push!(v, tojsonvalue(e, b))
     end
     return JSONArray(freeze!(v))
 end
-function tojsonvalue(x::Union{AbstractDict,NamedTuple})
+function tojsonvalue(x::Union{AbstractDict,NamedTuple}, b::Budget)
+    reserve!(b, 64 + 48 * length(x))                   # the frozen object shell, before it is built (D01)
     m = FrozenDict{String,Any}()
     order = FrozenVector{String}()
     for (k, v) in (x isa NamedTuple ? pairs(x) : x)
         ks = String(k)
         haskey(m, ks) && throw(ArgumentError("duplicate key \"$ks\""))
-        m[ks] = tojsonvalue(v)
+        m[ks] = tojsonvalue(v, b)
         push!(order, ks)
     end
     return JSONObject(freeze!(m), freeze!(order))
@@ -1264,6 +1294,31 @@ end
 # plus references.
 builderdepth() = get(task_local_storage(), :avro_builder_depth, 0)::Int
 importmemo() = get(task_local_storage(), :avro_import_memo, nothing)
+
+"""
+One construction budget per outermost public constructor call (plan §4.4, round-2 D01): the first
+public entry opens it and stores it task-locally; nested constructor calls — the builder form
+included — charge the same scope, so every copy a construction makes is reserved against one budget.
+"""
+function withconstruction(f, limits::Limits; direction::Symbol=:decode)
+    existing = get(task_local_storage(), :avro_construction_budget, nothing)
+    existing === nothing || return f(existing::Budget)
+    return withbudget(limits; direction=direction) do b
+        task_local_storage(:avro_construction_budget, b)
+        try
+            return f(b)
+        finally
+            task_local_storage(:avro_construction_budget, nothing)
+        end
+    end
+end
+
+"The open construction budget of the current public constructor call (an internal invariant)."
+function constructionbudget()
+    b = get(task_local_storage(), :avro_construction_budget, nothing)
+    b === nothing && throw(ArgumentError("internal error: no construction budget is open"))
+    return b::Budget
+end
 
 function withbuilder(f)
     outer = builderdepth() == 0
@@ -1286,7 +1341,7 @@ per-record fields, union branches, enum symbols, and name/alias bytes — so a c
 """
 function finalizepublic!(s::Schema, limits::Limits, nodes::Int, named::Int)
     builderdepth() > 0 && return s
-    return withbudget(limits) do budget
+    return withconstruction(limits) do budget
         metas = NodeMeta[]
         namedtypes = FrozenDict{String,Schema}()
         collectmetas!(s, metas, namedtypes, IdDict{NodeMeta,Nothing}(), limits, budget, 1)
@@ -1394,9 +1449,12 @@ function publicnamed(name::AbstractString, namespace::AbstractString, aliases, s
     isvalidnamespace(namespace) || throw(ArgumentError("invalid namespace \"$namespace\""))
     full = FullName(n, String(namespace))
     isreservedfullname(full) && throw(ArgumentError("\"$n\" is a primitive type name and cannot be redefined in the null namespace"))
+    b = constructionbudget()
+    reserve!(b, stringbytes(sizeof(n)) + stringbytes(sizeof(namespace)))   # the retained name copies (D01)
     raw = String[String(a) for a in aliases]
     norm = String[]
     for a in raw
+        reserve!(b, 2 * stringbytes(sizeof(a)) + 16)                       # raw and normalised alias copies
         na = normalizealias(a, full.namespace)
         (na == fullname(full) || na in norm) && continue
         push!(norm, na)
@@ -1408,63 +1466,73 @@ end
     Avro.FixedSchema(name, size; namespace="", logical=nothing, aliases=String[], props=(;), limits=Limits())
 """
 function FixedSchema(name::AbstractString, size::Integer; namespace::AbstractString="", logical=nothing, aliases=String[], props=(;), limits::Limits=Limits())
-    size >= 0 || throw(ArgumentError("fixed size must be ≥ 0"))
-    full, norm, raw, p = publicnamed(name, namespace, aliases, SCHEMA_GRAMMAR[:fixed], props, logical)
-    s = FixedSchema(full, norm, raw, Int(size), evaluatelogical(:fixed, Int(size), p), p, NodeMeta())
-    return finalizepublic!(s, limits, 1, 1)
+    return withconstruction(limits) do _
+        size >= 0 || throw(ArgumentError("fixed size must be ≥ 0"))
+        full, norm, raw, p = publicnamed(name, namespace, aliases, SCHEMA_GRAMMAR[:fixed], props, logical)
+        s = FixedSchema(full, norm, raw, Int(size), evaluatelogical(:fixed, Int(size), p), p, NodeMeta())
+        return finalizepublic!(s, limits, 1, 1)
+    end
 end
 
 """
     Avro.EnumSchema(name, symbols; namespace="", default=Avro.nodefault, aliases=String[], doc=nothing, props=(;), limits=Limits())
 """
 function EnumSchema(name::AbstractString, symbols; namespace::AbstractString="", default=nodefault, aliases=String[], doc=nothing, props=(;), limits::Limits=Limits())
-    full, norm, raw, p = publicnamed(name, namespace, aliases, SCHEMA_GRAMMAR[:enum], props, nothing)
-    syms = String[String(x) for x in symbols]
-    length(syms) <= limits.max_enum_symbols || throw(LimitError(:max_enum_symbols, length(syms), limits.max_enum_symbols, :max_enum_symbols, :encode))
-    index = FrozenDict{String,Int}()
-    for (i, sym) in enumerate(syms)
-        checkpublicname(sym, "enum symbol")
-        haskey(index, sym) && throw(ArgumentError("duplicate enum symbol \"$sym\""))
-        index[sym] = i
+    return withconstruction(limits) do _
+        full, norm, raw, p = publicnamed(name, namespace, aliases, SCHEMA_GRAMMAR[:enum], props, nothing)
+        syms = String[String(x) for x in symbols]
+        length(syms) <= limits.max_enum_symbols || throw(LimitError(:max_enum_symbols, length(syms), limits.max_enum_symbols, :max_enum_symbols, :encode))
+        index = FrozenDict{String,Int}()
+        for (i, sym) in enumerate(syms)
+            checkpublicname(sym, "enum symbol")
+            haskey(index, sym) && throw(ArgumentError("duplicate enum symbol \"$sym\""))
+            index[sym] = i
+        end
+        d = nodefault
+        if !(default isa NoDefault)
+            default isa AbstractString && haskey(index, String(default)) || throw(ArgumentError("enum default must be one of the symbols"))
+            d = DefaultValue(String(default), 0, sprint(escapejson, String(default)), index[String(default)], true)
+        end
+        s = EnumSchema(full, norm, raw, doc === nothing ? nothing : String(doc), freeze!(FrozenVector{String}(syms, false)), d, freeze!(index), p, NodeMeta())
+        return finalizepublic!(s, limits, 1, 1)
     end
-    d = nodefault
-    if !(default isa NoDefault)
-        default isa AbstractString && haskey(index, String(default)) || throw(ArgumentError("enum default must be one of the symbols"))
-        d = DefaultValue(String(default), 0, sprint(escapejson, String(default)), index[String(default)], true)
-    end
-    s = EnumSchema(full, norm, raw, doc === nothing ? nothing : String(doc), freeze!(FrozenVector{String}(syms, false)), d, freeze!(index), p, NodeMeta())
-    return finalizepublic!(s, limits, 1, 1)
 end
 
 """
     Avro.ArraySchema(items; props=(;), limits=Limits()) / Avro.MapSchema(values; props=(;), limits=Limits())
 """
 function ArraySchema(items::Schema; props=(;), limits::Limits=Limits())
-    s = withbuilder(() -> ArraySchema(importchild(items), makeprops(props, SCHEMA_GRAMMAR[:array], nothing), NodeMeta()))
-    return finalizepublic!(s, limits, 0, 0)
+    return withconstruction(limits) do _
+        s = withbuilder(() -> ArraySchema(importchild(items), makeprops(props, SCHEMA_GRAMMAR[:array], nothing), NodeMeta()))
+        return finalizepublic!(s, limits, 0, 0)
+    end
 end
 
 function MapSchema(values::Schema; props=(;), limits::Limits=Limits())
-    s = withbuilder(() -> MapSchema(importchild(values), makeprops(props, SCHEMA_GRAMMAR[:map], nothing), NodeMeta()))
-    return finalizepublic!(s, limits, 0, 0)
+    return withconstruction(limits) do _
+        s = withbuilder(() -> MapSchema(importchild(values), makeprops(props, SCHEMA_GRAMMAR[:map], nothing), NodeMeta()))
+        return finalizepublic!(s, limits, 0, 0)
+    end
 end
 
 """
     Avro.UnionSchema(branches; limits=Limits())
 """
 function UnionSchema(branches; limits::Limits=Limits())
-    bs = FrozenVector{Schema}()
-    withbuilder() do
-        for b in branches
-            b isa Schema || throw(ArgumentError("union branches must be schemas"))
-            b isa UnionSchema && throw(ArgumentError("unions may not immediately contain other unions"))
-            ident = branchidentity(b)
-            any(x -> branchidentity(x) == ident, bs) && throw(ArgumentError("duplicate union branch $(ident[6:end])"))
-            push!(bs, importchild(b))
+    return withconstruction(limits) do _
+        bs = FrozenVector{Schema}()
+        withbuilder() do
+            for b in branches
+                b isa Schema || throw(ArgumentError("union branches must be schemas"))
+                b isa UnionSchema && throw(ArgumentError("unions may not immediately contain other unions"))
+                ident = branchidentity(b)
+                any(x -> branchidentity(x) == ident, bs) && throw(ArgumentError("duplicate union branch $(ident[6:end])"))
+                push!(bs, importchild(b))
+            end
         end
+        length(bs) <= limits.max_union_branches || throw(LimitError(:max_union_branches, length(bs), limits.max_union_branches, :max_union_branches, :encode))
+        return finalizepublic!(UnionSchema(freeze!(bs), NodeMeta()), limits, 0, 0)
     end
-    length(bs) <= limits.max_union_branches || throw(LimitError(:max_union_branches, length(bs), limits.max_union_branches, :max_union_branches, :encode))
-    return finalizepublic!(UnionSchema(freeze!(bs), NodeMeta()), limits, 0, 0)
 end
 
 """
@@ -1474,21 +1542,23 @@ A record field; `default` is a Julia value converted to JSON (`nothing`/`missing
 validated against `schema` with the recursive default rule.
 """
 function Field(name::AbstractString, schema::Schema; default=nodefault, order::Symbol=:ascending, aliases=String[], doc=nothing, props=(;), limits::Limits=Limits())
-    checkpublicname(name, "field name")
-    order in (:ascending, :descending, :ignore) || throw(ArgumentError("order must be :ascending, :descending or :ignore"))
-    als = String[]
-    for a in aliases
-        (String(a) == name || String(a) in als) && continue
-        push!(als, String(a))
+    return withconstruction(limits) do _
+        checkpublicname(name, "field name")
+        order in (:ascending, :descending, :ignore) || throw(ArgumentError("order must be :ascending, :descending or :ignore"))
+        als = String[]
+        for a in aliases
+            (String(a) == name || String(a) in als) && continue
+            push!(als, String(a))
+        end
+        d = nodefault
+        if !(default isa NoDefault)
+            j = tojsonvalue(default === missing ? nothing : default, constructionbudget())
+            ok, branch = validatedefault(schema, j, limits.max_depth)
+            ok || throw(ArgumentError("default value for field \"$name\" does not match its schema"))
+            d = DefaultValue(j, branch, sprint(printjson, j, false, 0), 0, true)
+        end
+        return Field(String(name), schema, doc === nothing ? nothing : String(doc), d, order, freeze!(FrozenVector{String}(als, false)), makeprops(props, FIELD_GRAMMAR, nothing))
     end
-    d = nodefault
-    if !(default isa NoDefault)
-        j = tojsonvalue(default === missing ? nothing : default)
-        ok, branch = validatedefault(schema, j, limits.max_depth)
-        ok || throw(ArgumentError("default value for field \"$name\" does not match its schema"))
-        d = DefaultValue(j, branch, sprint(printjson, j, false, 0), 0, true)
-    end
-    return Field(String(name), schema, doc === nothing ? nothing : String(doc), d, order, freeze!(FrozenVector{String}(als, false)), makeprops(props, FIELD_GRAMMAR, nothing))
 end
 
 """
@@ -1500,10 +1570,18 @@ unfilled and returns its fields (an inner `RecordSchema(g, …)` may use outer r
 partial graph is discarded.
 """
 function RecordSchema(name::AbstractString; namespace::AbstractString="", fields=Field[], aliases=String[], doc=nothing, iserror::Bool=false, props=(;), limits::Limits=Limits())
-    return RecordSchema(_ -> fields, name; namespace=namespace, aliases=aliases, doc=doc, iserror=iserror, props=props, limits=limits)
+    return withconstruction(limits) do _
+        return RecordSchema(_ -> fields, name; namespace=namespace, aliases=aliases, doc=doc, iserror=iserror, props=props, limits=limits)
+    end
 end
 
 function RecordSchema(f, name::AbstractString; namespace::AbstractString="", aliases=String[], doc=nothing, iserror::Bool=false, props=(;), limits::Limits=Limits())
+    return withconstruction(limits) do _
+        recordschema_(f, name; namespace=namespace, aliases=aliases, doc=doc, iserror=iserror, props=props, limits=limits)
+    end
+end
+
+function recordschema_(f, name::AbstractString; namespace::AbstractString="", aliases=String[], doc=nothing, iserror::Bool=false, props=(;), limits::Limits=Limits())
     full, norm, raw, p = publicnamed(name, namespace, aliases, SCHEMA_GRAMMAR[:record], props, nothing)
     fields = FrozenVector{Field}()
     index = FrozenDict{String,Int}()

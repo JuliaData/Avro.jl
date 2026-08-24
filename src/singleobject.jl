@@ -46,21 +46,23 @@ Base.length(c::SchemaCache) = lock(() -> length(c.fingerprints), c.lock)
 Register `schema` and return its CRC-64-AVRO fingerprint.
 """
 function register!(c::SchemaCache, s::Schema; limits::Limits=Limits())
-    pcf = canonical(s; limits=limits)
-    fp = crc64avro(pcf)
-    return lock(c.lock) do
+    graphinfo(s).repaired_names && throw(ArgumentError("a schema with repaired invalid names has no Parsing Canonical Form"))
+    return withbudget(limits) do budget                # one operation: print, hash, compare, insert (D03)
+        w = BoundedWriter(budget, limits.max_schema_bytes)
+        canonicalprint(w, s, FrozenDict{String,Bool}())
+        pcflen = w.len
+        fp = crc64avro(boundedview(w))
+        lock(c.lock) do
         i = searchsortedfirst(c.fingerprints, fp)
         if i <= length(c.fingerprints) && c.fingerprints[i] == fp
             existing = c.schemas[i]
-            same = withbudget(limits) do budget
-                schemaequal(existing, s, Vector{Vector{Int32}}(), budget)
-            end
+            same = schemaequal(existing, s, Vector{Vector{Int32}}(), budget)
             same || throw(AmbiguousSchemaError(fp, existing, s))
             return fp
         end
         n = length(c.fingerprints) + 1
         n <= c.max_entries || throw(LimitError(:max_entries, n, c.max_entries, :max_entries, :decode))
-        cost = sizeof(pcf) + 64 + 16                   # PCF text + entry overhead + the two index slots
+        cost = pcflen + 64 + 16                        # PCF text + entry overhead + the two index slots
         retained = checked_add(c.bytes, cost)
         peak = checked_add(retained, checked_mul(16, n - 1))   # old index vectors overlap their replacements
         peak <= c.max_bytes || throw(LimitError(:max_bytes, peak, c.max_bytes, :max_bytes, :decode))
@@ -76,6 +78,7 @@ function register!(c::SchemaCache, s::Schema; limits::Limits=Limits())
         c.schemas = ns
         c.bytes = retained
         return fp
+        end
     end
 end
 
@@ -85,10 +88,14 @@ end
 The schema registered under `fingerprint` (`Avro.UnknownSchemaError` otherwise).
 """
 function lookup(c::SchemaCache, fp::UInt64; limits::Limits=Limits())
-    lock(c.lock) do
-        i = searchsortedfirst(c.fingerprints, fp)
-        (i <= length(c.fingerprints) && c.fingerprints[i] == fp) || throw(UnknownSchemaError(fp))
-        return c.schemas[i]
+    return withbudget(limits) do budget                # the binary search is charged work (D03)
+        lock(c.lock) do
+            n = length(c.fingerprints)
+            addcompare!(budget, 8 * (64 - leading_zeros(max(n, 1)) + 1))
+            i = searchsortedfirst(c.fingerprints, fp)
+            (i <= n && c.fingerprints[i] == fp) || throw(UnknownSchemaError(fp))
+            return c.schemas[i]
+        end
     end
 end
 
@@ -103,7 +110,7 @@ function encodesingle(s::Schema, x; limits::Limits=Limits())
     return withbudget(limits; direction=:encode) do budget    # one operation budget (plan §4.4, amendment round 1)
         w = BoundedWriter(budget, limits.max_schema_bytes)
         canonicalprint(w, s, FrozenDict{String,Bool}())
-        fp = crc64avro(String(take!(w.io)))
+        fp = crc64avro(boundedview(w))
         plan = writeplan(s; budget=budget)
         e = Encoder(budget)
         encodedatum!(plan, e, x)
@@ -138,17 +145,24 @@ function decodesingle(src::AbstractVector{UInt8}, store::SchemaStore; reader_sch
     for i in 0:7
         fp |= UInt64(src[3 + i]) << (8 * i)
     end
-    writer = lookup(store, fp; limits=limits)
-    writer isa Schema || throw(ArgumentError("the schema store returned $(typeof(writer)), not an Avro.Schema"))
     n - 10 <= limits.max_datum_bytes || throw(LimitError(:max_datum_bytes, n - 10, limits.max_datum_bytes, :max_datum_bytes, :decode))
-    v, plan2, adm = withbudget(limits) do budget               # one operation budget (plan §4.4, amendment round 1)
+    v, plan2, adm = withbudget(limits) do budget               # one operation budget end to end (D03)
+        writer = lock(store isa SchemaCache ? store.lock : ReentrantLock()) do
+            store isa SchemaCache || return lookup(store, fp; limits=limits)
+            n0 = length(store.fingerprints)
+            addcompare!(budget, 8 * (64 - leading_zeros(max(n0, 1)) + 1))
+            i = searchsortedfirst(store.fingerprints, fp)
+            (i <= n0 && store.fingerprints[i] == fp) || throw(UnknownSchemaError(fp))
+            store.schemas[i]
+        end
+        writer isa Schema || throw(ArgumentError("the schema store returned $(typeof(writer)), not an Avro.Schema"))
         w = BoundedWriter(budget, limits.max_schema_bytes)
         canonicalprint(w, writer, FrozenDict{String,Bool}())
-        actual = crc64avro(String(take!(w.io)))
+        actual = crc64avro(boundedview(w))
         actual == fp || throw(DataError("the schema store returned a schema with fingerprint $(string(actual; base=16)) for $(string(fp; base=16))", 3))
         effective = reader_schema === nothing ? writer : reader_schema
         plan = reader_schema === nothing ? readplan(writer; budget=budget) :
-               resolvingplan(writer, reader_schema; union_resolution=union_resolution, limits=limits)
+               resolvingplan(writer, reader_schema; union_resolution=union_resolution, limits=limits, budget=budget)
         tplan = T === nothing ? plan : typedplan(T, effective, plan, limits)
         adm0 = admission(names)
         payload = view(src, 11:n)
@@ -162,8 +176,8 @@ function decodesingle(src::AbstractVector{UInt8}, store::SchemaStore; reader_sch
 end
 
 function decodesingle(io::IO, store::SchemaStore; limits::Limits=Limits(), kw...)
-    bytes = withbudget(limits) do budget
-        sourcebytes(io, limits.max_datum_bytes + 10, budget, DataError)
-    end
-    return decodesingle(bytes, store; limits=limits, kw...)
+    bytes = withbudget(limits) do budget               # the buffered read is bounded; the payload is
+        Vector{UInt8}(sourcebytes(io, limits.max_datum_bytes + 10, budget, DataError))
+    end                                                # then owned and decoded through the byte path's
+    return decodesingle(bytes, store; limits=limits, kw...)   # own single operation budget
 end
