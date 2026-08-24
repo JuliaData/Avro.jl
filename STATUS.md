@@ -7,7 +7,7 @@ The implementation source after 25 round-two repair commits is `c580b29`. The fu
 `reviews/codex-implementation-review-2.md`.
 
 **Current disposition: REVISE.** This tree is not PR-ready and is not ready to ship as 2.0.0.
-R05, R08, R09, R15, R16, R17, and R18 are accepted. R01–R04, R06, R07, R10–R14, and R19 remain
+R05, R08, R09, R13, R15, R16, R17, and R18 are accepted. R01–R04, R06, R07, R10–R12, R14, and R19 remain
 disputed. The main blockers are incomplete single-operation resource accounting, live parallel-pool
 charges that end before their allocations die, incomplete interop and projection gates, a failing
 compile-cost gate, two failing performance targets, and unresolved repository-wide style violations.
