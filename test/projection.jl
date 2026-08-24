@@ -26,7 +26,7 @@ import Logging
     raised = Avro.Limits(max_total_bytes=2 << 30, max_block_bytes=16 << 20, max_block_output_bytes=256 << 20,
                          max_codec_memory=32 << 20, max_bytes=64 << 20, max_datum_bytes=64 << 20)
     function selections(names)
-        sels = Vector{Vector{Symbol}}()
+        sels = Vector{Symbol}[]
         push!(sels, Symbol[])                                 # select=()
         push!(sels, collect(names))                            # full selection, in source order
         for nm in names
@@ -154,7 +154,7 @@ import Logging
         end
 
         function corpusselections(names)
-            sels = Vector{Vector{Symbol}}()
+            sels = Vector{Symbol}[]
             push!(sels, Symbol[])
             if !isempty(names)
                 push!(sels, [names[1]])
