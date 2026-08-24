@@ -1,7 +1,5 @@
 reviews/*.pid
 reviews/codex-run-*.jsonl
 reviews/codex-run-*.err
-Manifest.toml
 docs/build/
-Manifest-v*.toml
 test/fuzz/failures/

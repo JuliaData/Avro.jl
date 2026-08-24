@@ -1,21 +1,21 @@
 # Benchmarks
 
-Recorded on the authoring host (Apple silicon, macOS, Julia 1.12.6, 2026-08-22); reproduce with
-`AVRO_PERF=true` in the test suite (`test/perf.jl`, best-of-3 timings). Baselines are Avro.jl 1.1.2
+Recorded on the authoring host (Apple silicon, macOS, Julia 1.12.6, 2026-08-23); reproduce with
+`AVRO_PERF=true` in the test suite (`test/perf.jl`: the §10.1 protocol, medians of 5 cold processes). Baselines are Avro.jl 1.1.2
 on the same host and file (1 M rows: `id::Int64`, `name::String`, `score::Float64`, `flag::Bool`).
 
 | Operation | Avro.jl 2.0 | Avro.jl 1.1.2 | ratio |
 |---|---|---|---|
-| `Avro.write`, null codec, 1 thread | 0.19 s | 1.40 s | 7.4× |
-| `Avro.Table`, null codec, 1 thread | 0.24 s | 5.69 s (read + materialise) | 23× |
-| `Avro.Table`, `ntasks=8`, 4 GiB limits | 0.07 s | — | 3.35× vs 1 thread |
-| `select=(:id,)`, `validate=:fast` | 0.04 s | — | 3.3× vs full decode |
-| zstandard `Table` vs null + raw transcode | 1.04× | — | ≤ 1.3× gate |
+| `Avro.write`, null codec, 1 thread | 0.145 s | 1.40 s | 9.6× |
+| `Avro.Table`, null codec, 1 thread | 0.126 s | 5.69 s (read + materialise) | 45× |
+| `Avro.Table`, `ntasks=8`, 4 GiB limits | — | — | 3.39× vs 1 thread |
+| `select=(:id,)`, `validate=:fast` | — | — | 2.4× vs full decode |
+| zstandard / deflate / snappy `Table` vs null + raw transcode | 1.03× / 0.99× / 1.06× | — | ≤ 1.3× gate |
 
-Micro-kernels (same host): prepared typed encode of a 4-field record into a reused encoder —
-**0 allocations**, ≈ 300 ns; prepared typed decode ≈ 850 ns (8 allocations through the
-`DatumReader` wrapper; the plan-level kernel allocates only the `String`);
-`Avro.parseschema(interop.avsc)` ≈ 58 µs; package load ≈ 0.37 s.
+Micro-kernels (same host, §10.1 protocol — median of 5 cold processes): prepared typed decode —
+**1 allocation (the string)**, ≈ 40 ns; prepared typed encode into a reused encoder —
+**0 allocations**, ≈ 57 ns; one-shot decode/encode (plan construction per call) ≈ 12 µs / 11 µs;
+`Avro.parseschema(interop.avsc)` ≈ 78 µs; package load ≈ 0.31 s; time-to-first-table ≈ 0.68 s.
 
 For comparison (different implementations, same class of file): fastavro reads the 1 M-row file in
 ≈ 0.5 s; warm Java ≈ 0.05 s.
