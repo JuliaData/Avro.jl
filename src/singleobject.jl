@@ -61,7 +61,9 @@ function register!(c::SchemaCache, s::Schema; limits::Limits=Limits())
         n = length(c.fingerprints) + 1
         n <= c.max_entries || throw(LimitError(:max_entries, n, c.max_entries, :max_entries, :decode))
         cost = sizeof(pcf) + 64 + 16                   # PCF text + entry overhead + the two index slots
-        c.bytes + cost <= c.max_bytes || throw(LimitError(:max_bytes, c.bytes + cost, c.max_bytes, :max_bytes, :decode))
+        retained = checked_add(c.bytes, cost)
+        peak = checked_add(retained, checked_mul(16, n - 1))   # old index vectors overlap their replacements
+        peak <= c.max_bytes || throw(LimitError(:max_bytes, peak, c.max_bytes, :max_bytes, :decode))
         nf = Vector{UInt64}(undef, n)                  # exact-capacity replacement (§4.4 growth rule):
         ns = Vector{Schema}(undef, n)                  # capacity equals length, and a failure above
         copyto!(nf, 1, c.fingerprints, 1, i - 1)       # leaves the table untouched (transactional)
@@ -72,7 +74,7 @@ function register!(c::SchemaCache, s::Schema; limits::Limits=Limits())
         copyto!(ns, i + 1, c.schemas, i, n - i)
         c.fingerprints = nf
         c.schemas = ns
-        c.bytes += cost
+        c.bytes = retained
         return fp
     end
 end
