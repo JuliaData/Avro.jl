@@ -3,10 +3,21 @@
 # (AVRO_TOOLS_JAR, sha256 6220e8bc089aaf917cdad4cd358bd651fc0394c0e5ddb8b36da402012c294a68), a Python with fastavro==1.12.2 + cramjam (PYTHON).
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
-JAR="${AVRO_TOOLS_JAR:?set AVRO_TOOLS_JAR}"; PY="${PYTHON:-python3}"; JH="${JAVA_HARNESS:-$here/../../interop/java}"
+gen="$here/generated"
+JAR="${AVRO_TOOLS_JAR:?set AVRO_TOOLS_JAR}"; PY="${PYTHON:-python3}"
 J() { java -jar "$JAR" "$@"; }
 echo "$(shasum -a 256 "$JAR")"
-mkdir -p "$here/data" "$here/evolution" "$here/singleobject" "$here/blocking" "$here/canonical"
+# Build the Java harness (test/interop/java) into a scratch classpath.
+HOUT="$(mktemp -d)"
+javac -cp "$JAR" -d "$HOUT" "$here"/../interop/java/*.java
+CP="$JAR:$HOUT"
+mkdir -p "$gen/data" "$gen/evolution" "$gen/singleobject" "$gen/blocking" "$gen/canonical" "$gen/roots"
+here="$gen"
+# Non-record roots: every kind, random data + tojson expectations.
+for r in "$gen"/roots/*.avsc; do b="$(basename "$r" .avsc)"
+  J random --count 20 --seed 11 --schema-file "$r" "$gen/roots/$b-null.avro" 2>/dev/null || true
+  [ -f "$gen/roots/$b-null.avro" ] && J tojson "$gen/roots/$b-null.avro" > "$gen/roots/$b.jsonl" || true
+done
 for s in bench everything wide interop; do J random --count 50 --seed 7 --schema-file "$here/schemas/$s.avsc" "$here/data/$s-null.avro"; done
 J random --count 3 --seed 7 --schema-file "$here/schemas/empty.avsc" "$here/data/empty-null.avro"
 J fromjson --schema-file "$here/schemas/logical.avsc" "$here/logical.json" > "$here/data/logical-null.avro"
@@ -22,10 +33,12 @@ for f in sorted(glob.glob(os.path.join(here, "data", "*-null.avro"))):
     b = f[:-len("-null.avro")]
     with open(f, "rb") as fh:
         r = fastavro.reader(fh); recs = list(r); sch = r.writer_schema
-    for codec in ("deflate", "xz"):
-        with open(f"{b}-fastavro-{codec}.avro", "wb") as out: fastavro.writer(out, sch, recs, codec=codec)
+    for codec in ("null", "deflate", "bzip2", "snappy", "zstandard", "xz"):
+        try:
+            with open(f"{b}-fastavro-{codec}.avro", "wb") as out: fastavro.writer(out, sch, recs, codec=codec)
+        except ValueError as e:
+            print(f"fastavro {codec}: {e}", file=sys.stderr)
 PYEOF
-CP="$JAR:$JH/out"
 for r in everything_readerA everything_readerB; do java -cp "$CP" ReadWithReader "$here/data/everything-null.avro" "$here/evolution/$r.avsc" > "$here/evolution/$r.jsonl"; done
 java -cp "$CP" ReadWithReader "$here/apache/weather.avro" "$here/evolution/weather_reader.avsc" > "$here/evolution/weather_reader.jsonl"
 java -cp "$CP" SingleObject encode "$here/singleobject/weather.avsc" "$here/singleobject/weather1.json" > "$here/singleobject/weather1.bin"
@@ -36,4 +49,8 @@ for f in "$here"/schemas/*.avsc "$here"/evolution/*.avsc "$here"/apache/*.avsc; 
   for alg in CRC-64-AVRO MD5 SHA-256; do printf '%s\t%s\t%s\n' "$b" "$alg" "$(J fingerprint --fingerprint $alg "$f" | tail -1 | awk '{print $1}')" >> "$here/fingerprints.tsv"; done
 done
 java -cp "$CP" BigDec 12.345 -1.5 0 123456789012345678901234567890.5 > "$here/bigdecimal.tsv"
+# Not regenerated here (documented inputs): legacy1x (written by the pinned Avro.jl 1.1.2 in its own
+# environment: julia +1.10 --project=<avro112 env> legacy1x/write_legacy.jl), highwindow (zstd CLI
+# --window-log=30 / xz --lzma2=dict=1GiB payloads wrapped by recodec), sortorder (CompareBytes over
+# sortorder/cases.jsonl -> verdicts.tsv).
 echo "done"

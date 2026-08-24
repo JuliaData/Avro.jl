@@ -86,6 +86,7 @@ jobs:
       - uses: julia-actions/julia-runtest@v1
         env:
           AVRO_INTEROP: 'true'
+          AVRO_PYTHON: python3
   docs:
     name: Documentation
     runs-on: ubuntu-latest
