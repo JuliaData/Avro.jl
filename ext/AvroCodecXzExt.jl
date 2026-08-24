@@ -12,6 +12,10 @@ end
 
 lzma_encoder_memusage(preset::Integer) = ccall((:lzma_easy_encoder_memusage, XZ_jll.liblzma), UInt64, (UInt32,), preset)
 lzma_decoder_memusage(preset::Integer) = ccall((:lzma_easy_decoder_memusage, XZ_jll.liblzma), UInt64, (UInt32,), preset)
+function Avro.compresscapacity(::Val{:xz}, n::Int)
+    bound = ccall((:lzma_stream_buffer_bound, XZ_jll.liblzma), Csize_t, (Csize_t,), n)
+    return Avro.boundint(:xz, bound)
+end
 
 function Avro.decompressblock(name::Symbol, r::XzReader, payload::AbstractVector{UInt8}, limits::Avro.Limits, budget::Avro.Budget)
     checkpoint = budget.reserved

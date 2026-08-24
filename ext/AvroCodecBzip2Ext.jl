@@ -7,6 +7,10 @@ using Avro, CodecBzip2
 const BZIP2_DECODER_BYTES = 3_700_000
 const BZIP2_ENCODER_BYTES = 7_600_000
 
+function Avro.compresscapacity(::Val{:bzip2}, n::Int)
+    return Avro.checked_add(Avro.checked_add(n, cld(n, 100)), 600)
+end
+
 struct Bzip2Reader end
 
 function Avro.decompressblock(name::Symbol, ::Bzip2Reader, payload::AbstractVector{UInt8}, limits::Avro.Limits, budget::Avro.Budget)
