@@ -21,7 +21,9 @@
                              max_bytes=1 << 20, max_datum_bytes=1 << 20,
                              max_schema_bytes=6, max_metadata_bytes=maxmetadata)
         long = Avro.LongSchema()
-        varint(n) = Avro.encode(long, Int64(n))
+        function varint(n)
+            return Avro.encode(long, Int64(n))
+        end
         header = IOBuffer()
         write(header, b"Obj\x01")
         write(header, varint(length(smallkeys) + 2))
@@ -83,25 +85,27 @@
     @testset "writer and reader use identical container work counters" begin
         limits = Avro.Limits(max_total_values=16)
         schema = Avro.StringSchema()
-        io = IOBuffer()
-        writer = Avro.Writer(io, schema; limits=limits)
-        push!(writer, "x")
-        close(writer)
-        bytes = take!(io)
-        writerstate = (values=writer.budget.values, input_bytes=writer.budget.input_bytes,
-                       rows=writer.budget.rows, blocks=writer.budget.blocks,
-                       members=writer.budget.members, compare_bytes=writer.budget.compare_bytes,
-                       allowance_used=Avro.allowanceused(writer.budget))
-        values, readerstate = Avro.Reader(IOBuffer(bytes); limits=limits) do reader
-            decoded = collect(Avro.eachdatum(reader))
-            state = (values=reader.budget.values, input_bytes=reader.budget.input_bytes,
-                     rows=reader.budget.rows, blocks=reader.budget.blocks,
-                     members=reader.budget.members, compare_bytes=reader.budget.compare_bytes,
-                     allowance_used=Avro.allowanceused(reader.budget))
-            return decoded, state
+        for codec in Avro.codecs()
+            io = IOBuffer()
+            writer = Avro.Writer(io, schema; codec=codec, limits=limits)
+            push!(writer, "x")
+            close(writer)
+            bytes = take!(io)
+            writerstate = (values=writer.budget.values, input_bytes=writer.budget.input_bytes,
+                           rows=writer.budget.rows, blocks=writer.budget.blocks,
+                           members=writer.budget.members, compare_bytes=writer.budget.compare_bytes,
+                           allowance_used=Avro.allowanceused(writer.budget))
+            values, readerstate = Avro.Reader(IOBuffer(bytes); limits=limits) do reader
+                decoded = collect(Avro.eachdatum(reader))
+                state = (values=reader.budget.values, input_bytes=reader.budget.input_bytes,
+                         rows=reader.budget.rows, blocks=reader.budget.blocks,
+                         members=reader.budget.members, compare_bytes=reader.budget.compare_bytes,
+                         allowance_used=Avro.allowanceused(reader.budget))
+                return decoded, state
+            end
+            @test values == ["x"]
+            @test writerstate == readerstate
         end
-        @test values == ["x"]
-        @test writerstate == readerstate
 
         tight = Avro.Limits(max_total_values=3)
         tightio = IOBuffer()
