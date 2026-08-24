@@ -100,8 +100,11 @@ end
     # value-level schema(x)
     rec = Avro.Record(pt, Any[1.0, missing, String[], DateTime(2020)])
     @test Avro.schema(rec) === pt
+    @test_throws Avro.LimitError Avro.schema(rec; limits=Avro.Limits(max_fields=1))
     ev = Avro.EnumValue(Avro.schema(T.Color), 2)
     @test Avro.schema(ev) === ev.schema && Avro.schema([ev, ev]) isa Avro.ArraySchema && Avro.schema([ev]).items == ev.schema   # imported (copied) child
+    @test_throws Avro.LimitError Avro.schema(ev; limits=Avro.Limits(max_enum_symbols=1))
+    @test_throws Avro.LimitError Avro.schema([ev]; limits=Avro.Limits(max_enum_symbols=1))
     fx = Avro.Fixed(Avro.FixedSchema("F", 2), UInt8[1, 2])
     @test Avro.schema(fx) === fx.schema && Avro.schema(Avro.Map([("a", fx)])).values == fx.schema
     @test_throws ArgumentError Avro.schema(Avro.EnumValue[])

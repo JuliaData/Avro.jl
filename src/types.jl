@@ -339,9 +339,24 @@ other values use the conventional `Avro.schema(typeof(x))`. Mixed identities, `V
 empty collections of identity-bearing element types, a bare `UnionValue` and a `Decimal` raise
 `ArgumentError` (use `Avro.encode(schema, x)`).
 """
-schema(x::Record; limits::Limits=Limits()) = getfield(x, :schema)
-schema(x::EnumValue; limits::Limits=Limits()) = x.schema
-schema(x::Fixed; limits::Limits=Limits()) = x.schema
+function identityschema(s::Schema, limits::Limits)
+    return withconstruction(limits; direction=:encode) do _
+        finalizepublic!(s, limits, 0, 0)
+        return s
+    end
+end
+
+function schema(x::Record; limits::Limits=Limits())
+    return identityschema(getfield(x, :schema), limits)
+end
+
+function schema(x::EnumValue; limits::Limits=Limits())
+    return identityschema(x.schema, limits)
+end
+
+function schema(x::Fixed; limits::Limits=Limits())
+    return identityschema(x.schema, limits)
+end
 schema(::UnionValue; limits::Limits=Limits()) = throw(ArgumentError("a bare Avro.UnionValue has no schema of its own: use `Avro.encode(schema, x)`"))
 schema(::Union{Decimal,WideDecimal}; limits::Limits=Limits()) = throw(ArgumentError("a decimal needs a precision and scale: use `Avro.encode(schema, x)`"))
 
@@ -350,20 +365,24 @@ const IDENTITY_VALUES = Union{Record,EnumValue,Fixed}
 function schema(x::AbstractVector{T}; limits::Limits=Limits()) where {T}
     T === UInt8 && return schema(Vector{UInt8}; limits=limits)
     (T <: IDENTITY_VALUES || T === Any) || return schema(typeof(x); limits=limits)
-    return ArraySchema(uniformschema(x); limits=limits)
+    return withconstruction(limits; direction=:encode) do _
+        return ArraySchema(uniformschema(x, limits); limits=limits)
+    end
 end
 
 function schema(x::Map{V}; limits::Limits=Limits()) where {V}
     (V <: IDENTITY_VALUES || V === Any) || return schema(typeof(x); limits=limits)
-    return MapSchema(uniformschema(x.vals); limits=limits)
+    return withconstruction(limits; direction=:encode) do _
+        return MapSchema(uniformschema(x.vals, limits); limits=limits)
+    end
 end
 
-function uniformschema(xs)
+function uniformschema(xs, limits::Limits)
     isempty(xs) && throw(ArgumentError("an empty collection of identity-bearing values has no schema of its own: use `Avro.encode(schema, x)`"))
     first = nothing
     for v in xs
         v isa IDENTITY_VALUES || throw(ArgumentError("a collection mixing identity-bearing and plain values has no schema of its own: use `Avro.encode(schema, x)`"))
-        s = schema(v)
+        s = schema(v; limits=limits)
         if first === nothing
             first = s
         elseif fullname(s) != fullname(first)
