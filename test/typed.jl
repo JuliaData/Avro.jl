@@ -400,6 +400,17 @@ end
                     expected_nullable_charge = Avro.vectorbytes(NullableT, length(nullable)) + 2 * scalar_charge
                     @test nullable_charge == expected_nullable_charge
                     @test nullable_charge >= summarysize(nullable)
+
+                    # A typed map's values vector receives the same immutable inline-shell transfer as
+                    # arrays: each decoded value's shell moves into its exact Vector{T} slot (round-3 item 4).
+                    map_schema = Avro.MapSchema(scalar_schema)
+                    map_input = Avro.Map{T}([("k1", case.value), ("k2", case.value)])
+                    avromap, map_charge = chargedtyped(map_schema, Avro.Map{T}, map_input)
+                    expected_map_charge = Avro.vectorbytes(String, 2) + 2 * Avro.stringbytes(2) +
+                                          Avro.vectorbytes(T, 2) + 2 * (scalar_charge - inline_shell) +
+                                          Avro.mapshellbytes(2)
+                    @test map_charge == expected_map_charge
+                    @test map_charge >= summarysize(avromap)
                 end
             end
         end

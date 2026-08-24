@@ -55,6 +55,7 @@ struct MapTarget{K,V,P<:TypedPlan} <: TypedPlan
     values::P
     minsize::Int
     dict::Bool
+    inlineshell::Int
 end
 
 "A two-branch nullable union into `Union{N,…}`: `N` is `Missing`, `Nothing`, or `Union{}` when null is rejected."
@@ -108,7 +109,7 @@ function typedvector(::Type{E}, n::Int, memo::TypedMemo) where {E}
         allocated!(memo.budget, charge)
         return values
     catch
-        release!(memo.budget, charge)
+        unreserve!(memo.budget, charge)
         rethrow()
     end
 end
@@ -134,7 +135,15 @@ function typedplan(::Type{T}, reader::Schema, plan::ReadPlan, limits::Limits;
         entries[i] = Pair{Any,TypedPlan}[]
     end
     allocated!(budget, memocharge)
-    return buildtyped(T, reader, plan, TypedMemo(entries, budget))
+    root = buildtyped(T, reader, plan, TypedMemo(entries, budget))
+    # The memo table is construction-only: the slot vectors, their pairs and the outer table die here.
+    # Memoised nodes stay charged — the plan graph (or a recursive reference) may hold them (item 4).
+    dead = vectorbytes(Vector{Pair{Any,TypedPlan}}, nodes)
+    for v in entries
+        dead = checked_add(dead, vectorbytes(Pair{Any,TypedPlan}, length(v)) + memopairbytes() * length(v))
+    end
+    release!(budget, dead)
+    return root
 end
 
 function memolookup(memo::TypedMemo, s::Schema, ::Type{T}) where {T}
@@ -144,14 +153,19 @@ function memolookup(memo::TypedMemo, s::Schema, ::Type{T}) where {T}
     return nothing
 end
 
+memopairbytes() = shellbytes(Pair{Any,TypedPlan})
+
 function memostore!(memo::TypedMemo, s::Schema, ::Type{T}, p::TypedPlan) where {T}
     slot = Int(nodeid(s)) + 1
     entries = memo[slot]
     for i in eachindex(entries)
         entries[i].first === T || continue
+        charge!(memo.budget, memopairbytes())          # the replacement pair, before it is built (D06)
         entries[i] = T => p
+        release!(memo.budget, memopairbytes())         # the replaced pair dies with the overwrite
         return p
     end
+    charge!(memo.budget, memopairbytes())              # the new pair, before it is built (D06)
     n = checked_add(length(entries), 1)
     newcharge = vectorbytes(Pair{Any,TypedPlan}, n)
     reserve!(memo.budget, newcharge)
@@ -160,7 +174,7 @@ function memostore!(memo::TypedMemo, s::Schema, ::Type{T}, p::TypedPlan) where {
         allocated!(memo.budget, newcharge)
         values
     catch
-        release!(memo.budget, newcharge)
+        unreserve!(memo.budget, newcharge)
         rethrow()
     end
     copyto!(replacement, 1, entries, 1, n - 1)
@@ -172,19 +186,64 @@ function memostore!(memo::TypedMemo, s::Schema, ::Type{T}, p::TypedPlan) where {
     return p
 end
 
+# ---- construction accounting (plan §4.4 (e), round-3 item 4) -----------------------------------------
+#
+# Every typed-plan node is charged to the construction scope before it is built. A node's box charge is
+# the `shellbytes` convention over its concrete type (an isbits node charges its box, since it lives
+# boxed behind the abstract `TypedPlan` interface). A freshly built immutable node captured inline by
+# its parent — a concrete immutable field or tuple element — has its transient box released after the
+# capture (the parent's own charge covers the inline copy). Abandoned fallback nodes stay charged until
+# the operation ends: they may be memo-referenced, so their boxes cannot be released individually.
+
+"The box charge of one typed-plan node of concrete type `P`, made before the node is built."
+nodebytes(::Type{P}) where {P} = isbitstype(P) ? boxbytes(P) : shellbytes(P)
+
+chargenode!(memo::TypedMemo, ::Type{P}) where {P} = (charge!(memo.budget, nodebytes(P)); nothing)
+
+"Release the transient box of a freshly built node its parent just captured inline (mutable: a reference, nothing to release)."
+releasecapture!(memo::TypedMemo, node) =
+    (ismutabletype(typeof(node)) || release!(memo.budget, nodebytes(typeof(node))); nothing)
+
+"""
+Build the tuple `(parts...,)` under the construction scope: a bound over the inline element sizes is
+reserved first, the actual box charge is settled and the slack returned. Returns `(tuple, boxbytes)`;
+the caller releases `boxbytes` once the tuple's owner is built (tuples used as type parameters are
+interned by the type system, which is process-global and outside operation accounting).
+"""
+function chargedtuple(memo::TypedMemo, parts::Vector)
+    bound = 16
+    for x in parts
+        bound += ismutabletype(typeof(x)) ? 8 : max(sizeof(typeof(x)), 8) + 16
+    end
+    reserve!(memo.budget, bound)
+    ps = (parts...,)
+    actual = 16 + sizeof(typeof(ps))
+    actual <= bound || throw(ArgumentError("tuple storage $actual exceeds its construction bound $bound"))
+    allocated!(memo.budget, actual)
+    unreserve!(memo.budget, bound - actual)
+    return (ps, actual)
+end
+
+chargedgeneric(p::ReadPlan, memo::TypedMemo) = (chargenode!(memo, GenericTarget{typeof(p)}); GenericTarget(p))
+
+function chargedsemantic(::Type{T}, p::ReadPlan, memo::TypedMemo) where {T}
+    chargenode!(memo, SemanticTarget{T})
+    return SemanticTarget{T}(p)
+end
+
 function buildtyped(::Type{T}, s::Schema, p::ReadPlan, memo::TypedMemo) where {T}
-    T === Any && return GenericTarget(p)
-    T === juliatype(s) && return GenericTarget(p)
-    customhooks(T) && return SemanticTarget{T}(p)
+    T === Any && return chargedgeneric(p, memo)
+    T === juliatype(s) && return chargedgeneric(p, memo)
+    customhooks(T) && return chargedsemantic(T, p, memo)
     if isresolving(p)                                        # the settled eligibility analysis applies to
         t = buildresolvedtyped(T, s, p, memo)                # resolved plans too (plan §4.8, R18); anything
         t === nothing || return t                            # ineligible converts through the semantic route
-        return SemanticTarget{T}(p)
+        return chargedsemantic(T, p, memo)
     end
     s isa UnionSchema && return builduniontarget(T, s, p::UnionPlan, memo)
     if T isa Union
         _, inner = splitoptional(T)
-        inner === nothing && return SemanticTarget{T}(p)
+        inner === nothing && return chargedsemantic(T, p, memo)
         return buildtyped(inner, s, p, memo)      # a non-union schema never produces the null member
     end
     s isa RecordSchema && return buildrecordtarget(T, s, p::RecordPlan, memo)
@@ -239,16 +298,21 @@ function builduniontarget(::Type{T}, s::UnionSchema, p::UnionPlan, memo::TypedMe
     if nb != 0
         other, op = s.branches[3 - nb], p.branches[3 - nb]
         N, inner = T isa Union ? splitoptional(T) : (Union{}, T)
-        inner === nothing && return SemanticTarget{T}(p)
+        inner === nothing && return chargedsemantic(T, p, memo)
         ip = buildtyped(inner, other, op, memo)
-        ip isa SemanticTarget && return SemanticTarget{T}(p)
-        return NullableTarget{N,typeof(ip)}(ip, nb)
+        ip isa SemanticTarget && return chargedsemantic(T, p, memo)
+        chargenode!(memo, NullableTarget{N,typeof(ip)})
+        out = NullableTarget{N,typeof(ip)}(ip, nb)
+        releasecapture!(memo, ip)
+        return out
     end
     rawmembers = T isa Union ? Base.uniontypes(T) : (T,)
+    memberscharge = vectorbytes(Any, length(rawmembers))
     members = typedvector(Any, length(rawmembers), memo)
     for i in eachindex(rawmembers)
         members[i] = rawmembers[i]
     end
+    branchescharge = vectorbytes(TypedPlan, length(s.branches))
     branches = typedvector(TypedPlan, length(s.branches), memo)
     for (i, (b, bp)) in enumerate(zip(s.branches, p.branches))
         found = nothing
@@ -258,17 +322,28 @@ function builduniontarget(::Type{T}, s::UnionSchema, p::UnionPlan, memo::TypedMe
             found = tp
             break
         end
-        found === nothing && return SemanticTarget{T}(p)
+        if found === nothing
+            release!(memo.budget, memberscharge + branchescharge)   # both scratch vectors die with the fallback
+            return chargedsemantic(T, p, memo)
+        end
         branches[i] = found
     end
+    release!(memo.budget, memberscharge)               # the member-type scratch dies here; `branches` is retained
+    chargenode!(memo, UnionTarget{T})
     return UnionTarget{T}(branches)
 end
 
 function buildleaftarget(::Type{T}, p::ReadPlan, memo::TypedMemo) where {T}
-    T === Symbol && p isa Union{StringPlan,EnumPlan} && return SymbolTarget(p)
+    if T === Symbol && p isa Union{StringPlan,EnumPlan}
+        chargenode!(memo, SymbolTarget{typeof(p)})
+        return SymbolTarget(p)
+    end
     T <: Base.Enum && p isa EnumPlan && return enumtarget(T, p, memo)
-    leafcompatible(T, p) && return LeafTarget{T,typeof(p)}(p)
-    return SemanticTarget{T}(p)
+    if leafcompatible(T, p)
+        chargenode!(memo, LeafTarget{T,typeof(p)})
+        return LeafTarget{T,typeof(p)}(p)
+    end
+    return chargedsemantic(T, p, memo)
 end
 
 function enumtarget(::Type{T}, p::EnumPlan, memo::TypedMemo) where {T<:Base.Enum}
@@ -280,6 +355,7 @@ function enumtarget(::Type{T}, p::EnumPlan, memo::TypedMemo) where {T<:Base.Enum
         haskey(p.schema.symbolindex, name) || continue
         members[p.schema.symbolindex[name]] = e
     end
+    chargenode!(memo, EnumTarget{T})
     return EnumTarget{T}(p, members)
 end
 
@@ -297,13 +373,14 @@ isbytetuple(::Type{T}, n::Int) where {T} = T <: Tuple && length(T.parameters) ==
 function buildrecordtarget(::Type{T}, s::RecordSchema, p::RecordPlan, memo::TypedMemo) where {T}
     cached = memolookup(memo, s, T)
     cached === nothing || return cached
-    fastroute(T) || return memostore!(memo, s, T, SemanticTarget{T}(p))
+    fastroute(T) || return memostore!(memo, s, T, chargedsemantic(T, p, memo))
+    chargenode!(memo, RefTarget{T})
     ref = RefTarget{T}(nothing)
     memostore!(memo, s, T, ref)
     built = buildrecordplan(T, s, p, memo)
     if built === nothing
         # Recursive references captured `ref` already: they convert semantically where they occur.
-        sem = SemanticTarget{T}(p)
+        sem = chargedsemantic(T, p, memo)
         ref.plan = sem
         return memostore!(memo, s, T, sem)
     end
@@ -344,29 +421,33 @@ function budgetedavrofieldname(tags, field::Symbol, budget::Budget)
     actual = stringbytes(sizeof(name))
     actual <= bound || throw(limiterror(budget, :max_name_bytes, sizeof(name), budget.limits.max_name_bytes))
     allocated!(budget, actual)
-    release!(budget, bound - actual)
+    unreserve!(budget, bound - actual)                 # the unused headroom never materialised
     return name
 end
 
 function buildrecordplan(::Type{T}, s::RecordSchema, p::RecordPlan, memo::TypedMemo) where {T}
     names = fieldnames(T)
     tags = StructUtils.fieldtags(AvroStyle(), T)
+    scratch = vectorbytes(String, length(names))       # construction-only storage, released on every exit
     avronames = typedvector(String, length(names), memo)
     for i in eachindex(names)
         avronames[i] = budgetedavrofieldname(tags, names[i], memo.budget)
+        scratch += stringbytes(sizeof(avronames[i]))
     end
     nschema = length(s.fields)
+    scratch += vectorbytes(TypedPlan, nschema) + vectorbytes(Int, length(names))
     plans = typedvector(TypedPlan, nschema, memo)
     map = typedvector(Int, length(names), memo)
     fill!(map, 0)
     for (j, f) in enumerate(s.fields)
         k = findfirst(==(f.name), avronames)
         if k === nothing
+            chargenode!(memo, SkipTarget{typeof(p.fields[j])})
             plans[j] = SkipTarget(p.fields[j])
             continue
         end
         tp = buildtyped(fieldtype(T, k), f.schema, p.fields[j], memo)
-        tp isa SemanticTarget && return nothing
+        tp isa SemanticTarget && (release!(memo.budget, scratch); return nothing)
         plans[j] = tp
         map[k] = j
     end
@@ -377,7 +458,11 @@ function buildrecordplan(::Type{T}, s::RecordSchema, p::RecordPlan, memo::TypedM
         ft = fieldtype(T, k)
         if haskey(defs, names[k])
             v = defs[names[k]]
-            v isa ft || return nothing
+            if !(v isa ft)
+                release!(memo.budget, scratch + vectorbytes(Any, length(names)))   # `defaults` dies with the fallback
+                return nothing
+            end
+            isbits(v) && charge!(memo.budget, boxbytes(typeof(v)))   # the retained Any-slot box
             defaults[k] = v
         elseif Missing <: ft
             defaults[k] = missing
@@ -387,8 +472,15 @@ function buildrecordplan(::Type{T}, s::RecordSchema, p::RecordPlan, memo::TypedM
             throw(ArgumentError("field $(names[k]) of $T has no field \"$(avronames[k])\" in record $(fullname(s)) and no default"))
         end
     end
-    ps = (plans...,)
-    return RecordTarget{T,typeof(ps),(map...,)}(s, ps, defaults, measuredshell(T, memo.budget))
+    ps, psbox = chargedtuple(memo, plans)
+    for x in plans                                     # freshly built immutable nodes now live inline in the tuple
+        releasecapture!(memo, x)
+    end
+    mp, mpbox = chargedtuple(memo, map)
+    chargenode!(memo, RecordTarget{T,typeof(ps),mp})
+    out = RecordTarget{T,typeof(ps),mp}(s, ps, defaults, measuredshell(T, memo.budget))
+    release!(memo.budget, psbox + mpbox + scratch)     # the tuple boxes and construction-only scratch die here
+    return out
 end
 
 """
@@ -405,6 +497,7 @@ function buildresolvedtyped(::Type{T}, s::Schema, p::ReadPlan, memo::TypedMemo) 
         inner === nothing && return nothing
         if p.readerindex == p.nullable
             N === Union{} && return nothing
+            chargenode!(memo, ResolvedNullTarget{N,typeof(p.inner)})
             return ResolvedNullTarget{N,typeof(p.inner)}(p.inner)
         end
         return buildtyped(inner, s.branches[p.readerindex], p.inner, memo)   # the writer never encodes null here
@@ -412,30 +505,40 @@ function buildresolvedtyped(::Type{T}, s::Schema, p::ReadPlan, memo::TypedMemo) 
     if p isa UnionResolvePlan && p.nullable != 0 && s isa UnionSchema
         N, inner = T isa Union ? splitoptional(T) : (Union{}, T)
         (inner === nothing || N === Union{}) && return nothing
+        branchescharge = vectorbytes(TypedPlan, length(p.branches))
         branches = typedvector(TypedPlan, length(p.branches), memo)
         isnull = typedvector(Bool, length(p.branches), memo)
         for (i, bp) in enumerate(p.branches)
             if p.readerindex[i] == p.nullable
-                branches[i] = GenericTarget(bp)                              # decodes missing
+                branches[i] = chargedgeneric(bp, memo)                       # decodes missing
                 isnull[i] = true
             else
-                bt = bp isa UnresolvableBranch ? GenericTarget(bp) :
+                bt = bp isa UnresolvableBranch ? chargedgeneric(bp, memo) :
                      buildtyped(inner, s.branches[p.readerindex[i]], bp, memo)
-                bt isa SemanticTarget && return nothing
+                if bt isa SemanticTarget
+                    release!(memo.budget, branchescharge + vectorbytes(Bool, length(p.branches)))   # both scratch vectors die
+                    return nothing
+                end
                 branches[i] = bt
                 isnull[i] = false
             end
         end
-        bs = (branches...,)
-        return ResolvedNullableTarget{N === Missing ? Missing : Nothing,typeof(bs)}(bs, isnull)
+        bs, bsbox = chargedtuple(memo, branches)
+        for x in branches                              # freshly built immutable nodes now live inline in the tuple
+            releasecapture!(memo, x)
+        end
+        chargenode!(memo, ResolvedNullableTarget{N === Missing ? Missing : Nothing,typeof(bs)})
+        out = ResolvedNullableTarget{N === Missing ? Missing : Nothing,typeof(bs)}(bs, isnull)
+        release!(memo.budget, bsbox + branchescharge)  # the tuple box and branch scratch die here; `isnull` is retained
+        return out
     end
     p isa ResolvedRecordPlan && s isa RecordSchema && return buildresolvedrecord(T, s, p, memo)
     return nothing
 end
 
 function buildenumremaptarget(::Type{T}, p::EnumRemapPlan, memo::TypedMemo) where {T}
-    T === String && return EnumRemapTarget{String}(p)
-    T === Symbol && return EnumRemapTarget{Symbol}(p)
+    T === String && (chargenode!(memo, EnumRemapTarget{String}); return EnumRemapTarget{String}(p))
+    T === Symbol && (chargenode!(memo, EnumRemapTarget{Symbol}); return EnumRemapTarget{Symbol}(p))
     T <: Base.Enum || return nothing
     members = typedvector(Union{Nothing,T}, length(p.reader.symbols), memo)
     fill!(members, nothing)
@@ -444,6 +547,7 @@ function buildenumremaptarget(::Type{T}, p::EnumRemapPlan, memo::TypedMemo) wher
         haskey(p.reader.symbolindex, name) || continue
         members[p.reader.symbolindex[name]] = e
     end
+    chargenode!(memo, EnumRemapNativeTarget{T})
     return EnumRemapNativeTarget{T}(p, members)
 end
 
@@ -488,12 +592,13 @@ end
 function buildresolvedrecord(::Type{T}, s::RecordSchema, p::ResolvedRecordPlan, memo::TypedMemo) where {T}
     cached = memolookup(memo, s, T)
     cached === nothing || return cached
-    fastroute(T) || return memostore!(memo, s, T, SemanticTarget{T}(p))
+    fastroute(T) || return memostore!(memo, s, T, chargedsemantic(T, p, memo))
+    chargenode!(memo, RefTarget{T})
     ref = RefTarget{T}(nothing)
     memostore!(memo, s, T, ref)
     built = buildresolvedrecordplan(T, s, p, memo)
     if built === nothing
-        sem = SemanticTarget{T}(p)
+        sem = chargedsemantic(T, p, memo)
         ref.plan = sem
         return memostore!(memo, s, T, sem)
     end
@@ -504,9 +609,11 @@ end
 function resolvedslotmap(::Type{T}, s::RecordSchema, memo::TypedMemo) where {T}
     names = fieldnames(T)
     tags = StructUtils.fieldtags(AvroStyle(), T)
+    namescharge = vectorbytes(String, length(names))   # construction-only: released before returning
     avronames = typedvector(String, length(names), memo)
     for i in eachindex(names)
         avronames[i] = budgetedavrofieldname(tags, names[i], memo.budget)
+        namescharge += stringbytes(sizeof(avronames[i]))
     end
     slotfor = typedvector(Int, length(s.fields), memo)    # reader slot -> T field
     fill!(slotfor, 0)
@@ -515,6 +622,7 @@ function resolvedslotmap(::Type{T}, s::RecordSchema, memo::TypedMemo) where {T}
         i == 0 && continue
         slotfor[i] = k
     end
+    release!(memo.budget, namescharge)                 # the name copies die here; the caller owns `slotfor`
     return (names, slotfor)
 end
 
@@ -525,11 +633,15 @@ function resolvedsteptargets(::Type{T}, s::RecordSchema, p::ResolvedRecordPlan, 
     for (i, (slot, sp)) in enumerate(p.steps)
         k = slot == 0 ? 0 : slotfor[slot]
         if k == 0
+            chargenode!(memo, SkipTarget{typeof(sp)})
             plans[i] = SkipTarget(sp)
             stepslot[i] = 0
         else
             tp = buildtyped(fieldtype(T, k), s.fields[slot].schema, sp, memo)
-            tp isa SemanticTarget && return nothing
+            if tp isa SemanticTarget
+                release!(memo.budget, vectorbytes(TypedPlan, length(p.steps)) + vectorbytes(Int, length(p.steps)))
+                return nothing
+            end
             plans[i] = tp
             stepslot[i] = k
         end
@@ -545,6 +657,7 @@ function checkedreaderdefault(::Type{T}, dp::DefaultPlan, budget::Budget) where 
         nothing
     end
     v2 isa T || return nothing
+    charge!(budget, nodebytes(ResolvedReaderDefault{T}))   # the retained default node, before it is built (D06)
     return ResolvedReaderDefault{T}(dp)
 end
 
@@ -561,7 +674,8 @@ function resolvedreaderdefaults!(::Type{T}, defaults::Vector{Any}, covered::Vect
     return true
 end
 
-function resolvedstaticdefaults!(::Type{T}, defaults::Vector{Any}, covered::Vector{Bool}, names) where {T}
+function resolvedstaticdefaults!(::Type{T}, defaults::Vector{Any}, covered::Vector{Bool}, names,
+                                 budget::Budget) where {T}
     defs = StructUtils.fielddefaults(AvroStyle(), T)
     for k in eachindex(names)
         covered[k] && continue
@@ -569,6 +683,7 @@ function resolvedstaticdefaults!(::Type{T}, defaults::Vector{Any}, covered::Vect
         if haskey(defs, names[k])
             v = defs[names[k]]
             v isa ft || return false
+            isbits(v) && charge!(budget, boxbytes(typeof(v)))   # the retained Any-slot box
             defaults[k] = v
         elseif Missing <: ft
             defaults[k] = missing
@@ -583,19 +698,35 @@ end
 
 function buildresolvedrecordplan(::Type{T}, s::RecordSchema, p::ResolvedRecordPlan, memo::TypedMemo) where {T}
     names, slotfor = resolvedslotmap(T, s, memo)
+    slotforcharge = vectorbytes(Int, length(s.fields))
     targets = resolvedsteptargets(T, s, p, memo, slotfor)
-    targets === nothing && return nothing
+    if targets === nothing
+        release!(memo.budget, slotforcharge)
+        return nothing
+    end
     plans, stepslot = targets
+    scratch = slotforcharge + vectorbytes(TypedPlan, length(p.steps)) + vectorbytes(Int, length(p.steps)) +
+              vectorbytes(Bool, length(names))         # construction-only storage, released on every exit
     defaults = typedvector(Any, length(names), memo)
     covered = typedvector(Bool, length(names), memo)
     fill!(covered, false)
     for k in stepslot
         k == 0 || (covered[k] = true)
     end
-    resolvedreaderdefaults!(T, defaults, covered, slotfor, p, memo.budget) || return nothing
-    resolvedstaticdefaults!(T, defaults, covered, names) || return nothing
-    ps = (plans...,)
-    return ResolvedRecordTarget{T,typeof(ps),(stepslot...,)}(s, ps, defaults, measuredshell(T, memo.budget))
+    if !(resolvedreaderdefaults!(T, defaults, covered, slotfor, p, memo.budget) &&
+         resolvedstaticdefaults!(T, defaults, covered, names, memo.budget))
+        release!(memo.budget, scratch + vectorbytes(Any, length(names)))   # `defaults` dies with the fallback
+        return nothing
+    end
+    ps, psbox = chargedtuple(memo, plans)
+    for x in plans                                     # freshly built immutable nodes now live inline in the tuple
+        releasecapture!(memo, x)
+    end
+    sm, smbox = chargedtuple(memo, stepslot)
+    chargenode!(memo, ResolvedRecordTarget{T,typeof(ps),sm})
+    out = ResolvedRecordTarget{T,typeof(ps),sm}(s, ps, defaults, measuredshell(T, memo.budget))
+    release!(memo.budget, psbox + smbox + scratch)     # the tuple boxes and construction-only scratch die here
+    return out
 end
 
 function resolveddefault(::Type{T}, x::ResolvedReaderDefault{T}, d::Decoder) where {T}
@@ -612,6 +743,7 @@ function typedvalue(p::ResolvedRecordTarget{T}, d::Decoder, names) where {T}
     enter!(d)
     reserve!(d.budget, p.shell)
     v = resolvedrecordvalue(p, d, names)
+    allocated!(d.budget, p.shell)                      # the value's shell (inline shells release at their vector slot)
     leave!(d)
     return v
 end
@@ -637,14 +769,17 @@ end
 end
 
 function buildarraytarget(::Type{T}, s::ArraySchema, p::ArrayPlan, memo::TypedMemo) where {T}
-    T <: Vector || return SemanticTarget{T}(p)
+    T <: Vector || return chargedsemantic(T, p, memo)
     E = eltype(T)
     ip = buildtyped(E, s.items, p.items, memo)
-    ip isa SemanticTarget && return SemanticTarget{T}(p)
+    ip isa SemanticTarget && return chargedsemantic(T, p, memo)
     # Julia 1.10's storage oracle counts an immutable non-isbits element both in its vector slot and
     # as a value shell. Julia 1.11 corrected that duplication, so only newer versions transfer it.
     inlineshell = VERSION >= v"1.11" && inlinestruct(E) ? measuredinlineshell(E, memo.budget) : 0
-    return ArrayTarget{E,typeof(ip)}(ip, p.minsize, inlineshell)
+    chargenode!(memo, ArrayTarget{E,typeof(ip)})
+    out = ArrayTarget{E,typeof(ip)}(ip, p.minsize, inlineshell)
+    releasecapture!(memo, ip)
+    return out
 end
 
 function buildmaptarget(::Type{T}, s::MapSchema, p::MapPlan, memo::TypedMemo) where {T}
@@ -653,11 +788,17 @@ function buildmaptarget(::Type{T}, s::MapSchema, p::MapPlan, memo::TypedMemo) wh
     elseif T <: Dict && (keytype(T) === String || keytype(T) === Symbol)
         K, V, dict = keytype(T), valtype(T), true
     else
-        return SemanticTarget{T}(p)
+        return chargedsemantic(T, p, memo)
     end
     vp = buildtyped(V, s.values, p.values, memo)
-    vp isa SemanticTarget && return SemanticTarget{T}(p)
-    return MapTarget{K,V,typeof(vp)}(vp, p.minsize, dict)
+    vp isa SemanticTarget && return chargedsemantic(T, p, memo)
+    # The same immutable inline-shell transfer as arrays: the decoded value's shell moves into its
+    # exact `Vector{V}` slot on Julia 1.11+ (round-3 item 4).
+    inlineshell = VERSION >= v"1.11" && inlinestruct(V) ? measuredinlineshell(V, memo.budget) : 0
+    chargenode!(memo, MapTarget{K,V,typeof(vp)})
+    out = MapTarget{K,V,typeof(vp)}(vp, p.minsize, dict, inlineshell)
+    releasecapture!(memo, vp)
+    return out
 end
 
 # ---- decoding ---------------------------------------------------------------------------------------
@@ -744,7 +885,12 @@ function typedvalue(p::ArrayTarget{E}, d::Decoder, names) where {E}
         end
     end
     leave!(d)
-    g === nothing && (reserve!(d.budget, STORAGE[].vector); return Vector{E}(undef, 0))
+    if g === nothing
+        reserve!(d.budget, STORAGE[].vector)
+        out = Vector{E}(undef, 0)
+        allocated!(d.budget, STORAGE[].vector)
+        return out
+    end
     return finish!(g, d)
 end
 
@@ -778,13 +924,21 @@ function typedvalue(p::MapTarget{K,V}, d::Decoder, names) where {K,V}
         for _ in 1:count
             push!(ks, d, readstring(d))
             push!(vs, d, decodetyped(p.values, d, names))
+            release!(d.budget, p.inlineshell)          # the concrete immutable shell now lives in its vector slot
         end
         size >= 0 && (d.pos == d.stop + 1 || dataerror(d, "sized map block not exactly consumed"))
         d.stop = outerstop
     end
     leave!(d)
     keys = finish!(ks, d)
-    vals = vs === nothing ? Vector{V}(undef, 0) : finish!(vs, d)
+    vals = if vs === nothing
+        reserve!(d.budget, STORAGE[].vector)
+        empty = Vector{V}(undef, 0)
+        allocated!(d.budget, STORAGE[].vector)
+        empty
+    else
+        finish!(vs, d)
+    end
     p.dict || (addinput!(d.budget, 0); return buildmap(V, keys, vals, d.budget))
     return todict(K, V, keys, vals, names)
 end
@@ -804,6 +958,7 @@ function typedvalue(p::RecordTarget{T}, d::Decoder, names) where {T}
     enter!(d)
     reserve!(d.budget, p.shell)
     v = recordvalue(p, d, names)
+    allocated!(d.budget, p.shell)                      # the value's shell (inline shells release at their vector slot)
     leave!(d)
     return v
 end
@@ -827,7 +982,7 @@ end
 "Measure the complete immutable shell that becomes part of a concrete vector element slot."
 function measuredinlineshell(::Type{T}, budget::Budget) where {T}
     bound = checked_add(checked_add(sizeof(T), checked_mul(8, fieldcount(T))), 64)
-    reserve!(budget, bound)
+    charge!(budget, bound)                             # covers the transient probe object
     try
         return try
             max(Int(Base.summarysize(emptyprobe(T))), 8)
@@ -842,7 +997,7 @@ end
 function measuredshell(::Type{T}, budget::Union{Nothing,Budget}=nothing) where {T}
     isbitstype(T) && return 0
     bound = checked_add(checked_add(sizeof(T), checked_mul(8, fieldcount(T))), 64)
-    budget === nothing || reserve!(budget, bound)
+    budget === nothing || charge!(budget, bound)       # covers the transient probe object
     try
         shell = if ismutabletype(T) || isstructtype(T)
             try
