@@ -371,9 +371,28 @@ mutable struct ResolvedRecordTarget{T,PS<:Tuple,SLOTMAP} <: TypedPlan
     const shell::Int
 end
 
+"A reader-field default retained as JSON and materialised afresh for each decoded record."
+struct ResolvedReaderDefault{T}
+    plan::DefaultPlan
+end
+
 function buildresolvedrecord(::Type{T}, s::RecordSchema, p::ResolvedRecordPlan, memo::TypedMemo) where {T}
-    (T <: NamedTuple || (isstructtype(T) && !ismutabletype(T)) || ismutabletype(T)) || return nothing
-    T <: Union{AbstractArray,AbstractString,AbstractDict} && return nothing
+    cached = memolookup(memo, s, T)
+    cached === nothing || return cached
+    fastroute(T) || return memostore!(memo, s, T, SemanticTarget{T}(p))
+    ref = RefTarget{T}(nothing)
+    memostore!(memo, s, T, ref)
+    built = buildresolvedrecordplan(T, s, p, memo)
+    if built === nothing
+        sem = SemanticTarget{T}(p)
+        ref.plan = sem
+        return memostore!(memo, s, T, sem)
+    end
+    ref.plan = built
+    return memostore!(memo, s, T, built)
+end
+
+function resolvedslotmap(::Type{T}, s::RecordSchema) where {T}
     names = fieldnames(T)
     tags = StructUtils.fieldtags(AvroStyle(), T)
     avronames = String[avrofieldname(tags, n) for n in names]
@@ -383,6 +402,11 @@ function buildresolvedrecord(::Type{T}, s::RecordSchema, p::ResolvedRecordPlan, 
         i == 0 && continue
         slotfor[i] = k
     end
+    return (names, slotfor)
+end
+
+function resolvedsteptargets(::Type{T}, s::RecordSchema, p::ResolvedRecordPlan, memo::TypedMemo,
+                             slotfor::Vector{Int}) where {T}
     plans = TypedPlan[]
     stepslot = Int[]
     for (slot, sp) in p.steps
@@ -397,34 +421,43 @@ function buildresolvedrecord(::Type{T}, s::RecordSchema, p::ResolvedRecordPlan, 
             push!(stepslot, k)
         end
     end
-    defaults = Vector{Any}(undef, length(names))
-    defs = StructUtils.fielddefaults(AvroStyle(), T)
-    covered = falses(length(names))
-    for (j, k) in enumerate(stepslot)
-        k == 0 || (covered[k] = true)
+    return (plans, stepslot)
+end
+
+function checkedreaderdefault(::Type{T}, dp::DefaultPlan, limits::Limits) where {T}
+    v = withbudget(limits) do budget
+        jsonvalue(dp.schema, dp.json, budget)
     end
+    v2 = v isa T ? v : try
+        convertleaf(T, v)
+    catch
+        nothing
+    end
+    v2 isa T || return nothing
+    return ResolvedReaderDefault{T}(dp)
+end
+
+function resolvedreaderdefaults!(::Type{T}, defaults::Vector{Any}, covered::BitVector,
+                                 slotfor::Vector{Int}, p::ResolvedRecordPlan, s::RecordSchema) where {T}
     for (slot, dp) in p.defaults
         k = slotfor[slot]
         k == 0 && continue
-        ft = fieldtype(T, k)
-        v = withbudget(graphlimits(s)) do budget
-            jsonvalue(dp.schema, dp.json, budget)
-        end
-        v2 = v isa ft ? v : try
-            convertleaf(ft, v)
-        catch
-            nothing
-        end
-        v2 isa ft || return nothing                       # a non-static or unconvertible default is ineligible
-        defaults[k] = v2
+        dflt = checkedreaderdefault(fieldtype(T, k), dp, graphlimits(s))
+        dflt === nothing && return false
+        defaults[k] = dflt
         covered[k] = true
     end
+    return true
+end
+
+function resolvedstaticdefaults!(::Type{T}, defaults::Vector{Any}, covered::BitVector, names) where {T}
+    defs = StructUtils.fielddefaults(AvroStyle(), T)
     for k in eachindex(names)
         covered[k] && continue
         ft = fieldtype(T, k)
         if haskey(defs, names[k])
             v = defs[names[k]]
-            v isa ft || return nothing
+            v isa ft || return false
             defaults[k] = v
         elseif Missing <: ft
             defaults[k] = missing
@@ -434,8 +467,33 @@ function buildresolvedrecord(::Type{T}, s::RecordSchema, p::ResolvedRecordPlan, 
             throw(ArgumentError("field $(names[k]) of $T has no writer field, no reader default and no static default"))
         end
     end
+    return true
+end
+
+function buildresolvedrecordplan(::Type{T}, s::RecordSchema, p::ResolvedRecordPlan, memo::TypedMemo) where {T}
+    names, slotfor = resolvedslotmap(T, s)
+    targets = resolvedsteptargets(T, s, p, memo, slotfor)
+    targets === nothing && return nothing
+    plans, stepslot = targets
+    defaults = Vector{Any}(undef, length(names))
+    covered = falses(length(names))
+    for k in stepslot
+        k == 0 || (covered[k] = true)
+    end
+    resolvedreaderdefaults!(T, defaults, covered, slotfor, p, s) || return nothing
+    resolvedstaticdefaults!(T, defaults, covered, names) || return nothing
     ps = (plans...,)
     return ResolvedRecordTarget{T,typeof(ps),(stepslot...,)}(s, ps, defaults, measuredshell(T))
+end
+
+function resolveddefault(::Type{T}, x::ResolvedReaderDefault{T}, d::Decoder) where {T}
+    countvalues!(d.budget)
+    v = jsonvalue(x.plan.schema, x.plan.json, d.budget)
+    return v isa T ? v : convertleaf(T, v)::T
+end
+
+function resolveddefault(::Type{T}, x, d::Decoder) where {T}
+    return x::T
 end
 
 function typedvalue(p::ResolvedRecordTarget{T}, d::Decoder, names) where {T}
@@ -456,10 +514,10 @@ end
             push!(body.args, :($(Symbol("f", SLOTMAP[j])) = decodetyped(p.plans[$j], d, names)))
         end
     end
-    args = Any[]
+    args = []
     for k in 1:fieldcount(T)
         ft = fieldtype(T, k)
-        push!(args, k in SLOTMAP ? :($(Symbol("f", k))::$ft) : :(p.defaults[$k]::$ft))
+        push!(args, k in SLOTMAP ? :($(Symbol("f", k))::$ft) : :(resolveddefault($ft, p.defaults[$k], d)))
     end
     construct = T <: NamedTuple ? :($T(($(args...),))) : Expr(:new, T, args...)
     push!(body.args, :(return $construct))

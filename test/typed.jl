@@ -316,6 +316,25 @@ StructUtils.lift(::Avro.AvroStyle, ::Type{Hooked}, x) = Hooked(1.0, missing, Int
         drn = Avro.DatumReader(wn, TN; reader_schema=rn)
         @test drn.plan isa Avro.ResolvedRecordTarget
         @test drn(Avro.encode(wn, (in=(x=Int32(4),),))) == (in=(x=Int64(4),),)
+        # recursive resolved records terminate plan construction and stay on the direct route
+        wll = P("{\"type\":\"record\",\"name\":\"RLL\",\"fields\":[{\"name\":\"value\",\"type\":\"int\"},{\"name\":\"next\",\"type\":[\"null\",\"RLL\"]}]}")
+        rll = P("{\"type\":\"record\",\"name\":\"RLL\",\"fields\":[{\"name\":\"value\",\"type\":\"long\"},{\"name\":\"next\",\"type\":[\"null\",\"RLL\"]}]}")
+        drll = Avro.DatumReader(wll, LL; reader_schema=rll)
+        @test drll.plan isa Avro.ResolvedRecordTarget
+        llbytes = Avro.encode(wll, (value=Int32(1), next=(value=Int32(2), next=missing)))
+        @test drll(llbytes) == LL(1, LL(2, missing))
+        # reader defaults are materialised for every datum
+        wdflt = P("{\"type\":\"record\",\"name\":\"D\",\"fields\":[]}")
+        rdflt = P("{\"type\":\"record\",\"name\":\"D\",\"fields\":[{\"name\":\"xs\",\"type\":{\"type\":\"array\",\"items\":\"long\"},\"default\":[1]}]}")
+        TD = @NamedTuple{xs::Vector{Int64}}
+        drdflt = Avro.DatumReader(wdflt, TD; reader_schema=rdflt)
+        x = drdflt(UInt8[])
+        y = drdflt(UInt8[])
+        @test x == y == (xs=Int64[1],)
+        @test x.xs !== y.xs
+        tiny = Avro.Limits(max_total_values=2)
+        @test_throws Avro.LimitError Avro.DatumReader(wdflt; reader_schema=rdflt, limits=tiny)(UInt8[])
+        @test_throws Avro.LimitError Avro.DatumReader(wdflt, TD; reader_schema=rdflt, limits=tiny)(UInt8[])
         # a custom-hooked target still takes the semantic route
         drh = Avro.DatumReader(w, Hooked; reader_schema=r)
         @test drh.plan isa Avro.SemanticTarget || !(drh.plan isa Avro.ResolvedRecordTarget)
