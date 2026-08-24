@@ -11,10 +11,15 @@
                                   # the full lines in benchmarks/logs/avro112.log (2026-08-24)
     cold = joinpath(@__DIR__, "perf", "cold.jl")
     project = Base.active_project()
+    # Pkg.test forces --check-bounds=yes on this process and Base.julia_cmd() reproduces it; the
+    # §10.1 protocol measures default-flag cold processes (the 1.1.2 baselines were recorded that
+    # way), so the child drops the flag — globally-forced bounds checks compress the projection
+    # skip-path ratio from ≈2.4 to ≈1.85 while the suite's own assertions keep running checked.
+    juliacmd = Cmd(filter(a -> !startswith(a, "--check-bounds"), Base.julia_cmd().exec))
     function coldmetric(metric; threads=1)
         samples = Vector{Float64}[]
         for _ in 1:5
-            out = read(`$(Base.julia_cmd()) --startup-file=no --threads=$threads --project=$project $cold $metric`, String)
+            out = read(`$juliacmd --startup-file=no --threads=$threads --project=$project $cold $metric`, String)
             fields = split(strip(out))
             @assert fields[1] == metric
             push!(samples, parse.(Float64, fields[2:end]))
