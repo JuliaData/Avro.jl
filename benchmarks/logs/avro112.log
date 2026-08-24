@@ -1,22 +1,22 @@
 impl=Avro.jl version=1.1.2 julia=1.12.6 threads=1 cpu=Apple M3 Max rows=1000000
-metric=write codec=null best_s=0.969899458 all_s=[0.996716792, 1.093888583, 0.969899458] bytes=23100364
-metric=write codec=zstd best_s=1.066863625 all_s=[1.30495025, 1.066863625, 1.184511708] bytes=13964340
-metric=write codec=deflate best_s=1.679749375 all_s=[1.766511125, 1.679749375, 1.684411375] bytes=13943344
-metric=read_index codec=null best_s=1.455399917 all_s=[1.455399917, 1.456310875, 1.572371583]
-metric=materialize_columns codec=null best_s=3.548123666 all_s=[3.807323792, 3.548123666, 3.551897875]
-metric=read_to_columns codec=null best_s=5.035989208 all_s=[5.087610167, 5.035989208, 5.042858459]
-metric=read_to_columns codec=zstd best_s=5.251227792 all_s=[5.714624875, 5.251227792, 5.435315458]
+metric=write codec=null best_s=1.1051045 all_s=[1.1051045, 1.338560166, 1.272886375] bytes=22050364
+metric=write codec=zstd best_s=1.0153025 all_s=[1.392034583, 1.0153025, 1.057156375] bytes=3833531
+metric=write codec=deflate best_s=1.434964833 all_s=[1.461554458, 1.536612333, 1.434964833] bytes=5833839
+metric=read_index codec=null best_s=1.48623825 all_s=[1.593502167, 1.84474725, 1.48623825]
+metric=materialize_columns codec=null best_s=3.712629209 all_s=[4.402292333, 3.712629209, 3.841621708]
+metric=read_to_columns codec=null best_s=5.296807 all_s=[5.565824708, 5.590989, 5.296807]
+metric=read_to_columns codec=zstd best_s=5.213614958 all_s=[5.495354833, 5.213614958, 5.330697042]
 metric=single_record_read bytes=1376 allocs=187
 metric=single_record_write bytes=944 allocs=200
 
-# 5 cold processes (§10.1 protocol, 2026-08-24, same host/julia; medians: write=0.921567791 read_to_columns=4.851203083)
-metric=write codec=null best_s=0.921567791 all_s=[0.921567791, 1.044399375, 0.926218917] bytes=23100364
-metric=read_to_columns codec=null best_s=4.983209333 all_s=[4.983209333, 5.007788084, 5.043900709]
-metric=write codec=null best_s=0.931873958 all_s=[0.939065792, 1.03874675, 0.931873958] bytes=23100364
-metric=read_to_columns codec=null best_s=5.001066875 all_s=[5.006930375, 5.001066875, 5.009614708]
-metric=write codec=null best_s=0.911317333 all_s=[0.949807083, 1.02728325, 0.911317333] bytes=23100364
-metric=read_to_columns codec=null best_s=4.815221333 all_s=[4.878754875, 4.815221333, 4.900801375]
-metric=write codec=null best_s=0.901034708 all_s=[0.910553416, 1.002449708, 0.901034708] bytes=23100364
-metric=read_to_columns codec=null best_s=4.77364925 all_s=[4.809700333, 4.95223125, 4.77364925]
-metric=write codec=null best_s=0.92628375 all_s=[0.951835959, 1.037172167, 0.92628375] bytes=23100364
-metric=read_to_columns codec=null best_s=4.851203083 all_s=[4.990488, 5.032339375, 4.851203083]
+# 5 cold processes (§10.1 protocol, 2026-08-24, same host/julia; medians: write=0.945999958 read_to_columns=5.051266584)
+metric=write codec=null best_s=1.1051045 all_s=[1.1051045, 1.338560166, 1.272886375] bytes=22050364
+metric=read_to_columns codec=null best_s=5.296807 all_s=[5.565824708, 5.590989, 5.296807]
+metric=write codec=null best_s=0.945999958 all_s=[0.945999958, 1.118558709, 1.051731459] bytes=22050364
+metric=read_to_columns codec=null best_s=5.042072541 all_s=[5.04952475, 5.042072541, 5.044909792]
+metric=write codec=null best_s=1.203622292 all_s=[1.333107416, 1.296336292, 1.203622292] bytes=22050364
+metric=read_to_columns codec=null best_s=5.109198583 all_s=[5.743161334, 6.10493025, 5.109198583]
+metric=write codec=null best_s=0.926025875 all_s=[0.936610583, 1.023436292, 0.926025875] bytes=22050364
+metric=read_to_columns codec=null best_s=5.051266584 all_s=[5.066904708, 5.051266584, 5.104348041]
+metric=write codec=null best_s=0.937682916 all_s=[1.057313584, 0.937682916, 1.038905709] bytes=22050364
+metric=read_to_columns codec=null best_s=5.032883875 all_s=[5.032883875, 5.433302083, 5.562869666]
