@@ -1,13 +1,13 @@
 # Benchmarks
 
 Recorded on the authoring host (Apple silicon, macOS, Julia 1.12.6, 2026-08-23); reproduce with
-`AVRO_PERF=true` in the test suite (`test/perf.jl`: the §10.1 protocol, medians of 5 cold processes). Baselines are Avro.jl 1.1.2
-on the same host and file (1 M rows: `id::Int64`, `name::String`, `score::Float64`, `flag::Bool`).
+`AVRO_PERF=true` in the test suite (`test/perf.jl`: the §10.1 protocol, medians of 5 cold processes). Baselines are Avro.jl 1.1.2 on the same host under the same §10.1 protocol (medians of 5 cold
+processes, deterministic 1 M-row `{id, x, name, flag}` data; `benchmarks/logs/avro112.log`).
 
 | Operation | Avro.jl 2.0 | Avro.jl 1.1.2 | ratio |
 |---|---|---|---|
-| `Avro.write`, null codec, 1 thread | 0.145 s | 1.40 s | 9.6× |
-| `Avro.Table`, null codec, 1 thread | 0.126 s | 5.69 s (read + materialise) | 45× |
+| `Avro.write`, null codec, 1 thread | 0.145 s | 0.92 s | 6.4× |
+| `Avro.Table`, null codec, 1 thread | 0.126 s | 4.85 s (read + materialise) | 38× |
 | `Avro.Table`, `ntasks=8`, 4 GiB limits | — | — | 3.39× vs 1 thread |
 | `select=(:id,)`, `validate=:fast` | — | — | 2.4× vs full decode |
 | zstandard / deflate / snappy `Table` vs null + raw transcode | 1.03× / 0.99× / 1.06× | — | ≤ 1.3× gate |

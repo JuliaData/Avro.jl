@@ -8,3 +8,15 @@ metric=read_to_columns codec=null best_s=5.035989208 all_s=[5.087610167, 5.03598
 metric=read_to_columns codec=zstd best_s=5.251227792 all_s=[5.714624875, 5.251227792, 5.435315458]
 metric=single_record_read bytes=1376 allocs=187
 metric=single_record_write bytes=944 allocs=200
+
+# 5 cold processes (§10.1 protocol, 2026-08-24, same host/julia; medians: write=0.921567791 read_to_columns=4.851203083)
+metric=write codec=null best_s=0.921567791 all_s=[0.921567791, 1.044399375, 0.926218917] bytes=23100364
+metric=read_to_columns codec=null best_s=4.983209333 all_s=[4.983209333, 5.007788084, 5.043900709]
+metric=write codec=null best_s=0.931873958 all_s=[0.939065792, 1.03874675, 0.931873958] bytes=23100364
+metric=read_to_columns codec=null best_s=5.001066875 all_s=[5.006930375, 5.001066875, 5.009614708]
+metric=write codec=null best_s=0.911317333 all_s=[0.949807083, 1.02728325, 0.911317333] bytes=23100364
+metric=read_to_columns codec=null best_s=4.815221333 all_s=[4.878754875, 4.815221333, 4.900801375]
+metric=write codec=null best_s=0.901034708 all_s=[0.910553416, 1.002449708, 0.901034708] bytes=23100364
+metric=read_to_columns codec=null best_s=4.77364925 all_s=[4.809700333, 4.95223125, 4.77364925]
+metric=write codec=null best_s=0.92628375 all_s=[0.951835959, 1.037172167, 0.92628375] bytes=23100364
+metric=read_to_columns codec=null best_s=4.851203083 all_s=[4.990488, 5.032339375, 4.851203083]

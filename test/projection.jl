@@ -143,7 +143,7 @@
             fullct = Tables.columntable(full)
             sels = Vector{Symbol}[[names[1]], [names[end], names[1]]]
             length(names) > 2 && push!(sels, names[1:2:end])
-            for sel in sels, val in (:strict, :fast), nt in (1, 8)
+            for sel in sels, val in (:strict, :fast), nt in (1, 2, 8)
                 pt = Avro.Table(data; select=Tuple(sel), validate=val, ntasks=nt, limits=raised)
                 @test Tables.columnnames(pt) == sel && length(pt) == length(full)
                 for (k, nm) in enumerate(sel)
