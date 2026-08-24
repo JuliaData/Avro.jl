@@ -322,6 +322,10 @@ function buildresolvedtyped(::Type{T}, s::Schema, p::ReadPlan, memo::TypedMemo) 
     if p isa WrapPlan && p.nullable != 0 && s isa UnionSchema
         N, inner = T isa Union ? splitoptional(T) : (Union{}, T)
         inner === nothing && return nothing
+        if p.readerindex == p.nullable
+            N === Union{} && return nothing
+            return ResolvedNullTarget{N,typeof(p.inner)}(p.inner)
+        end
         return buildtyped(inner, s.branches[p.readerindex], p.inner, memo)   # the writer never encodes null here
     end
     if p isa UnionResolvePlan && p.nullable != 0 && s isa UnionSchema
@@ -346,6 +350,16 @@ function buildresolvedtyped(::Type{T}, s::Schema, p::ReadPlan, memo::TypedMemo) 
     end
     p isa ResolvedRecordPlan && s isa RecordSchema && return buildresolvedrecord(T, s, p, memo)
     return nothing
+end
+
+"A non-union null writer resolved to the target's nullable convention."
+struct ResolvedNullTarget{N,P<:ReadPlan} <: TypedPlan
+    plan::P
+end
+
+function typedvalue(p::ResolvedNullTarget{N}, d::Decoder, names) where {N}
+    decodevalue(p.plan, d)
+    return N === Missing ? missing : nothing
 end
 
 "A resolved two-branch-nullable union into `Union{Missing|Nothing, X}` typed targets per writer branch."

@@ -335,6 +335,12 @@ StructUtils.lift(::Avro.AvroStyle, ::Type{Hooked}, x) = Hooked(1.0, missing, Int
         tiny = Avro.Limits(max_total_values=2)
         @test_throws Avro.LimitError Avro.DatumReader(wdflt; reader_schema=rdflt, limits=tiny)(UInt8[])
         @test_throws Avro.LimitError Avro.DatumReader(wdflt, TD; reader_schema=rdflt, limits=tiny)(UInt8[])
+        # a null writer resolves through either nullable reader position and null target convention
+        wnull = P("\"null\"")
+        for rnull in (P("[\"null\",\"long\"]"), P("[\"long\",\"null\"]"))
+            @test Avro.DatumReader(wnull, Union{Nothing,Int64}; reader_schema=rnull)(UInt8[]) === nothing
+            @test Avro.DatumReader(wnull, Union{Missing,Int64}; reader_schema=rnull)(UInt8[]) === missing
+        end
         # a custom-hooked target still takes the semantic route
         drh = Avro.DatumReader(w, Hooked; reader_schema=r)
         @test drh.plan isa Avro.SemanticTarget || !(drh.plan isa Avro.ResolvedRecordTarget)
