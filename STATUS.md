@@ -3,37 +3,38 @@
 ## Current implementation review (2026-08-24)
 
 Round 2 reviewed `c6faaa4` against base `59a1e85`, the agreed v24 plan, and `../AGENTS.md`.
-The implementation source after 25 round-two repair commits is `c580b29`. The full report is
+The implementation source after 28 round-two repair commits is `168a896`. The full report is
 `reviews/codex-implementation-review-2.md`.
 
 **Current disposition: REVISE.** This tree is not PR-ready and is not ready to ship as 2.0.0.
 R05, R08, R09, R13, R15, R16, R17, and R18 are accepted. R01–R04, R06, R07, R10–R12, R14, and R19 remain
 disputed. The main blockers are incomplete single-operation resource accounting, live parallel-pool
 charges that end before their allocations die, incomplete interop and projection gates, a failing
-compile-cost gate, two failing performance targets, and unresolved repository-wide style violations.
+compile-cost gate, a failing performance target, and unresolved repository-wide style violations.
 
 The round-two repairs include schema-name and recursive-graph limits, exact writer/reader work
 accounting, transactional cache replacement overlap, source-equivalent header charges, direct typed
 resolution correctness, locked admission charging, byte-identical block-output failures, exact
 compressor bounds, exact block-table growth, the container-only legacy fixed-name boundary, live
 interop paths, strict performance assertions, and tracked test manifests for Julia 1.10, 1.11, and
-1.12. These repairs do not close the disputed items listed above.
+1.12. Fixture generation is now idempotent, covers data and root schemas, and fails on root-generation
+errors. These repairs do not close the disputed items listed above.
 
 ### Current verification
 
-| Gate | Result at `c580b29` |
+| Gate | Result at final implementation source `168a896` |
 |---|---|
-| Julia 1.12.6 full suite plus Aqua/JET, `-t4` | 9,433 passed, 1 failed. The compile-cost gate created 10 Avro specializations. Aqua and JET passed. |
-| Julia 1.10.11 full suite, `-t4` | 9,421 passed, 1 failed. The compile-cost gate created 8 Avro specializations. |
-| Julia 1.11.9 full suite with tracked `Manifest-v1.11.toml`, `-t4`, compiled modules disabled | 9,411 passed, 2 failed. The compile-cost gate created 8 Avro specializations and grew RSS by 71.0 MB against the 50 MB limit. |
-| Stand-alone Julia 1.12.6 compile-cost gate | 1,173 passed, 2 failed: 42 new specializations and 159.6 MB RSS growth. The result is order-sensitive and is not a green release gate. |
+| Julia 1.12.6 full suite plus Aqua/JET, `-t4` | 9,434 passed, 1 failed in 6m49.1s. The compile-cost gate created 10 Avro specializations and grew RSS by 43.6 MB. Aqua 10/10 and JET 1/1 passed. |
+| Julia 1.10.11 full suite, `-t4` | 9,423 passed, 1 failed in 5m45.6s. The compile-cost gate created 8 Avro specializations and grew RSS by 47.1 MB. |
+| Julia 1.11.9 full suite with tracked root and test `Manifest-v1.11.toml` files, `-t4`, compiled modules disabled | 9,412 passed, 2 failed in 6m56.7s. The compile-cost gate created 8 Avro specializations and grew RSS by 71.1 MB against the 50 MB limit. |
+| Stand-alone Julia 1.12.6 compile-cost gate | 1,173 passed, 2 failed in 55.1s: 42 new specializations and 156.3 MB RSS growth. The result is order-sensitive and is not a green release gate. |
 | §8.5 live interop with avro-tools 1.12.2 and fastavro 1.12.2 | 58/58 datum checks and 345/345 matrix checks passed. The category-coverage gaps in R12 remain. |
-| `AVRO_PERF=true`, Julia 1.12.6, `-t8` | 14/16 passed. The 8-thread ratio was 2.919, below 3. Schema parsing used 2,062 allocations, above 300. |
-| `AVRO_RSS_GATE=true`, Julia 1.12.6, `-t8` | 6/6 passed. Baseline 319.8 MB; peak 3,055.0 MB; 4,096 MB ceiling. |
+| `AVRO_PERF=true`, Julia 1.12.6, `-t8` | 15/16 passed in 2m02.1s. The 8-thread ratio passed at 4.44. Schema parsing used 2,062 allocations, above 300. |
+| `AVRO_RSS_GATE=true`, Julia 1.12.6, `-t8` | 6/6 passed. Baseline 316.5 MB; peak 3,089.9 MB; 4,096 MB ceiling. |
 | `AVRO_SMOKE=true` | 5/5 passed. |
 | Cross-version files | 32/32 passed for 1.10.11→1.12.6 and 32/32 for 1.12.6→1.10.11. |
 | Docs | Strict doctests, references, document checks, and HTML build passed. |
-| Fixture generation | Completed in an isolated copy. It produced 12 fastavro files for each of null, deflate, bzip2, snappy, zstandard, and xz. |
+| Fixture generation | Completed in a clean isolated copy with the supplied tools. Each codec produced 6 data plus 13 root files, for 19 total. No nested derived names remained, and every root-generation command succeeded. |
 
 The review used the supplied local Java and Python tools. It did not fetch, push, rewrite history, or
 touch another checkout. The untracked `test/Manifest.toml` existed before round 2 and remains untouched.
