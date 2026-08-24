@@ -438,6 +438,9 @@ end
         @test_throws Avro.LimitError Avro.RecordSchema("RecursiveDepth"; limits=Avro.Limits(max_schema_depth=1)) do ref
             return [Avro.Field("next", ref)]
         end
+        @test_throws Avro.LimitError Avro.RecordSchema("RecursiveValues"; limits=Avro.Limits(max_total_values=1)) do ref
+            return [Avro.Field("next", ref)]
+        end
         let s = Avro.LongSchema(), lim = Avro.Limits(max_schema_depth=4)
             e = try
                 for _ in 1:6
