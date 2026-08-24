@@ -312,8 +312,9 @@ end
         # an inline nested struct charges its own shell: the outer measures the marginal
         Outer = @NamedTuple{x::Int64, inner::@NamedTuple{s::String, y::Int64}}
         Inner = @NamedTuple{s::String, y::Int64}
-        @test Avro.measuredshell(Outer) + Avro.measuredshell(Inner) ==
-              max(Int(Base.summarysize(Avro.emptyprobe(Outer))), 8)       # marginal + nested = the whole layout
+        expectedshell = max(Int(Base.summarysize(Avro.emptyprobe(Outer))), 8)
+        VERSION < v"1.11" && (expectedshell += Avro.measuredshell(Inner)) # Julia 1.10's oracle counts the inline child again
+        @test Avro.measuredshell(Outer) + Avro.measuredshell(Inner) == expectedshell
         # the probe bound reserves and trues up to zero on a live budget
         b = Avro.Budget(Avro.Limits())
         r0 = b.reserved
@@ -380,7 +381,8 @@ end
                     # slots already contain the scalar probe shell; only referenced payload stays extra.
                     array_schema = Avro.ArraySchema(scalar_schema)
                     array, array_charge = chargedtyped(array_schema, Vector{T}, T[case.value, case.value])
-                    inline_shell = isstructtype(T) && !ismutabletype(T) && !isbitstype(T) ? probeshell(T) : 0
+                    inline_shell = VERSION >= v"1.11" && isstructtype(T) && !ismutabletype(T) &&
+                                   !isbitstype(T) ? probeshell(T) : 0
                     expected_array_charge = Avro.vectorbytes(T, length(array)) +
                                             length(array) * (scalar_charge - inline_shell)
                     @test array_charge == expected_array_charge

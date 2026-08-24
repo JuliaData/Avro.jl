@@ -641,7 +641,9 @@ function buildarraytarget(::Type{T}, s::ArraySchema, p::ArrayPlan, memo::TypedMe
     E = eltype(T)
     ip = buildtyped(E, s.items, p.items, memo)
     ip isa SemanticTarget && return SemanticTarget{T}(p)
-    inlineshell = inlinestruct(E) ? measuredinlineshell(E, memo.budget) : 0
+    # Julia 1.10's storage oracle counts an immutable non-isbits element both in its vector slot and
+    # as a value shell. Julia 1.11 corrected that duplication, so only newer versions transfer it.
+    inlineshell = VERSION >= v"1.11" && inlinestruct(E) ? measuredinlineshell(E, memo.budget) : 0
     return ArrayTarget{E,typeof(ip)}(ip, p.minsize, inlineshell)
 end
 
@@ -848,7 +850,7 @@ function measuredshell(::Type{T}, budget::Union{Nothing,Budget}=nothing) where {
                 marginal = Int(Base.summarysize(probe))
                 for i in 1:fieldcount(T)                   # inline nested structs charge their own shells
                     F = fieldtype(T, i)
-                    if inlinestruct(F)
+                    if inlinestruct(F) && VERSION >= v"1.11"
                         marginal -= measuredshell(F, budget)
                     end
                 end
