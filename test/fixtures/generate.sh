@@ -20,8 +20,8 @@ here="$gen"
 for f in "$here"/{data,roots}/*-fastavro-*.avro; do rm -- "$f"; done
 # Non-record roots: every kind, random data + tojson expectations.
 for r in "$gen"/roots/*.avsc; do b="$(basename "$r" .avsc)"
-  J random --count 20 --seed 11 --schema-file "$r" "$gen/roots/$b-null.avro" 2>/dev/null || true
-  [ -f "$gen/roots/$b-null.avro" ] && J tojson "$gen/roots/$b-null.avro" > "$gen/roots/$b.jsonl" || true
+  J random --count 20 --seed 11 --schema-file "$r" "$gen/roots/$b-null.avro" 2>/dev/null
+  J tojson "$gen/roots/$b-null.avro" > "$gen/roots/$b.jsonl"
 done
 for s in bench everything wide interop; do J random --count 50 --seed 7 --schema-file "$here/schemas/$s.avsc" "$here/data/$s-null.avro"; done
 J random --count 3 --seed 7 --schema-file "$here/schemas/empty.avsc" "$here/data/empty-null.avro"
