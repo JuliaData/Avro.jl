@@ -153,8 +153,8 @@ function readheader(s::BlockSource, limits::Limits, budget::Budget; legacy, allo
     sync = ntuple(_ -> sourcebyte(s), 16)
     schemabytes = get(metadata, "avro.schema", nothing)
     schemabytes === nothing && throw(DataError("the container has no avro.schema", position(s)))
-    schema = parseschema(schemabytes; allow_invalid_names=allow_invalid_names, allow_invalid_defaults=allow_invalid_defaults, limits=limits,
-                         legacy_fixed_names=legacy === :avrojl1, budget=budget)
+    schema = parseschemaimpl(schemabytes, legacy === :avrojl1; allow_invalid_names=allow_invalid_names,
+                             allow_invalid_defaults=allow_invalid_defaults, limits=limits, budget=budget)
     codecbytes = get(metadata, "avro.codec", nothing)
     codecname = "null"
     if codecbytes !== nothing

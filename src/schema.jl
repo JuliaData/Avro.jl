@@ -298,10 +298,18 @@ marked `repaired_names`); with `allow_invalid_defaults=true` invalid defaults ar
 `valid=false`.
 """
 function parseschema(src; allow_invalid_names::Bool=false, allow_invalid_defaults::Bool=false, limits::Limits=Limits(),
-                     legacy_fixed_names::Bool=false, budget::Union{Nothing,Budget}=nothing)
+                     budget::Union{Nothing,Budget}=nothing)
+    return parseschemaimpl(src, false; allow_invalid_names=allow_invalid_names,
+        allow_invalid_defaults=allow_invalid_defaults, limits=limits, budget=budget)
+end
+
+function parseschemaimpl(src, legacy_fixed_names::Bool; allow_invalid_names::Bool=false,
+                         allow_invalid_defaults::Bool=false, limits::Limits=Limits(),
+                         budget::Union{Nothing,Budget}=nothing)
     budget === nothing &&
-        return withbudget(b -> parseschema(src; allow_invalid_names=allow_invalid_names, allow_invalid_defaults=allow_invalid_defaults,
-                                           limits=limits, legacy_fixed_names=legacy_fixed_names, budget=b), limits)
+        return withbudget(b -> parseschemaimpl(src, legacy_fixed_names; allow_invalid_names=allow_invalid_names,
+                                               allow_invalid_defaults=allow_invalid_defaults,
+                                               limits=limits, budget=b), limits)
     buf = sourcebytes(src, limits.max_schema_bytes, budget, SchemaError)
     errfn = (msg, pos) -> throw(SchemaError(string(msg, " (byte ", pos, ")"), "\$"))
     limitfn = (limit, observed, value) -> throw(LimitError(limit, observed, value, limit, :decode))
