@@ -388,10 +388,9 @@ end
 Write `s` as a JSON string literal, re-escaping every WTF-8 surrogate sequence as `\\uXXXX` so metadata
 round-trips code-unit-exactly.
 """
-function escapejson(io::IO, s::AbstractString)
+function escapejsoncontents(io::IO, s::AbstractString)
     cu = codeunits(s)
     n = length(cu)
-    print(io, '"')
     i = 1
     while i <= n
         b = cu[i]
@@ -412,6 +411,12 @@ function escapejson(io::IO, s::AbstractString)
             Base.write(io, b); i += 1
         end
     end
+    return nothing
+end
+
+function escapejson(io::IO, s::AbstractString)
+    print(io, '"')
+    escapejsoncontents(io, s)
     print(io, '"')
     return nothing
 end

@@ -322,8 +322,9 @@ caller).
 """
 function release!(b::Budget, n::Int)
     n <= 0 && return b
+    n <= b.reserved || throw(ArgumentError("release of $n bytes exceeds the live reservation $(b.reserved)"))
     allocated!(b, n)
-    b.reserved = max(b.reserved - n, 0)
+    b.reserved -= n
     return b
 end
 

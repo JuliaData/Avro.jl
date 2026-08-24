@@ -115,6 +115,17 @@ end
             blocks = Avro.Reader(rr -> collect(Avro.eachblock(rr)), Avro.tobuffer(rows; codec=codecname, block_bytes=256))
             @test sum(first, blocks) == length(rows) && length(blocks) > 3
         end
+        # Exact reader-header indexes at and across growth boundaries. The two reserved Avro
+        # entries make these total metadata counts 8, 16, and 33.
+        for nuser in (6, 14, 31)
+            usermeta = Dict("user-$(lpad(i, 2, '0'))" => UInt8[mod(i, 256)] for i in 1:nuser)
+            metadata_reader = Avro.Reader(Avro.tobuffer(rows[1:1]; metadata=usermeta))
+            parsed_metadata = Avro.metadata(metadata_reader)
+            @test length(parsed_metadata) == nuser + 2
+            @test Avro.capacity(parsed_metadata.keys) == length(parsed_metadata.keys)
+            @test Avro.capacity(parsed_metadata.vals) == length(parsed_metadata.vals)
+            close(metadata_reader)
+        end
         # a held block's bytes stay valid after iteration advances
         io = Avro.tobuffer(rows; block_bytes=256)
         r = Avro.Reader(io)

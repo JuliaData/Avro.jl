@@ -93,17 +93,46 @@ end
 
 # ---- header -----------------------------------------------------------------------------------------
 
+"The exact retained storage of the parallel metadata key and value indexes."
+function metadataindexbytes(n::Int)
+    return checked_add(vectorbytes(String, n), vectorbytes(Vector{UInt8}, n))
+end
+
+"Allocate the two exact-capacity metadata indexes after reserving each one."
+function metadataindexes(capacity::Int, budget::Budget)
+    keycharge = vectorbytes(String, capacity)
+    reserve!(budget, keycharge)
+    newkeys = try
+        keys = Vector{String}(undef, capacity)
+        allocated!(budget, keycharge)
+        keys
+    catch
+        release!(budget, keycharge)
+        rethrow()
+    end
+    valcharge = vectorbytes(Vector{UInt8}, capacity)
+    reserve!(budget, valcharge)
+    newvals = try
+        vals = Vector{Vector{UInt8}}(undef, capacity)
+        allocated!(budget, valcharge)
+        vals
+    catch
+        newkeys = nothing
+        release!(budget, keycharge)
+        release!(budget, valcharge)
+        rethrow()
+    end
+    return (newkeys, newvals)
+end
+
 "The parsed container header: metadata (duplicates rejected), schema, codec name and sync marker."
 function readheader(s::BlockSource, limits::Limits, budget::Budget; legacy, allow_invalid_names::Bool, allow_invalid_defaults::Bool)
     for m in MAGIC
         (sourceeof(s) || sourcebyte(s) != m) && throw(DataError("not an Avro object container file (bad magic)", position(s)))
     end
-    keycap = 8
-    reserve!(budget, 2 * STORAGE[].vector + 16 * keycap)   # charged exact-replacement growth (§4.4, round-2 D04)
-    keys = String[]
-    vals = Vector{UInt8}[]
-    sizehint!(keys, keycap)
-    sizehint!(vals, keycap)
+    keycap = min(8, limits.max_metadata_entries)
+    keys, vals = metadataindexes(keycap, budget)
+    nkeys = 0
     total = 0
     while true
         count = sourcevarint(s)
@@ -119,7 +148,7 @@ function readheader(s::BlockSource, limits::Limits, budget::Budget; legacy, allo
         count <= limits.max_metadata_entries || throw(LimitError(:max_metadata_entries, Int(count), limits.max_metadata_entries, :max_metadata_entries, :decode))
         for _ in 1:count
             countvalues!(budget)
-            length(keys) < limits.max_metadata_entries || throw(LimitError(:max_metadata_entries, length(keys) + 1, limits.max_metadata_entries, :max_metadata_entries, :decode))
+            nkeys < limits.max_metadata_entries || throw(LimitError(:max_metadata_entries, nkeys + 1, limits.max_metadata_entries, :max_metadata_entries, :decode))
             klen = sourcevarint(s)
             (0 <= klen <= limits.max_metadata_bytes) || throw(DataError("invalid metadata key length $klen", position(s)))
             kbytes = sourcepayload(s, Int(klen), budget)
@@ -127,11 +156,22 @@ function readheader(s::BlockSource, limits::Limits, budget::Budget; legacy, allo
             keybuffer = if kbytes isa Vector{UInt8}
                 kbytes                                             # the streamed payload is already owned and charged
             else
-                reserve!(budget, bytesbytes(Int(klen)))             # reserve the byte-source copy before allocation
-                Vector{UInt8}(kbytes)
+                keycharge = bytesbytes(Int(klen))
+                reserve!(budget, keycharge)                         # reserve the byte-source copy before allocation
+                try
+                    buffer = Vector{UInt8}(kbytes)
+                    allocated!(budget, keycharge)
+                    buffer
+                catch
+                    release!(budget, keycharge)
+                    rethrow()
+                end
             end
-            reserve!(budget, stringbytes(0))                         # the String shell overlaps the owned byte buffer
+            keyshell = stringbytes(0)
+            reserve!(budget, keyshell)                               # the String shell overlaps the owned byte buffer
             key = String(keybuffer)                                 # takes ownership of the one key buffer
+            allocated!(budget, keyshell)
+            keybuffer = nothing
             release!(budget, bytesbytes(0))                          # the emptied Vector shell is no longer live
             vlen = sourcevarint(s)
             (0 <= vlen <= limits.max_metadata_bytes) || throw(DataError("invalid metadata value length $vlen", position(s)))
@@ -141,19 +181,31 @@ function readheader(s::BlockSource, limits::Limits, budget::Budget; legacy, allo
             value = if vpayload isa Vector{UInt8}
                 vpayload                                            # a stream buffer is owned and already charged
             else
-                reserve!(budget, bytesbytes(Int(vlen)))             # a byte-source view is copied, reserved first
-                Vector{UInt8}(vpayload)
+                valuecharge = bytesbytes(Int(vlen))
+                reserve!(budget, valuecharge)                       # a byte-source view is copied, reserved first
+                try
+                    buffer = Vector{UInt8}(vpayload)
+                    allocated!(budget, valuecharge)
+                    buffer
+                catch
+                    release!(budget, valuecharge)
+                    rethrow()
+                end
             end
-            if length(keys) == keycap
-                newcap = 2 * keycap
-                reserve!(budget, 2 * STORAGE[].vector + 16 * newcap)
-                release!(budget, 2 * STORAGE[].vector + 16 * keycap)
+            if nkeys == keycap
+                newcap = min(max(1, checked_mul(2, keycap)), limits.max_metadata_entries)
+                newkeys, newvals = metadataindexes(newcap, budget)
+                copyto!(newkeys, 1, keys, 1, nkeys)
+                copyto!(newvals, 1, vals, 1, nkeys)
+                oldcharge = metadataindexbytes(keycap)
+                keys = newkeys
+                vals = newvals
+                release!(budget, oldcharge)
                 keycap = newcap
-                sizehint!(keys, keycap)
-                sizehint!(vals, keycap)
             end
-            push!(keys, key)
-            push!(vals, value)
+            nkeys += 1
+            keys[nkeys] = key
+            vals[nkeys] = value
         end
         if size >= 0
             consumed = position(s) - blockstart
@@ -161,11 +213,14 @@ function readheader(s::BlockSource, limits::Limits, budget::Budget; legacy, allo
         end
     end
     addinput!(budget, total)
-    if keycap != length(keys)                              # compact to exact capacity: retained is 16 per entry
-        reserve!(budget, 2 * STORAGE[].vector + 16 * length(keys))
-        keys = Vector{String}(keys)
-        vals = Vector{Vector{UInt8}}(vals)
-        release!(budget, 2 * STORAGE[].vector + 16 * keycap)
+    if keycap != nkeys
+        newkeys, newvals = metadataindexes(nkeys, budget)
+        copyto!(newkeys, 1, keys, 1, nkeys)
+        copyto!(newvals, 1, vals, 1, nkeys)
+        oldcharge = metadataindexbytes(keycap)
+        keys = newkeys
+        vals = newvals
+        release!(budget, oldcharge)
     end
     metadata = buildmap(Vector{UInt8}, keys, vals, budget; duplicateposition=position(s))
     sync = ntuple(_ -> sourcebyte(s), 16)
@@ -177,7 +232,22 @@ function readheader(s::BlockSource, limits::Limits, budget::Budget; legacy, allo
     codecname = "null"
     if codecbytes !== nothing
         validutf8(codecbytes, 1, length(codecbytes)) || throw(DataError("avro.codec is not valid UTF-8", position(s)))
-        codecname = String(copy(codecbytes))
+        codecvectorsize = bytesbytes(length(codecbytes))
+        reserve!(budget, codecvectorsize)
+        codeccopy = try
+            bytes = copy(codecbytes)
+            allocated!(budget, codecvectorsize)
+            bytes
+        catch
+            release!(budget, codecvectorsize)
+            rethrow()
+        end
+        codecshell = stringbytes(0)
+        reserve!(budget, codecshell)
+        codecname = String(codeccopy)
+        allocated!(budget, codecshell)
+        codeccopy = nothing
+        release!(budget, bytesbytes(0))
     end
     return (metadata=metadata, schema=schema, codecname=codecname, sync=sync)
 end
@@ -679,7 +749,7 @@ function Writer(dst::Union{AbstractString,IO}, schema::Schema; codec::Symbol=:nu
         allowance0 = budget.allowance_used
         workcap0 = budget.workcap
         jw = BoundedWriter(budget, limits.max_schema_bytes)       # the schema JSON is produced charged and bounded
-        printschema(jw, schema, "", FrozenDict{String,Bool}(), false, 0)
+        printschema(jw, schema, "", schemaseen(schema, budget), false, 0)
         schemajson = boundedtake!(jw)
         # Printing is bounded in this operation, but the container counters must start with the exact
         # header work that its Reader performs. Keep all printer reservations and rebase only work.
@@ -716,6 +786,7 @@ function Writer(dst::Union{AbstractString,IO}, schema::Schema; codec::Symbol=:nu
         base0 = budget.reserved
         pfschema = parseschema(schemajson; allow_invalid_names=allow_invalid_names, allow_invalid_defaults=allow_invalid_defaults,
                                limits=limits, budget=budget)
+        reserve!(budget, stringbytes(length(entries[2][2])))             # the reader's retained codec name
         reserve!(budget, 2 * STORAGE[].vector + 16 * length(entries))   # the mirror key/value vectors, exact capacity
         pfkeys = Vector{String}(undef, length(entries))
         pfvals = Vector{Vector{UInt8}}(undef, length(entries))

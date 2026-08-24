@@ -4,6 +4,8 @@
 # mutually recursive roots — in both validation modes and for ntasks ∈ {1, 2, 8}; malformed data inside
 # projected-away fields follows each mode's documented policy; projected tables round-trip their schema.
 
+import Logging
+
 @testset "Projection equivalence matrix (plan §6)" begin
     P = Avro.parseschema
     fixtures = Tuple{String,String,Vector{<:Any}}[]
@@ -23,15 +25,17 @@
         [(v=Int64(i), b=i % 3 == 0 ? missing : (w="w$i", a=missing)) for i in 1:400]))
     raised = Avro.Limits(max_total_bytes=2 << 30, max_block_bytes=16 << 20, max_block_output_bytes=256 << 20,
                          max_codec_memory=32 << 20, max_bytes=64 << 20, max_datum_bytes=64 << 20)
-    selections(names) = begin
-        sels = Vector{Vector{Symbol}}()
+    function selections(names)
+        sels = Vector{Symbol}[]
         push!(sels, Symbol[])                                 # select=()
+        push!(sels, collect(names))                            # full selection, in source order
         for nm in names
             push!(sels, [nm])                                 # every single column
         end
         length(names) > 1 && push!(sels, reverse(collect(names)))
         length(names) > 2 && push!(sels, [names[end], names[1]])
-        sels
+        unique!(sels)
+        return sels
     end
     for (label, json, rows) in fixtures
         s = P(json)
@@ -60,8 +64,7 @@
                 # recursive root the projection is graph-wide, so nested records re-encode projected and
                 # only the schema and row count round-trip value-independently
                 names = collect(Tables.columnnames(full))
-                isempty(names) && continue
-                sel = [names[end]]
+                sel = isempty(names) ? Symbol[] : [names[end]]
                 pt = Avro.Table(IOBuffer(bytes); select=Tuple(sel), validate=val, limits=raised)
                 io = IOBuffer()
                 Avro.write(io, pt; limits=raised)
@@ -70,7 +73,7 @@
                 @test Avro.json(Avro.schema(t2)) == Avro.json(Avro.schema(pt))
                 @test length(t2) == length(pt)
                 recursive = occursin("recursive", label)
-                recursive || @test isequal(Tables.getcolumn(t2, 1), Tables.getcolumn(pt, 1))
+                recursive || @test isequal(Tables.columntable(t2), Tables.columntable(pt))
             end
         end
     end
@@ -128,60 +131,226 @@
         end
     end
 
-    @testset "corpus sweep: every generated fixture file and selection shape, Table and Rows (R14, D09)" begin
-        gen = joinpath(@__DIR__, "fixtures", "generated")
+    @testset "corpus sweep: exact fixture scope and projection matrix (R14, D09)" begin
+        fixtureroot = joinpath(@__DIR__, "fixtures")
+        gen = joinpath(fixtureroot, "generated")
+        apache = joinpath(fixtureroot, "apache")
+        datadir = joinpath(gen, "data")
+        rootsdir = joinpath(gen, "roots")
+        legacydir = joinpath(gen, "legacy1x")
+        highwindowdir = joinpath(gen, "highwindow")
         raised = Avro.Limits(max_total_bytes=2 << 30, max_block_bytes=16 << 20, max_block_output_bytes=256 << 20,
                              max_codec_memory=32 << 20, max_bytes=64 << 20, max_datum_bytes=64 << 20)
-        datafiles = readdir(joinpath(gen, "data"); join=true)
-        swept = 0
-        for avsc in filter(f -> endswith(f, ".avsc"), readdir(joinpath(gen, "schemas"); join=true))
-            s = Avro.parseschema(read(avsc, String))
-            s isa Avro.RecordSchema || continue
-            stem = basename(avsc)[1:end - 5]
-            pat = Regex("^" * stem * "(-fastavro)?-[a-z0-9]+\\.avro\$")
-            for data in filter(f -> occursin(pat, basename(f)), datafiles)
-                if endswith(basename(data), "-fastavro-deflate.avro")
-                    # documented divergence (plan §4.9/§8.4): fastavro emits suffix bytes after the
-                    # final deflate block, which Avro.jl rejects; classified like test/container.jl
+
+        function avrofiles(root)
+            files = String[]
+            for (dir, _, names) in walkdir(root)
+                for name in names
+                    endswith(name, ".avro") && push!(files, joinpath(dir, name))
+                end
+            end
+            sort!(files)
+            return files
+        end
+
+        function corpusselections(names)
+            sels = Vector{Symbol}[]
+            push!(sels, Symbol[])
+            if !isempty(names)
+                push!(sels, [names[1]])
+                push!(sels, collect(names))
+                push!(sels, reverse(collect(names)))
+                length(names) > 1 && push!(sels, [names[end], names[1]])
+                length(names) > 2 && push!(sels, collect(names[1:2:end]))
+            end
+            unique!(sels)
+            return sels
+        end
+
+        function readoptions(data)
+            startswith(data, legacydir) && return (; legacy=:avrojl1, decimal_byteorder=:little)
+            return (;)
+        end
+
+        function quietly(f::Function, data)
+            if startswith(data, legacydir)
+                return Logging.with_logger(Logging.NullLogger()) do
+                    return f()
+                end
+            end
+            return f()
+        end
+
+        datafiles = avrofiles(datadir)
+        rejected = filter(f -> endswith(f, "-fastavro-deflate.avro"), datafiles)
+        rootfiles = avrofiles(rootsdir)
+        legacyfiles = avrofiles(legacydir)
+        highwindowfiles = avrofiles(highwindowdir)
+        overlimit = filter(f -> occursin("1g.avro", basename(f)), highwindowfiles)
+        highwindowcontrols = setdiff(highwindowfiles, overlimit)
+        apachefiles = avrofiles(apache)
+        recordfiles = sort!(vcat(setdiff(datafiles, rejected), apachefiles, legacyfiles, highwindowcontrols))
+        allfiles = avrofiles(fixtureroot)
+
+        # Plan §8.1/§8.2 defines this exact corpus. Projection applies only to generic record
+        # roots; the two deliberate high-window bombs are excluded from default decoding by §4.4.
+        @test length(datafiles) == 72
+        @test length(rejected) == 6
+        @test length(rootfiles) == 156
+        @test length(legacyfiles) == 5
+        @test length(apachefiles) == 8
+        @test length(highwindowcontrols) == 2 && length(overlimit) == 2
+        @test length(recordfiles) == 81
+        @test allfiles == sort!(vcat(recordfiles, rejected, rootfiles, overlimit))
+        @test sort([relpath(f, apache) for f in apachefiles]) == [
+            "schemas/simple/data.avro", "schemas/withUnion/data.avro", "syncInMeta.avro",
+            "weather-deflate.avro", "weather-snappy.avro", "weather-sorted.avro",
+            "weather-zstd.avro", "weather.avro"]
+        @test sort(basename.(legacyfiles)) == [
+            "avrojl112-bzip2.avro", "avrojl112-deflate.avro", "avrojl112-null.avro",
+            "avrojl112-xz.avro", "avrojl112-zstd.avro"]
+        @test sort(basename.(highwindowcontrols)) == ["xz-default.avro", "zstd-default.avro"]
+        @test sort(basename.(overlimit)) == ["xz-dict1g.avro", "zstd-window1g.avro"]
+
+        rootschemas = sort(filter(f -> endswith(f, ".avsc"), readdir(rootsdir; join=true)))
+        rootstems = sort([splitext(basename(f))[1] for f in rootschemas])
+        @test rootstems == ["array", "boolean", "bytes", "double", "enum", "fixed", "float",
+                            "int", "long", "map", "null", "string", "union"]
+        for schemafile in rootschemas
+            @test !(Avro.parseschema(read(schemafile, String)) isa Avro.RecordSchema)
+        end
+        for data in rootfiles
+            @test any(stem -> startswith(basename(data), stem * "-"), rootstems)
+            r = Avro.Reader(data; limits=raised)
+            try
+                @test !(Avro.writerschema(r) isa Avro.RecordSchema)
+            finally
+                close(r)
+            end
+        end
+
+        for data in recordfiles
+            opts = readoptions(data)
+            @testset "$(relpath(data, fixtureroot))" begin
+                for val in (:strict, :fast)
+                    full = quietly(data) do
+                        return Avro.Table(data; validate=val, ntasks=1, limits=raised, opts...)
+                    end
+                    names = collect(Tables.columnnames(full))
+                    fullct = Tables.columntable(full)
+                    fullsch = Tables.schema(full)
+                    for sel in corpusselections(names)
+                        expectedtypes = Type[fullsch.types[findfirst(==(nm), collect(fullsch.names))] for nm in sel]
+                        rowresult = quietly(data) do
+                            rl = Avro.Rows(data; select=Tuple(sel), validate=val, limits=raised, opts...)
+                            try
+                                return (Tables.schema(rl), collect(rl))
+                            finally
+                                close(rl)
+                            end
+                        end
+                        rowschema, rows = rowresult
+                        @test collect(rowschema.names) == sel
+                        @test collect(rowschema.types) == expectedtypes
+                        @test length(rows) == length(full)
+                        for (k, nm) in enumerate(sel)
+                            @test isequal([Tables.getcolumn(r, k) for r in rows], collect(fullct[nm]))
+                        end
+                        for nt in (1, 2, 8)
+                            pt = quietly(data) do
+                                return Avro.Table(data; select=Tuple(sel), validate=val, ntasks=nt,
+                                                  limits=raised, opts...)
+                            end
+                            @test collect(Tables.columnnames(pt)) == sel
+                            @test length(pt) == length(full)
+                            psch = Tables.schema(pt)
+                            @test collect(psch.names) == sel
+                            @test collect(psch.types) == expectedtypes
+                            @test isequal(Tables.columntable(pt), fullct[Tuple(sel)])
+                            for (k, nm) in enumerate(sel)
+                                got = Tables.getcolumn(pt, k)
+                                want = fullct[nm]
+                                @test isequal(got, want) && typeof(got) == typeof(want)
+                            end
+                        end
+                    end
+                end
+
+                # One projection from every readable record fixture must remain writable. This also
+                # covers the authoritative row count of empty records and `select=()`.
+                full = quietly(data) do
+                    return Avro.Table(data; validate=:strict, ntasks=1, limits=raised, opts...)
+                end
+                names = collect(Tables.columnnames(full))
+                sel = isempty(names) ? Symbol[] : [names[end]]
+                projected = quietly(data) do
+                    return Avro.Table(data; select=Tuple(sel), validate=:strict, ntasks=1,
+                                      limits=raised, opts...)
+                end
+                io = IOBuffer()
+                Avro.write(io, projected; limits=raised)
+                seekstart(io)
+                roundtrip = Avro.Table(io; limits=raised)
+                @test Avro.json(Avro.schema(roundtrip)) == Avro.json(Avro.schema(projected))
+                @test length(roundtrip) == length(projected)
+                @test isequal(Tables.columntable(roundtrip), Tables.columntable(projected))
+            end
+        end
+
+        # These files are record roots, but their documented codec verdict prevents a projection.
+        # Exercise every selection/mode/task combination so the exclusion cannot hide a success or
+        # change the accepted language.
+        for data in rejected
+            r = Avro.Reader(data; limits=raised)
+            s = Avro.writerschema(r)
+            close(r)
+            @test s isa Avro.RecordSchema
+            names = Symbol[Symbol(f.name) for f in s.fields]
+            for sel in corpusselections(names), val in (:strict, :fast)
+                for nt in (1, 2, 8)
                     err = try
-                        Avro.Table(data; limits=raised)
+                        Avro.Table(data; select=Tuple(sel), validate=val, ntasks=nt, limits=raised)
                         nothing
                     catch e
                         e
                     end
-                    @test err isa Avro.CodecError && occursin("bytes after the final deflate block", err.msg)
-                    swept += 1
-                    continue
+                    @test err isa Avro.CodecError
+                    err isa Avro.CodecError && @test occursin("bytes after the final deflate block", err.msg)
                 end
-                full = Avro.Table(data; limits=raised)
-                names = collect(Tables.columnnames(full))
-                fullct = Tables.columntable(full)
-                sels = Vector{Symbol}[Symbol[]]                              # select=() on every fixture
-                if !isempty(names)
-                    push!(sels, [names[1]], reverse(names), copy(names))     # single, reverse, full in order
-                    length(names) > 1 && push!(sels, [names[end], names[1]])
-                    length(names) > 2 && push!(sels, names[1:2:end])
-                end
-                unique!(sels)
-                for sel in sels, val in (:strict, :fast), nt in (1, 2, 8)
-                    pt = Avro.Table(data; select=Tuple(sel), validate=val, ntasks=nt, limits=raised)
-                    @test collect(Tables.columnnames(pt)) == sel && length(pt) == length(full)
-                    for (k, nm) in enumerate(sel)
-                        got = Tables.getcolumn(pt, k)
-                        want = fullct[nm]
-                        @test isequal(got, want) && typeof(got) == typeof(want)
-                    end
-                    rl = Avro.Rows(data; select=Tuple(sel), validate=val, limits=raised)
-                    rows = collect(rl)
+                rl = Avro.Rows(data; select=Tuple(sel), validate=val, limits=raised)
+                err = try
+                    collect(rl)
+                    nothing
+                catch e
+                    e
+                finally
                     close(rl)
-                    @test length(rows) == length(full)
-                    for (k, nm) in enumerate(sel)
-                        @test isequal([Tables.getcolumn(r, k) for r in rows], collect(fullct[nm]))
-                    end
                 end
-                swept += 1
+                @test err isa Avro.CodecError
+                err isa Avro.CodecError && @test occursin("bytes after the final deflate block", err.msg)
             end
         end
-        @test swept >= 70                                                    # every stem x writer x codec fixture opened
+
+        # The plan deliberately excludes these two files from decode-under-defaults. They still
+        # receive the full projection verdict surface under the gate's 32 MiB codec-memory limit.
+        for data in overlimit
+            r = Avro.Reader(data; limits=raised)
+            s = Avro.writerschema(r)
+            close(r)
+            @test s isa Avro.RecordSchema
+            names = Symbol[Symbol(f.name) for f in s.fields]
+            for sel in corpusselections(names), val in (:strict, :fast)
+                for nt in (1, 2, 8)
+                    @test_throws Avro.CodecError Avro.Table(data; select=Tuple(sel), validate=val,
+                                                            ntasks=nt, limits=raised)
+                end
+                rl = Avro.Rows(data; select=Tuple(sel), validate=val, limits=raised)
+                try
+                    @test_throws Avro.CodecError collect(rl)
+                finally
+                    close(rl)
+                end
+            end
+        end
     end
 end

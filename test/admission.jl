@@ -95,22 +95,43 @@
     @test e3 isa Avro.LimitError && e3.limit == :max_names && length(cap) == Avro.RUN_BASE + 1
     @test Avro.admit!(cap, "c0001") === :c0001            # existing names still admit after the failure
 
-    # A carry that cannot reserve its next merge must fail before it commits the new name.
+    # A maintenance cascade that cannot reserve its next merge must fail before it moves
+    # a cursor, replaces a run, or commits the new name. The same retry must fail with the
+    # same observation; a failed call cannot make its own retry admissible.
     transactional = Avro.SymbolAdmission(max_names=10_000, max_bytes=70_000)
-    admissionname(i) = "x$(lpad(i, 4, '0'))"
-    for i in 1:5_119
-        try
-            Avro.admit!(transactional, admissionname(i))
-        catch err
-            @test i == 4_097 && err isa Avro.LimitError && err.limit == :max_bytes
-            Avro.admit!(transactional, admissionname(i))
-        end
+    function admissionname(i)
+        return "x$(lpad(i, 4, '0'))"
     end
-    before = length(transactional)
-    carryerror = try Avro.admit!(transactional, admissionname(5_120)); nothing catch err; err end
-    @test carryerror isa Avro.LimitError && carryerror.limit == :max_bytes
-    @test length(transactional) == before
-    @test !Avro.contains_unlocked(transactional, admissionname(5_120))
+    for i in 1:4_096
+        Avro.admit!(transactional, admissionname(i))
+    end
+    function admissionstate(a)
+        merge = a.merge
+        merge_state = merge === nothing ? nothing :
+                      (objectid(merge), objectid(merge.out), merge.i, merge.j)
+        return (merge_state, objectid.(a.runs), length.(a.runs), copy(a.recent),
+                a.mergeat, a.count, a.bytes)
+    end
+    before = admissionstate(transactional)
+    first_error = try
+        Avro.admit!(transactional, admissionname(4_097))
+        nothing
+    catch err
+        err
+    end
+    @test first_error isa Avro.LimitError && first_error.limit == :max_bytes
+    @test admissionstate(transactional) == before
+    retry_error = try
+        Avro.admit!(transactional, admissionname(4_097))
+        nothing
+    catch err
+        err
+    end
+    @test retry_error isa Avro.LimitError
+    @test (retry_error.limit, retry_error.observed, retry_error.value) ==
+          (first_error.limit, first_error.observed, first_error.value)
+    @test admissionstate(transactional) == before
+    @test !Avro.contains_unlocked(transactional, admissionname(4_097))
 
     # the admitting operation's lookup and merge-step work charges its own budget (§4.4, R07)
     ab = Avro.SymbolAdmission(max_names=1 << 16, max_bytes=1 << 24)

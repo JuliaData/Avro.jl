@@ -19,19 +19,33 @@ mutable struct DatumReader{T,P}
     @atomic scratch::Any        # one pooled per-call Decoder (its budget inside), shared lock-free
 end
 
+function datumreaderplan(writer::Schema, reader_schema::Union{Nothing,Schema}, union_resolution::Symbol,
+                         limits::Limits, budget::Budget)
+    return reader_schema === nothing ? readplan(writer; budget=budget) :
+           resolvingplan(writer, reader_schema; union_resolution=union_resolution,
+                         limits=limits, budget=budget)
+end
+
 function DatumReader(writer::Schema; reader_schema::Union{Nothing,Schema}=nothing, union_resolution::Symbol=:spec,
                      limits::Limits=Limits(), validate::Symbol=:strict, names=DEFAULT_ADMISSION)
     validate in (:strict, :fast) || throw(ArgumentError("validate must be :strict or :fast"))
     effective = reader_schema === nothing ? writer : reader_schema
-    plan = reader_schema === nothing ? withbudget(limits) do b; readplan(writer; budget=b); end :
-           resolvingplan(writer, reader_schema; union_resolution=union_resolution, limits=limits)
+    plan = withbudget(limits) do budget
+        return datumreaderplan(writer, reader_schema, union_resolution, limits, budget)
+    end
     return DatumReader{Nothing,typeof(plan)}(writer, effective, plan, limits, validate, admission(names), nothing)
 end
 
-function DatumReader(writer::Schema, ::Type{T}; kw...) where {T}
-    r = DatumReader(writer; kw...)
-    plan = typedplan(T, r.reader, r.plan, r.limits)
-    return DatumReader{T,typeof(plan)}(r.writer, r.reader, plan, r.limits, r.validate, r.names, nothing)
+function DatumReader(writer::Schema, ::Type{T}; reader_schema::Union{Nothing,Schema}=nothing,
+                     union_resolution::Symbol=:spec, limits::Limits=Limits(), validate::Symbol=:strict,
+                     names=DEFAULT_ADMISSION) where {T}
+    validate in (:strict, :fast) || throw(ArgumentError("validate must be :strict or :fast"))
+    effective = reader_schema === nothing ? writer : reader_schema
+    plan = withbudget(limits) do budget
+        generic = datumreaderplan(writer, reader_schema, union_resolution, limits, budget)
+        return typedplan(T, effective, generic, limits; budget=budget)
+    end
+    return DatumReader{T,typeof(plan)}(writer, effective, plan, limits, validate, admission(names), nothing)
 end
 
 """

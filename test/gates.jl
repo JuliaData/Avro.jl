@@ -180,7 +180,5 @@ end
     GC.gc(true)
     growth = (Sys.maxrss() - rss0) / 2^20
     @info "compile-cost gate" specializations=before new=after - before rss_growth_mb=round(growth; digits=1)
-    # Calibrated bound (review round 2): measured 35.1 MB on 1.12.6 and 55.2 MB on 1.10.11, with a
-    # second thousand adding only 6.6 MB on 1.10 — saturating runtime caches, not per-schema retention.
-    @test growth < 64
+    @test growth < 50
 end

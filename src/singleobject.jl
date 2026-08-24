@@ -49,7 +49,7 @@ function register!(c::SchemaCache, s::Schema; limits::Limits=Limits())
     graphinfo(s).repaired_names && throw(ArgumentError("a schema with repaired invalid names has no Parsing Canonical Form"))
     return withbudget(limits) do budget                # one operation: print, hash, compare, insert (D03)
         w = BoundedWriter(budget, limits.max_schema_bytes)
-        canonicalprint(w, s, FrozenDict{String,Bool}())
+        canonicalprint(w, s, schemaseen(s, budget))
         pcflen = w.len
         fp = crc64avro(boundedview(w))
         lock(c.lock) do
@@ -109,7 +109,7 @@ function encodesingle(s::Schema, x; limits::Limits=Limits())
     graphinfo(s).repaired_names && throw(ArgumentError("a schema with repaired invalid names has no Parsing Canonical Form"))
     return withbudget(limits; direction=:encode) do budget    # one operation budget (plan §4.4, amendment round 1)
         w = BoundedWriter(budget, limits.max_schema_bytes)
-        canonicalprint(w, s, FrozenDict{String,Bool}())
+        canonicalprint(w, s, schemaseen(s, budget))
         fp = crc64avro(boundedview(w))
         plan = writeplan(s; budget=budget)
         e = Encoder(budget)
@@ -134,9 +134,10 @@ recomputes the fingerprint of the returned schema (rejecting a mismatch), resolv
 `reader_schema` when given and decodes the payload exactly (trailing bytes are a `DataError`). `T`
 selects a typed target.
 """
-function decodesingle(src::AbstractVector{UInt8}, store::SchemaStore; reader_schema::Union{Nothing,Schema}=nothing,
-                      union_resolution::Symbol=:spec, validate::Symbol=:strict, limits::Limits=Limits(),
-                      names=DEFAULT_ADMISSION, T=nothing)
+function decodesingleoperation(src::AbstractVector{UInt8}, store::SchemaStore, budget::Budget;
+                               reader_schema::Union{Nothing,Schema}=nothing,
+                               union_resolution::Symbol=:spec, validate::Symbol=:strict,
+                               limits::Limits=Limits(), names=DEFAULT_ADMISSION, T=nothing)
     T === nothing || T isa Type || throw(ArgumentError("T must be a type or nothing"))
     n = length(src)
     n >= 10 || throw(DataError("single-object message shorter than the 10-byte header", n + 1))
@@ -146,38 +147,51 @@ function decodesingle(src::AbstractVector{UInt8}, store::SchemaStore; reader_sch
         fp |= UInt64(src[3 + i]) << (8 * i)
     end
     n - 10 <= limits.max_datum_bytes || throw(LimitError(:max_datum_bytes, n - 10, limits.max_datum_bytes, :max_datum_bytes, :decode))
-    v, plan2, adm = withbudget(limits) do budget               # one operation budget end to end (D03)
-        writer = lock(store isa SchemaCache ? store.lock : ReentrantLock()) do
-            store isa SchemaCache || return lookup(store, fp; limits=limits)
+    writer = if store isa SchemaCache
+        lock(store.lock) do
             n0 = length(store.fingerprints)
             addcompare!(budget, 8 * (64 - leading_zeros(max(n0, 1)) + 1))
             i = searchsortedfirst(store.fingerprints, fp)
             (i <= n0 && store.fingerprints[i] == fp) || throw(UnknownSchemaError(fp))
-            store.schemas[i]
+            return store.schemas[i]
         end
-        writer isa Schema || throw(ArgumentError("the schema store returned $(typeof(writer)), not an Avro.Schema"))
-        w = BoundedWriter(budget, limits.max_schema_bytes)
-        canonicalprint(w, writer, FrozenDict{String,Bool}())
-        actual = crc64avro(boundedview(w))
-        actual == fp || throw(DataError("the schema store returned a schema with fingerprint $(string(actual; base=16)) for $(string(fp; base=16))", 3))
-        effective = reader_schema === nothing ? writer : reader_schema
-        plan = reader_schema === nothing ? readplan(writer; budget=budget) :
-               resolvingplan(writer, reader_schema; union_resolution=union_resolution, limits=limits, budget=budget)
-        tplan = T === nothing ? plan : typedplan(T, effective, plan, limits)
-        adm0 = admission(names)
-        payload = view(src, 11:n)
-        addinput!(budget, length(payload))
-        d = Decoder(payload, budget; validate=validate)
-        v0 = decodetyped(T === nothing ? Nothing : T, tplan, d, adm0)
-        d.pos == length(payload) + 1 || throw(DataError("trailing bytes after the datum", d.pos + 10))
-        return (v0, tplan, adm0)
+    else
+        lookup(store, fp; limits=limits)
     end
-    return finishtyped(plan2, v, adm)                          # semantic conversion in caller space
+    writer isa Schema || throw(ArgumentError("the schema store returned $(typeof(writer)), not an Avro.Schema"))
+    w = BoundedWriter(budget, limits.max_schema_bytes)
+    canonicalprint(w, writer, schemaseen(writer, budget))
+    actual = crc64avro(boundedview(w))
+    actual == fp || throw(DataError("the schema store returned a schema with fingerprint $(string(actual; base=16)) for $(string(fp; base=16))", 3))
+    effective = reader_schema === nothing ? writer : reader_schema
+    plan = reader_schema === nothing ? readplan(writer; budget=budget) :
+           resolvingplan(writer, reader_schema; union_resolution=union_resolution, limits=limits, budget=budget)
+    tplan = T === nothing ? plan : typedplan(T, effective, plan, limits; budget=budget)
+    adm = admission(names)
+    payload = view(src, 11:n)
+    addinput!(budget, length(payload))
+    d = Decoder(payload, budget; validate=validate)
+    value = decodetyped(T === nothing ? Nothing : T, tplan, d, adm)
+    d.pos == length(payload) + 1 || throw(DataError("trailing bytes after the datum", d.pos + 10))
+    return (value, tplan, adm)
+end
+
+function decodesingle(src::AbstractVector{UInt8}, store::SchemaStore; reader_schema::Union{Nothing,Schema}=nothing,
+                      union_resolution::Symbol=:spec, validate::Symbol=:strict, limits::Limits=Limits(),
+                      names=DEFAULT_ADMISSION, T=nothing)
+    value, plan, adm = withbudget(limits) do budget
+        return decodesingleoperation(src, store, budget; reader_schema=reader_schema,
+                                     union_resolution=union_resolution, validate=validate,
+                                     limits=limits, names=names, T=T)
+    end
+    return finishtyped(plan, value, adm)
 end
 
 function decodesingle(io::IO, store::SchemaStore; limits::Limits=Limits(), kw...)
-    bytes = withbudget(limits) do budget               # the buffered read is bounded; the payload is
-        Vector{UInt8}(sourcebytes(io, limits.max_datum_bytes + 10, budget, DataError))
-    end                                                # then owned and decoded through the byte path's
-    return decodesingle(bytes, store; limits=limits, kw...)   # own single operation budget
+    value, plan, adm = withbudget(limits) do budget
+        maxmessage = limits.max_datum_bytes > typemax(Int) - 10 ? typemax(Int) : limits.max_datum_bytes + 10
+        bytes = sourcebytes(io, maxmessage, budget, DataError)
+        return decodesingleoperation(bytes, store, budget; limits=limits, kw...)
+    end
+    return finishtyped(plan, value, adm)
 end

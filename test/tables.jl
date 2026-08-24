@@ -241,6 +241,9 @@ import DataAPI
         @test Tables.getcolumn(t, :a) == [1.0, 2.0]                              # PromotePlan under the little rewrite
         @test Tables.getcolumn(t, :dec) == [Avro.Decimal(12345, 2), Avro.Decimal(-123, 2)]
         @test Tables.getcolumn(t, :z) == Int32[7, 7]
+        tf = @test_logs (:warn, r"legacy") match_mode=:any Avro.Table(leg; reader_schema=rdr, legacy=:avrojl1,
+                                                                       decimal_byteorder=:little, validate=:fast)
+        @test Tables.columntable(tf) == Tables.columntable(t)                    # the null-block cushion is independent of validation mode
         rl = Avro.Rows(leg; reader_schema=rdr, legacy=:avrojl1, decimal_byteorder=:little, select=(:dec,))
         got = @test_logs (:warn, r"legacy") match_mode=:any [Tables.getcolumn(row, :dec) for row in rl]
         close(rl)

@@ -242,7 +242,13 @@ function decodedirect!(r::Reader, e::BlockEntry, plan, builders::Vector{ColumnBu
         decoderow!(cells, d, plan)
         checkblockoutput(b, outputbase, done, slotrow, cap)
     end
-    d.pos == length(out) + 1 || throw(DataError("block datums did not consume the block exactly", d.pos))
+    if d.pos != length(out) + 1
+        if r.legacy === :avrojl1 && r.codecname === :null
+            r.warned || (@warn "accepting trailing bytes after $(n) datums in a null-codec block (legacy=:avrojl1; Avro.jl ≤ 1.1.2 sizing cushion)" source = 1; r.warned = true)
+        else
+            throw(DataError("block datums did not consume the block exactly", d.pos))
+        end
+    end
     addrows!(b, n)
     release!(b, bytesbytes(length(out)))
     return nothing
@@ -258,9 +264,9 @@ function decodejob!(job::BlockJob, r::Reader, plan, sel::Union{Nothing,Vector{In
         notify(job.done)
         return nothing
     end
-    phook(:workerstart, e.index)
     b = job.budget
     try
+        phook(:workerstart, e.index)
         src = r.source::BytesSource
         payload = view(src.buf, e.offset:e.offset + e.size - 1)
         cname, codec = readercodec(String(r.codecname), r.limits, r.legacy)
@@ -305,6 +311,27 @@ end
 function workerloop(ch::Channel{BlockJob}, r::Reader, plan, sel::Union{Nothing,Vector{Int}}, fail::FailBox, slotrow::Int)
     for job in ch
         decodejob!(job, r, plan, sel, fail, slotrow)
+    end
+    return nothing
+end
+
+"Close one worker channel and wait until every successfully started worker has stopped."
+function settleworkers!(ch::Channel{BlockJob}, workers::Vector{Task}, nstarted::Int=length(workers))
+    close(ch)
+    for i in 1:nstarted
+        wait(workers[i])
+    end
+    return nothing
+end
+
+"Release reservations owned by jobs that never committed."
+function abandonjobs!(jobs::Vector{Union{Nothing,BlockJob}}, b::Budget, stats::ParallelStats)
+    for job in jobs
+        job === nothing && continue
+        st = @atomic job.state
+        st === :done && (stats.speculative_decoded += 1)
+        release!(b, job.W)
+        close!(job.budget)
     end
     return nothing
 end
@@ -387,7 +414,10 @@ function decodeblocks!(r::Reader, plan, sel::Union{Nothing,Vector{Int}}, finals:
     if nworkers > 0 && r.legacy === nothing          # legacy tolerance mutates reader state: direct path only
         Whead = blockworstcase(r.limits, entries[1], cols)
         W2 = blockworstcase(r.limits, entries[2], cols)
-        poolstate = WORKER_STATE * nworkers          # admission arithmetic only: acceptance stays sequential-identical
+        workersstate = checked_mul(WORKER_STATE, nworkers)
+        jobsstate = vectorbytes(Union{Nothing,BlockJob}, nblocks)
+        channelstate = vectorbytes(BlockJob, inflightcap)
+        poolstate = checked_add(workersstate, checked_add(jobsstate, channelstate))
         checked_add(checked_add(b.reserved, Whead), checked_add(W2, poolstate)) <= b.ceiling || (nworkers = 0)
     else
         nworkers = 0
@@ -402,23 +432,38 @@ function decodeblocks!(r::Reader, plan, sel::Union{Nothing,Vector{Int}}, finals:
         finalcounters!(stats, b)
         return stats
     end
-    fail = FailBox(typemax(Int))
-    poolstate = checked_add(poolstate, STORAGE[].vector + 8 * nblocks)   # the jobs vector is pool state
-    reserve!(b, poolstate)                             # the pool is charged once, before it exists, for
-    poolalive = true                                   # its whole lifetime (§4.4 (d), round-2 D05)
-    jobs = Vector{Union{Nothing,BlockJob}}(nothing, nblocks)
-    ch = Channel{BlockJob}(nblocks)
-    workers = Task[Threads.@spawn workerloop(ch, r, plan, sel, fail, slotrow) for _ in 1:nworkers]
-    foreach(errormonitor, workers)
-    retirepool! = function ()                          # the barrier drains every wave, so in-flight is
-        poolalive || return nothing                    # always zero here: the pool can retire without
-        close(ch)                                      # reordering commits, and the sequential tail runs
-        for t in workers                               # with the pool's memory genuinely released
-            wait(t)
+    # Reserve the complete pool before its first package-owned object. Locals become `nothing`
+    # before the reservation is released, so no job index, channel, task, or fail box outlives it.
+    reserve!(b, poolstate)
+    poolalive = false
+    fail::Union{Nothing,FailBox} = nothing
+    jobs::Union{Nothing,Vector{Union{Nothing,BlockJob}}} = nothing
+    ch::Union{Nothing,Channel{BlockJob}} = nothing
+    workers::Union{Nothing,Vector{Task}} = nothing
+    nstarted = 0
+    try
+        fail = FailBox(typemax(Int))
+        jobs = Vector{Union{Nothing,BlockJob}}(nothing, nblocks)
+        ch = Channel{BlockJob}(inflightcap)
+        workers = Vector{Task}(undef, nworkers)
+        for i in 1:nworkers
+            workers[i] = Threads.@spawn workerloop(ch::Channel{BlockJob}, r, plan, sel,
+                                                    fail::FailBox, slotrow)
+            errormonitor(workers[i])
+            nstarted = i
         end
+        allocated!(b, poolstate)
+        poolalive = true
+    catch
+        if ch !== nothing
+            workers === nothing ? close(ch) : settleworkers!(ch, workers, nstarted)
+        end
+        fail = nothing
+        jobs = nothing
+        ch = nothing
+        workers = nothing
         release!(b, poolstate)
-        poolalive = false
-        return nothing
+        rethrow()
     end
     inflight = 0
     next = 1
@@ -429,15 +474,23 @@ function decodeblocks!(r::Reader, plan, sel::Union{Nothing,Vector{Int}}, finals:
             headidx = next
             next += 1
             Whead = blockworstcase(r.limits, head, cols)
-            poolalive && checked_add(b.reserved, Whead) > b.ceiling && retirepool!()   # never crowd the head
+            if poolalive && checked_add(b.reserved, Whead) > b.ceiling
+                settleworkers!(ch::Channel{BlockJob}, workers::Vector{Task})
+                fail = nothing
+                jobs = nothing
+                ch = nothing
+                workers = nothing
+                release!(b, poolstate)
+                poolalive = false
+            end
             while poolalive && next <= nblocks && inflight < inflightcap
                 e2 = entries[next]
                 Wi = blockworstcase(r.limits, e2, cols)
                 checked_add(checked_add(b.reserved, Whead), Wi) <= b.ceiling || break
                 reserve!(b, Wi)
                 job = BlockJob(e2, Wi, blockbudget(r.limits, Wi), Threads.Event(), nothing, 0, nothing, :pending)
-                jobs[next] = job
-                put!(ch, job)
+                (jobs::Vector{Union{Nothing,BlockJob}})[next] = job
+                put!(ch::Channel{BlockJob}, job)
                 inflight += 1
                 stats.inflight_highwater = max(stats.inflight_highwater, inflight + 1)
                 phook(:admitted, e2.index)
@@ -447,22 +500,23 @@ function decodeblocks!(r::Reader, plan, sel::Union{Nothing,Vector{Int}}, finals:
             try
                 decodedirect!(r, head, plan, builders, slotrow)
             catch
-                recordfailure!(fail, headidx)                          # queued higher blocks abandon
+                poolalive && recordfailure!(fail::FailBox, headidx)    # queued higher blocks abandon
                 rethrow()
             end
             tocommit = headidx + 1
             phook(:headdone, headidx)
-            while tocommit <= nblocks && jobs[tocommit] !== nothing    # the admission-wave barrier
-                job = jobs[tocommit]::BlockJob
+            while poolalive && tocommit <= nblocks &&
+                  (jobs::Vector{Union{Nothing,BlockJob}})[tocommit] !== nothing
+                job = (jobs::Vector{Union{Nothing,BlockJob}})[tocommit]::BlockJob
                 wait(job.done)
                 inflight -= 1
                 st = @atomic job.state
                 st === :done || throw(job.err::Exception)              # the lowest uncommitted block's own failure
-                jobs[tocommit] = nothing                               # commitjob! owns every reservation from here
+                (jobs::Vector{Union{Nothing,BlockJob}})[tocommit] = nothing
                 try
                     commitjob!(r, job, finals, keptidx, stats)
                 catch
-                    recordfailure!(fail, job.entry.index)
+                    recordfailure!(fail::FailBox, job.entry.index)
                     rethrow()
                 end
                 tocommit += 1
@@ -473,22 +527,17 @@ function decodeblocks!(r::Reader, plan, sel::Union{Nothing,Vector{Int}}, finals:
         finalcounters!(stats, b)
         return stats
     catch err
-        recordfailure!(fail, nblocks + 1)                              # abandon everything still queued
+        poolalive && recordfailure!(fail::FailBox, nblocks + 1)        # abandon everything still queued
         rethrow()
     finally
         if poolalive
-            close(ch)
-            for t in workers
-                wait(t)
-            end
+            settleworkers!(ch::Channel{BlockJob}, workers::Vector{Task})
         end
-        for job in jobs                                                # uncommitted reservations
-            job === nothing && continue
-            st = @atomic job.state
-            st === :done && (stats.speculative_decoded += 1)
-            release!(b, job.W)
-            close!(job.budget)
-        end
+        jobs === nothing || abandonjobs!(jobs, b, stats)
+        fail = nothing
+        jobs = nothing
+        ch = nothing
+        workers = nothing
         if poolalive
             release!(b, poolstate)
             poolalive = false

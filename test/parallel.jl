@@ -123,6 +123,24 @@
             end
         end
     end
+    @testset "worker startup failure settles and poisons the ordered job" begin
+        if Threads.nthreads() > 1
+            pending0 = @atomic Avro.GUARD.pending
+            Avro.PARALLEL_HOOK[] = (event, index) -> begin
+                event === :workerstart && error("worker startup failure $index")
+                return nothing
+            end
+            err = try
+                geterr(() -> Avro.Table(IOBuffer(bytes); ntasks=4, limits=raised))
+            finally
+                Avro.PARALLEL_HOOK[] = nothing
+            end
+            @test err isa ErrorException && occursin("worker startup failure", err.msg)
+            @test (@atomic Avro.GUARD.pending) == pending0
+            recovered = Tables.columntable(Avro.Table(IOBuffer(bytes); ntasks=1, limits=raised))
+            @test all(isequal(recovered[name], reference[name]) for name in keys(reference))
+        end
+    end
     @testset "failure selection: the lowest failing index wins for every kind pairing" begin
         entries = entriesof(nullbytes)
         @test length(entries) > 15

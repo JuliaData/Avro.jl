@@ -312,8 +312,9 @@ end
         # an inline nested struct charges its own shell: the outer measures the marginal
         Outer = @NamedTuple{x::Int64, inner::@NamedTuple{s::String, y::Int64}}
         Inner = @NamedTuple{s::String, y::Int64}
-        @test Avro.measuredshell(Outer) + Avro.measuredshell(Inner) ==
-              max(Int(Base.summarysize(Avro.emptyprobe(Outer))), 8)       # marginal + nested = the whole layout
+        expectedshell = max(Int(Base.summarysize(Avro.emptyprobe(Outer))), 8)
+        VERSION < v"1.11" && (expectedshell += Avro.measuredshell(Inner)) # Julia 1.10's oracle counts the inline child again
+        @test Avro.measuredshell(Outer) + Avro.measuredshell(Inner) == expectedshell
         # the probe bound reserves and trues up to zero on a live budget
         b = Avro.Budget(Avro.Limits())
         r0 = b.reserved
@@ -323,6 +324,85 @@ end
         # typedplan construction is budget-bounded
         deep = Avro.parseschema("{\"type\":\"record\",\"name\":\"TPB\",\"fields\":[{\"name\":\"a\",\"type\":\"long\"}]}")
         @test Avro.typedplan(@NamedTuple{a::Int64}, deep, Avro.readplan(deep), Avro.Limits()) isa Avro.TypedPlan
+
+        @testset "generated scalar, array and nullable layout oracle" begin
+            NestedLayout = @NamedTuple{lead::Int8, inner::@NamedTuple{x::Int64, s::String}, tail::Int16}
+            ReferenceLayout = @NamedTuple{s::String, bytes::Vector{UInt8}, items::Vector{String}}
+            NullableChild = @NamedTuple{x::Int64, s::String}
+            NullableLayout = @NamedTuple{label::Union{Missing,String}, child::Union{Missing,NullableChild}}
+            cases = (
+                (label="zero-field immutable", T=Empty, value=Empty()),
+                (label="zero-field mutable", T=MutEmpty, value=MutEmpty()),
+                (label="padded isbits", T=Bits, value=Bits(Int32(3), 1.5f0, true)),
+                (label="padded reference-bearing", T=ShellPadded, value=ShellPadded(Int8(1), Int64(2), "pad")),
+                (label="mutable reference-bearing", T=ShellMut, value=ShellMut(Int64(3), "mutable")),
+                (label="nested inline", T=NestedLayout,
+                 value=NestedLayout((Int8(4), (x=Int64(5), s="nested"), Int16(6)))),
+                (label="multiple references", T=ReferenceLayout,
+                 value=ReferenceLayout(("refs", UInt8[0x01, 0x02, 0x03], String["a", "bb"]))),
+                (label="nullable fields", T=NullableLayout,
+                 value=NullableLayout((missing, NullableChild((Int64(7), "nullable"))))),
+            )
+
+            function chargedtyped(s::Avro.Schema, ::Type{T}, x) where {T}
+                bytes = Avro.encode(s, x)
+                target = Avro.typedplan(T, s, Avro.readplan(s), Avro.Limits())
+                budget = Avro.Budget(Avro.Limits(); available=1 << 40)
+                Avro.addinput!(budget, length(bytes))
+                try
+                    d = Avro.Decoder(bytes, budget)
+                    value = Avro.decodetyped(target, d, :trusted)
+                    @test d.pos == length(bytes) + 1
+                    return value, budget.reserved
+                finally
+                    Avro.close!(budget)
+                end
+            end
+
+            summarysize(x) = Int(Base.summarysize(x; exclude=Avro.Schema))
+            function probeshell(::Type{T}) where {T}
+                isbitstype(T) && return 0
+                return max(Int(Base.summarysize(Avro.emptyprobe(T))), 8)
+            end
+
+            for (i, case) in enumerate(cases)
+                @testset "$(case.label)" begin
+                    T = case.T
+                    scalar_schema = Avro.schema(T; name="ShellOracle$i")
+                    scalar, scalar_charge = chargedtyped(scalar_schema, T, case.value)
+                    @test typeof(scalar) === T
+                    if isbitstype(T)
+                        @test scalar_charge == 0             # the returned scalar owns no heap storage
+                    else
+                        @test scalar_charge >= summarysize(scalar)
+                    end
+
+                    # A concrete immutable non-isbits record lives inline in Vector{T}. Its exact vector
+                    # slots already contain the scalar probe shell; only referenced payload stays extra.
+                    array_schema = Avro.ArraySchema(scalar_schema)
+                    array, array_charge = chargedtyped(array_schema, Vector{T}, T[case.value, case.value])
+                    inline_shell = VERSION >= v"1.11" && isstructtype(T) && !ismutabletype(T) &&
+                                   !isbitstype(T) ? probeshell(T) : 0
+                    expected_array_charge = Avro.vectorbytes(T, length(array)) +
+                                            length(array) * (scalar_charge - inline_shell)
+                    @test array_charge == expected_array_charge
+                    @test array_charge >= summarysize(array)
+
+                    # A non-isbits nullable vector stores non-missing records through reference slots, so
+                    # each present value keeps its scalar shell. Isbits nullable payload stays in the slot.
+                    NullableT = Union{Missing,T}
+                    nullable_schema = Avro.ArraySchema(Avro.UnionSchema((Avro.NullSchema(), scalar_schema)))
+                    nullable_input = Vector{NullableT}(undef, 3)
+                    nullable_input[1] = missing
+                    nullable_input[2] = case.value
+                    nullable_input[3] = case.value
+                    nullable, nullable_charge = chargedtyped(nullable_schema, Vector{NullableT}, nullable_input)
+                    expected_nullable_charge = Avro.vectorbytes(NullableT, length(nullable)) + 2 * scalar_charge
+                    @test nullable_charge == expected_nullable_charge
+                    @test nullable_charge >= summarysize(nullable)
+                end
+            end
+        end
     end
 
     @testset "the direct typed route over resolving plans (plan §4.8, R18)" begin

@@ -47,6 +47,7 @@ end
 struct ArrayTarget{E,P<:TypedPlan} <: TypedPlan
     items::P
     minsize::Int
+    inlineshell::Int
 end
 
 "`Avro.Map{V}`, `Dict{String,V}` or `Dict{Symbol,V}` (keys admitted) targets."
@@ -98,21 +99,42 @@ end
 
 Base.getindex(m::TypedMemo, i::Int) = m.entries[i]
 
+"Allocate one exact-capacity typed-plan vector after charging it to the construction scope."
+function typedvector(::Type{E}, n::Int, memo::TypedMemo) where {E}
+    charge = vectorbytes(E, n)
+    reserve!(memo.budget, charge)
+    try
+        values = Vector{E}(undef, n)
+        allocated!(memo.budget, charge)
+        return values
+    catch
+        release!(memo.budget, charge)
+        rethrow()
+    end
+end
+
 """
     typedplan(T, reader_schema, plan, limits) -> TypedPlan
 
 The typed plan decoding `plan` (the generic or resolving plan of `reader_schema`) into `T`.
 """
-function typedplan(::Type{T}, reader::Schema, plan::ReadPlan, limits::Limits) where {T}
-    return withbudget(limits) do budget                # one construction budget (§4.4, round-2 D06)
-        nodes = graphinfo(reader).nodes
-        reserve!(budget, STORAGE[].vector + nodes * (8 + STORAGE[].vector))   # the memo skeleton
-        entries = Vector{Vector{Pair{Any,TypedPlan}}}(undef, nodes)
-        for i in eachindex(entries)
-            entries[i] = Pair{Any,TypedPlan}[]
+function typedplan(::Type{T}, reader::Schema, plan::ReadPlan, limits::Limits;
+                   budget::Union{Nothing,Budget}=nothing) where {T}
+    if budget === nothing
+        return withbudget(limits) do operation_budget
+            return typedplan(T, reader, plan, limits; budget=operation_budget)
         end
-        return buildtyped(T, reader, plan, TypedMemo(entries, budget))
     end
+    nodes = graphinfo(reader).nodes
+    memocharge = checked_add(vectorbytes(Vector{Pair{Any,TypedPlan}}, nodes),
+                             checked_mul(STORAGE[].vector, nodes))
+    reserve!(budget, memocharge)
+    entries = Vector{Vector{Pair{Any,TypedPlan}}}(undef, nodes)
+    for i in eachindex(entries)
+        entries[i] = Pair{Any,TypedPlan}[]
+    end
+    allocated!(budget, memocharge)
+    return buildtyped(T, reader, plan, TypedMemo(entries, budget))
 end
 
 function memolookup(memo::TypedMemo, s::Schema, ::Type{T}) where {T}
@@ -123,14 +145,30 @@ function memolookup(memo::TypedMemo, s::Schema, ::Type{T}) where {T}
 end
 
 function memostore!(memo::TypedMemo, s::Schema, ::Type{T}, p::TypedPlan) where {T}
-    reserve!(memo.budget, 32)                          # each memo entry is charged before it is stored
-    entries = memo[Int(nodeid(s)) + 1]
+    slot = Int(nodeid(s)) + 1
+    entries = memo[slot]
     for i in eachindex(entries)
         entries[i].first === T || continue
         entries[i] = T => p
         return p
     end
-    push!(entries, T => p)
+    n = checked_add(length(entries), 1)
+    newcharge = vectorbytes(Pair{Any,TypedPlan}, n)
+    reserve!(memo.budget, newcharge)
+    replacement = try
+        values = Vector{Pair{Any,TypedPlan}}(undef, n)
+        allocated!(memo.budget, newcharge)
+        values
+    catch
+        release!(memo.budget, newcharge)
+        rethrow()
+    end
+    copyto!(replacement, 1, entries, 1, n - 1)
+    replacement[n] = T => p
+    oldcharge = vectorbytes(Pair{Any,TypedPlan}, n - 1)
+    memo.entries[slot] = replacement
+    entries = nothing
+    release!(memo.budget, oldcharge)
     return p
 end
 
@@ -152,7 +190,7 @@ function buildtyped(::Type{T}, s::Schema, p::ReadPlan, memo::TypedMemo) where {T
     s isa RecordSchema && return buildrecordtarget(T, s, p::RecordPlan, memo)
     s isa ArraySchema && return buildarraytarget(T, s, p::ArrayPlan, memo)
     s isa MapSchema && return buildmaptarget(T, s, p::MapPlan, memo)
-    return buildleaftarget(T, p)
+    return buildleaftarget(T, p, memo)
 end
 
 """
@@ -206,9 +244,13 @@ function builduniontarget(::Type{T}, s::UnionSchema, p::UnionPlan, memo::TypedMe
         ip isa SemanticTarget && return SemanticTarget{T}(p)
         return NullableTarget{N,typeof(ip)}(ip, nb)
     end
-    members = T isa Union ? Base.uniontypes(T) : Any[T]
-    branches = TypedPlan[]
-    for (b, bp) in zip(s.branches, p.branches)
+    rawmembers = T isa Union ? Base.uniontypes(T) : (T,)
+    members = typedvector(Any, length(rawmembers), memo)
+    for i in eachindex(rawmembers)
+        members[i] = rawmembers[i]
+    end
+    branches = typedvector(TypedPlan, length(s.branches), memo)
+    for (i, (b, bp)) in enumerate(zip(s.branches, p.branches))
         found = nothing
         for m in members
             tp = buildtyped(m, b, bp, memo)
@@ -217,21 +259,22 @@ function builduniontarget(::Type{T}, s::UnionSchema, p::UnionPlan, memo::TypedMe
             break
         end
         found === nothing && return SemanticTarget{T}(p)
-        push!(branches, found)
+        branches[i] = found
     end
     return UnionTarget{T}(branches)
 end
 
-function buildleaftarget(::Type{T}, p::ReadPlan) where {T}
+function buildleaftarget(::Type{T}, p::ReadPlan, memo::TypedMemo) where {T}
     T === Symbol && p isa Union{StringPlan,EnumPlan} && return SymbolTarget(p)
-    T <: Base.Enum && p isa EnumPlan && return enumtarget(T, p)
+    T <: Base.Enum && p isa EnumPlan && return enumtarget(T, p, memo)
     leafcompatible(T, p) && return LeafTarget{T,typeof(p)}(p)
     return SemanticTarget{T}(p)
 end
 
-function enumtarget(::Type{T}, p::EnumPlan) where {T<:Base.Enum}
+function enumtarget(::Type{T}, p::EnumPlan, memo::TypedMemo) where {T<:Base.Enum}
     syms = p.schema.symbols
-    members = Vector{Union{Nothing,T}}(nothing, length(syms))
+    members = typedvector(Union{Nothing,T}, length(syms), memo)
+    fill!(members, nothing)
     for e in instances(T)
         name = avrosymbol(T, e)
         haskey(p.schema.symbolindex, name) || continue
@@ -294,13 +337,28 @@ function avrofieldname(tags, field::Symbol)
     return t === nothing ? String(field) : String(t)
 end
 
+function budgetedavrofieldname(tags, field::Symbol, budget::Budget)
+    bound = stringbytes(budget.limits.max_name_bytes)
+    reserve!(budget, bound)
+    name = avrofieldname(tags, field)
+    actual = stringbytes(sizeof(name))
+    actual <= bound || throw(limiterror(budget, :max_name_bytes, sizeof(name), budget.limits.max_name_bytes))
+    allocated!(budget, actual)
+    release!(budget, bound - actual)
+    return name
+end
+
 function buildrecordplan(::Type{T}, s::RecordSchema, p::RecordPlan, memo::TypedMemo) where {T}
     names = fieldnames(T)
     tags = StructUtils.fieldtags(AvroStyle(), T)
-    avronames = String[avrofieldname(tags, n) for n in names]
+    avronames = typedvector(String, length(names), memo)
+    for i in eachindex(names)
+        avronames[i] = budgetedavrofieldname(tags, names[i], memo.budget)
+    end
     nschema = length(s.fields)
-    plans = Vector{TypedPlan}(undef, nschema)
-    map = zeros(Int, length(names))
+    plans = typedvector(TypedPlan, nschema, memo)
+    map = typedvector(Int, length(names), memo)
+    fill!(map, 0)
     for (j, f) in enumerate(s.fields)
         k = findfirst(==(f.name), avronames)
         if k === nothing
@@ -312,7 +370,7 @@ function buildrecordplan(::Type{T}, s::RecordSchema, p::RecordPlan, memo::TypedM
         plans[j] = tp
         map[k] = j
     end
-    defaults = Vector{Any}(undef, length(names))
+    defaults = typedvector(Any, length(names), memo)
     defs = StructUtils.fielddefaults(AvroStyle(), T)
     for k in eachindex(names)
         map[k] == 0 || continue
@@ -340,8 +398,8 @@ wrapped or per-writer-branch target; resolved records decode writer-ordered step
 fields with reader-only defaults materialised once at plan time. Returns `nothing` when ineligible.
 """
 function buildresolvedtyped(::Type{T}, s::Schema, p::ReadPlan, memo::TypedMemo) where {T}
-    p isa PromotePlan && return buildleaftarget(T, p)
-    p isa EnumRemapPlan && return buildenumremaptarget(T, p)
+    p isa PromotePlan && return buildleaftarget(T, p, memo)
+    p isa EnumRemapPlan && return buildenumremaptarget(T, p, memo)
     if p isa WrapPlan && p.nullable != 0 && s isa UnionSchema
         N, inner = T isa Union ? splitoptional(T) : (Union{}, T)
         inner === nothing && return nothing
@@ -354,18 +412,18 @@ function buildresolvedtyped(::Type{T}, s::Schema, p::ReadPlan, memo::TypedMemo) 
     if p isa UnionResolvePlan && p.nullable != 0 && s isa UnionSchema
         N, inner = T isa Union ? splitoptional(T) : (Union{}, T)
         (inner === nothing || N === Union{}) && return nothing
-        branches = TypedPlan[]
-        isnull = Bool[]
+        branches = typedvector(TypedPlan, length(p.branches), memo)
+        isnull = typedvector(Bool, length(p.branches), memo)
         for (i, bp) in enumerate(p.branches)
             if p.readerindex[i] == p.nullable
-                push!(branches, GenericTarget(bp))                            # decodes missing
-                push!(isnull, true)
+                branches[i] = GenericTarget(bp)                              # decodes missing
+                isnull[i] = true
             else
                 bt = bp isa UnresolvableBranch ? GenericTarget(bp) :
                      buildtyped(inner, s.branches[p.readerindex[i]], bp, memo)
                 bt isa SemanticTarget && return nothing
-                push!(branches, bt)
-                push!(isnull, false)
+                branches[i] = bt
+                isnull[i] = false
             end
         end
         bs = (branches...,)
@@ -375,11 +433,12 @@ function buildresolvedtyped(::Type{T}, s::Schema, p::ReadPlan, memo::TypedMemo) 
     return nothing
 end
 
-function buildenumremaptarget(::Type{T}, p::EnumRemapPlan) where {T}
+function buildenumremaptarget(::Type{T}, p::EnumRemapPlan, memo::TypedMemo) where {T}
     T === String && return EnumRemapTarget{String}(p)
     T === Symbol && return EnumRemapTarget{Symbol}(p)
     T <: Base.Enum || return nothing
-    members = Vector{Union{Nothing,T}}(nothing, length(p.reader.symbols))
+    members = typedvector(Union{Nothing,T}, length(p.reader.symbols), memo)
+    fill!(members, nothing)
     for e in instances(T)
         name = avrosymbol(T, e)
         haskey(p.reader.symbolindex, name) || continue
@@ -442,11 +501,15 @@ function buildresolvedrecord(::Type{T}, s::RecordSchema, p::ResolvedRecordPlan, 
     return memostore!(memo, s, T, built)
 end
 
-function resolvedslotmap(::Type{T}, s::RecordSchema) where {T}
+function resolvedslotmap(::Type{T}, s::RecordSchema, memo::TypedMemo) where {T}
     names = fieldnames(T)
     tags = StructUtils.fieldtags(AvroStyle(), T)
-    avronames = String[avrofieldname(tags, n) for n in names]
-    slotfor = zeros(Int, length(s.fields))               # reader slot -> T field
+    avronames = typedvector(String, length(names), memo)
+    for i in eachindex(names)
+        avronames[i] = budgetedavrofieldname(tags, names[i], memo.budget)
+    end
+    slotfor = typedvector(Int, length(s.fields), memo)    # reader slot -> T field
+    fill!(slotfor, 0)
     for (k, an) in enumerate(avronames)
         i = get(s.fieldindex, an, 0)
         i == 0 && continue
@@ -457,27 +520,25 @@ end
 
 function resolvedsteptargets(::Type{T}, s::RecordSchema, p::ResolvedRecordPlan, memo::TypedMemo,
                              slotfor::Vector{Int}) where {T}
-    plans = TypedPlan[]
-    stepslot = Int[]
-    for (slot, sp) in p.steps
+    plans = typedvector(TypedPlan, length(p.steps), memo)
+    stepslot = typedvector(Int, length(p.steps), memo)
+    for (i, (slot, sp)) in enumerate(p.steps)
         k = slot == 0 ? 0 : slotfor[slot]
         if k == 0
-            push!(plans, SkipTarget(sp))
-            push!(stepslot, 0)
+            plans[i] = SkipTarget(sp)
+            stepslot[i] = 0
         else
             tp = buildtyped(fieldtype(T, k), s.fields[slot].schema, sp, memo)
             tp isa SemanticTarget && return nothing
-            push!(plans, tp)
-            push!(stepslot, k)
+            plans[i] = tp
+            stepslot[i] = k
         end
     end
     return (plans, stepslot)
 end
 
-function checkedreaderdefault(::Type{T}, dp::DefaultPlan, limits::Limits) where {T}
-    v = withbudget(limits) do budget
-        jsonvalue(dp.schema, dp.json, budget)
-    end
+function checkedreaderdefault(::Type{T}, dp::DefaultPlan, budget::Budget) where {T}
+    v = jsonvalue(dp.schema, dp.json, budget)
     v2 = v isa T ? v : try
         convertleaf(T, v)
     catch
@@ -487,12 +548,12 @@ function checkedreaderdefault(::Type{T}, dp::DefaultPlan, limits::Limits) where 
     return ResolvedReaderDefault{T}(dp)
 end
 
-function resolvedreaderdefaults!(::Type{T}, defaults::Vector{Any}, covered::BitVector,
-                                 slotfor::Vector{Int}, p::ResolvedRecordPlan, s::RecordSchema) where {T}
+function resolvedreaderdefaults!(::Type{T}, defaults::Vector{Any}, covered::Vector{Bool},
+                                 slotfor::Vector{Int}, p::ResolvedRecordPlan, budget::Budget) where {T}
     for (slot, dp) in p.defaults
         k = slotfor[slot]
         k == 0 && continue
-        dflt = checkedreaderdefault(fieldtype(T, k), dp, graphlimits(s))
+        dflt = checkedreaderdefault(fieldtype(T, k), dp, budget)
         dflt === nothing && return false
         defaults[k] = dflt
         covered[k] = true
@@ -500,7 +561,7 @@ function resolvedreaderdefaults!(::Type{T}, defaults::Vector{Any}, covered::BitV
     return true
 end
 
-function resolvedstaticdefaults!(::Type{T}, defaults::Vector{Any}, covered::BitVector, names) where {T}
+function resolvedstaticdefaults!(::Type{T}, defaults::Vector{Any}, covered::Vector{Bool}, names) where {T}
     defs = StructUtils.fielddefaults(AvroStyle(), T)
     for k in eachindex(names)
         covered[k] && continue
@@ -521,16 +582,17 @@ function resolvedstaticdefaults!(::Type{T}, defaults::Vector{Any}, covered::BitV
 end
 
 function buildresolvedrecordplan(::Type{T}, s::RecordSchema, p::ResolvedRecordPlan, memo::TypedMemo) where {T}
-    names, slotfor = resolvedslotmap(T, s)
+    names, slotfor = resolvedslotmap(T, s, memo)
     targets = resolvedsteptargets(T, s, p, memo, slotfor)
     targets === nothing && return nothing
     plans, stepslot = targets
-    defaults = Vector{Any}(undef, length(names))
-    covered = falses(length(names))
+    defaults = typedvector(Any, length(names), memo)
+    covered = typedvector(Bool, length(names), memo)
+    fill!(covered, false)
     for k in stepslot
         k == 0 || (covered[k] = true)
     end
-    resolvedreaderdefaults!(T, defaults, covered, slotfor, p, s) || return nothing
+    resolvedreaderdefaults!(T, defaults, covered, slotfor, p, memo.budget) || return nothing
     resolvedstaticdefaults!(T, defaults, covered, names) || return nothing
     ps = (plans...,)
     return ResolvedRecordTarget{T,typeof(ps),(stepslot...,)}(s, ps, defaults, measuredshell(T, memo.budget))
@@ -579,7 +641,10 @@ function buildarraytarget(::Type{T}, s::ArraySchema, p::ArrayPlan, memo::TypedMe
     E = eltype(T)
     ip = buildtyped(E, s.items, p.items, memo)
     ip isa SemanticTarget && return SemanticTarget{T}(p)
-    return ArrayTarget{E,typeof(ip)}(ip, p.minsize)
+    # Julia 1.10's storage oracle counts an immutable non-isbits element both in its vector slot and
+    # as a value shell. Julia 1.11 corrected that duplication, so only newer versions transfer it.
+    inlineshell = VERSION >= v"1.11" && inlinestruct(E) ? measuredinlineshell(E, memo.budget) : 0
+    return ArrayTarget{E,typeof(ip)}(ip, p.minsize, inlineshell)
 end
 
 function buildmaptarget(::Type{T}, s::MapSchema, p::MapPlan, memo::TypedMemo) where {T}
@@ -672,10 +737,10 @@ function typedvalue(p::ArrayTarget{E}, d::Decoder, names) where {E}
         g === nothing && (g = GrowBuf{E}(d, count))
         if size >= 0
             stop = d.pos + size - 1
-            filltyped!(g, p.items, d, names, count, stop)
+            filltyped!(g, p.items, p.inlineshell, d, names, count, stop)
             d.pos == stop + 1 || dataerror(d, "sized array block not exactly consumed")
         else
-            filltyped!(g, p.items, d, names, count, -1)
+            filltyped!(g, p.items, p.inlineshell, d, names, count, -1)
         end
     end
     leave!(d)
@@ -683,11 +748,13 @@ function typedvalue(p::ArrayTarget{E}, d::Decoder, names) where {E}
     return finish!(g, d)
 end
 
-function filltyped!(g::GrowBuf{E}, items::TypedPlan, d::Decoder, names, count::Int, stop::Int) where {E}
+function filltyped!(g::GrowBuf{E}, items::TypedPlan, inlineshell::Int, d::Decoder, names,
+                    count::Int, stop::Int) where {E}
     outerstop = d.stop
     stop >= 0 && (stop <= d.stop || dataerror(d, "sized block exceeds the remaining bytes"); d.stop = stop)
     for _ in 1:count
         push!(g, d, decodetyped(items, d, names))
+        release!(d.budget, inlineshell)                 # the concrete immutable shell now lives in its vector slot
     end
     d.stop = outerstop
     return g
@@ -757,29 +824,48 @@ function inlinestruct(::Type{F}) where {F}
            !(F <: AbstractArray) && !(F <: AbstractString) && !(F <: AbstractDict)
 end
 
-function measuredshell(::Type{T}, budget::Union{Nothing,Budget}=nothing) where {T}
-    isbitstype(T) && return 0
-    bound = sizeof(T) + 8 * fieldcount(T) + 64         # the §4.4 checked bound, reserved before the probe
-    budget === nothing || reserve!(budget, bound)
-    shell = if ismutabletype(T) || isstructtype(T)
-        try
-            probe = emptyprobe(T)
-            marginal = Int(Base.summarysize(probe))
-            for i in 1:fieldcount(T)                   # inline nested structs charge their own shells
-                F = fieldtype(T, i)
-                if inlinestruct(F)
-                    marginal -= measuredshell(F, nothing)
-                end
-            end
-            max(marginal, 8)
+"Measure the complete immutable shell that becomes part of a concrete vector element slot."
+function measuredinlineshell(::Type{T}, budget::Budget) where {T}
+    bound = checked_add(checked_add(sizeof(T), checked_mul(8, fieldcount(T))), 64)
+    reserve!(budget, bound)
+    try
+        return try
+            max(Int(Base.summarysize(emptyprobe(T))), 8)
         catch
             bound
         end
-    else
-        16 + sizeof(T)
+    finally
+        release!(budget, bound)
     end
-    budget === nothing || release!(budget, bound)      # the probe is transient: the bound trues up to zero
-    return shell
+end
+
+function measuredshell(::Type{T}, budget::Union{Nothing,Budget}=nothing) where {T}
+    isbitstype(T) && return 0
+    bound = checked_add(checked_add(sizeof(T), checked_mul(8, fieldcount(T))), 64)
+    budget === nothing || reserve!(budget, bound)
+    try
+        shell = if ismutabletype(T) || isstructtype(T)
+            try
+                probe = emptyprobe(T)
+                marginal = Int(Base.summarysize(probe))
+                for i in 1:fieldcount(T)                   # inline nested structs charge their own shells
+                    F = fieldtype(T, i)
+                    if inlinestruct(F) && VERSION >= v"1.11"
+                        marginal -= measuredshell(F, budget)
+                    end
+                end
+                max(marginal, 8)
+            catch err
+                err isa LimitError && rethrow()
+                bound
+            end
+        else
+            16 + sizeof(T)
+        end
+        return shell
+    finally
+        budget === nothing || release!(budget, bound)
+    end
 end
 
 shellbytes(::Type{T}) where {T} = isbitstype(T) ? 0 : 16 + sizeof(T)

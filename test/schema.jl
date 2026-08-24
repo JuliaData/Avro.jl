@@ -86,13 +86,43 @@
             end
         end
         @test_throws ArgumentError Avro.fingerprint(weather; algorithm=:sha1)
+
+        @testset "fingerprint workspace is reserved before hashing" begin
+            for algorithm in (:md5, :sha256)
+                ample = Avro.Budget(Avro.Limits(); available=1 << 40)
+                digest = Avro.hashfingerprint(UInt8[0x01], algorithm, ample)
+                @test ample.reserved == Base.summarysize(digest)
+                peak = ample.peak
+                Avro.close!(ample)
+
+                tight = Avro.Budget(Avro.Limits(); available=1 << 40)
+                err = try
+                    Avro.reserve!(tight, tight.ceiling - peak + 1)
+                    Avro.hashfingerprint(UInt8[0x01], algorithm, tight)
+                    nothing
+                catch e
+                    e
+                finally
+                    Avro.close!(tight)
+                end
+                @test err isa Avro.LimitError
+                @test err.limit === :max_total_bytes
+                @test err.observed == tight.ceiling + 1
+                @test err.value == tight.ceiling
+            end
+        end
     end
 
     @testset "printing round trips every fixture schema structurally" begin
+        negativeschemas = joinpath(FIXTURES, "interop", "negative", "schema")
+        isnegativeschema(path) = first(splitpath(relpath(path, negativeschemas))) != ".."
         files = String[]
         for (root, _, fs) in walkdir(FIXTURES), f in fs
+            isnegativeschema(root) && continue
             (endswith(f, ".avsc") || f == "schema.json") && push!(files, joinpath(root, f))
         end
+        @test any(f -> endswith(f, ".avsc"), readdir(negativeschemas))
+        @test all(!isnegativeschema(f) for f in files)
         @test length(files) >= 20
         for f in files
             s = P(read(f, String))

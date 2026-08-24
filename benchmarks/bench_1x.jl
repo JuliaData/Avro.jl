@@ -1,9 +1,7 @@
 # Baseline for Avro.jl 1.1.2 (run with --project=<env pinned to Avro@1.1.2>, -t 1). Prints one JSON-ish line per metric.
-using Avro, Tables, Random, Pkg
-Random.seed!(1)
+using Avro, Tables, Pkg
 const N = 1_000_000
-tbl = (id = collect(Int64, 1:N), x = rand(N), name = [string("name_", rand(1000:9999)) for _ in 1:N], flag = rand(Bool, N))
-rt = Tables.rowtable(tbl)
+rt = [(id=Int64(i), x=i / 7, name="name-$(i % 1000)", flag=isodd(i)) for i in 1:N]
 dir = ARGS[1]
 ver = Pkg.dependencies()[Base.identify_package("Avro").uuid].version
 println("impl=Avro.jl version=$ver julia=$VERSION threads=$(Threads.nthreads()) cpu=$(Sys.cpu_info()[1].model) rows=$N")
