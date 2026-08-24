@@ -89,10 +89,15 @@
     end
 
     @testset "printing round trips every fixture schema structurally" begin
+        negativeschemas = joinpath(FIXTURES, "interop", "negative", "schema")
+        isnegativeschema(path) = first(splitpath(relpath(path, negativeschemas))) != ".."
         files = String[]
         for (root, _, fs) in walkdir(FIXTURES), f in fs
+            isnegativeschema(root) && continue
             (endswith(f, ".avsc") || f == "schema.json") && push!(files, joinpath(root, f))
         end
+        @test any(f -> endswith(f, ".avsc"), readdir(negativeschemas))
+        @test all(!isnegativeschema(f) for f in files)
         @test length(files) >= 20
         for f in files
             s = P(read(f, String))
