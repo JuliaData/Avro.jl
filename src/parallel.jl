@@ -56,6 +56,7 @@ function prescanblocks(r::Reader)
     tablecap = 64
     reserve!(r.budget, blocktablecharge(tablecap))     # the block table grows by reserved exact-capacity replacement (§4.4)
     entries = Vector{BlockEntry}(undef, tablecap)
+    allocated!(r.budget, blocktablecharge(tablecap))
     nentries = 0
     rows = 0
     pending = nothing
@@ -86,9 +87,10 @@ function prescanblocks(r::Reader)
                 newcap = checked_mul(2, tablecap)
                 reserve!(r.budget, blocktablecharge(newcap))
                 replacement = Vector{BlockEntry}(undef, newcap)
+                allocated!(r.budget, blocktablecharge(newcap))
                 copyto!(replacement, 1, entries, 1, nentries)
+                entries = replacement                  # the old table is unreachable only after the rebind
                 release!(r.budget, blocktablecharge(tablecap))
-                entries = replacement
                 tablecap = newcap
             end
             nentries += 1
@@ -330,7 +332,7 @@ function abandonjobs!(jobs::Vector{Union{Nothing,BlockJob}}, b::Budget, stats::P
         job === nothing && continue
         st = @atomic job.state
         st === :done && (stats.speculative_decoded += 1)
-        release!(b, job.W)
+        unreserve!(b, job.W)                           # worst-case headroom: reserved, never resident
         close!(job.budget)
     end
     return nothing
@@ -348,9 +350,10 @@ function commitjob!(r::Reader, job::BlockJob, finals::Vector{AbstractVector}, ke
     committed = false
     try
         phook(:commit, e.index)
-        release!(b, job.W)
+        unreserve!(b, job.W)                         # worst-case headroom: reserved, never resident
         worstowned = false
         reserve!(b, retained)                        # the block's retained chunks and payload
+        allocated!(b, retained)                      # resident under the job budget; the charge transfers here
         retainedowned = true
         addblocks!(b)
         addinput!(b, job.budget.input_bytes)
@@ -378,7 +381,7 @@ function commitjob!(r::Reader, job::BlockJob, finals::Vector{AbstractVector}, ke
         return nothing
     finally
         if !committed
-            worstowned && release!(b, job.W)
+            worstowned && unreserve!(b, job.W)       # worst-case headroom: reserved, never resident
             retainedowned && release!(b, retained)
             close!(job.budget)
         end

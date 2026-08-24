@@ -14,7 +14,7 @@ end
 struct Bzip2Reader end
 
 function Avro.decompressblock(name::Symbol, ::Bzip2Reader, payload::AbstractVector{UInt8}, limits::Avro.Limits, budget::Avro.Budget)
-    checkpoint = budget.reserved
+    checkpoint = Avro.budgetcheckpoint(budget)
     try
         total = length(payload)
         total > 0 || throw(Avro.CodecError(:bzip2, :decompress, "bzip2 payload has no stream"))
@@ -24,6 +24,7 @@ function Avro.decompressblock(name::Symbol, ::Bzip2Reader, payload::AbstractVect
         members = 0
         while pos <= total
             Avro.reserve!(budget, BZIP2_DECODER_BYTES)
+            Avro.allocated!(budget, BZIP2_DECODER_BYTES)      # the native workspace is malloc'd by initialize inside transcodemember!
             consumed, out, outlen = Avro.transcodemember!(:bzip2, Bzip2Decompressor(), payload, pos, total, out, outlen, limits.max_block_bytes, budget)
             Avro.release!(budget, BZIP2_DECODER_BYTES)
             consumed == 0 && throw(Avro.CodecError(:bzip2, :decompress, "invalid bzip2 stream at payload byte $pos"))

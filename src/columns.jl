@@ -89,7 +89,9 @@ end
 
 function makecolumn(::Type{E}, plan::P, capacity::Int, budget::Budget) where {E,P<:ReadPlan}
     reserve!(budget, vectorbytes(E, capacity))
-    return TypedColumn{E,P}(plan, Vector{E}(undef, capacity), 0)
+    c = TypedColumn{E,P}(plan, Vector{E}(undef, capacity), 0)
+    allocated!(budget, vectorbytes(E, capacity))
+    return c
 end
 
 """
@@ -165,9 +167,11 @@ end
 function grow!(c::TypedColumn{E}, budget::Budget, newcap::Int) where {E}
     reserve!(budget, vectorbytes(E, newcap))
     nd = Vector{E}(undef, newcap)
+    allocated!(budget, vectorbytes(E, newcap))
     copyto!(nd, 1, c.data, 1, c.len)
-    release!(budget, vectorbytes(E, length(c.data)))
-    c.data = nd
+    oldbytes = vectorbytes(E, length(c.data))
+    c.data = nd                                        # the old storage is unreachable only after the rebind
+    release!(budget, oldbytes)
     return nothing
 end
 
@@ -181,9 +185,11 @@ function finishcolumn!(c::TypedColumn{E}, budget::Budget) where {E}
     if c.len != length(out)
         reserve!(budget, vectorbytes(E, c.len))
         out = Vector{E}(undef, c.len)
+        allocated!(budget, vectorbytes(E, c.len))
         copyto!(out, 1, c.data, 1, c.len)
-        release!(budget, vectorbytes(E, length(c.data)))
-        c.data = out
+        oldbytes = vectorbytes(E, length(c.data))
+        c.data = out                                   # the old storage is unreachable only after the rebind
+        release!(budget, oldbytes)
     end
     return out
 end

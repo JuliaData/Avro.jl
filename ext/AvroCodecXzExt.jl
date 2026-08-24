@@ -18,7 +18,7 @@ function Avro.compresscapacity(::Val{:xz}, n::Int)
 end
 
 function Avro.decompressblock(name::Symbol, r::XzReader, payload::AbstractVector{UInt8}, limits::Avro.Limits, budget::Avro.Budget)
-    checkpoint = budget.reserved
+    checkpoint = Avro.budgetcheckpoint(budget)
     try
         total = length(payload)
         total > 0 || throw(Avro.CodecError(:xz, :decompress, "xz payload has no stream"))
@@ -38,6 +38,7 @@ function Avro.decompressblock(name::Symbol, r::XzReader, payload::AbstractVector
                 break                                                  # trailing padding in multiples of four ends the payload
             end
             Avro.reserve!(budget, limits.max_codec_memory)
+            Avro.allocated!(budget, limits.max_codec_memory)      # the native workspace is malloc'd by initialize inside transcodemember!
             consumed, out, outlen = Avro.transcodemember!(:xz, XzDecompressor(memlimit=r.memlimit, flags=UInt32(0)), payload, pos, total, out, outlen, limits.max_block_bytes, budget)
             Avro.release!(budget, limits.max_codec_memory)
             consumed == 0 && throw(Avro.CodecError(:xz, :decompress, "invalid xz stream at payload byte $pos"))

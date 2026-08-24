@@ -150,12 +150,16 @@ decodevalue(::BytesPlan, d::Decoder) = readbytes(d)
 decodevalue(::StringPlan, d::Decoder) = readstring(d)
 function decodevalue(p::FixedPlan, d::Decoder)
     reserve!(d.budget, STORAGE[].fixed)
-    return Fixed(p.schema, readfixed(d, p.schema.size), Val(:unchecked))
+    v = Fixed(p.schema, readfixed(d, p.schema.size), Val(:unchecked))
+    allocated!(d.budget, STORAGE[].fixed)
+    return v
 end
 function decodevalue(p::EnumPlan, d::Decoder)
     i = readindex(d, length(p.schema.symbols))
     reserve!(d.budget, enumvaluebytes())
-    return EnumValue(p.schema, Int32(i), Val(:unchecked))
+    v = EnumValue(p.schema, Int32(i), Val(:unchecked))
+    allocated!(d.budget, enumvaluebytes())
+    return v
 end
 
 const DATE_EPOCH = Date(1970, 1, 1)
@@ -199,6 +203,7 @@ function decimalfrombytes(d::Decoder, p::DecimalPlan, start::Int, n::Int)
     big = p.wide || n > 16
     big && reserve!(d.budget, widedecimalbytes(n))        # the BigInt path allocates before the value is known
     v = decimalunscaled(d, p, start, n)
+    big && allocated!(d.budget, widedecimalbytes(n))
     v isa Int128 || return WideDecimal(v, p.scale)
     big && release!(d.budget, widedecimalbytes(n))        # a narrow result computed through a transient BigInt
     return Decimal(v, p.scale)                            # isbits: charged where it is boxed or stored
@@ -319,7 +324,9 @@ end
 function GrowBuf{T}(d::Decoder, hint::Int) where {T}
     cap = max(min(hint, 1024), 0)
     reserve!(d.budget, vectorbytes(T, cap))
-    return GrowBuf{T}(Vector{T}(undef, cap), 0)
+    g = GrowBuf{T}(Vector{T}(undef, cap), 0)
+    allocated!(d.budget, vectorbytes(T, cap))
+    return g
 end
 
 @inline function Base.push!(g::GrowBuf{T}, d::Decoder, x) where {T}
@@ -327,9 +334,11 @@ end
         newcap = max(2 * length(g.data), 4)
         reserve!(d.budget, vectorbytes(T, newcap))
         nd = Vector{T}(undef, newcap)
+        allocated!(d.budget, vectorbytes(T, newcap))
         copyto!(nd, 1, g.data, 1, g.len)
-        release!(d.budget, vectorbytes(T, length(g.data)))
-        g.data = nd
+        oldbytes = vectorbytes(T, length(g.data))
+        g.data = nd                                       # the old storage is unreachable only after the rebind
+        release!(d.budget, oldbytes)
     end
     g.len += 1
     @inbounds g.data[g.len] = x
@@ -341,8 +350,11 @@ function finish!(g::GrowBuf{T}, d::Decoder) where {T}
     if g.len != length(out)
         reserve!(d.budget, vectorbytes(T, g.len))
         out = Vector{T}(undef, g.len)
+        allocated!(d.budget, vectorbytes(T, g.len))
         copyto!(out, 1, g.data, 1, g.len)
-        release!(d.budget, vectorbytes(T, length(g.data)))
+        oldbytes = vectorbytes(T, length(g.data))
+        g.data = out                                      # the old storage is unreachable only after the rebind
+        release!(d.budget, oldbytes)
     end
     return out
 end
@@ -373,7 +385,12 @@ function decodevalue(p::ArrayPlan, d::Decoder)
         first = false
     end
     leave!(d)
-    g === nothing && (reserve!(d.budget, STORAGE[].vector); return p.eltype === Any ? [] : Vector{p.eltype}(undef, 0))
+    if g === nothing
+        reserve!(d.budget, STORAGE[].vector)
+        out = p.eltype === Any ? [] : Vector{p.eltype}(undef, 0)
+        allocated!(d.budget, STORAGE[].vector)
+        return out
+    end
     return finish!(g, d)
 end
 
@@ -433,8 +450,11 @@ function decodevalue(p::UnionPlan, d::Decoder)
     end
     reserve!(d.budget, unionvaluebytes())
     v = decodevalue(p.branches[i], d)
-    isbits(v) && reserve!(d.budget, boxbytes(typeof(v)))
-    return UnionValue(i, v)
+    box = isbits(v) ? boxbytes(typeof(v)) : 0
+    box > 0 && reserve!(d.budget, box)
+    u = UnionValue(i, v)                                  # the shell and the box become resident here
+    allocated!(d.budget, unionvaluebytes() + box)
+    return u
 end
 
 function decodevalue(p::RecordPlan, d::Decoder)
@@ -446,10 +466,13 @@ function decodevalue(p::RecordPlan, d::Decoder)
         v = decode(p.fields[i], d)
         b = p.boxes[i]
         b > 0 && reserve!(d.budget, b)
-        vals[i] = v
+        vals[i] = v                                       # an isbits value boxes on assignment
+        b > 0 && allocated!(d.budget, b)
     end
     leave!(d)
-    return Record(p.schema, vals, Val(:unchecked))
+    r = Record(p.schema, vals, Val(:unchecked))
+    allocated!(d.budget, recordbytes(n))
+    return r
 end
 
 # ---- skipping ----------------------------------------------------------------------------------------
@@ -490,6 +513,7 @@ function skipvalue(p::DecimalPlan, d::Decoder)
     big = p.wide || n > 16
     big && reserve!(d.budget, widedecimalbytes(n))        # the transient BigInt of the check
     decimalunscaled(d, p, d.pos, n)
+    big && allocated!(d.budget, widedecimalbytes(n))
     big && release!(d.budget, widedecimalbytes(n))
     d.pos += n
     return nothing

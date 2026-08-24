@@ -214,7 +214,7 @@ schemaerror(msg::AbstractString, path::AbstractString) = throw(SchemaError(Strin
 function newmeta!(ctx::ParseContext, path::AbstractString)
     length(ctx.metas) < ctx.limits.max_schema_nodes ||
         throw(LimitError(:max_schema_nodes, length(ctx.metas) + 1, ctx.limits.max_schema_nodes, :max_schema_nodes, :decode))
-    reserve!(ctx.budget, 160)
+    charge!(ctx.budget, 160)
     m = NodeMeta()
     push!(ctx.metas, m)
     return m
@@ -237,7 +237,7 @@ function collectprops(ctx::ParseContext, obj::JSONObject, grammar, path::Abstrac
     p = Props()
     for (i, k) in enumerate(obj.order)
         k in grammar && continue
-        reserve!(ctx.budget, sizeof(k) + 32)
+        charge!(ctx.budget, sizeof(k) + 32)
         p[k] = obj[k]
     end
     return freeze!(p)
@@ -333,14 +333,14 @@ function sourcebytes(src::Union{String,SubString{String}}, maxbytes::Int, budget
 end
 sourcebytes(src::Vector{UInt8}, maxbytes::Int, budget::Budget, ::Type{E}) where {E} = src
 function sourcebytes(src::AbstractString, maxbytes::Int, budget::Budget, ::Type{E}) where {E}
-    reserve!(budget, sizeof(src) + 40)
+    charge!(budget, sizeof(src) + 40)
     return Vector{UInt8}(codeunits(String(src)))
 end
 function sourcebytes(src::AbstractVector{UInt8}, maxbytes::Int, budget::Budget, ::Type{E}) where {E}
     if src isa SubArray && parent(src) isa Vector{UInt8} && Base.iscontiguous(src)
         return src
     end
-    reserve!(budget, length(src) + 40)
+    charge!(budget, length(src) + 40)
     return Vector{UInt8}(src)
 end
 function sourcebytes(io::IO, maxbytes::Int, budget::Budget, ::Type{E}) where {E}
@@ -348,9 +348,11 @@ function sourcebytes(io::IO, maxbytes::Int, budget::Budget, ::Type{E}) where {E}
     cap = min(64 * KiB, readlimit)
     reserve!(budget, bytesbytes(cap))
     out = Vector{UInt8}(undef, cap)
+    allocated!(budget, bytesbytes(cap))
     chunkcap = min(64 * KiB, readlimit)
     reserve!(budget, bytesbytes(chunkcap))
     chunk = Vector{UInt8}(undef, chunkcap)
+    allocated!(budget, bytesbytes(chunkcap))
     len = 0
     while !eof(io)
         n = readbytes!(io, chunk, min(length(chunk), readlimit - len))
@@ -361,9 +363,10 @@ function sourcebytes(io::IO, maxbytes::Int, budget::Budget, ::Type{E}) where {E}
             newcap = min(max(grown, need), readlimit)
             reserve!(budget, bytesbytes(newcap))
             replacement = Vector{UInt8}(undef, newcap)
+            allocated!(budget, bytesbytes(newcap))
             copyto!(replacement, 1, out, 1, len)
+            out = replacement                          # the old buffer is unreachable only after the rebind
             release!(budget, bytesbytes(cap))
-            out = replacement
             cap = newcap
         end
         copyto!(out, len + 1, chunk, 1, n)
@@ -377,9 +380,10 @@ function sourcebytes(io::IO, maxbytes::Int, budget::Budget, ::Type{E}) where {E}
     if len != cap
         reserve!(budget, bytesbytes(len))
         exact = Vector{UInt8}(undef, len)
+        allocated!(budget, bytesbytes(len))
         copyto!(exact, 1, out, 1, len)
+        out = exact                                    # the old buffer is unreachable only after the rebind
         release!(budget, bytesbytes(cap))
-        out = exact
     end
     return out
 end
@@ -430,7 +434,7 @@ function parseunion(ctx::ParseContext, arr::JSONArray, enclosing::String, path::
     length(arr) <= ctx.limits.max_union_branches ||
         throw(LimitError(:max_union_branches, length(arr), ctx.limits.max_union_branches, :max_union_branches, :decode))
     branches = FrozenVector{Schema}()
-    reserve!(ctx.budget, 8 * length(arr) + 40)
+    charge!(ctx.budget, 8 * length(arr) + 40)
     for (i, b) in enumerate(arr)
         bpath = string(path, "[", i - 1, "]")
         b isa JSONArray && schemaerror("unions may not immediately contain other unions", bpath)
@@ -510,7 +514,7 @@ function register!(ctx::ParseContext, s::NamedSchema, path::String)
     end
     ctx.named[full] = s
     for a in s.aliases
-        reserve!(ctx.budget, sizeof(a) + 24)
+        charge!(ctx.budget, sizeof(a) + 24)
     end
     return s
 end
@@ -541,7 +545,7 @@ function parseenum(ctx::ParseContext, obj::JSONObject, enclosing::String, path::
         spath = string(path, ".symbols[", i - 1, "]")
         checkname(ctx, sym, "enum symbol", spath)
         haskey(index, sym) && schemaerror("duplicate enum symbol \"$(escapename(sym))\"", spath)
-        reserve!(ctx.budget, sizeof(sym) + 32)
+        charge!(ctx.budget, sizeof(sym) + 32)
         index[sym] = i
     end
     doc = stringattr(obj, "doc", path)
@@ -594,7 +598,7 @@ function parserecord(ctx::ParseContext, obj::JSONObject, enclosing::String, path
         for a in field.aliases
             (a == field.name || haskey(fieldindex, a)) && continue
         end
-        reserve!(ctx.budget, sizeof(field.name) + 96)
+        charge!(ctx.budget, sizeof(field.name) + 96)
         push!(fields, field)
         fieldindex[field.name] = i
     end
@@ -641,7 +645,7 @@ function parsefield(ctx::ParseContext, obj::JSONObject, ns::String, path::String
 end
 
 function makedefault(ctx::ParseContext, schema::Schema, json, span::String, path::String)
-    reserve!(ctx.budget, sizeof(span) + 64)
+    charge!(ctx.budget, sizeof(span) + 64)
     ok, branch = validatedefault(schema, json, ctx.limits.max_depth)
     if ok
         return DefaultValue(json, branch, span, 0, true)
@@ -905,7 +909,7 @@ function BoundedWriter(budget::Budget, maxbytes::Int)
         allocated!(budget, charge)
         return BoundedWriter(buf, 0, budget, maxbytes)
     catch
-        release!(budget, charge)
+        unreserve!(budget, charge)
         rethrow()
     end
 end
@@ -925,12 +929,12 @@ function boundedgrow!(w::BoundedWriter, n::Int)
             allocated!(w.budget, newcharge)
             out
         catch
-            release!(w.budget, newcharge)
+            unreserve!(w.budget, newcharge)
             rethrow()
         end
         copyto!(nb, 1, w.buf, 1, w.len)
+        w.buf = nb                                     # the old buffer is unreachable only after the rebind
         release!(w.budget, bytesbytes(cap))
-        w.buf = nb
     end
     addinput!(w.budget, n)                             # produced text, not reserved capacity, is the denominator
     return nothing
@@ -959,7 +963,7 @@ function boundedtake!(w::BoundedWriter)
         allocated!(w.budget, stringcharge)
         text
     catch
-        release!(w.budget, stringcharge)
+        unreserve!(w.budget, stringcharge)
         rethrow()
     end
     emptycharge = bytesbytes(0)
@@ -969,7 +973,7 @@ function boundedtake!(w::BoundedWriter)
         allocated!(w.budget, emptycharge)
         buf
     catch
-        release!(w.budget, emptycharge)
+        unreserve!(w.budget, emptycharge)
         rethrow()
     end
     oldcharge = bytesbytes(length(w.buf))
@@ -989,7 +993,7 @@ function boundedview(w::BoundedWriter)
         allocated!(w.budget, charge)
         buf
     catch
-        release!(w.budget, charge)
+        unreserve!(w.budget, charge)
         rethrow()
     end
     copyto!(exact, 1, w.buf, 1, w.len)
@@ -1009,7 +1013,7 @@ function schemaseen(s::Schema, budget::Budget)
         allocated!(budget, charge)
         values
     catch
-        release!(budget, charge)
+        unreserve!(budget, charge)
         rethrow()
     end
     fill!(seen, false)
@@ -1316,12 +1320,24 @@ end
 
 makeprops(propsin, structural, logical) = makeprops(propsin, structural, logical, constructionbudget())
 
+# The frozen-dictionary shell (struct plus two empty backing vectors) and one key/value slot pair.
+frozendictshell() = 2 * STORAGE[].vector + 48
+frozenvectorshell() = STORAGE[].vector + 24
+
 function makeprops(propsin, structural, logical, budget::Budget)
+    sized = Base.IteratorSize(propsin) isa Union{Base.HasLength,Base.HasShape}
+    extra = logical === nothing ? 0 : (logical isa DecimalLogical ? 3 : 1)
+    cap = (sized ? length(propsin) : 0) + extra
+    charge!(budget, frozendictshell() + 16 * cap)      # shell and exact slot capacity, before construction (D01)
     p = Props()
-    kvs = propsin isa NamedTuple ? (String(k) => v for (k, v) in pairs(propsin)) : propsin
+    sizehint!(p.keys, cap)
+    sizehint!(p.vals, cap)
+    kvs = propsin isa NamedTuple ? pairs(propsin) : propsin
     for (k, v) in kvs
+        k isa Union{AbstractString,Symbol} || throw(ArgumentError("`props` keys must be strings or symbols"))
+        sized || charge!(budget, 16)                   # per-slot growth for unsized iterables
+        charge!(budget, stringbytes(sizeof(k)))        # the retained key copy, before it is made (D01)
         ks = String(k)
-        reserve!(budget, 32 + sizeof(ks))              # the retained key, before it is stored (D01)
         ks in structural && throw(ArgumentError("`props` key \"$ks\" collides with a structural attribute emitted by this constructor"))
         logical !== nothing && ks in ("logicalType", "precision", "scale") &&
             throw(ArgumentError("`props` key \"$ks\" is synthesised by `logical=`"))
@@ -1331,6 +1347,7 @@ function makeprops(propsin, structural, logical, budget::Budget)
     if logical !== nothing
         p["logicalType"] = logicalname(logical)
         if logical isa DecimalLogical
+            charge!(budget, 2 * boxbytes(Int64))       # the two boxed integers, before they are stored
             p["precision"] = Int64(logical.precision)
             p["scale"] = Int64(logical.scale)
         end
@@ -1340,22 +1357,29 @@ end
 
 tojsonvalue(x::Union{Nothing,Bool,Int64,String,JSONNumber,JSONArray,JSONObject}, ::Budget) = x
 tojsonvalue(x::Integer, ::Budget) = Int64(x)
-tojsonvalue(x::AbstractFloat, b::Budget) = isfinite(x) ? (reserve!(b, 32); JSONNumber(repr(Float64(x)))) : (isnan(x) ? "NaN" : (x > 0 ? "Infinity" : "-Infinity"))
-tojsonvalue(x::AbstractString, b::Budget) = (reserve!(b, stringbytes(sizeof(x))); String(x))
-tojsonvalue(x::Symbol, b::Budget) = (reserve!(b, stringbytes(sizeof(String(x)))); String(x))
+tojsonvalue(x::AbstractFloat, b::Budget) = isfinite(x) ? (charge!(b, 32); JSONNumber(repr(Float64(x)))) : (isnan(x) ? "NaN" : (x > 0 ? "Infinity" : "-Infinity"))
+tojsonvalue(x::AbstractString, b::Budget) = (charge!(b, stringbytes(sizeof(x))); String(x))
+tojsonvalue(x::Symbol, b::Budget) = (charge!(b, stringbytes(sizeof(String(x)))); String(x))
 function tojsonvalue(x::AbstractVector, b::Budget)
-    reserve!(b, 48 + 16 * length(x))                   # the frozen array shell, before it is built (D01)
+    n = length(x)
+    charge!(b, frozenvectorshell() + vectorbytes(Any, n) + 16)   # shell, exact capacity and wrapper, before construction (D01)
     v = FrozenVector{Any}()
+    sizehint!(v.data, n)
     for e in x
         push!(v, tojsonvalue(e, b))
     end
     return JSONArray(freeze!(v))
 end
 function tojsonvalue(x::Union{AbstractDict,NamedTuple}, b::Budget)
-    reserve!(b, 64 + 48 * length(x))                   # the frozen object shell, before it is built (D01)
+    n = length(x)
+    charge!(b, frozendictshell() + frozenvectorshell() + 24 * n + 64)   # shells, exact slot capacity and wrapper (D01)
     m = FrozenDict{String,Any}()
     order = FrozenVector{String}()
+    sizehint!(m.keys, n)
+    sizehint!(m.vals, n)
+    sizehint!(order.data, n)
     for (k, v) in (x isa NamedTuple ? pairs(x) : x)
+        charge!(b, stringbytes(sizeof(k)))             # the retained key copy, before it is made (D01)
         ks = String(k)
         haskey(m, ks) && throw(ArgumentError("duplicate key \"$ks\""))
         m[ks] = tojsonvalue(v, b)
@@ -1418,6 +1442,7 @@ per-record fields, union branches, enum symbols, and name/alias bytes — so a c
 function finalizepublic!(s::Schema, limits::Limits, nodes::Int, named::Int)
     builderdepth() > 0 && return s
     return withconstruction(limits) do budget
+        charge!(budget, STORAGE[].vector + frozendictshell() + 64 + 32 * 16)   # the walk's memo shells and the visited table's initial slots, before allocation (D01)
         metas = NodeMeta[]
         namedtypes = FrozenDict{String,Schema}()
         collectmetas!(s, metas, namedtypes, IdDict{NodeMeta,Nothing}(), limits, budget, 1)
@@ -1464,7 +1489,7 @@ function collectmetas!(s::Schema, metas::Vector{NodeMeta}, namedtypes::FrozenDic
     haskey(visited, s.meta) && return metas
     length(metas) < limits.max_schema_nodes ||
         throw(LimitError(:max_schema_nodes, length(metas) + 1, limits.max_schema_nodes, :max_schema_nodes, :decode))
-    reserve!(budget, 160)                              # the parser's per-node construction charge
+    charge!(budget, 160)                              # the parser's per-node construction charge
     visited[s.meta] = nothing
     push!(metas, s.meta)
     if s isa NamedSchema
@@ -1526,15 +1551,19 @@ function publicnamed(name::AbstractString, namespace::AbstractString, aliases, s
     full = FullName(n, String(namespace))
     isreservedfullname(full) && throw(ArgumentError("\"$n\" is a primitive type name and cannot be redefined in the null namespace"))
     b = constructionbudget()
-    reserve!(b, stringbytes(sizeof(n)) + stringbytes(sizeof(namespace)))   # the retained name copies (D01)
-    raw = String[String(a) for a in aliases]
+    charge!(b, stringbytes(sizeof(n)) + stringbytes(sizeof(namespace)))   # the retained name copies (D01)
+    raw = String[]
     norm = String[]
-    for a in raw
-        reserve!(b, 2 * stringbytes(sizeof(a)) + 16)                       # raw and normalised alias copies
-        na = normalizealias(a, full.namespace)
+    for a in aliases
+        a isa Union{AbstractString,Symbol} || throw(ArgumentError("aliases must be strings"))
+        charge!(b, 2 * stringbytes(sizeof(a)) + 32)                       # raw and normalised copies and their slots, before they are made (D01)
+        sa = String(a)
+        push!(raw, sa)
+        na = normalizealias(sa, full.namespace)
         (na == fullname(full) || na in norm) && continue
         push!(norm, na)
     end
+    charge!(b, 2 * frozenvectorshell())                                   # the frozen wrappers
     return full, freeze!(FrozenVector{String}(norm, false)), freeze!(FrozenVector{String}(raw, false)), makeprops(propsin, structural, logical)
 end
 
@@ -1556,9 +1585,17 @@ end
 function EnumSchema(name::AbstractString, symbols; namespace::AbstractString="", default=nodefault, aliases=String[], doc=nothing, props=(;), limits::Limits=Limits())
     return withconstruction(limits) do _
         full, norm, raw, p = publicnamed(name, namespace, aliases, SCHEMA_GRAMMAR[:enum], props, nothing)
-        syms = String[String(x) for x in symbols]
-        length(syms) <= limits.max_enum_symbols || throw(LimitError(:max_enum_symbols, length(syms), limits.max_enum_symbols, :max_enum_symbols, :encode))
+        b = constructionbudget()
+        charge!(b, frozenvectorshell() + frozendictshell())               # the symbol vector and index shells (D01)
+        syms = String[]
         index = FrozenDict{String,Int}()
+        for x in symbols
+            x isa Union{AbstractString,Symbol} || throw(ArgumentError("enum symbols must be strings"))
+            length(syms) < limits.max_enum_symbols || throw(LimitError(:max_enum_symbols, length(syms) + 1, limits.max_enum_symbols, :max_enum_symbols, :encode))
+            charge!(b, stringbytes(sizeof(x)) + 32)                       # the retained copy, its slot and index entry, before they are made (D01)
+            sym = String(x)
+            push!(syms, sym)
+        end
         for (i, sym) in enumerate(syms)
             checkpublicname(sym, "enum symbol")
             haskey(index, sym) && throw(ArgumentError("duplicate enum symbol \"$sym\""))
@@ -1567,8 +1604,13 @@ function EnumSchema(name::AbstractString, symbols; namespace::AbstractString="",
         d = nodefault
         if !(default isa NoDefault)
             default isa AbstractString && haskey(index, String(default)) || throw(ArgumentError("enum default must be one of the symbols"))
-            d = DefaultValue(String(default), 0, sprint(escapejson, String(default)), index[String(default)], true)
+            charge!(b, stringbytes(sizeof(default)))                      # the retained default copy (D01)
+            ds = String(default)
+            jw = BoundedWriter(b, limits.max_schema_bytes)
+            escapejson(jw, ds)
+            d = DefaultValue(ds, 0, boundedtake!(jw), index[ds], true)
         end
+        doc === nothing || charge!(b, stringbytes(sizeof(doc)))
         s = EnumSchema(full, norm, raw, doc === nothing ? nothing : String(doc), freeze!(FrozenVector{String}(syms, false)), d, freeze!(index), p, NodeMeta())
         return finalizepublic!(s, limits, 1, 1)
     end
@@ -1619,20 +1661,27 @@ validated against `schema` with the recursive default rule.
 """
 function Field(name::AbstractString, schema::Schema; default=nodefault, order::Symbol=:ascending, aliases=String[], doc=nothing, props=(;), limits::Limits=Limits())
     return withconstruction(limits) do _
+        b = constructionbudget()
         checkpublicname(name, "field name")
         order in (:ascending, :descending, :ignore) || throw(ArgumentError("order must be :ascending, :descending or :ignore"))
         als = String[]
         for a in aliases
-            (String(a) == name || String(a) in als) && continue
-            push!(als, String(a))
+            a isa Union{AbstractString,Symbol} || throw(ArgumentError("aliases must be strings"))
+            charge!(b, stringbytes(sizeof(a)) + 16)                       # the retained copy and its slot, before they are made (D01)
+            sa = String(a)
+            (sa == name || sa in als) && continue
+            push!(als, sa)
         end
         d = nodefault
         if !(default isa NoDefault)
-            j = tojsonvalue(default === missing ? nothing : default, constructionbudget())
+            j = tojsonvalue(default === missing ? nothing : default, b)
             ok, branch = validatedefault(schema, j, limits.max_depth)
             ok || throw(ArgumentError("default value for field \"$name\" does not match its schema"))
-            d = DefaultValue(j, branch, sprint(printjson, j, false, 0), 0, true)
+            jw = BoundedWriter(b, limits.max_schema_bytes)
+            printjson(jw, j, false, 0)
+            d = DefaultValue(j, branch, boundedtake!(jw), 0, true)
         end
+        charge!(b, stringbytes(sizeof(name)) + (doc === nothing ? 0 : stringbytes(sizeof(doc))) + frozenvectorshell() + 128)   # name and doc copies, the frozen wrapper and the Field shell (D01)
         return Field(String(name), schema, doc === nothing ? nothing : String(doc), d, order, freeze!(FrozenVector{String}(als, false)), makeprops(props, FIELD_GRAMMAR, nothing))
     end
 end
@@ -1659,15 +1708,23 @@ end
 
 function recordschema_(f, name::AbstractString; namespace::AbstractString="", aliases=String[], doc=nothing, iserror::Bool=false, props=(;), limits::Limits=Limits())
     full, norm, raw, p = publicnamed(name, namespace, aliases, SCHEMA_GRAMMAR[:record], props, nothing)
+    b = constructionbudget()
+    charge!(b, frozenvectorshell() + frozendictshell() + 128 + (doc === nothing ? 0 : stringbytes(sizeof(doc))))   # field vector, index and record shells and the doc copy (D01)
     fields = FrozenVector{Field}()
     index = FrozenDict{String,Int}()
     rec = RecordSchema(full, norm, raw, doc === nothing ? nothing : String(doc), iserror, p, fields, index, NodeMeta())
     withbuilder() do
         fs = f(rec)
         length(fs) <= limits.max_fields || throw(LimitError(:max_fields, length(fs), limits.max_fields, :max_fields, :encode))
+        nf = length(fs)
+        charge!(b, 32 * nf)                                               # exact field-slot and index capacity, before construction (D01)
+        sizehint!(fields.data, nf)
+        sizehint!(index.keys, nf)
+        sizehint!(index.vals, nf)
         for (i, fld) in enumerate(fs)
             fld isa Field || throw(ArgumentError("fields must be Avro.Field values"))
             haskey(index, fld.name) && throw(ArgumentError("duplicate field name \"$(fld.name)\""))
+            charge!(b, 128)                                               # the rebuilt Field shell, before it is made (D01)
             push!(fields, Field(fld.name, importchild(fld.schema), fld.doc, fld.default, fld.order, fld.aliases, fld.props))
             index[fld.name] = i
         end

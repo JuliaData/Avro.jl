@@ -94,26 +94,56 @@ end
 # ---- the member loop over a TranscodingStreams codec -------------------------------------------------
 
 function growbuffer!(budget::Budget, buf::Vector{UInt8}, newcap::Int, len::Int)
-    reserve!(budget, bytesbytes(newcap))
-    nb = Vector{UInt8}(undef, newcap)
+    charge = bytesbytes(newcap)
+    reserve!(budget, charge)
+    nb = try
+        out = Vector{UInt8}(undef, newcap)
+        allocated!(budget, charge)
+        out
+    catch
+        unreserve!(budget, charge)
+        rethrow()
+    end
     copyto!(nb, 1, buf, 1, len)
-    release!(budget, bytesbytes(length(buf)))
+    release!(budget, bytesbytes(length(buf)))          # the old buffer dies with the caller's rebind
     return nb
 end
 
 function shrinkexact(budget::Budget, buf::Vector{UInt8}, len::Int)
     len == length(buf) && return buf
-    reserve!(budget, bytesbytes(len))
-    out = Vector{UInt8}(undef, len)
+    charge = bytesbytes(len)
+    reserve!(budget, charge)
+    out = try
+        o = Vector{UInt8}(undef, len)
+        allocated!(budget, charge)
+        o
+    catch
+        unreserve!(budget, charge)
+        rethrow()
+    end
     copyto!(out, 1, buf, 1, len)
-    release!(budget, bytesbytes(length(buf)))
+    release!(budget, bytesbytes(length(buf)))          # the old buffer dies with the caller's rebind
     return out
 end
 
-"Release every reservation acquired after `checkpoint` on a failed ownership transfer."
-function rollbackreservations!(budget::Budget, checkpoint::Int)
-    delta = budget.reserved - checkpoint
-    delta > 0 && release!(budget, delta)
+"Capture the counters `rollbackreservations!` needs to unwind an operation exactly."
+budgetcheckpoint(b::Budget) = (b.reserved, b.pending)
+
+"""
+Unwind every reservation acquired after `checkpoint` (a `budgetcheckpoint`) on a failed ownership
+transfer. The pending delta since the checkpoint is this operation's in-flight remainder and returns
+through `unreserve!`; the settled rest — storage that dies with the failed operation — is released.
+The budget may carry unrelated pending headroom (parallel worst-case reservations), so the split
+must come from the checkpoint, not from the counters alone.
+"""
+function rollbackreservations!(budget::Budget, checkpoint::NTuple{2,Int})
+    reserved0, pending0 = checkpoint
+    delta = budget.reserved - reserved0
+    delta <= 0 && return nothing
+    pend = budget.pending - pending0
+    pend > 0 && unreserve!(budget, pend)
+    resident = delta - max(pend, 0)
+    resident > 0 && release!(budget, resident)
     return nothing
 end
 
@@ -153,7 +183,13 @@ function transcodemember!(name::Symbol, codec::TranscodingStreams.Codec, input::
     end
 end
 
-initialoutput(budget::Budget, inputlen::Int, maxout::Int) = (cap = min(max(4 * inputlen, 1 << 12), maxout); reserve!(budget, bytesbytes(cap)); Vector{UInt8}(undef, cap))
+function initialoutput(budget::Budget, inputlen::Int, maxout::Int)
+    cap = min(max(4 * inputlen, 1 << 12), maxout)
+    reserve!(budget, bytesbytes(cap))
+    out = Vector{UInt8}(undef, cap)
+    allocated!(budget, bytesbytes(cap))
+    return out
+end
 
 # ---- decompression ----------------------------------------------------------------------------------
 
@@ -165,12 +201,14 @@ requirement checked against `max_codec_memory` and reserved, members counted, th
 exhausted, and the output bounded by `max_block_bytes`.
 """
 function decompressblock(name::Symbol, ::NullCodec, payload::AbstractVector{UInt8}, limits::Limits, budget::Budget)
-    checkpoint = budget.reserved
+    checkpoint = budgetcheckpoint(budget)
     try
         addinput!(budget, length(payload))
         addmembers!(budget)
         reserve!(budget, bytesbytes(length(payload)))
-        return Vector{UInt8}(payload)
+        out = Vector{UInt8}(payload)
+        allocated!(budget, bytesbytes(length(payload)))
+        return out
     catch
         rollbackreservations!(budget, checkpoint)
         rethrow()
@@ -178,9 +216,10 @@ function decompressblock(name::Symbol, ::NullCodec, payload::AbstractVector{UInt
 end
 
 function decompressblock(name::Symbol, ::DeflateReader, payload::AbstractVector{UInt8}, limits::Limits, budget::Budget)
-    checkpoint = budget.reserved
+    checkpoint = budgetcheckpoint(budget)
     try
         reserve!(budget, DEFLATE_DECODER_BYTES)
+        allocated!(budget, DEFLATE_DECODER_BYTES)      # the native workspace is malloc'd by initialize inside transcodemember!
         out = initialoutput(budget, length(payload), limits.max_block_bytes)
         consumed, out, outlen = transcodemember!(:deflate, DeflateDecompressor(), payload, 1, length(payload), out, 0, limits.max_block_bytes, budget)
         release!(budget, DEFLATE_DECODER_BYTES)
@@ -196,7 +235,7 @@ function decompressblock(name::Symbol, ::DeflateReader, payload::AbstractVector{
 end
 
 function decompressblock(name::Symbol, ::SnappyCodec, payload::AbstractVector{UInt8}, limits::Limits, budget::Budget)
-    checkpoint = budget.reserved
+    checkpoint = budgetcheckpoint(budget)
     try
         n = length(payload)
         n >= 4 || throw(CodecError(:snappy, :decompress, "snappy block shorter than its 4-byte CRC"))
@@ -208,6 +247,7 @@ function decompressblock(name::Symbol, ::SnappyCodec, payload::AbstractVector{UI
         m <= limits.max_block_bytes || throw(LimitError(:max_block_bytes, m, limits.max_block_bytes, :max_block_bytes, :decode))
         reserve!(budget, bytesbytes(m))
         out = Vector{UInt8}(undef, m)
+        allocated!(budget, bytesbytes(m))
         len = Ref{Csize_t}(m)
         st2 = GC.@preserve payload out Snappy.LibSnappy.snappy_uncompress(pointer(payload), datalen, pointer(out), len)
         (st2 == Snappy.LibSnappy.SNAPPY_OK && Int(len[]) == m) || throw(CodecError(:snappy, :decompress, "snappy decompression failed (status $st2)"))
@@ -223,7 +263,7 @@ function decompressblock(name::Symbol, ::SnappyCodec, payload::AbstractVector{UI
 end
 
 function decompressblock(name::Symbol, z::ZstdReader, payload::AbstractVector{UInt8}, limits::Limits, budget::Budget)
-    checkpoint = budget.reserved
+    checkpoint = budgetcheckpoint(budget)
     try
         total = length(payload)
         total > 0 || throw(CodecError(:zstandard, :decompress, "zstandard payload has no frame"))
@@ -244,6 +284,7 @@ function decompressblock(name::Symbol, z::ZstdReader, payload::AbstractVector{UI
             est === nothing && throw(CodecError(:zstandard, :decompress, "unreadable zstandard frame header at payload byte $pos"))
             est <= limits.max_codec_memory || throw(CodecError(:zstandard, :decompress, "the frame at payload byte $pos needs $est bytes of decoder memory; max_codec_memory is $(limits.max_codec_memory)"))
             reserve!(budget, est)
+            allocated!(budget, est)                    # the native frame workspace is malloc'd by initialize inside transcodemember!
             consumed, out, outlen = transcodemember!(:zstandard, ZstdDecompressor(windowLogMax=z.windowlogmax), payload, pos, pos + fsz - 1, out, outlen, limits.max_block_bytes, budget)
             release!(budget, est)
             consumed == fsz || throw(CodecError(:zstandard, :decompress, "zstandard frame not exactly consumed"))

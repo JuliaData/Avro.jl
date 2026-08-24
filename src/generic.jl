@@ -83,12 +83,15 @@ function buildmap(::Type{V}, keys::Vector{String}, vals::Vector{V}, budget::Unio
         perm[i] = Int32(i)
     end
     scratch = Vector{Int32}(undef, cld(n, 2))
+    budget === nothing || allocated!(budget, vectorbytes(Int32, n) + vectorbytes(Int32, cld(n, 2)))   # the Map shell settles at construction
     compared = mergesort!(perm, scratch, keys)
     budget === nothing || addcompare!(budget, compared + 4 * n)
     # duplicates: the sorted run groups equal keys; the earliest index keeps the position, the last value wins
     ndup = 0
     if n > 1
-        keep = trues(n)
+        budget === nothing || reserve!(budget, vectorbytes(Bool, n))
+        keep = fill(true, n)
+        budget === nothing || allocated!(budget, vectorbytes(Bool, n))
         i = 1
         while i <= n
             j = i
@@ -108,7 +111,9 @@ function buildmap(::Type{V}, keys::Vector{String}, vals::Vector{V}, budget::Unio
             i = j + 1
         end
         if ndup > 0
+            budget === nothing || reserve!(budget, vectorbytes(Int32, n))
             newindex = Vector{Int32}(undef, n)
+            budget === nothing || allocated!(budget, vectorbytes(Int32, n))
             w = 0
             for i in 1:n
                 if keep[i]
@@ -120,7 +125,9 @@ function buildmap(::Type{V}, keys::Vector{String}, vals::Vector{V}, budget::Unio
             end
             resize!(keys, w)
             resize!(vals, w)
+            budget === nothing || reserve!(budget, vectorbytes(Int32, w))
             out = Vector{Int32}(undef, w)
+            budget === nothing || allocated!(budget, vectorbytes(Int32, w))
             r = 0
             for k in 1:n
                 p = perm[k]
@@ -128,11 +135,15 @@ function buildmap(::Type{V}, keys::Vector{String}, vals::Vector{V}, budget::Unio
                 r += 1
                 out[r] = newindex[p]
             end
-            perm = out
+            perm = out                                                       # the original permutation dies at the rebind
+            budget === nothing || release!(budget, vectorbytes(Int32, n) + vectorbytes(Int32, n))   # it and the index map
         end
+        budget === nothing || release!(budget, vectorbytes(Bool, n))         # the keep mask dies with this block
     end
     budget === nothing || release!(budget, vectorbytes(Int32, cld(n, 2)))
-    return Map{V}(keys, vals, perm)
+    m = Map{V}(keys, vals, perm)
+    budget === nothing || allocated!(budget, STORAGE[].map)
+    return m
 end
 
 """
@@ -279,11 +290,20 @@ struct Record
     values::Vector{Any}
     Record(schema::RecordSchema, values::Vector{Any}, ::Val{:unchecked}) = new(schema, values)
     function Record(schema::RecordSchema, values; limits::Limits=Limits())
-        vs = Any[v for v in values]
-        length(vs) == length(schema.fields) || throw(ArgumentError("record \"$(fullname(schema))\" has $(length(schema.fields)) fields, got $(length(vs)) values"))
+        nf = length(schema.fields)
         return withbudget(limits; direction=:encode) do budget
-            reserve!(budget, recordbytes(length(vs)))
-            new(schema, vs)
+            reserve!(budget, recordbytes(nf))                                # before the values copy
+            vs = Vector{Any}(undef, nf)
+            i = 0
+            for v in values
+                i += 1
+                i <= nf || throw(ArgumentError("record \"$(fullname(schema))\" has $nf fields, got more values"))
+                vs[i] = v
+            end
+            i == nf || throw(ArgumentError("record \"$(fullname(schema))\" has $nf fields, got $i values"))
+            r = new(schema, vs)
+            allocated!(budget, recordbytes(nf))
+            return r
         end
     end
 end
@@ -365,7 +385,9 @@ struct Fixed
         length(bytes) == schema.size || throw(ArgumentError("fixed \"$(fullname(schema))\" has size $(schema.size), got $(length(bytes)) bytes"))
         return withbudget(limits; direction=:encode) do budget
             reserve!(budget, fixedbytes(length(bytes)))
-            new(schema, Vector{UInt8}(bytes))
+            f = new(schema, Vector{UInt8}(bytes))
+            allocated!(budget, fixedbytes(length(bytes)))
+            return f
         end
     end
 end

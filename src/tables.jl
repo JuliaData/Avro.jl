@@ -130,6 +130,7 @@ function Table(src; reader_schema::Union{Nothing,Schema}=nothing, union_resoluti
             for E in colstypes
                 reserve!(r.budget, vectorbytes(E, nrows))
                 push!(finals, Vector{E}(undef, nrows))
+                allocated!(r.budget, vectorbytes(E, nrows))
             end
             decodeblocks!(r, plan, sel, finals, keptidx, colstypes, pre, taskcount)
             counts = Int[e.count for e in pre.entries]
@@ -259,14 +260,16 @@ end
 
 "The streamed consumer: per-block exact chunk columns assembled once at the end (plan §4.4/§4.9)."
 function decodestreamed!(r::Reader, plan, sel::Union{Nothing,Vector{Int}}, colstypes::Vector{Type})
+    reserve!(r.budget, blocktablecharge(0))
     counts = Int[]
     chunkcols = Vector{AbstractVector}[]
-    reserve!(r.budget, blocktablecharge(0))
+    allocated!(r.budget, blocktablecharge(0))
     slotrow = sum(slotbytes, colstypes; init=0)
     while (blk = nextblock!(r; walk=false)) !== nothing
         reserve!(r.budget, 40 + STORAGE[].vector + 8 * length(colstypes))   # the block-table entry and outer chunk container (R06)
         count, bytes = blk
         reserve!(r.budget, bytesbytes(length(bytes)))
+        allocated!(r.budget, bytesbytes(length(bytes)))                     # decompressed by nextblock!; already resident
         d = Decoder(bytes, r.budget; validate=r.validate)
         cols = columnbuilders(plan, sel, count, r.budget)
         cells = plan isa RecordPlan ? fuseskips(cols) : cols
@@ -285,12 +288,14 @@ function decodestreamed!(r::Reader, plan, sel::Union{Nothing,Vector{Int}}, colst
         end
         push!(chunkcols, keep)
         push!(counts, count)
+        allocated!(r.budget, 40 + STORAGE[].vector + 8 * length(colstypes))
     end
     nrows = sum(counts; init=0)
     finals = AbstractVector[]
     for E in colstypes                                 # both sets of reference slots coexist during assembly (plan §4.4)
         reserve!(r.budget, vectorbytes(E, nrows))
         push!(finals, Vector{E}(undef, nrows))
+        allocated!(r.budget, vectorbytes(E, nrows))
     end
     for k in eachindex(finals)
         col = finals[k]
@@ -439,6 +444,7 @@ function Base.iterate(rows::Rows, ::Nothing=nothing)
         rows.bytes = blk[2]
         rows.blockout = 0
         reserve!(b, bytesbytes(length(rows.bytes)))
+        allocated!(b, bytesbytes(length(rows.bytes)))          # decompressed by nextblock!; already resident
         rows.decoder = Decoder(rows.bytes, b; validate=r.validate)
         rows.remaining == 0 && release!(b, bytesbytes(length(rows.bytes)))
     end
@@ -477,32 +483,41 @@ end
 "Decode one record keeping the selected fields (in the caller's order); the rest are skipped."
 function projectrow(p::RecordPlan, d::Decoder, sel::Vector{Int}, out::RecordSchema)
     enter!(d)
-    reserve!(d.budget, recordbytes(length(sel)))
-    kept = Vector{Any}(undef, length(p.fields))
+    nf = length(p.fields)
+    reserve!(d.budget, recordbytes(length(sel)) + vectorbytes(Any, nf))
+    kept = Vector{Any}(undef, nf)
+    allocated!(d.budget, vectorbytes(Any, nf))
     for (i, f) in enumerate(p.fields)
         if i in sel
             v = decode(f, d)
             b = p.boxes[i]
             b > 0 && reserve!(d.budget, b)
-            kept[i] = v
+            kept[i] = v                                        # an isbits value boxes on assignment
+            b > 0 && allocated!(d.budget, b)
         else
             skip(f, d)
         end
     end
     leave!(d)
-    return Any[kept[i] for i in sel]
+    out = Any[kept[i] for i in sel]
+    allocated!(d.budget, recordbytes(length(sel)))
+    release!(d.budget, vectorbytes(Any, nf))                   # the projection scratch dies with this frame
+    return out
 end
 
 function projectrow(p::ResolvedRecordPlan, d::Decoder, sel::Vector{Int}, out::RecordSchema)
     enter!(d)
-    reserve!(d.budget, recordbytes(length(sel)))
-    kept = Vector{Any}(undef, length(p.schema.fields))
+    nf = length(p.schema.fields)
+    reserve!(d.budget, recordbytes(length(sel)) + vectorbytes(Any, nf))
+    kept = Vector{Any}(undef, nf)
+    allocated!(d.budget, vectorbytes(Any, nf))
     for (slot, plan) in p.steps
         if slot != 0 && slot in sel
             v = decode(plan, d)
             b = p.boxes[slot]
             b > 0 && reserve!(d.budget, b)
-            kept[slot] = v
+            kept[slot] = v                                     # an isbits value boxes on assignment
+            b > 0 && allocated!(d.budget, b)
         else
             skip(plan, d)
         end
@@ -510,10 +525,16 @@ function projectrow(p::ResolvedRecordPlan, d::Decoder, sel::Vector{Int}, out::Re
     for (slot, dp) in p.defaults
         slot in sel || continue
         countvalues!(d.budget)
+        b = p.boxes[slot]
+        b > 0 && reserve!(d.budget, b)
         kept[slot] = jsonvalue(dp.schema, dp.json, d.budget)
+        b > 0 && allocated!(d.budget, b)
     end
     leave!(d)
-    return Any[kept[i] for i in sel]
+    out = Any[kept[i] for i in sel]
+    allocated!(d.budget, recordbytes(length(sel)))
+    release!(d.budget, vectorbytes(Any, nf))                   # the projection scratch dies with this frame
+    return out
 end
 
 "Per-block partitions of generic-mode rows: each block materialised as an `Avro.Table` when iterated."
@@ -540,6 +561,7 @@ function Base.iterate(it::RowsPartitions, ::Nothing=nothing)
     baseline = b.reserved
     try
         reserve!(b, bytesbytes(length(bytes)))
+        allocated!(b, bytesbytes(length(bytes)))               # decompressed by nextblock!; already resident
         before = b.reserved
         d = Decoder(bytes, b; validate=r.validate)
         plan = rows.plan

@@ -385,26 +385,37 @@ fromraw(::TimestampPlan{P}, d::Decoder, raw::Int32) where {P} = Timestamp{P}(Int
 fromraw(::LocalTimestampPlan{P}, d::Decoder, raw::Int32) where {P} = LocalTimestamp{P}(Int64(raw))
 function fromraw(::StringPlan, d::Decoder, raw::Vector{UInt8})
     validutf8(raw, 1, length(raw)) || dataerror(d, "invalid UTF-8 in string")
-    reserve!(d.budget, stringbytes(length(raw)))
-    release!(d.budget, bytesbytes(length(raw)))
-    return String(raw)
+    n = length(raw)
+    reserve!(d.budget, stringbytes(n))
+    str = String(raw)                                     # steals the buffer; raw is consumed here
+    allocated!(d.budget, stringbytes(n))
+    release!(d.budget, bytesbytes(n))
+    return str
 end
 function fromraw(::UUIDStringPlan, d::Decoder, raw::Vector{UInt8})
     validuuid(raw, 1, length(raw)) || dataerror(d, "invalid uuid string")
+    u = uuidfrombuffer(raw, 1)
     release!(d.budget, bytesbytes(length(raw)))
-    return uuidfrombuffer(raw, 1)
+    return u
 end
 function fromraw(::BytesPlan, d::Decoder, raw::String)
     n = sizeof(raw)
     reserve!(d.budget, bytesbytes(n))
-    release!(d.budget, stringbytes(n))
-    return Vector{UInt8}(codeunits(raw))
+    out = Vector{UInt8}(codeunits(raw))
+    allocated!(d.budget, bytesbytes(n))
+    release!(d.budget, stringbytes(n))                    # the promoted string dies with this frame
+    return out
 end
 function fromraw(p::DecimalPlan, d::Decoder, raw::String)
+    n = sizeof(raw)
+    reserve!(d.budget, bytesbytes(n))
     bytes = Vector{UInt8}(codeunits(raw))
+    allocated!(d.budget, bytesbytes(n))
+    release!(d.budget, stringbytes(n))                    # the promoted string dies with this frame
     isempty(bytes) && dataerror(d, "empty decimal payload")
-    release!(d.budget, stringbytes(length(bytes)))
-    return decimalfrombytes(Decoder(bytes, d.budget), p, 1, length(bytes))
+    v = decimalfrombytes(Decoder(bytes, d.budget), p, 1, n)
+    release!(d.budget, bytesbytes(n))                     # the transient copy dies with this frame
+    return v
 end
 fromraw(p::ReadPlan, d::Decoder, raw) = dataerror(d, "internal error: no promotion of $(typeof(raw)) into $(typeof(p))")
 
@@ -424,7 +435,9 @@ end
 function decodevalue(p::EnumRemapPlan, d::Decoder)
     j = enumremapindex(p, d)
     reserve!(d.budget, enumvaluebytes())
-    return EnumValue(p.reader, j, Val(:unchecked))
+    v = EnumValue(p.reader, j, Val(:unchecked))
+    allocated!(d.budget, enumvaluebytes())
+    return v
 end
 skipvalue(p::EnumRemapPlan, d::Decoder) = (readindex(d, length(p.writer.symbols)); nothing)
 
@@ -433,9 +446,11 @@ skipvalue(p::UnresolvableBranch, d::Decoder) = skipvalue(p.skipper, d)
 
 function wrapreader(d::Decoder, v, j::Int, nullable::Int)
     nullable != 0 && return j == nullable ? missing : v
-    reserve!(d.budget, unionvaluebytes())
-    isbits(v) && reserve!(d.budget, boxbytes(typeof(v)))
-    return UnionValue(j, v)
+    box = isbits(v) ? boxbytes(typeof(v)) : 0
+    reserve!(d.budget, unionvaluebytes() + box)
+    u = UnionValue(j, v)
+    allocated!(d.budget, unionvaluebytes() + box)
+    return u
 end
 
 function decodevalue(p::UnionResolvePlan, d::Decoder)
@@ -461,6 +476,7 @@ function decodevalue(p::ResolvedRecordPlan, d::Decoder)
     n = length(p.schema.fields)
     reserve!(d.budget, recordbytes(n))
     vals = Vector{Any}(undef, n)
+    allocated!(d.budget, vectorbytes(Any, n))                # the Record shell settles at construction
     for (slot, plan) in p.steps
         if slot == 0
             skip(plan, d)
@@ -468,7 +484,8 @@ function decodevalue(p::ResolvedRecordPlan, d::Decoder)
             v = decode(plan, d)
             b = p.boxes[slot]
             b > 0 && reserve!(d.budget, b)
-            vals[slot] = v
+            vals[slot] = v                                   # an isbits value boxes on assignment
+            b > 0 && allocated!(d.budget, b)
         end
     end
     for (slot, dp) in p.defaults
@@ -477,9 +494,12 @@ function decodevalue(p::ResolvedRecordPlan, d::Decoder)
         b = p.boxes[slot]
         b > 0 && reserve!(d.budget, b)
         vals[slot] = v
+        b > 0 && allocated!(d.budget, b)
     end
     leave!(d)
-    return Record(p.schema, vals, Val(:unchecked))
+    r = Record(p.schema, vals, Val(:unchecked))
+    allocated!(d.budget, recordbytes(n) - vectorbytes(Any, n))
+    return r
 end
 
 function skipvalue(p::ResolvedRecordPlan, d::Decoder)

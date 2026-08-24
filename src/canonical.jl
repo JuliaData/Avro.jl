@@ -119,7 +119,7 @@ function hashfingerprint(pcf::AbstractVector{UInt8}, algorithm::Symbol, budget::
         release!(budget, transient)
         return digest
     catch
-        release!(budget, peak)
+        unreserve!(budget, peak)
         rethrow()
     end
 end

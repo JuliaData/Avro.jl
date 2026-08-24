@@ -330,6 +330,7 @@ function jsonkind(s::StringSchema, j, ctx, depth)
         return u
     end
     reserve!(ctx.budget, stringbytes(sizeof(j)))
+    allocated!(ctx.budget, stringbytes(sizeof(j)))     # the reader's string is already resident; it transfers here
     return j
 end
 
@@ -337,7 +338,9 @@ function jsonkind(s::EnumSchema, j, ctx, depth)
     j isa String || jsonerror("expected an enum symbol string, got $(describejson(j))")
     haskey(s.symbolindex, j) || jsonerror("\"$j\" is not a symbol of enum $(fullname(s))")
     reserve!(ctx.budget, enumvaluebytes())
-    return EnumValue(s, Int32(s.symbolindex[j]), Val(:unchecked))
+    v = EnumValue(s, Int32(s.symbolindex[j]), Val(:unchecked))
+    allocated!(ctx.budget, enumvaluebytes())
+    return v
 end
 
 function jsonkind(s::ArraySchema, j, ctx, depth)
@@ -347,6 +350,7 @@ function jsonkind(s::ArraySchema, j, ctx, depth)
     n = length(j)
     reserve!(ctx.budget, vectorbytes(E, n))
     out = Vector{E}(undef, n)
+    allocated!(ctx.budget, vectorbytes(E, n))
     for i in 1:n
         out[i] = jsontovalue(s.items, j[i], ctx, depth + 1)
     end
@@ -362,6 +366,7 @@ function jsonkind(s::MapSchema, j, ctx, depth)
     reserve!(ctx.budget, vectorbytes(String, n) + vectorbytes(V, n))   # buildmap charges the struct and permutation
     keys = Vector{String}(undef, n)
     vals = Vector{V}(undef, n)
+    allocated!(ctx.budget, vectorbytes(String, n) + vectorbytes(V, n))
     for i in 1:n
         k = ks[i]
         isstrictutf8(k) || jsonerror("map key is not valid UTF-8 (lone surrogate escape)")
@@ -382,7 +387,10 @@ function jsonkind(s::RecordSchema, j, ctx, depth)
     end
     reserve!(ctx.budget, recordbytes(n))
     vals = Vector{Any}(undef, n)
+    allocated!(ctx.budget, vectorbytes(Any, n))        # the Record shell settles at construction
     for (i, f) in enumerate(s.fields)
+        b = boxcharge(juliatype(f.schema))
+        b > 0 && reserve!(ctx.budget, b)                                # before the assignment can box
         if haskey(j, f.name)
             vals[i] = jsontovalue(f.schema, j[f.name], ctx, depth + 1)
         elseif ctx.bareunion && f.default isa DefaultValue
@@ -390,10 +398,21 @@ function jsonkind(s::RecordSchema, j, ctx, depth)
         else
             jsonerror("missing field \"$(f.name)\" of record $(fullname(s))")
         end
-        b = boxcharge(juliatype(f.schema))
-        b > 0 && reserve!(ctx.budget, b)
+        b > 0 && allocated!(ctx.budget, b)
     end
-    return Record(s, vals, Val(:unchecked))
+    r = Record(s, vals, Val(:unchecked))
+    allocated!(ctx.budget, recordbytes(n) - vectorbytes(Any, n))
+    return r
+end
+
+# A `UnionValue` wrapper charged and settled under the JSON decode budget (shell plus the box an
+# isbits payload takes on assignment into the wrapper's Any field).
+function chargedunion(i::Int, v, ctx)
+    box = isbits(v) ? boxbytes(typeof(v)) : 0
+    reserve!(ctx.budget, unionvaluebytes() + box)
+    u = UnionValue(i, v)
+    allocated!(ctx.budget, unionvaluebytes() + box)
+    return u
 end
 
 function jsonkind(s::UnionSchema, j, ctx, depth)
@@ -406,14 +425,14 @@ function jsonkind(s::UnionSchema, j, ctx, depth)
                 e isa DataError || rethrow()
                 continue
             end
-            return nb != 0 ? v : UnionValue(i, v)
+            return nb != 0 ? v : chargedunion(i, v, ctx)
         end
         jsonerror("no union branch accepts the default $(describejson(j))")
     end
     if j === nothing
         i = findfirst(b -> b isa NullSchema, s.branches)
         i === nothing && jsonerror("union has no null branch")
-        return nb != 0 ? missing : UnionValue(i, missing)
+        return nb != 0 ? missing : chargedunion(i, missing, ctx)
     end
     (j isa JSONObject && length(j) == 1) || jsonerror("expected null or a one-member object for a union, got $(describejson(j))")
     label = j.order[1]
@@ -422,7 +441,7 @@ function jsonkind(s::UnionSchema, j, ctx, depth)
     i == -1 && jsonerror("union label \"$label\" is ambiguous (a named type and a kind share it)")
     checkdepth(ctx.budget, depth)
     v = jsontovalue(s.branches[i], j[label], ctx, depth + 1)
-    return nb != 0 ? v : UnionValue(i, v)
+    return nb != 0 ? v : chargedunion(i, v, ctx)
 end
 
 describejson(j) = j === nothing ? "null" : j isa Bool ? "a boolean" : j isa Int64 ? "an integer" : j isa Union{JSONNumber,Float64} ? "a number" :
@@ -435,6 +454,7 @@ function bytesfromjson(j, size::Int, ctx::JSONContext)
     size < 0 || n == size || jsonerror("fixed of size $size given $n bytes")
     reserve!(ctx.budget, bytesbytes(n))
     out = Vector{UInt8}(undef, n)
+    allocated!(ctx.budget, bytesbytes(n))
     for (i, c) in enumerate(j)
         out[i] = UInt8(c)
     end

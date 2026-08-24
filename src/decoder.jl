@@ -131,6 +131,7 @@ function readbytes(d::Decoder)
     n = readlen(d, d.budget.limits.max_bytes, :max_bytes)
     reserve!(d.budget, bytesbytes(n))
     out = Vector{UInt8}(undef, n)
+    allocated!(d.budget, bytesbytes(n))
     copyto!(out, 1, d.buf, d.pos, n)
     d.pos += n
     return out
@@ -147,6 +148,7 @@ function readstring(d::Decoder)
     validutf8(d.buf, p, p + n - 1) || dataerror(d, "invalid UTF-8 in string")
     reserve!(d.budget, stringbytes(n))
     s = unsafe_substring(d.buf, p, n)
+    allocated!(d.budget, stringbytes(n))
     d.pos = p + n
     return s
 end
@@ -172,6 +174,7 @@ function readfixed(d::Decoder, n::Int)
     n <= remaining(d) || dataerror(d, "fixed of $n bytes exceeds the remaining $(remaining(d)) bytes")
     reserve!(d.budget, bytesbytes(n))
     out = Vector{UInt8}(undef, n)
+    allocated!(d.budget, bytesbytes(n))
     copyto!(out, 1, d.buf, d.pos, n)
     d.pos += n
     return out

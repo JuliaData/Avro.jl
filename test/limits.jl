@@ -67,16 +67,21 @@
         Avro.allocated!(b, 400)
         @test b.pending == 600 + Avro.GUARD_CHUNK
         @test (@atomic Avro.GUARD.pending) == pending0 + 1000 + Avro.GUARD_CHUNK    # removals batch too
-        Avro.release!(b, 1000 + Avro.GUARD_CHUNK)
+        @test_throws ArgumentError Avro.release!(b, 401)                            # only the resident 400 can release
+        @test_throws ArgumentError Avro.allocated!(b, 601 + Avro.GUARD_CHUNK)       # settlement mismatch fails, no clamp
+        @test_throws ArgumentError Avro.unreserve!(b, 601 + Avro.GUARD_CHUNK)       # only pending returns via unreserve!
+        Avro.release!(b, 400)                                                       # the resident portion
+        Avro.unreserve!(b, 600 + Avro.GUARD_CHUNK)                                  # the never-resident headroom
         @test b.reserved == 0 && b.pending == 0
-        @test (@atomic Avro.GUARD.pending) == pending0                              # a full drain republishes
+        @test (@atomic Avro.GUARD.pending) == pending0                              # a full drain withdraws the publication
         Avro.reserve!(b, 10)
         pending_underflow = @atomic Avro.GUARD.pending
         underflow_state = (b.reserved, b.pending, pending_underflow)
         @test_throws ArgumentError Avro.release!(b, 11)
+        @test_throws ArgumentError Avro.release!(b, 10)                             # reserved but pending: nothing resident yet
         pending_after_underflow = @atomic Avro.GUARD.pending
         @test (b.reserved, b.pending, pending_after_underflow) == underflow_state
-        Avro.release!(b, 10)
+        Avro.unreserve!(b, 10)
         @test_throws Avro.LimitError Avro.reserve!(b, b.ceiling + 1)
         Avro.reserve!(b, b.ceiling)   # exactly the ceiling is admitted
         @test_throws Avro.LimitError Avro.reserve!(b, 1)
@@ -120,6 +125,83 @@
             foreach(fetch, drains)
             @test (@atomic Avro.GUARD.pending) == pending0
         end
+    end
+
+    @testset "guard residency: settlement contract (review round 3, item 2)" begin
+        b = Avro.Budget(l; available=1 << 40)
+        Avro.reserve!(b, 1000)
+        @test b.pending == 1000 && b.reserved == 1000
+        @test_throws ArgumentError Avro.allocated!(b, 1001)              # settlement mismatch fails, no clamp
+        @test_throws ArgumentError Avro.release!(b, 1)                   # nothing resident yet
+        Avro.allocated!(b, 600)
+        @test b.pending == 400
+        @test_throws ArgumentError Avro.unreserve!(b, 401)               # only pending returns via unreserve!
+        Avro.unreserve!(b, 400)
+        @test b.pending == 0 && b.reserved == 600
+        Avro.release!(b, 600)
+        @test b.reserved == 0
+        Avro.close!(b)
+
+        # the guard batches by GUARD_CHUNK: a large unsettled reservation is published, settlement
+        # withdraws it, and resident bytes never linger in the pending counter
+        g0 = @atomic Avro.GUARD.pending
+        big = Avro.Budget(l; available=1 << 40)
+        n = 8 << 20
+        Avro.reserve!(big, n)
+        @test (@atomic Avro.GUARD.pending) - g0 >= n - Avro.GUARD_CHUNK  # published as pending
+        Avro.allocated!(big, n)
+        @test (@atomic Avro.GUARD.pending) <= g0                         # resident bytes left the guard
+        Avro.release!(big, n)
+        Avro.close!(big)
+        @test (@atomic Avro.GUARD.pending) <= g0
+
+        # LimitError(:available_memory).observed is pure: another budget's resident storage does not
+        # perturb the observed value of an identical failing admission (resident bytes must not be
+        # subtracted twice from available_memory())
+        tiny = Avro.Limits(max_total_bytes=1 << 30)
+        need = Avro.first_unit_bytes(tiny)
+        observed = Int[]
+        for _ in 1:2
+            holder = Avro.Budget(l; available=1 << 40)
+            Avro.reserve!(holder, 4 << 20)
+            Avro.allocated!(holder, 4 << 20)                             # resident, settled
+            e = try
+                Avro.Budget(tiny; available=2 * need - 1)
+                nothing
+            catch err
+                err
+            end
+            @test e isa Avro.LimitError && e.limit === :available_memory
+            push!(observed, e.observed)
+            Avro.release!(holder, 4 << 20)
+            Avro.close!(holder)
+        end
+        @test observed[1] == observed[2] == 2 * need - 1
+    end
+
+    @testset "guard residency: a live Writer publishes only its preflight model (round 3, item 2)" begin
+        meta = Dict("user.blob" => rand(UInt8, 2 << 20))
+        s = Avro.parseschema("{\"type\":\"record\",\"name\":\"RP\",\"fields\":[{\"name\":\"a\",\"type\":\"long\"}]}")
+        io = IOBuffer()
+        w = Avro.Writer(io, s; metadata=meta)
+        try
+            b = w.budget
+            # the retained header copies (schema json, codec, metadata) are resident and settled;
+            # only the preflight reader-model (never materialised in this process) may stay pending
+            @test b.pending <= w.preflightbase
+            @test b.reserved - b.pending >= Avro.bytesbytes(2 << 20)     # the resident metadata copy
+            @test b.published <= b.pending
+        finally
+            close(w)
+        end
+        # decode-side: a completed datum decode leaves nothing pending
+        db = Avro.Budget(Avro.Limits())
+        bytes = Avro.encode(s, (a=Int64(1),))
+        d = Avro.Decoder(bytes, db)
+        v = Avro.decode(Avro.readplan(s), d)
+        @test v.a == 1
+        @test db.pending == 0 && db.reserved > 0                         # all live output is settled resident
+        Avro.close!(db)
     end
 
     @testset "prepared reader restores guard after failure" begin

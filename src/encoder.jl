@@ -16,7 +16,9 @@ end
 
 function Encoder(budget::Budget; capacity::Int=256)
     reserve!(budget, bytesbytes(capacity))
-    return Encoder(Vector{UInt8}(undef, capacity), 0, budget, 0, 0)
+    e = Encoder(Vector{UInt8}(undef, capacity), 0, budget, 0, 0)
+    allocated!(budget, bytesbytes(capacity))
+    return e
 end
 
 Base.length(e::Encoder) = e.pos
@@ -36,9 +38,11 @@ function ensureroom!(e::Encoder, n::Int)
         throw(LimitError(:max_datum_bytes, newcap, e.budget.limits.max_datum_bytes, :max_datum_bytes, :encode))
     reserve!(e.budget, bytesbytes(newcap))
     nb = Vector{UInt8}(undef, newcap)
+    allocated!(e.budget, bytesbytes(newcap))
     copyto!(nb, 1, e.buf, 1, e.pos)
-    release!(e.budget, bytesbytes(length(e.buf)))
-    e.buf = nb
+    oldbytes = bytesbytes(length(e.buf))
+    e.buf = nb                                        # the old buffer is unreachable only after the rebind
+    release!(e.budget, oldbytes)
     return nothing
 end
 

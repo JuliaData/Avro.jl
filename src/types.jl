@@ -113,7 +113,7 @@ const LOGICAL_LONG = Dict{Type,LogicalType}(
 )
 
 function derive(ctx::DeriveContext, ::Type{T}, name, namespace) where {T}
-    reserve!(ctx.budget, 160)
+    charge!(ctx.budget, 160)
     T === Missing && return NullSchema(Props(), NodeMeta())
     T === Nothing && return NullSchema(Props(), NodeMeta())
     T === Bool && return BooleanSchema(Props(), NodeMeta())
@@ -190,12 +190,18 @@ end
 function deriveenum(ctx::DeriveContext, ::Type{E}, name, namespace) where {E<:Base.Enum}
     full = derivedname(ctx, E, name, namespace)
     haskey(ctx.named, fullname(full)) && return registerderived!(ctx, ctx.named[fullname(full)], E)
+    n = length(instances(E))
+    charge!(ctx.budget, 2 * frozenvectorshell() + frozendictshell() + 32 * n)   # shells and exact slot capacity, before construction (D01)
     syms = String[]
     index = FrozenDict{String,Int}()
+    sizehint!(syms, n)
+    sizehint!(index.keys, n)
+    sizehint!(index.vals, n)
     for (i, inst) in enumerate(instances(E))
         sym = avrosymbol(E, inst)
         checkderivedname(sym, "enum symbol \"$sym\"", string(E), "override `Avro.avrosymbol(::Type{$E}, x)`")
         haskey(index, sym) && throw(ArgumentError("enum $E derives the symbol \"$sym\" twice"))
+        charge!(ctx.budget, stringbytes(sizeof(sym)))                     # the retained symbol, before it is stored (D01)
         push!(syms, sym)
         index[sym] = i
     end
@@ -207,10 +213,13 @@ function deriveunion(ctx::DeriveContext, ::Type{U}, namespace) where {U}
     members = Base.uniontypes(U)
     if length(members) == 2 && Missing in members && !(Nothing in members)
         other = members[1] === Missing ? members[2] : members[1]
+        charge!(ctx.budget, frozenvectorshell() + 16)                     # the two-branch vector, before construction (D01)
         bs = FrozenVector{Schema}(Schema[NullSchema(Props(), NodeMeta()), derive(ctx, other, nothing, namespace)], false)
         return UnionSchema(freeze!(bs), NodeMeta())
     end
+    charge!(ctx.budget, frozenvectorshell() + 8 * length(members))       # shell and exact branch slots, before construction (D01)
     bs = FrozenVector{Schema}()
+    sizehint!(bs.data, length(members))
     for m in members
         s = derive(ctx, m, nothing, namespace)
         s isa UnionSchema && throw(ArgumentError("union member $m derives a union; Avro unions cannot nest"))
@@ -237,12 +246,18 @@ function derivenamedtuple(ctx::DeriveContext, ::Type{T}, name, namespace) where 
     ns = namespace === nothing ? "" : namespace
     full = FullName(checkderivedname(name, "name \"$name\"", string(T), "pass a valid `name=`"), checkderivednamespace(ns, string(T)))
     haskey(ctx.named, fullname(full)) && throw(ArgumentError("the Avro name \"$(fullname(full))\" is derived twice"))
+    nf = length(names)
+    charge!(ctx.budget, frozenvectorshell() + frozendictshell() + 128 + 32 * nf)   # record shells and exact field capacity (D01)
     fields = FrozenVector{Field}()
     index = FrozenDict{String,Int}()
+    sizehint!(fields.data, nf)
+    sizehint!(index.keys, nf)
+    sizehint!(index.vals, nf)
     rec = RecordSchema(full, freeze!(FrozenVector{String}()), freeze!(FrozenVector{String}()), nothing, false, Props(), fields, index, NodeMeta())
     registerderived!(ctx, rec, T)
     for (i, (fname, ftype)) in enumerate(zip(names, types))
         fn = checkderivedname(string(fname), "field name \"$fname\"", string(T), "rename the field")
+        charge!(ctx.budget, stringbytes(sizeof(fn)) + 2 * frozenvectorshell() + 128)   # the field name, wrappers and Field shell, before construction (D01)
         push!(fields, Field(fn, derive(ctx, ftype, nothing, full.namespace), nothing, nodefault, :ascending, freeze!(FrozenVector{String}()), Props()))
         index[fn] = i
     end
@@ -265,8 +280,13 @@ function derivestruct(ctx::DeriveContext, ::Type{T}, name, namespace) where {T}
     haskey(ctx.named, fullname(full)) && return registerderived!(ctx, ctx.named[fullname(full)], T)
     tags = StructUtils.fieldtags(AvroStyle(), T)
     defaults = StructUtils.fielddefaults(AvroStyle(), T)
+    nf = fieldcount(T)
+    charge!(ctx.budget, frozenvectorshell() + frozendictshell() + 128 + 32 * nf)   # record shells and exact field capacity (D01)
     fields = FrozenVector{Field}()
     index = FrozenDict{String,Int}()
+    sizehint!(fields.data, nf)
+    sizehint!(index.keys, nf)
+    sizehint!(index.vals, nf)
     rec = RecordSchema(full, freeze!(FrozenVector{String}()), freeze!(FrozenVector{String}()), nothing, false, Props(), fields, index, NodeMeta())
     registerderived!(ctx, rec, T)
     for (i, fname) in enumerate(fieldnames(T))
@@ -282,7 +302,9 @@ function derivestruct(ctx::DeriveContext, ::Type{T}, name, namespace) where {T}
             j = tojsonvalue(tagdefault, ctx.budget)
             ok, branch = validatedefault(fs, j, ctx.limits.max_depth)
             ok || throw(ArgumentError("the `avro=(default=…,)` tag of $T.$fname is not a valid default for its schema"))
-            d = DefaultValue(j, branch, sprint(printjson, j, false, 0), 0, true)
+            jw = BoundedWriter(ctx.budget, ctx.limits.max_schema_bytes)
+            printjson(jw, j, false, 0)
+            d = DefaultValue(j, branch, boundedtake!(jw), 0, true)
         elseif haskey(defaults, fname)
             dv = defaults[fname]
             j = try
@@ -292,8 +314,11 @@ function derivestruct(ctx::DeriveContext, ::Type{T}, name, namespace) where {T}
             end
             ok, branch = validatedefault(fs, j, ctx.limits.max_depth)
             ok || throw(ArgumentError("the default of $T.$fname is not JSON-encodable under its schema; supply one with the `&(avro=(default=…,),)` tag"))
-            d = DefaultValue(j, branch, sprint(printjson, j, false, 0), 0, true)
+            jw = BoundedWriter(ctx.budget, ctx.limits.max_schema_bytes)
+            printjson(jw, j, false, 0)
+            d = DefaultValue(j, branch, boundedtake!(jw), 0, true)
         end
+        charge!(ctx.budget, stringbytes(sizeof(fn)) + 2 * frozenvectorshell() + 128)   # the field name, wrappers and Field shell, before construction (D01)
         push!(fields, Field(fn, fs, nothing, d, :ascending, freeze!(FrozenVector{String}()), Props()))
         index[fn] = i
     end

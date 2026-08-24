@@ -56,6 +56,7 @@ function register!(c::SchemaCache, s::Schema; limits::Limits=Limits())
         i = searchsortedfirst(c.fingerprints, fp)
         if i <= length(c.fingerprints) && c.fingerprints[i] == fp
             existing = c.schemas[i]
+            charge!(budget, STORAGE[].vector)          # the equality memo, before it is allocated (D03)
             same = schemaequal(existing, s, Vector{Int32}[], budget)
             same || throw(AmbiguousSchemaError(fp, existing, s))
             return fp
@@ -66,8 +67,11 @@ function register!(c::SchemaCache, s::Schema; limits::Limits=Limits())
         retained = checked_add(c.bytes, cost)
         peak = checked_add(retained, checked_mul(16, n - 1))   # old index vectors overlap their replacements
         peak <= c.max_bytes || throw(LimitError(:max_bytes, peak, c.max_bytes, :max_bytes, :decode))
+        replcharge = vectorbytes(UInt64, n) + vectorbytes(Schema, n)
+        reserve!(budget, replcharge)                   # the replacement vectors, charged to the caller operation (D03)
         nf = Vector{UInt64}(undef, n)                  # exact-capacity replacement (§4.4 growth rule):
         ns = Vector{Schema}(undef, n)                  # capacity equals length, and a failure above
+        allocated!(budget, replcharge)                 # ownership transfers to the cache at return
         copyto!(nf, 1, c.fingerprints, 1, i - 1)       # leaves the table untouched (transactional)
         copyto!(ns, 1, c.schemas, 1, i - 1)
         nf[i] = fp
@@ -89,13 +93,26 @@ The schema registered under `fingerprint` (`Avro.UnknownSchemaError` otherwise).
 """
 function lookup(c::SchemaCache, fp::UInt64; limits::Limits=Limits())
     return withbudget(limits) do budget                # the binary search is charged work (D03)
-        lock(c.lock) do
-            n = length(c.fingerprints)
-            addcompare!(budget, 8 * (64 - leading_zeros(max(n, 1)) + 1))
-            i = searchsortedfirst(c.fingerprints, fp)
-            (i <= n && c.fingerprints[i] == fp) || throw(UnknownSchemaError(fp))
-            return c.schemas[i]
-        end
+        return lookup(c, fp, budget)
+    end
+end
+
+"""
+    Avro.lookup(store, fingerprint, budget::Avro.Budget) -> Schema
+
+The shared-budget route `decodesingle` uses: the lookup's work is charged to the caller's operation
+budget instead of opening a second one. The fallback calls the two-argument form (its own budget);
+custom stores may extend this method to share the operation budget (D03).
+"""
+lookup(store::SchemaStore, fp::UInt64, budget::Budget) = lookup(store, fp; limits=budget.limits)
+
+function lookup(c::SchemaCache, fp::UInt64, budget::Budget)
+    lock(c.lock) do
+        n = length(c.fingerprints)
+        addcompare!(budget, 8 * (64 - leading_zeros(max(n, 1)) + 1))
+        i = searchsortedfirst(c.fingerprints, fp)
+        (i <= n && c.fingerprints[i] == fp) || throw(UnknownSchemaError(fp))
+        return c.schemas[i]
     end
 end
 
@@ -117,6 +134,7 @@ function encodesingle(s::Schema, x; limits::Limits=Limits())
         npayload = e.pos
         reserve!(budget, bytesbytes(10 + npayload))
         out = Vector{UInt8}(undef, 10 + npayload)
+        allocated!(budget, bytesbytes(10 + npayload))
         out[1], out[2] = SINGLE_OBJECT_MARKER
         for i in 0:7
             out[3 + i] = UInt8((fp >> (8 * i)) & 0xff)
@@ -147,17 +165,7 @@ function decodesingleoperation(src::AbstractVector{UInt8}, store::SchemaStore, b
         fp |= UInt64(src[3 + i]) << (8 * i)
     end
     n - 10 <= limits.max_datum_bytes || throw(LimitError(:max_datum_bytes, n - 10, limits.max_datum_bytes, :max_datum_bytes, :decode))
-    writer = if store isa SchemaCache
-        lock(store.lock) do
-            n0 = length(store.fingerprints)
-            addcompare!(budget, 8 * (64 - leading_zeros(max(n0, 1)) + 1))
-            i = searchsortedfirst(store.fingerprints, fp)
-            (i <= n0 && store.fingerprints[i] == fp) || throw(UnknownSchemaError(fp))
-            return store.schemas[i]
-        end
-    else
-        lookup(store, fp; limits=limits)
-    end
+    writer = lookup(store, fp, budget)                 # the shared-budget route (D03); SchemaCache charges this budget
     writer isa Schema || throw(ArgumentError("the schema store returned $(typeof(writer)), not an Avro.Schema"))
     w = BoundedWriter(budget, limits.max_schema_bytes)
     canonicalprint(w, writer, schemaseen(writer, budget))

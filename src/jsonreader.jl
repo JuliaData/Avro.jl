@@ -442,7 +442,9 @@ function skipws!(r::JSONReader)
 end
 
 function charge!(r::JSONReader, n::Int)
-    r.budget === nothing || reserve!(r.budget, n)
+    # Amortized per-token charges: the corresponding storage is allocated in the same breath, so the
+    # reservation settles immediately (no pending window is left behind on the guard).
+    r.budget === nothing || (reserve!(r.budget, n); allocated!(r.budget, n))
     return nothing
 end
 
@@ -488,8 +490,8 @@ function parsevalue!(r::JSONReader)
     elseif b == UInt8('-') || isdigit8(b)
         start = r.pos
         r.pos = scannumber(r.buf, r.pos, r.n, r.errfn)
+        charge!(r, (r.pos - start) + 8)                  # before the token copy it covers
         tok = String(r.buf[start:r.pos - 1])
-        charge!(r, sizeof(tok) + 8)
         iv = parseinteger(tok)
         iv === nothing || return iv
         return JSONNumber(tok)

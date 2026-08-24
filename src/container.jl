@@ -69,6 +69,7 @@ end
 function sourcepayload(s::StreamSource, n::Int, budget::Budget)
     reserve!(budget, bytesbytes(n))
     out = Vector{UInt8}(undef, n)
+    allocated!(budget, bytesbytes(n))
     readbytes!(s.io, out, n) == n || throw(DataError("truncated file", 0))
     return out
 end
@@ -107,7 +108,7 @@ function metadataindexes(capacity::Int, budget::Budget)
         allocated!(budget, keycharge)
         keys
     catch
-        release!(budget, keycharge)
+        unreserve!(budget, keycharge)
         rethrow()
     end
     valcharge = vectorbytes(Vector{UInt8}, capacity)
@@ -118,8 +119,8 @@ function metadataindexes(capacity::Int, budget::Budget)
         vals
     catch
         newkeys = nothing
-        release!(budget, keycharge)
-        release!(budget, valcharge)
+        release!(budget, keycharge)                    # the key vector allocated above dies with this frame
+        unreserve!(budget, valcharge)
         rethrow()
     end
     return (newkeys, newvals)
@@ -163,7 +164,7 @@ function readheader(s::BlockSource, limits::Limits, budget::Budget; legacy, allo
                     allocated!(budget, keycharge)
                     buffer
                 catch
-                    release!(budget, keycharge)
+                    unreserve!(budget, keycharge)
                     rethrow()
                 end
             end
@@ -188,7 +189,7 @@ function readheader(s::BlockSource, limits::Limits, budget::Budget; legacy, allo
                     allocated!(budget, valuecharge)
                     buffer
                 catch
-                    release!(budget, valuecharge)
+                    unreserve!(budget, valuecharge)
                     rethrow()
                 end
             end
@@ -239,7 +240,7 @@ function readheader(s::BlockSource, limits::Limits, budget::Budget; legacy, allo
             allocated!(budget, codecvectorsize)
             bytes
         catch
-            release!(budget, codecvectorsize)
+            unreserve!(budget, codecvectorsize)
             rethrow()
         end
         codecshell = stringbytes(0)
@@ -400,7 +401,7 @@ end
 function nextblock!(r::Reader; walk::Bool=true)
     checkopen(r)
     sourceeof(r.source) && return nothing
-    checkpoint = r.budget.reserved
+    checkpoint = budgetcheckpoint(r.budget)
     try
         count = sourcevarint(r.source)
         (0 <= count <= r.limits.max_block_count) || (count < 0 ? throw(DataError("negative block count $count", position(r.source))) :
@@ -494,6 +495,7 @@ function Base.iterate(it::EachDatum, ::Nothing=nothing)
         it.bytes = blk[2]
         it.blockout = 0
         reserve!(b, bytesbytes(length(it.bytes)))     # the block is resident while its datums decode
+        allocated!(b, bytesbytes(length(it.bytes)))   # decompressed by nextblock!; already resident
         it.decoder = Decoder(it.bytes, b; validate=it.reader.validate)
         it.remaining == 0 && release!(b, bytesbytes(length(it.bytes)))
     end
@@ -744,6 +746,7 @@ function Writer(dst::Union{AbstractString,IO}, schema::Schema; codec::Symbol=:nu
     wcodec = writercodec(codec, level, limits)
     w = try
         reserve!(budget, wcodec.workspace)
+        allocated!(budget, wcodec.workspace)                      # the codec object and its native state exist with the writer
         values0 = budget.values
         input0 = budget.input_bytes
         allowance0 = budget.allowance_used
@@ -761,10 +764,13 @@ function Writer(dst::Union{AbstractString,IO}, schema::Schema; codec::Symbol=:nu
         nentries <= limits.max_metadata_entries || throw(LimitError(:max_metadata_entries, nentries, limits.max_metadata_entries, :max_metadata_entries, :encode))
         reserve!(budget, STORAGE[].vector + 16 * nentries)        # the entries vector at exact capacity (§4.4 growth rule)
         entries = Vector{Tuple{String,Vector{UInt8}}}(undef, nentries)
+        allocated!(budget, STORAGE[].vector + 16 * nentries)
         reserve!(budget, stringbytes(11) + bytesbytes(sizeof(schemajson)))
         entries[1] = ("avro.schema", Vector{UInt8}(codeunits(schemajson)))
+        allocated!(budget, stringbytes(11) + bytesbytes(sizeof(schemajson)))
         reserve!(budget, stringbytes(10) + bytesbytes(sizeof(String(codec))))
         entries[2] = ("avro.codec", Vector{UInt8}(codeunits(String(codec))))
+        allocated!(budget, stringbytes(10) + bytesbytes(sizeof(String(codec))))
         i = 2
         for (k, v) in metadata
             startswith(k, "avro.") && throw(ArgumentError("metadata keys in the avro.* namespace are reserved (got \"$k\"); avro.schema and avro.codec come from the constructor"))
@@ -772,6 +778,7 @@ function Writer(dst::Union{AbstractString,IO}, schema::Schema; codec::Symbol=:nu
             reserve!(budget, stringbytes(sizeof(k)) + bytesbytes(length(v)))   # each retained copy, before it is made
             i += 1
             entries[i] = (String(k), Vector{UInt8}(v))
+            allocated!(budget, stringbytes(sizeof(k)) + bytesbytes(length(v)))
         end
         total = sum(e -> sizeof(e[1]) + length(e[2]), entries; init=0)
         total <= limits.max_metadata_bytes || throw(LimitError(:max_metadata_bytes, total, limits.max_metadata_bytes, :max_metadata_bytes, :encode))
@@ -790,6 +797,7 @@ function Writer(dst::Union{AbstractString,IO}, schema::Schema; codec::Symbol=:nu
         reserve!(budget, 2 * STORAGE[].vector + 16 * length(entries))   # the mirror key/value vectors, exact capacity
         pfkeys = Vector{String}(undef, length(entries))
         pfvals = Vector{Vector{UInt8}}(undef, length(entries))
+        allocated!(budget, 2 * STORAGE[].vector + 16 * length(entries))
         for (j, (k, v)) in enumerate(entries)
             reserve!(budget, checked_add(stringbytes(sizeof(k)), bytesbytes(length(v))))  # the retained metadata entry (byte and stream readers now charge identically)
             pfkeys[j] = k
@@ -968,16 +976,18 @@ function flushblock!(w::Writer)
         uncreditedpayload = w.encoder.pos - w.encoder.credited
         reserve!(w.budget, bytesbytes(w.encoder.pos))              # the pending-block copy, before take! (R04)
         blockbytes = take!(w.encoder)
+        allocated!(w.budget, bytesbytes(length(blockbytes)))
         cbound = compressbound(w.wcodec, length(blockbytes))
         reserve!(w.budget, cbound)                                  # the compressor's output bound, before it allocates
         compressed = compressblock(w.wcodec, blockbytes)
+        allocated!(w.budget, cbound)                                # output and workspace peak within the bound
         length(compressed) <= w.limits.max_block_bytes ||
             throw(LimitError(:max_block_bytes, length(compressed), w.limits.max_block_bytes, :max_block_bytes, :encode))
         verifyframe(w.wcodec, compressed, w.limits)
         peak = readerblockpeak(length(compressed), length(blockbytes), w.pendingbytes,
                                w.wcodec.name === :null ? 0 : w.limits.max_codec_memory, w.wcodec.name === :null)
         reserve!(w.budget, peak)                       # one block's transient reader peak fits the ceiling
-        release!(w.budget, peak)
+        unreserve!(w.budget, peak)                     # a pure admission probe; nothing was allocated
         if pf !== nothing
             pf.chunkbytes = chunk
             pf.payload = payload

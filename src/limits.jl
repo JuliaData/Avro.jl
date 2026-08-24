@@ -297,14 +297,10 @@ function reserve!(b::Budget, n::Int)
     return b
 end
 
-"""
-    allocated!(budget, n)
-
-Record that `n` previously reserved bytes are now resident (they leave the guard's pending counter).
-"""
-function allocated!(b::Budget, n::Int)
+# Drop `n` bytes from the budget's pending counter and (batched) from the guard. Internal: the public
+# entry points are `allocated!`, `unreserve!` and `close!`, which validate their side of the contract.
+function settlepending!(b::Budget, n::Int)
     n <= 0 && return b
-    n = min(n, b.pending)
     b.pending -= n
     if b.published - b.pending >= GUARD_CHUNK || (b.pending == 0 && b.published > 0)
         delta = b.published - b.pending
@@ -315,15 +311,54 @@ function allocated!(b::Budget, n::Int)
 end
 
 """
+    allocated!(budget, n)
+
+Record that `n` previously reserved bytes are now resident: they leave the guard's pending counter,
+which must only carry reservations not yet backed by storage (plan §4.4 — the OS counters already see
+resident pages, so leaving them pending would subtract them twice from `available_memory()`). Settling
+more bytes than are pending is a settlement mismatch and throws instead of clamping.
+"""
+function allocated!(b::Budget, n::Int)
+    n <= 0 && return b
+    n <= b.pending || throw(ArgumentError("settlement of $n bytes exceeds the pending reservation $(b.pending)"))
+    return settlepending!(b, n)
+end
+
+"""
+    charge!(budget, n)
+
+Reserve `n` bytes and settle them immediately: the shorthand for storage allocated in the same
+breath as its charge (amortized parser and construction charges). A bare `reserve!` without a
+matching `allocated!`/`unreserve!` is reserved for worst-case headroom that never materialises.
+"""
+charge!(b::Budget, n::Int) = (reserve!(b, n); allocated!(b, n); b)
+
+"""
     release!(budget, n)
 
-Release `n` reserved bytes (after the corresponding storage became unreachable or was handed to the
-caller).
+Release `n` reserved **resident** bytes (after the corresponding storage became unreachable or was
+handed to the caller). Reservations that never became resident are returned with [`unreserve!`](@ref);
+asking to release more than the resident portion is a settlement mismatch and throws.
 """
 function release!(b::Budget, n::Int)
     n <= 0 && return b
     n <= b.reserved || throw(ArgumentError("release of $n bytes exceeds the live reservation $(b.reserved)"))
-    allocated!(b, n)
+    resident = b.reserved - b.pending
+    n <= resident || throw(ArgumentError("release of $n bytes exceeds the resident portion $resident ($(b.pending) of $(b.reserved) reserved bytes are pending; unfulfilled reservations return through unreserve!)"))
+    b.reserved -= n
+    return b
+end
+
+"""
+    unreserve!(budget, n)
+
+Return `n` reserved bytes that never became resident (worst-case headroom, or the unwind of a failed
+allocation) to the guard and the budget.
+"""
+function unreserve!(b::Budget, n::Int)
+    n <= 0 && return b
+    n <= b.pending || throw(ArgumentError("unreserve of $n bytes exceeds the pending reservation $(b.pending)"))
+    settlepending!(b, n)
     b.reserved -= n
     return b
 end
@@ -334,7 +369,7 @@ end
 Return every pending reservation to the guard (called in the `finally` of every operation).
 """
 function close!(b::Budget)
-    allocated!(b, b.pending)
+    settlepending!(b, b.pending)
     return b
 end
 
