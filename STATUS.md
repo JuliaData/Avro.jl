@@ -34,7 +34,7 @@ errors. These repairs do not close the disputed items listed above.
 | `AVRO_SMOKE=true` | 5/5 passed. |
 | Cross-version files | 32/32 passed for 1.10.11→1.12.6 and 32/32 for 1.12.6→1.10.11. |
 | Docs | Strict doctests, references, document checks, and HTML build passed. |
-| Fixture generation | Completed in a clean isolated copy with the supplied tools. Each codec produced 6 data plus 13 root files, for 19 total. No nested derived names remained, and every root-generation command succeeded. |
+| Fixture generation | Completed in a clean isolated copy with the supplied tools. The fastavro half produced 6 data and 13 root files for each of six codecs, for 19 per codec. No nested derived names remained, and every root-generation command succeeded. |
 
 The review used the supplied local Java and Python tools. It did not fetch, push, rewrite history, or
 touch another checkout. The untracked `test/Manifest.toml` existed before round 2 and remains untouched.
