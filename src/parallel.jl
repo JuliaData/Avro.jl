@@ -193,7 +193,6 @@ function decodedirect!(r::Reader, e::BlockEntry, plan, builders::Vector{ColumnBu
     addinput!(b, varintlength(e.count) + varintlength(e.size) + 16)
     out = decompressblock(r.codecname, r.codec, payload, r.limits, b)
     n = e.count
-    before = b.reserved
     if r.validate === :strict && r.legacy === :avrojl1
         d0 = Decoder(out, b)
         for _ in 1:n
@@ -210,20 +209,14 @@ function decodedirect!(r::Reader, e::BlockEntry, plan, builders::Vector{ColumnBu
     end
     d = Decoder(out, b; validate=r.validate)
     cells = plan isa RecordPlan ? fuseskips(builders) : builders
+    outputbase = b.reserved
     cap = r.limits.max_block_output_bytes
-    done = 0
-    for _ in 1:n
+    for done in 1:n
         countvalues!(b)
         decoderow!(cells, d, plan)
-        done += 1                                       # the cap is enforced per row, so the error kind
-        rowout = checked_add(max(b.reserved - before, 0), checked_mul(done, slotrow))
-        rowout <= cap ||                                # never depends on remaining ceiling headroom (R06)
-            throw(LimitError(:max_block_output_bytes, rowout, cap, :max_block_output_bytes, :decode))
+        checkblockoutput(b, outputbase, done, slotrow, cap)
     end
     d.pos == length(out) + 1 || throw(DataError("block datums did not consume the block exactly", d.pos))
-    blockout = checked_add(max(b.reserved - before, 0), checked_mul(n, slotrow))
-    blockout <= r.limits.max_block_output_bytes ||
-        throw(LimitError(:max_block_output_bytes, blockout, r.limits.max_block_output_bytes, :max_block_output_bytes, :decode))
     addrows!(b, n)
     release!(b, bytesbytes(length(out)))
     return nothing
@@ -232,7 +225,7 @@ end
 # ---- worker decode ----------------------------------------------------------------------------------
 
 "Decode one admitted higher block into per-block chunk columns under its own full reservation."
-function decodejob!(job::BlockJob, r::Reader, plan, sel::Union{Nothing,Vector{Int}}, fail::FailBox)
+function decodejob!(job::BlockJob, r::Reader, plan, sel::Union{Nothing,Vector{Int}}, fail::FailBox, slotrow::Int)
     e = job.entry
     if (@atomic fail.idx) < e.index
         @atomic job.state = :abandoned
@@ -248,7 +241,6 @@ function decodejob!(job::BlockJob, r::Reader, plan, sel::Union{Nothing,Vector{In
         addinput!(b, varintlength(e.count) + varintlength(e.size) + 16)
         out = decompressblock(cname, codec, payload, r.limits, b)
         n = e.count
-        before = b.reserved
         if r.validate === :strict && r.legacy === :avrojl1
             d0 = Decoder(out, b)
             for _ in 1:n
@@ -260,16 +252,16 @@ function decodejob!(job::BlockJob, r::Reader, plan, sel::Union{Nothing,Vector{In
         cols = columnbuilders(plan, sel, n, b)
         cells = plan isa RecordPlan ? fuseskips(cols) : cols
         d = Decoder(out, b; validate=r.validate)
+        outputbase = b.reserved
         cap = r.limits.max_block_output_bytes
-        for _ in 1:n
+        blockout = 0
+        for done in 1:n
             countvalues!(b)
             decoderow!(cells, d, plan)
-            rowout = max(b.reserved - before, 0)
-            rowout <= cap ||
-                throw(LimitError(:max_block_output_bytes, rowout, cap, :max_block_output_bytes, :decode))
+            blockout = checkblockoutput(b, outputbase, done, slotrow, cap)
         end
         d.pos == length(out) + 1 || throw(DataError("block datums did not consume the block exactly", d.pos))
-        job.outputbytes = max(b.reserved - before, 0)
+        job.outputbytes = blockout
         release!(b, bytesbytes(length(out)))
         job.cols = cols
         @atomic job.state = :done
@@ -284,9 +276,9 @@ function decodejob!(job::BlockJob, r::Reader, plan, sel::Union{Nothing,Vector{In
     return nothing
 end
 
-function workerloop(ch::Channel{BlockJob}, r::Reader, plan, sel::Union{Nothing,Vector{Int}}, fail::FailBox)
+function workerloop(ch::Channel{BlockJob}, r::Reader, plan, sel::Union{Nothing,Vector{Int}}, fail::FailBox, slotrow::Int)
     for job in ch
-        decodejob!(job, r, plan, sel, fail)
+        decodejob!(job, r, plan, sel, fail, slotrow)
     end
     return nothing
 end
@@ -388,7 +380,7 @@ function decodeblocks!(r::Reader, plan, sel::Union{Nothing,Vector{Int}}, finals:
     poolstate = checked_add(poolstate, STORAGE[].vector + 8 * nblocks)   # jobs vector rides the wave charge
     jobs = Vector{Union{Nothing,BlockJob}}(nothing, nblocks)
     ch = Channel{BlockJob}(nblocks)
-    workers = Task[Threads.@spawn workerloop(ch, r, plan, sel, fail) for _ in 1:nworkers]
+    workers = Task[Threads.@spawn workerloop(ch, r, plan, sel, fail, slotrow) for _ in 1:nworkers]
     foreach(errormonitor, workers)
     inflight = 0
     wavecharged = false                                # the settled 16 KiB per-worker state, charged per

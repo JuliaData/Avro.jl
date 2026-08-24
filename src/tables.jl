@@ -203,26 +203,22 @@ function decodestreamed!(r::Reader, plan, sel::Union{Nothing,Vector{Int}}, colst
     counts = Int[]
     chunkcols = Vector{Vector{AbstractVector}}()
     reserve!(r.budget, blocktablecharge(0))
+    slotrow = sum(slotbytes, colstypes; init=0)
     while (blk = nextblock!(r; walk=false)) !== nothing
         reserve!(r.budget, 40 + STORAGE[].vector + 8 * length(colstypes))   # the block-table entry and outer chunk container (R06)
         count, bytes = blk
         reserve!(r.budget, bytesbytes(length(bytes)))
-        before = r.budget.reserved
         d = Decoder(bytes, r.budget; validate=r.validate)
         cols = columnbuilders(plan, sel, count, r.budget)
         cells = plan isa RecordPlan ? fuseskips(cols) : cols
+        outputbase = r.budget.reserved
         cap = r.limits.max_block_output_bytes
-        for _ in 1:count
+        for done in 1:count
             countvalues!(r.budget)
             decoderow!(cells, d, plan)
-            rowout = max(r.budget.reserved - before, 0)
-            rowout <= cap ||
-                throw(LimitError(:max_block_output_bytes, rowout, cap, :max_block_output_bytes, :decode))
+            checkblockoutput(r.budget, outputbase, done, slotrow, cap)
         end
         d.pos == length(bytes) + 1 || throw(DataError("block datums did not consume the block exactly", d.pos))
-        blockout = max(r.budget.reserved - before, 0)   # chunk slots and payload the block produced
-        blockout <= r.limits.max_block_output_bytes ||
-            throw(LimitError(:max_block_output_bytes, blockout, r.limits.max_block_output_bytes, :max_block_output_bytes, :decode))
         release!(r.budget, bytesbytes(length(bytes)))
         keep = AbstractVector[]
         for i in (sel === nothing ? eachindex(cols) : sel)

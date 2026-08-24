@@ -21,6 +21,35 @@
     for nt in (0, -1, big(typemax(Int)) + 1)
         @test_throws ArgumentError Avro.Table(IOBuffer(bytes); ntasks=nt)
     end
+    @testset "the block-output error is identical for stream and every ntasks" begin
+        capschema = P("{\"type\":\"record\",\"name\":\"Cap\",\"fields\":[{\"name\":\"x\",\"type\":\"long\"}]}")
+        capio = IOBuffer()
+        capwriter = Avro.Writer(capio, capschema; sync=zeros(UInt8, 16))
+        for i in 1:5
+            push!(capwriter, (x=Int64(i),))
+        end
+        flush(capwriter)
+        for i in 6:45
+            push!(capwriter, (x=Int64(i),))
+        end
+        close(capwriter)
+        capbytes = take!(capio)
+        caplimits = Avro.Limits(max_block_output_bytes=80)
+        e1 = geterr(() -> Avro.Table(IOBuffer(capbytes); ntasks=1, limits=caplimits))
+        e8 = geterr(() -> Avro.Table(IOBuffer(capbytes); ntasks=8, limits=caplimits))
+        estream = mktemp() do path, io
+            write(io, capbytes)
+            close(io)
+            geterr(() -> open(src -> Avro.Table(src; limits=caplimits), path))
+        end
+        @test e1 isa Avro.LimitError && e8 isa Avro.LimitError
+        @test (e1.limit, e1.observed, e1.value) == (e8.limit, e8.observed, e8.value) ==
+              (:max_block_output_bytes, 88, 80)
+        @test sprint(showerror, e1) == sprint(showerror, e8)
+        @test estream isa Avro.LimitError
+        @test (estream.limit, estream.observed, estream.value) == (e1.limit, e1.observed, e1.value)
+        @test sprint(showerror, estream) == sprint(showerror, e1)
+    end
     @testset "identical results and acceptance for ntasks ∈ {1,2,8}, both limits, both modes" begin
         for nt in (1, 2, 8), lim in (Avro.Limits(), raised), val in (:strict, :fast)
             t = Avro.Table(IOBuffer(bytes); ntasks=nt, limits=lim, validate=val)

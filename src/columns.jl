@@ -5,6 +5,13 @@
 
 abstract type ColumnBuilder end
 
+"Check the selected output produced through `rows`: completed slots plus retained payload, not chunk capacity."
+function checkblockoutput(budget::Budget, baseline::Int, rows::Int, slotrow::Int, cap::Int)
+    output = checked_add(max(budget.reserved - baseline, 0), checked_mul(rows, slotrow))
+    output <= cap || throw(limiterror(budget, :max_block_output_bytes, output, cap))
+    return output
+end
+
 "A selected field decoded into a `Vector{E}` (`E = juliatype(field schema)`) by its plan `P`."
 mutable struct TypedColumn{E,P<:ReadPlan} <: ColumnBuilder
     const plan::P
