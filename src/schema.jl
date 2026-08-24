@@ -154,14 +154,37 @@ Base.hash(s::Schema, h::UInt) = hash(s.meta.hash[], h)
 Public constructors validate every §4.2 rule, reject `props` keys that collide with the structural keys
 the same constructor emits, deep-copy already-frozen children into the new graph, and freeze.
 """
-NullSchema(; props=(;), limits::Limits=Limits()) = build(NullSchema, props; limits=limits)
-BooleanSchema(; props=(;), limits::Limits=Limits()) = build(BooleanSchema, props; limits=limits)
-FloatSchema(; props=(;), limits::Limits=Limits()) = build(FloatSchema, props; limits=limits)
-DoubleSchema(; props=(;), limits::Limits=Limits()) = build(DoubleSchema, props; limits=limits)
-IntSchema(; logical=nothing, props=(;), limits::Limits=Limits()) = build(IntSchema, props; logical=logical, limits=limits)
-LongSchema(; logical=nothing, props=(;), limits::Limits=Limits()) = build(LongSchema, props; logical=logical, limits=limits)
-BytesSchema(; logical=nothing, props=(;), limits::Limits=Limits()) = build(BytesSchema, props; logical=logical, limits=limits)
-StringSchema(; logical=nothing, props=(;), limits::Limits=Limits()) = build(StringSchema, props; logical=logical, limits=limits)
+function NullSchema(; props=(;), limits::Limits=Limits())
+    return build(NullSchema, props; limits=limits)
+end
+
+function BooleanSchema(; props=(;), limits::Limits=Limits())
+    return build(BooleanSchema, props; limits=limits)
+end
+
+function FloatSchema(; props=(;), limits::Limits=Limits())
+    return build(FloatSchema, props; limits=limits)
+end
+
+function DoubleSchema(; props=(;), limits::Limits=Limits())
+    return build(DoubleSchema, props; limits=limits)
+end
+
+function IntSchema(; logical=nothing, props=(;), limits::Limits=Limits())
+    return build(IntSchema, props; logical=logical, limits=limits)
+end
+
+function LongSchema(; logical=nothing, props=(;), limits::Limits=Limits())
+    return build(LongSchema, props; logical=logical, limits=limits)
+end
+
+function BytesSchema(; logical=nothing, props=(;), limits::Limits=Limits())
+    return build(BytesSchema, props; logical=logical, limits=limits)
+end
+
+function StringSchema(; logical=nothing, props=(;), limits::Limits=Limits())
+    return build(StringSchema, props; logical=logical, limits=limits)
+end
 
 # ---- parse context -----------------------------------------------------------------------------
 
@@ -175,6 +198,7 @@ mutable struct ParseContext
     const metas::Vector{NodeMeta}             # in creation order → dense ids
     const namedcount::Base.RefValue{Int}
     const legacyfixednames::Bool              # legacy=:avrojl1: Avro.jl ≤ 1.1.2 wrote fixed schemas without names
+    legacyfixedcount::Int                     # nameless-fixed ordinal within this document
     repaired_names::Bool
     repaired_defaults::Bool
     depth::Int
@@ -182,7 +206,7 @@ end
 
 function ParseContext(limits::Limits, budget::Budget, allow_invalid_names::Bool, allow_invalid_defaults::Bool, legacyfixednames::Bool=false)
     return ParseContext(limits, budget, allow_invalid_names, allow_invalid_defaults, FrozenDict{String,Schema}(),
-        RecordSchema[], NodeMeta[], Ref(0), legacyfixednames, false, false, 0)
+        RecordSchema[], NodeMeta[], Ref(0), legacyfixednames, 0, false, false, 0)
 end
 
 schemaerror(msg::AbstractString, path::AbstractString) = throw(SchemaError(String(msg), String(path)))
@@ -274,10 +298,18 @@ marked `repaired_names`); with `allow_invalid_defaults=true` invalid defaults ar
 `valid=false`.
 """
 function parseschema(src; allow_invalid_names::Bool=false, allow_invalid_defaults::Bool=false, limits::Limits=Limits(),
-                     legacy_fixed_names::Bool=false, budget::Union{Nothing,Budget}=nothing)
+                     budget::Union{Nothing,Budget}=nothing)
+    return parseschemaimpl(src, false; allow_invalid_names=allow_invalid_names,
+        allow_invalid_defaults=allow_invalid_defaults, limits=limits, budget=budget)
+end
+
+function parseschemaimpl(src, legacy_fixed_names::Bool; allow_invalid_names::Bool=false,
+                         allow_invalid_defaults::Bool=false, limits::Limits=Limits(),
+                         budget::Union{Nothing,Budget}=nothing)
     budget === nothing &&
-        return withbudget(b -> parseschema(src; allow_invalid_names=allow_invalid_names, allow_invalid_defaults=allow_invalid_defaults,
-                                           limits=limits, legacy_fixed_names=legacy_fixed_names, budget=b), limits)
+        return withbudget(b -> parseschemaimpl(src, legacy_fixed_names; allow_invalid_names=allow_invalid_names,
+                                               allow_invalid_defaults=allow_invalid_defaults,
+                                               limits=limits, budget=b), limits)
     buf = sourcebytes(src, limits.max_schema_bytes, budget, SchemaError)
     errfn = (msg, pos) -> throw(SchemaError(string(msg, " (byte ", pos, ")"), "\$"))
     limitfn = (limit, observed, value) -> throw(LimitError(limit, observed, value, limit, :decode))
@@ -486,7 +518,8 @@ end
 function parsefixed(ctx::ParseContext, obj::JSONObject, enclosing::String, path::String)
     full, aliases, raw = if ctx.legacyfixednames && !haskey(obj, "name")
         # Avro.jl ≤ 1.1.2 wrote nameless fixed schemas (they carry no references, so a synthetic name is unambiguous)
-        (FullName(string("_avrojl1_fixed_", length(ctx.metas) + 1), ""), freeze!(FrozenVector{String}()), freeze!(FrozenVector{String}()))
+        ctx.legacyfixedcount = checked_add(ctx.legacyfixedcount, 1)
+        (FullName(string("_avrojl1_fixed_", ctx.legacyfixedcount), ""), freeze!(FrozenVector{String}()), freeze!(FrozenVector{String}()))
     else
         parsenamed(ctx, obj, enclosing, path)
     end
@@ -864,20 +897,23 @@ mutable struct BoundedWriter <: IO
     charged::Int
 end
 
-BoundedWriter(budget::Budget, maxbytes::Int) = BoundedWriter(IOBuffer(), budget, maxbytes, 0, 0)
+function BoundedWriter(budget::Budget, maxbytes::Int)
+    return BoundedWriter(IOBuffer(), budget, maxbytes, 0, 0)
+end
 
 const PRINT_CHUNK = 4096
 
 function boundedgrow!(w::BoundedWriter, n::Int)
-    w.written += n
-    w.written <= w.maxbytes ||
-        throw(LimitError(:max_schema_bytes, w.written, w.maxbytes, :max_schema_bytes, :encode))
-    if w.written > w.charged
-        step = max(PRINT_CHUNK, w.written - w.charged)
+    written = checked_add(w.written, n)
+    written <= w.maxbytes ||
+        throw(LimitError(:max_schema_bytes, written, w.maxbytes, :max_schema_bytes, :encode))
+    if written > w.charged
+        step = max(PRINT_CHUNK, written - w.charged)
         reserve!(w.budget, step)
-        addinput!(w.budget, step)                      # produced text is the work-rule denominator
-        w.charged += step
+        w.charged = checked_add(w.charged, step)
     end
+    w.written = written
+    addinput!(w.budget, n)                             # produced text, not reserved capacity, is the denominator
     return nothing
 end
 
@@ -891,14 +927,28 @@ function Base.unsafe_write(w::BoundedWriter, p::Ptr{UInt8}, n::UInt)
     return Base.unsafe_write(w.io, p, n)
 end
 
-chargeseen!(::IO, ::Int) = nothing
-chargeseen!(w::BoundedWriter, n::Int) = (reserve!(w.budget, n); nothing)
+function chargeseen!(::IO, ::Int)
+    return nothing
+end
 
-countnode!(::IO) = nothing
-countnode!(w::BoundedWriter) = (countvalues!(w.budget); nothing)
+function chargeseen!(w::BoundedWriter, n::Int)
+    reserve!(w.budget, n)
+    return nothing
+end
+
+function countnode!(::IO)
+    return nothing
+end
+
+function countnode!(w::BoundedWriter)
+    countvalues!(w.budget)
+    return nothing
+end
 
 "The schema's recorded construction/parse limits (every root stores them in its `GraphInfo`)."
-graphlimits(s::Schema) = graphinfo(s).limits
+function graphlimits(s::Schema)
+    return graphinfo(s).limits
+end
 
 """
     Avro.json(schema; pretty=false) -> String
@@ -973,7 +1023,6 @@ function printprops(io::IO, p::Props, pretty::Bool, level::Int, first::Bool)
 end
 
 function printschema(io::IO, s::Schema, enclosing::String, seen::FrozenDict{String,Bool}, pretty::Bool, level::Int)
-    countnode!(io)
     if s isa PrimitiveSchema
         if isempty(s.props)
             print(io, '"', kind(s), '"')
@@ -1008,12 +1057,14 @@ function printschema(io::IO, s::Schema, enclosing::String, seen::FrozenDict{Stri
         full = fullname(s)
         if haskey(seen, full)
             escapejson(io, s.name.namespace == enclosing ? s.name.name : full)
+            countnode!(io)
             return nothing
         end
         seen[full] = true
         chargeseen!(io, 32 + sizeof(full))
         printnamed(io, s, enclosing, seen, pretty, level)
     end
+    countnode!(io)
     return nothing
 end
 
@@ -1247,30 +1298,42 @@ function finalizepublic!(s::Schema, limits::Limits, nodes::Int, named::Int)
             fillonce!(m.id, Int32(i - 1))
             fillonce!(m.graph, info)
         end
+        checkpublicprint!(s, limits, budget)
         computehashes!(s, metas)
         return s
     end
 end
 
+"Charge and bound the exact schema text retained properties and defaults will produce."
+function checkpublicprint!(s::Schema, limits::Limits, budget::Budget)
+    writer = BoundedWriter(budget, limits.max_schema_bytes)
+    printschema(writer, s, "", FrozenDict{String,Bool}(), false, 0)
+    return nothing
+end
+
+function checkgraphnamebytes(name::AbstractString, limits::Limits)
+    sizeof(name) <= limits.max_name_bytes ||
+        throw(LimitError(:max_name_bytes, sizeof(name), limits.max_name_bytes, :max_name_bytes, :decode))
+    return nothing
+end
+
 function checkgraphnames(s::NamedSchema, limits::Limits)
-    sizeof(fullname(s)) <= limits.max_name_bytes ||
-        throw(LimitError(:max_name_bytes, sizeof(fullname(s)), limits.max_name_bytes, :max_name_bytes, :decode))
+    checkgraphnamebytes(fullname(s), limits)
     for a in s.aliases
-        sizeof(a) <= limits.max_name_bytes ||
-            throw(LimitError(:max_name_bytes, sizeof(a), limits.max_name_bytes, :max_name_bytes, :decode))
+        checkgraphnamebytes(a, limits)
     end
     return nothing
 end
 
 function collectmetas!(s::Schema, metas::Vector{NodeMeta}, namedtypes::FrozenDict{String,Schema},
                        visited::IdDict{NodeMeta,Nothing}, limits::Limits, budget::Budget, depth::Int)
-    haskey(visited, s.meta) && return metas
     depth <= limits.max_schema_depth ||
         throw(LimitError(:max_schema_depth, depth, limits.max_schema_depth, :max_schema_depth, :decode))
+    countvalues!(budget)
+    haskey(visited, s.meta) && return metas
     length(metas) < limits.max_schema_nodes ||
         throw(LimitError(:max_schema_nodes, length(metas) + 1, limits.max_schema_nodes, :max_schema_nodes, :decode))
     reserve!(budget, 160)                              # the parser's per-node construction charge
-    countvalues!(budget)
     visited[s.meta] = nothing
     push!(metas, s.meta)
     if s isa NamedSchema
@@ -1294,13 +1357,18 @@ function collectmetas!(s::Schema, metas::Vector{NodeMeta}, namedtypes::FrozenDic
         length(s.fields) <= limits.max_fields ||
             throw(LimitError(:max_fields, length(s.fields), limits.max_fields, :max_fields, :decode))
         for f in s.fields
-            sizeof(f.name) <= limits.max_name_bytes ||
-                throw(LimitError(:max_name_bytes, sizeof(f.name), limits.max_name_bytes, :max_name_bytes, :decode))
+            checkgraphnamebytes(f.name, limits)
+            for a in f.aliases
+                checkgraphnamebytes(a, limits)
+            end
             collectmetas!(f.schema, metas, namedtypes, visited, limits, budget, depth + 1)
         end
     elseif s isa EnumSchema
         length(s.symbols) <= limits.max_enum_symbols ||
             throw(LimitError(:max_enum_symbols, length(s.symbols), limits.max_enum_symbols, :max_enum_symbols, :decode))
+        for sym in s.symbols
+            checkgraphnamebytes(sym, limits)
+        end
     end
     return metas
 end

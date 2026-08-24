@@ -168,6 +168,26 @@ end
         @test got == expected
     end
     @testset "legacy 1.x files and decimal byte order" begin
+        legacy_schema_json = """{"type":"record","name":"LegacyFixedOrdinals","fields":[
+            {"name":"plain","type":"long"},
+            {"name":"first","type":{"type":"fixed","size":1}},
+            {"name":"nested","type":{"type":"array","items":{"type":"fixed","size":2}}}]}
+            """
+        function legacyvarint(n)
+            return Avro.encode(P("\"long\""), Int64(n))
+        end
+        function legacyentry(key::String, value::Vector{UInt8})
+            return vcat(legacyvarint(sizeof(key)), Vector{UInt8}(key),
+                        legacyvarint(length(value)), value)
+        end
+        legacy_header = vcat(collect(b"Obj\x01"), legacyvarint(2),
+            legacyentry("avro.schema", Vector{UInt8}(legacy_schema_json)),
+            legacyentry("avro.codec", Vector{UInt8}("null")), legacyvarint(0), zeros(UInt8, 16))
+        @test_throws Avro.SchemaError Avro.Reader(legacy_header)
+        legacy_schema = Avro.Reader(Avro.writerschema, legacy_header; legacy=:avrojl1)
+        @test Avro.fullname(legacy_schema.fields[2].schema) == "_avrojl1_fixed_1"
+        @test Avro.fullname(legacy_schema.fields[3].schema.items) == "_avrojl1_fixed_2"
+
         leg = joinpath(gen, "legacy1x")
         @test_throws Avro.SchemaError readall(joinpath(leg, "avrojl112-null.avro"))               # 1.x wrote nameless fixed schemas
         @test_throws Avro.SchemaError readall(joinpath(leg, "avrojl112-zstd.avro"))

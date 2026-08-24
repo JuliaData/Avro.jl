@@ -33,6 +33,17 @@ struct EnumTarget{T} <: TypedPlan
     members::Vector{Union{Nothing,T}}    # by symbol position; `nothing` → ConversionError
 end
 
+"A resolving enum remap decoded directly to `String` or `Symbol`."
+struct EnumRemapTarget{T} <: TypedPlan
+    plan::EnumRemapPlan
+end
+
+"A resolving enum remap decoded to a `Base.Enum` by reader symbol."
+struct EnumRemapNativeTarget{T} <: TypedPlan
+    plan::EnumRemapPlan
+    members::Vector{Union{Nothing,T}}
+end
+
 struct ArrayTarget{E,P<:TypedPlan} <: TypedPlan
     items::P
     minsize::Int
@@ -318,10 +329,15 @@ wrapped or per-writer-branch target; resolved records decode writer-ordered step
 fields with reader-only defaults materialised once at plan time. Returns `nothing` when ineligible.
 """
 function buildresolvedtyped(::Type{T}, s::Schema, p::ReadPlan, memo::TypedMemo) where {T}
-    p isa Union{PromotePlan,EnumRemapPlan} && return buildleaftarget(T, p)
+    p isa PromotePlan && return buildleaftarget(T, p)
+    p isa EnumRemapPlan && return buildenumremaptarget(T, p)
     if p isa WrapPlan && p.nullable != 0 && s isa UnionSchema
         N, inner = T isa Union ? splitoptional(T) : (Union{}, T)
         inner === nothing && return nothing
+        if p.readerindex == p.nullable
+            N === Union{} && return nothing
+            return ResolvedNullTarget{N,typeof(p.inner)}(p.inner)
+        end
         return buildtyped(inner, s.branches[p.readerindex], p.inner, memo)   # the writer never encodes null here
     end
     if p isa UnionResolvePlan && p.nullable != 0 && s isa UnionSchema
@@ -348,6 +364,29 @@ function buildresolvedtyped(::Type{T}, s::Schema, p::ReadPlan, memo::TypedMemo) 
     return nothing
 end
 
+function buildenumremaptarget(::Type{T}, p::EnumRemapPlan) where {T}
+    T === String && return EnumRemapTarget{String}(p)
+    T === Symbol && return EnumRemapTarget{Symbol}(p)
+    T <: Base.Enum || return nothing
+    members = Vector{Union{Nothing,T}}(nothing, length(p.reader.symbols))
+    for e in instances(T)
+        name = avrosymbol(T, e)
+        haskey(p.reader.symbolindex, name) || continue
+        members[p.reader.symbolindex[name]] = e
+    end
+    return EnumRemapNativeTarget{T}(p, members)
+end
+
+"A non-union null writer resolved to the target's nullable convention."
+struct ResolvedNullTarget{N,P<:ReadPlan} <: TypedPlan
+    plan::P
+end
+
+function typedvalue(p::ResolvedNullTarget{N}, d::Decoder, names) where {N}
+    decodevalue(p.plan, d)
+    return N === Missing ? missing : nothing
+end
+
 "A resolved two-branch-nullable union into `Union{Missing|Nothing, X}` typed targets per writer branch."
 struct ResolvedNullableTarget{N,BS<:Tuple} <: TypedPlan
     branches::BS
@@ -371,9 +410,28 @@ mutable struct ResolvedRecordTarget{T,PS<:Tuple,SLOTMAP} <: TypedPlan
     const shell::Int
 end
 
+"A reader-field default retained as JSON and materialised afresh for each decoded record."
+struct ResolvedReaderDefault{T}
+    plan::DefaultPlan
+end
+
 function buildresolvedrecord(::Type{T}, s::RecordSchema, p::ResolvedRecordPlan, memo::TypedMemo) where {T}
-    (T <: NamedTuple || (isstructtype(T) && !ismutabletype(T)) || ismutabletype(T)) || return nothing
-    T <: Union{AbstractArray,AbstractString,AbstractDict} && return nothing
+    cached = memolookup(memo, s, T)
+    cached === nothing || return cached
+    fastroute(T) || return memostore!(memo, s, T, SemanticTarget{T}(p))
+    ref = RefTarget{T}(nothing)
+    memostore!(memo, s, T, ref)
+    built = buildresolvedrecordplan(T, s, p, memo)
+    if built === nothing
+        sem = SemanticTarget{T}(p)
+        ref.plan = sem
+        return memostore!(memo, s, T, sem)
+    end
+    ref.plan = built
+    return memostore!(memo, s, T, built)
+end
+
+function resolvedslotmap(::Type{T}, s::RecordSchema) where {T}
     names = fieldnames(T)
     tags = StructUtils.fieldtags(AvroStyle(), T)
     avronames = String[avrofieldname(tags, n) for n in names]
@@ -383,6 +441,11 @@ function buildresolvedrecord(::Type{T}, s::RecordSchema, p::ResolvedRecordPlan, 
         i == 0 && continue
         slotfor[i] = k
     end
+    return (names, slotfor)
+end
+
+function resolvedsteptargets(::Type{T}, s::RecordSchema, p::ResolvedRecordPlan, memo::TypedMemo,
+                             slotfor::Vector{Int}) where {T}
     plans = TypedPlan[]
     stepslot = Int[]
     for (slot, sp) in p.steps
@@ -397,34 +460,43 @@ function buildresolvedrecord(::Type{T}, s::RecordSchema, p::ResolvedRecordPlan, 
             push!(stepslot, k)
         end
     end
-    defaults = Vector{Any}(undef, length(names))
-    defs = StructUtils.fielddefaults(AvroStyle(), T)
-    covered = falses(length(names))
-    for (j, k) in enumerate(stepslot)
-        k == 0 || (covered[k] = true)
+    return (plans, stepslot)
+end
+
+function checkedreaderdefault(::Type{T}, dp::DefaultPlan, limits::Limits) where {T}
+    v = withbudget(limits) do budget
+        jsonvalue(dp.schema, dp.json, budget)
     end
+    v2 = v isa T ? v : try
+        convertleaf(T, v)
+    catch
+        nothing
+    end
+    v2 isa T || return nothing
+    return ResolvedReaderDefault{T}(dp)
+end
+
+function resolvedreaderdefaults!(::Type{T}, defaults::Vector{Any}, covered::BitVector,
+                                 slotfor::Vector{Int}, p::ResolvedRecordPlan, s::RecordSchema) where {T}
     for (slot, dp) in p.defaults
         k = slotfor[slot]
         k == 0 && continue
-        ft = fieldtype(T, k)
-        v = withbudget(graphlimits(s)) do budget
-            jsonvalue(dp.schema, dp.json, budget)
-        end
-        v2 = v isa ft ? v : try
-            convertleaf(ft, v)
-        catch
-            nothing
-        end
-        v2 isa ft || return nothing                       # a non-static or unconvertible default is ineligible
-        defaults[k] = v2
+        dflt = checkedreaderdefault(fieldtype(T, k), dp, graphlimits(s))
+        dflt === nothing && return false
+        defaults[k] = dflt
         covered[k] = true
     end
+    return true
+end
+
+function resolvedstaticdefaults!(::Type{T}, defaults::Vector{Any}, covered::BitVector, names) where {T}
+    defs = StructUtils.fielddefaults(AvroStyle(), T)
     for k in eachindex(names)
         covered[k] && continue
         ft = fieldtype(T, k)
         if haskey(defs, names[k])
             v = defs[names[k]]
-            v isa ft || return nothing
+            v isa ft || return false
             defaults[k] = v
         elseif Missing <: ft
             defaults[k] = missing
@@ -434,8 +506,33 @@ function buildresolvedrecord(::Type{T}, s::RecordSchema, p::ResolvedRecordPlan, 
             throw(ArgumentError("field $(names[k]) of $T has no writer field, no reader default and no static default"))
         end
     end
+    return true
+end
+
+function buildresolvedrecordplan(::Type{T}, s::RecordSchema, p::ResolvedRecordPlan, memo::TypedMemo) where {T}
+    names, slotfor = resolvedslotmap(T, s)
+    targets = resolvedsteptargets(T, s, p, memo, slotfor)
+    targets === nothing && return nothing
+    plans, stepslot = targets
+    defaults = Vector{Any}(undef, length(names))
+    covered = falses(length(names))
+    for k in stepslot
+        k == 0 || (covered[k] = true)
+    end
+    resolvedreaderdefaults!(T, defaults, covered, slotfor, p, s) || return nothing
+    resolvedstaticdefaults!(T, defaults, covered, names) || return nothing
     ps = (plans...,)
     return ResolvedRecordTarget{T,typeof(ps),(stepslot...,)}(s, ps, defaults, measuredshell(T))
+end
+
+function resolveddefault(::Type{T}, x::ResolvedReaderDefault{T}, d::Decoder) where {T}
+    countvalues!(d.budget)
+    v = jsonvalue(x.plan.schema, x.plan.json, d.budget)
+    return v isa T ? v : convertleaf(T, v)::T
+end
+
+function resolveddefault(::Type{T}, x, d::Decoder) where {T}
+    return x::T
 end
 
 function typedvalue(p::ResolvedRecordTarget{T}, d::Decoder, names) where {T}
@@ -456,10 +553,10 @@ end
             push!(body.args, :($(Symbol("f", SLOTMAP[j])) = decodetyped(p.plans[$j], d, names)))
         end
     end
-    args = Any[]
+    args = []
     for k in 1:fieldcount(T)
         ft = fieldtype(T, k)
-        push!(args, k in SLOTMAP ? :($(Symbol("f", k))::$ft) : :(p.defaults[$k]::$ft))
+        push!(args, k in SLOTMAP ? :($(Symbol("f", k))::$ft) : :(resolveddefault($ft, p.defaults[$k], d)))
     end
     construct = T <: NamedTuple ? :($T(($(args...),))) : Expr(:new, T, args...)
     push!(body.args, :(return $construct))
@@ -504,7 +601,9 @@ typedvalue(p::GenericTarget, d::Decoder, names) = decodevalue(p.plan, d)
 typedvalue(p::SemanticTarget{T}, d::Decoder, names) where {T} = semanticvalue(T, decodevalue(p.plan, d), names)
 typedvalue(p::LeafTarget{T}, d::Decoder, names) where {T} = convertleaf(T, decodevalue(p.plan, d))::T
 typedvalue(p::LeafTarget{String,EnumPlan}, d::Decoder, names) = p.plan.schema.symbols[readindex(d, length(p.plan.schema.symbols))]
-typedvalue(p::SymbolTarget{StringPlan}, d::Decoder, names) = admit!(names, readstring(d); budget=d.budget)
+function typedvalue(p::SymbolTarget{StringPlan}, d::Decoder, names)
+    return admit!(names, readstring(d); budget=d.budget)
+end
 typedvalue(p::RefTarget{T}, d::Decoder, names) where {T} = typedvalue(p.plan::TypedPlan, d, names)::T
 
 function typedvalue(p::SymbolTarget{EnumPlan}, d::Decoder, names)
@@ -517,6 +616,22 @@ function typedvalue(p::EnumTarget{T}, d::Decoder, names) where {T}
     i = readindex(d, length(syms))
     m = p.members[i]
     m === nothing && throw(ConversionError("enum symbol \"$(syms[i])\" of $(fullname(p.plan.schema)) has no $T member"))
+    return m
+end
+
+function typedvalue(p::EnumRemapTarget{String}, d::Decoder, names)
+    return p.plan.reader.symbols[enumremapindex(p.plan, d)]
+end
+
+function typedvalue(p::EnumRemapTarget{Symbol}, d::Decoder, names)
+    sym = p.plan.reader.symbols[enumremapindex(p.plan, d)]
+    return admit!(names, sym; budget=d.budget)
+end
+
+function typedvalue(p::EnumRemapNativeTarget{T}, d::Decoder, names) where {T}
+    i = enumremapindex(p.plan, d)
+    m = p.members[i]
+    m === nothing && throw(ConversionError("enum symbol \"$(p.plan.reader.symbols[i])\" of $(fullname(p.plan.reader)) has no $T member"))
     return m
 end
 
@@ -621,7 +736,9 @@ fields: reference fields stay undefined, so `Base.summarysize` reports exactly t
 inline layout — including nested inline structs — and no referenced payload; plan §4.4, R10). The
 checked fallback bound covers types `:new` cannot probe.
 """
-@generated emptyprobe(::Type{T}) where {T} = Expr(:new, T)
+@generated function emptyprobe(::Type{T}) where {T}
+    return Expr(:new, T)
+end
 
 function measuredshell(::Type{T}) where {T}
     isbitstype(T) && return 0
@@ -646,7 +763,7 @@ shellbytes(::Type{T}) where {T} = isbitstype(T) ? 0 : 16 + sizeof(T)
             push!(body.args, :($(Symbol("f", j)) = decodetyped(p.plans[$j], d, names)))
         end
     end
-    args = Any[]
+    args = []
     for k in 1:fieldcount(T)
         ft = fieldtype(T, k)
         j = MAP[k]

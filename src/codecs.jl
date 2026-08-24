@@ -5,6 +5,7 @@
 # exact exhaustion; deflate rejects bytes after its final block; snappy carries the big-endian CRC32 of
 # the uncompressed data.
 
+import CodecZlib
 using CodecZlib: DeflateCompressor, DeflateDecompressor
 using CodecZstd: ZstdCompressor, ZstdDecompressor
 import Snappy
@@ -303,12 +304,76 @@ function writercodec(name::Symbol, level, limits::Limits)
     throw(UnsupportedCodecError(String(name), get(EXTENSION_PACKAGES, name, nothing)))
 end
 
-"An upper bound on `compressblock`'s output allocation, reserved before the codec runs (R04)."
+function boundint(name::Symbol, n::Unsigned)
+    n <= UInt(typemax(Int)) || throw(OverflowError("$name compressed-output bound exceeds typemax(Int)"))
+    return Int(n)
+end
+
+function compresscapacity(::Val{:null}, n::Int)
+    return 0
+end
+
+function compresscapacity(::Val{:deflate}, n::Int)
+    bound = ccall((:compressBound, CodecZlib.libz), Culong, (Culong,), n)
+    return boundint(:deflate, bound)
+end
+
+function compresscapacity(::Val{:snappy}, n::Int)
+    bound = boundint(:snappy, Snappy.LibSnappy.snappy_max_compressed_length(UInt(n)))
+    return checked_add(bound, 4)
+end
+
+function compresscapacity(::Val{:zstandard}, n::Int)
+    bound = ccall((:ZSTD_compressBound, Zstd_jll.libzstd), Csize_t, (Csize_t,), n)
+    return boundint(:zstandard, bound)
+end
+
+"The exact-capacity compressor output allocation, reserved before the codec runs (R04)."
 function compressbound(w::WriterCodec, n::Int)
+    n >= 0 || throw(ArgumentError("input length must be non-negative"))
     w.name === :null && return 0
-    w.name === :snappy && return bytesbytes(Int(Snappy.LibSnappy.snappy_max_compressed_length(UInt(n))) + 4)
-    w.name === :zstandard && return bytesbytes(Int(ccall((:ZSTD_compressBound, Zstd_jll.libzstd), Csize_t, (Csize_t,), n)))
-    return bytesbytes(n + (n >> 9) + 96)               # deflate and the extension codecs: zlib-style worst case
+    return bytesbytes(compresscapacity(Val(w.name), n))
+end
+
+function boundedtranscode(name::Symbol, codec::TranscodingStreams.Codec, bytes::Vector{UInt8}, cap::Int)
+    out = Vector{UInt8}(undef, cap)
+    err = TranscodingStreams.Error()
+    initialized = false
+    try
+        TranscodingStreams.initialize(codec)
+        initialized = true
+        TranscodingStreams.startproc(codec, :write, err) === :ok ||
+            throw(CodecError(name, :compress, codecmessage(err)))
+        TranscodingStreams.pledgeinsize(codec, Int64(length(bytes)), err) === :ok ||
+            throw(CodecError(name, :compress, codecmessage(err)))
+        inpos = 1
+        outpos = 1
+        while true
+            navail = length(bytes) - inpos + 1
+            nmargin = length(out) - outpos + 1
+            nmargin > 0 || throw(CodecError(name, :compress, "compressed output exceeded its $cap-byte bound"))
+            delta_in, delta_out, status = GC.@preserve bytes out TranscodingStreams.process(
+                codec,
+                TranscodingStreams.Memory(navail > 0 ? pointer(bytes, inpos) : Ptr{UInt8}(0), UInt(max(navail, 0))),
+                TranscodingStreams.Memory(pointer(out, outpos), UInt(nmargin)), err)
+            inpos += delta_in
+            outpos += delta_out
+            if status === :end
+                inpos == length(bytes) + 1 ||
+                    throw(CodecError(name, :compress, "codec ended before consuming its input"))
+                resize!(out, outpos - 1)
+                return out
+            elseif status === :error
+                throw(CodecError(name, :compress, codecmessage(err)))
+            elseif status !== :ok
+                throw(CodecError(name, :compress, "codec returned invalid status $status"))
+            end
+            (delta_in > 0 || delta_out > 0) ||
+                throw(CodecError(name, :compress, "codec made no progress"))
+        end
+    finally
+        initialized && TranscodingStreams.finalize(codec)
+    end
 end
 
 "Compress one block's encoded bytes (snappy appends the big-endian CRC32 of the uncompressed data)."
@@ -326,7 +391,8 @@ function compressblock(w::WriterCodec, bytes::Vector{UInt8})
         resize!(out, m + 4)
         return out
     end
-    return TranscodingStreams.transcode(w.factory()::TranscodingStreams.Codec, bytes)
+    cap = compresscapacity(Val(w.name), length(bytes))
+    return boundedtranscode(w.name, w.factory()::TranscodingStreams.Codec, bytes, cap)
 end
 
 "Verify an emitted zstandard frame decodes under `max_codec_memory` (unreachable by construction; gated)."

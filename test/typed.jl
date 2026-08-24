@@ -79,7 +79,9 @@ struct ResolvedDTO
     a::Float64
     b::Union{Missing,Int64}
     z::Int32
-    ResolvedDTO() = error("the positional constructor must not run on the fast route")
+    function ResolvedDTO()
+        return error("the positional constructor must not run on the fast route")
+    end
 end
 
 struct Hooked
@@ -87,7 +89,9 @@ struct Hooked
     b::Union{Missing,Int64}
     z::Int32
 end
-StructUtils.lift(::Avro.AvroStyle, ::Type{Hooked}, x) = Hooked(1.0, missing, Int32(0))
+function StructUtils.lift(::Avro.AvroStyle, ::Type{Hooked}, x)
+    return Hooked(1.0, missing, Int32(0))
+end
 
 @testset "Typed decoding" begin
     using .TypedTestTypes: Plain, Mut, Empty, MutEmpty, Bits, Guarded, Colour, red, green, blue, Tagged, WithDefault, NoDefault, Optional, LL, Node, Shape, Circle, Lifted, Wrapper, HasWrapper, SymField, Nested
@@ -316,6 +320,42 @@ StructUtils.lift(::Avro.AvroStyle, ::Type{Hooked}, x) = Hooked(1.0, missing, Int
         drn = Avro.DatumReader(wn, TN; reader_schema=rn)
         @test drn.plan isa Avro.ResolvedRecordTarget
         @test drn(Avro.encode(wn, (in=(x=Int32(4),),))) == (in=(x=Int64(4),),)
+        # recursive resolved records terminate plan construction and stay on the direct route
+        wll = P("{\"type\":\"record\",\"name\":\"RLL\",\"fields\":[{\"name\":\"value\",\"type\":\"int\"},{\"name\":\"next\",\"type\":[\"null\",\"RLL\"]}]}")
+        rll = P("{\"type\":\"record\",\"name\":\"RLL\",\"fields\":[{\"name\":\"value\",\"type\":\"long\"},{\"name\":\"next\",\"type\":[\"null\",\"RLL\"]}]}")
+        drll = Avro.DatumReader(wll, LL; reader_schema=rll)
+        @test drll.plan isa Avro.ResolvedRecordTarget
+        llbytes = Avro.encode(wll, (value=Int32(1), next=(value=Int32(2), next=missing)))
+        @test drll(llbytes) == LL(1, LL(2, missing))
+        # reader defaults are materialised for every datum
+        wdflt = P("{\"type\":\"record\",\"name\":\"D\",\"fields\":[]}")
+        rdflt = P("{\"type\":\"record\",\"name\":\"D\",\"fields\":[{\"name\":\"xs\",\"type\":{\"type\":\"array\",\"items\":\"long\"},\"default\":[1]}]}")
+        TD = @NamedTuple{xs::Vector{Int64}}
+        drdflt = Avro.DatumReader(wdflt, TD; reader_schema=rdflt)
+        x = drdflt(UInt8[])
+        y = drdflt(UInt8[])
+        @test x == y == (xs=Int64[1],)
+        @test x.xs !== y.xs
+        tiny = Avro.Limits(max_total_values=2)
+        @test_throws Avro.LimitError Avro.DatumReader(wdflt; reader_schema=rdflt, limits=tiny)(UInt8[])
+        @test_throws Avro.LimitError Avro.DatumReader(wdflt, TD; reader_schema=rdflt, limits=tiny)(UInt8[])
+        # a null writer resolves through either nullable reader position and null target convention
+        wnull = P("\"null\"")
+        for rnull in (P("[\"null\",\"long\"]"), P("[\"long\",\"null\"]"))
+            @test Avro.DatumReader(wnull, Union{Nothing,Int64}; reader_schema=rnull)(UInt8[]) === nothing
+            @test Avro.DatumReader(wnull, Union{Missing,Int64}; reader_schema=rnull)(UInt8[]) === missing
+        end
+        # enum remaps stay direct for all supported typed enum representations
+        wenum = P("{\"type\":\"enum\",\"name\":\"RemappedColour\",\"symbols\":[\"red\",\"green\",\"blue\"]}")
+        renum = P("{\"type\":\"enum\",\"name\":\"RemappedColour\",\"symbols\":[\"blue\",\"green\",\"red\"]}")
+        enumbytes = Avro.encode(wenum, "green")
+        for (TEnum, expected) in ((String, "green"), (Symbol, :green), (Colour, green))
+            enumreader = Avro.DatumReader(wenum, TEnum; reader_schema=renum)
+            @test !(enumreader.plan isa Avro.SemanticTarget)
+            @test enumreader(enumbytes) === expected
+        end
+        @test_throws Avro.LimitError Avro.DatumReader(wenum, Symbol; reader_schema=renum,
+            names=Avro.SymbolAdmission(max_names=0))(enumbytes)
         # a custom-hooked target still takes the semantic route
         drh = Avro.DatumReader(w, Hooked; reader_schema=r)
         @test drh.plan isa Avro.SemanticTarget || !(drh.plan isa Avro.ResolvedRecordTarget)

@@ -416,6 +416,14 @@ end
     @test Avro.minsize(huge) == typemax(Int)
     @test Avro.varintlength(0) == 1 && Avro.varintlength(63) == 1 && Avro.varintlength(64) == 2
 
+    legacy_fixed_json = """{"type":"record","name":"LegacyFixedOrdinals","fields":[
+        {"name":"plain","type":"long"},
+        {"name":"first","type":{"type":"fixed","size":1}},
+        {"name":"nested","type":{"type":"array","items":{"type":"fixed","size":2}}}]}
+        """
+    @test_throws Avro.SchemaError Avro.parseschema(legacy_fixed_json)
+    @test_throws MethodError Avro.parseschema(legacy_fixed_json; legacy_fixed_names=true)
+
     @testset "construction scope enforces graph limits (plan §4.4, amendment round 1)" begin
         tight = Avro.Limits(max_schema_nodes=1)
         @test_throws Avro.LimitError Avro.ArraySchema(Avro.LongSchema(); limits=tight)
@@ -424,6 +432,19 @@ end
         @test_throws Avro.LimitError Avro.FixedSchema("F", 4; limits=Avro.Limits(max_named_types=0))
         @test_throws Avro.LimitError Avro.schema(NamedTuple{(:a,),Tuple{Int64}}; limits=Avro.Limits(max_schema_nodes=1))
         @test_throws Avro.LimitError Avro.EnumSchema("E", ["a", "b", "c"]; limits=Avro.Limits(max_enum_symbols=2))
+        @test_throws Avro.LimitError Avro.EnumSchema("E", ["ab"]; limits=Avro.Limits(max_name_bytes=1))
+        aliased = Avro.Field("a", Avro.IntSchema(); aliases=["bc"])
+        @test_throws Avro.LimitError Avro.RecordSchema("R"; fields=[aliased], limits=Avro.Limits(max_name_bytes=1))
+        @test_throws Avro.LimitError Avro.RecordSchema("RecursiveDepth"; limits=Avro.Limits(max_schema_depth=1)) do ref
+            return [Avro.Field("next", ref)]
+        end
+        @test_throws Avro.LimitError Avro.RecordSchema("RecursiveValues"; limits=Avro.Limits(max_total_values=1)) do ref
+            return [Avro.Field("next", ref)]
+        end
+        bytebounded = Avro.Limits(max_schema_bytes=1024)
+        @test_throws Avro.LimitError Avro.NullSchema(; props=(large=repeat("a", 2000),), limits=bytebounded)
+        largefield = Avro.Field("x", Avro.StringSchema(); default=repeat("a", 2000))
+        @test_throws Avro.LimitError Avro.RecordSchema("LargeDefault"; fields=[largefield], limits=bytebounded)
         let s = Avro.LongSchema(), lim = Avro.Limits(max_schema_depth=4)
             e = try
                 for _ in 1:6
@@ -450,6 +471,9 @@ end
             end
             @test e isa Avro.LimitError && e.limit === :max_schema_bytes
         end
+        exactwork = Avro.Limits(work_allowance=0)
+        @test Avro.json(Avro.NullSchema(); limits=exactwork) == "\"null\""
+        @test Avro.canonical(Avro.NullSchema(); limits=exactwork) == "\"null\""
         @test Avro.json(s) == Avro.json(Avro.parseschema(Avro.json(s)))                  # recorded-limits default round-trips
         @test occursin("BP", sprint(show, s))                                            # show never throws for admitted schemas
     end

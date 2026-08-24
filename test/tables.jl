@@ -235,7 +235,7 @@ import DataAPI
     end
     @testset "resolved little-endian decimals through tables (legacy fixture)" begin
         leg = joinpath(@__DIR__, "fixtures", "generated", "legacy1x", "avrojl112-null.avro")
-        rdr = P("{\"type\":\"record\",\"name\":\"Record_5380612083211919099\",\"fields\":[{\"name\":\"a\",\"type\":\"double\"},{\"name\":\"dec\",\"type\":{\"type\":\"fixed\",\"name\":\"_avrojl1_fixed_7\",\"size\":16,\"logicalType\":\"decimal\",\"precision\":10,\"scale\":2}},{\"name\":\"z\",\"type\":\"int\",\"default\":7}]}")
+        rdr = P("{\"type\":\"record\",\"name\":\"Record_5380612083211919099\",\"fields\":[{\"name\":\"a\",\"type\":\"double\"},{\"name\":\"dec\",\"type\":{\"type\":\"fixed\",\"name\":\"_avrojl1_fixed_1\",\"size\":16,\"logicalType\":\"decimal\",\"precision\":10,\"scale\":2}},{\"name\":\"z\",\"type\":\"int\",\"default\":7}]}")
         t = @test_logs (:warn, r"legacy") match_mode=:any Avro.Table(leg; reader_schema=rdr, legacy=:avrojl1, decimal_byteorder=:little)
         @test Tables.columnnames(t) == [:a, :dec, :z]
         @test Tables.getcolumn(t, :a) == [1.0, 2.0]                              # PromotePlan under the little rewrite

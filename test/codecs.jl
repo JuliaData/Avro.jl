@@ -1,6 +1,44 @@
 import CodecBzip2, CodecXz                       # activate the codec extensions
 import CodecZstd, CodecZlib, TranscodingStreams, Zlib_jll
 
+mutable struct CompressionReservationIO <: IO
+    inner::IOBuffer
+    writer::Any
+    baseline::Int
+    encoded::Int
+    outputcharge::Int
+    outputcapacity::Int
+end
+
+function CompressionReservationIO()
+    return CompressionReservationIO(IOBuffer(), nothing, 0, 0, -1, -1)
+end
+
+function Base.isopen(io::CompressionReservationIO)
+    return isopen(io.inner)
+end
+
+function Base.flush(io::CompressionReservationIO)
+    return flush(io.inner)
+end
+
+function Base.write(io::CompressionReservationIO, b::UInt8)
+    return Base.write(io.inner, b)
+end
+
+function Base.unsafe_write(io::CompressionReservationIO, p::Ptr{UInt8}, n::UInt)
+    return Base.unsafe_write(io.inner, p, n)
+end
+
+function Base.write(io::CompressionReservationIO, bytes::Vector{UInt8})
+    if io.writer !== nothing
+        w = io.writer
+        io.outputcharge = w.budget.reserved - io.baseline - Avro.bytesbytes(io.encoded)
+        io.outputcapacity = Avro.capacity(bytes)
+    end
+    return Base.write(io.inner, bytes)
+end
+
 @testset "Codecs" begin
     L = Avro.Limits()
     data = reduce(vcat, [Vector{UInt8}("hello avro codec block $(i % 7) ") for i in 1:2000])
@@ -27,6 +65,20 @@ import CodecZstd, CodecZlib, TranscodingStreams, Zlib_jll
             @test codecdec(name, block) == data
             name === :null ? (@test block == data) : (@test length(block) < length(data))
             @test codecdec(name, Avro.compressblock(w, UInt8[])) == UInt8[]
+        end
+    end
+    @testset "Writer reserves the compressor's output allocation" begin
+        schema = Avro.schema(Vector{UInt8})
+        rng = Random.Xoshiro(42)
+        for name in (:deflate, :zstandard, :bzip2, :xz)
+            sink = CompressionReservationIO()
+            writer = Avro.Writer(sink, schema; codec=name, block_bytes=1 << 20)
+            push!(writer, rand(rng, UInt8, 512 << 10))
+            sink.writer = writer
+            sink.baseline = writer.budget.reserved
+            sink.encoded = writer.encoder.pos
+            close(writer)
+            @test sink.outputcharge >= Avro.bytesbytes(sink.outputcapacity)
         end
     end
     @testset "levels, workspaces and unsupported codecs" begin

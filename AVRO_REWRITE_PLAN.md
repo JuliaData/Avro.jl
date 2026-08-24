@@ -221,25 +221,26 @@ requirements for later inclusion recorded.
 
 ```julia
 abstract type Schema end
-struct NullSchema <: Schema; props::Props; hash::UInt64; end        # Props = FrozenDict{String,FrozenJSON}; FrozenJSON = recursively
-struct BooleanSchema <: Schema; props; hash; end                     # frozen JSON tree (FrozenDict / FrozenVector / immutable scalars)
-struct IntSchema <: Schema; logical::Union{Nothing,LogicalType}; props; hash; end
-struct LongSchema <: Schema; logical; props; hash; end
-struct FloatSchema <: Schema; props; hash; end
-struct DoubleSchema <: Schema; props; hash; end
-struct BytesSchema <: Schema; logical; props; hash; end
-struct StringSchema <: Schema; logical; props; hash; end
-struct ArraySchema <: Schema; items::Schema; props; hash; end
-struct MapSchema <: Schema; values::Schema; props; hash; end
-struct UnionSchema <: Schema; branches::FrozenVector{Schema}; hash; end
+# Every Schema subtype is a heap node: `mutable struct`, with every field declared `const`.
+mutable struct NullSchema <: Schema; const props::Props; const hash::UInt64; end        # Props = FrozenDict{String,FrozenJSON}; FrozenJSON = recursively
+mutable struct BooleanSchema <: Schema; const props; const hash; end                    # frozen JSON tree (FrozenDict / FrozenVector / immutable scalars)
+mutable struct IntSchema <: Schema; const logical::Union{Nothing,LogicalType}; const props; const hash; end
+mutable struct LongSchema <: Schema; const logical; const props; const hash; end
+mutable struct FloatSchema <: Schema; const props; const hash; end
+mutable struct DoubleSchema <: Schema; const props; const hash; end
+mutable struct BytesSchema <: Schema; const logical; const props; const hash; end
+mutable struct StringSchema <: Schema; const logical; const props; const hash; end
+mutable struct ArraySchema <: Schema; const items::Schema; const props; const hash; end
+mutable struct MapSchema <: Schema; const values::Schema; const props; const hash; end
+mutable struct UnionSchema <: Schema; const branches::FrozenVector{Schema}; const hash; end
 # every node additionally carries `id::FrozenRef{Int32}` (dense, graph-local, 0-based) and `graph::FrozenRef{GraphInfo}`
 # (the `Limits` the graph was admitted under, its repair flags `repaired_names`/`repaired_defaults`, node and
 # named-type counts), both filled exactly once by `freeze!` on every creation path — parser, public
 # constructors, `Avro.schema(T)` — so no identity side table exists and `==`/plans/resolution key on ids; a public constructor that
 # receives an already-frozen child deep-copies it into the new graph with fresh ids through one graph-wide copy memo, so the same child passed twice is one definition plus references (charged to the constructing
 # operation); `max_schema_nodes` keeps ids within `Int32` (validated)
-struct FixedSchema <: Schema; name::FullName; aliases::FrozenVector{String}; size::Int; logical; props; hash; end   # no `doc`: fixed defines none; a fixed `doc` lives in `props`
-struct EnumSchema <: Schema; name::FullName; aliases; doc; symbols::FrozenVector{String}; default::Default; symbolindex::FrozenDict{String,Int}; props; hash; end
+mutable struct FixedSchema <: Schema; const name::FullName; const aliases::FrozenVector{String}; const size::Int; const logical; const props; const hash; end   # no `doc`: fixed defines none; a fixed `doc` lives in `props`
+mutable struct EnumSchema <: Schema; const name::FullName; const aliases; const doc; const symbols::FrozenVector{String}; const default::Default; const symbolindex::FrozenDict{String,Int}; const props; const hash; end
 struct Field; name::String; schema::Schema; doc; default::Default; order::Order; aliases::FrozenVector{String}; props; end
 mutable struct RecordSchema <: Schema   # heap node with all-`const` fields (see the amendment below);
     const name::FullName; const aliases; const doc; const iserror::Bool; const props   # `fields`/`fieldindex`/`hash` are frozen

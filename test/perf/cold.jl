@@ -1,6 +1,7 @@
 # One cold-process §10.1 measurement: `julia --startup-file=no cold.jl <metric>` prints `metric value`.
-# Each metric reports the best of 3 in-process repetitions after one warm-up; the driver takes the
-# median of 5 cold processes. Kernels use prepared objects built outside the timed region.
+# Workload metrics report the best of 3 in-process repetitions after one warm-up; load and time-to-
+# first-table measure cold startup directly. The driver takes the median of 5 cold processes. Kernels
+# use prepared objects built outside the timed region.
 
 metric = ARGS[1]
 
@@ -24,11 +25,36 @@ const S4 = Avro.parseschema("""{"type":"record","name":"Bench","fields":[
     {"name":"id","type":"long"},{"name":"x","type":"double"},
     {"name":"name","type":"string"},{"name":"flag","type":"boolean"}]}""")
 const N = 1_000_000
-rows() = [(id=Int64(i), x=i / 7, name="name-$(i % 1000)", flag=isodd(i)) for i in 1:N]
-raisedlimits() = Avro.Limits(max_total_bytes=4 << 30, max_block_bytes=16 << 20, max_block_output_bytes=256 << 20,
-                             max_codec_memory=32 << 20, max_bytes=64 << 20, max_datum_bytes=64 << 20)
+function rows()
+    return [(id=Int64(i), x=i / 7, name="name-$(i % 1000)", flag=isodd(i)) for i in 1:N]
+end
 
-bestof3(f) = minimum((f(); GC.gc(); t0 = time(); f(); time() - t0) for _ in 1:3)
+function raisedlimits()
+    return Avro.Limits(max_total_bytes=4 << 30, max_block_bytes=16 << 20, max_block_output_bytes=256 << 20,
+                       max_codec_memory=32 << 20, max_bytes=64 << 20, max_datum_bytes=64 << 20)
+end
+
+function bestof3(f)
+    f()
+    best = Inf
+    for _ in 1:3
+        GC.gc()
+        t0 = time_ns()
+        f()
+        best = min(best, (time_ns() - t0) / 1e9)
+    end
+    return best
+end
+
+function bestallocsof3(f, args...)
+    f(args...)
+    best = typemax(Int)
+    for _ in 1:3
+        GC.gc()
+        best = min(best, @allocations f(args...))
+    end
+    return best
+end
 
 if metric == "write"
     data = rows()
@@ -57,9 +83,12 @@ elseif startswith(metric, "codec-")
     r = Avro.Reader(codecf)
     entries = Avro.prescanblocks(r).entries
     src = r.source
-    transcode1() = for e in entries
-        Avro.decompressblock(r.codecname, r.codec, view(src.buf, e.offset:e.offset + e.size - 1), r.limits, r.budget)
-        Avro.release!(r.budget, r.budget.reserved)
+    function transcode1()
+        for e in entries
+            Avro.decompressblock(r.codecname, r.codec, view(src.buf, e.offset:e.offset + e.size - 1), r.limits, r.budget)
+            Avro.release!(r.budget, r.budget.reserved)
+        end
+        return nothing
     end
     ttrans = bestof3(transcode1)
     close(r)
@@ -95,29 +124,34 @@ elseif metric == "kernels"
     deck(dr, bytes, 10)
     enck(dw, enc, v, 5000)                             # steady state: the reused encoder is fully grown
     take!(enc)
-    da = (@allocations deck(dr, bytes, 1000)) / 1000
-    t0 = time_ns()
-    deck(dr, bytes, 200_000)
-    dns = (time_ns() - t0) / 200_000
-    ea = (@allocations enck(dw, enc, v, 1000)) / 1000
+    da = bestallocsof3(deck, dr, bytes, 1000) / 1000
+    dns = bestof3(() -> deck(dr, bytes, 200_000)) * 1e9 / 200_000
+    ea = bestallocsof3(enck, dw, enc, v, 1000) / 1000
     take!(enc)
-    t0 = time_ns()
-    enck(dw, enc, v, 200_000)
-    ens = (time_ns() - t0) / 200_000
+    ens = bestof3(() -> enck(dw, enc, v, 200_000)) * 1e9 / 200_000
     # one-shot (informational): plan construction per call
-    Avro.decode(S4, bytes)
-    t0 = time_ns()
-    for _ in 1:200
-        Avro.decode(S4, bytes)
+    function oneshotdecode(n)
+        for _ in 1:n
+            Avro.decode(S4, bytes)
+        end
+        return nothing
     end
-    oneshot_dec = (time_ns() - t0) / 200
-    t0 = time_ns()
-    for _ in 1:200
-        Avro.encode(S4, v)
+    function oneshotencode(n)
+        for _ in 1:n
+            Avro.encode(S4, v)
+        end
+        return nothing
     end
-    oneshot_enc = (time_ns() - t0) / 200
+    oneshot_dec = bestof3(() -> oneshotdecode(200)) * 1e9 / 200
+    oneshot_enc = bestof3(() -> oneshotencode(200)) * 1e9 / 200
     avsc = read(joinpath(@__DIR__, "..", "fixtures", "apache", "interop.avsc"), String)
-    Avro.parseschema(avsc)
-    tparse = minimum((t0 = time_ns(); Avro.parseschema(avsc); (time_ns() - t0) / 1000) for _ in 1:50)
-    println("kernels ", da, " ", dns, " ", ea, " ", ens, " ", oneshot_dec, " ", oneshot_enc, " ", tparse)
+    function parsebatch(n)
+        for _ in 1:n
+            Avro.parseschema(avsc)
+        end
+        return nothing
+    end
+    tparse = bestof3(() -> parsebatch(50)) * 1e6 / 50
+    parseallocs = bestallocsof3(parsebatch, 50) / 50
+    println("kernels ", da, " ", dns, " ", ea, " ", ens, " ", oneshot_dec, " ", oneshot_enc, " ", tparse, " ", parseallocs)
 end

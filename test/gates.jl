@@ -60,7 +60,8 @@ end
                join(["{\"name\":\"f$i\",\"type\":$(randomschema(depth + 1))}" for i in 1:n], ",") * "]}"
     end
     function exercise(n)
-        for _ in 1:n
+        completed = 0
+        while completed < n
             src = "{\"type\":\"record\",\"name\":\"Top\",\"fields\":[" *
                   join(["{\"name\":\"g$i\",\"type\":$(randomschema(1))}" for i in 1:rand(rng, 0:8)], ",") * "]}"
             s = try
@@ -80,10 +81,10 @@ end
                 foreach(c -> c isa Avro.TypedColumn && Avro.finishcolumn!(c, budget), cols)
             end
             Avro.fromjson(s, Avro.tojson(s, v))
+            completed += 1
         end
+        return completed
     end
-    exercise(50)                                       # second warm-up: random shapes once
-    GC.gc()
     before = avrospecializations()
     # The agreed §10.2 protocol (review round 1, R14): the RSS baseline is taken after the `E` warm-up,
     # and the single post-warm-up batch of 1,000 random schemas must grow the high-water mark by less
@@ -92,10 +93,12 @@ end
     GC.gc(true)
     GC.gc(true)
     rss0 = Sys.maxrss()
+    completed = 0
     for _ in 1:20                                      # collect between slices so the high-water delta
-        exercise(50)                                   # measures retention, not the collector's heap sizing
+        completed += exercise(50)                      # measures retention, not the collector's heap sizing
         GC.gc(false)
     end
+    @test completed == 1000
     after = avrospecializations()
     @test after == before
     GC.gc(true)

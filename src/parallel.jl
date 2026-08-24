@@ -15,6 +15,29 @@ struct BlockEntry
     rowstart::Int        # 1-based row offset of the block's first datum
 end
 
+"A logical view of an exact-capacity block-table allocation."
+struct BlockTable <: AbstractVector{BlockEntry}
+    storage::Vector{BlockEntry}
+    count::Int
+end
+
+function Base.size(table::BlockTable)
+    return (table.count,)
+end
+
+function Base.IndexStyle(::Type{BlockTable})
+    return IndexLinear()
+end
+
+function Base.getindex(table::BlockTable, i::Int)
+    @boundscheck checkbounds(table, i)
+    return @inbounds table.storage[i]
+end
+
+function capacity(table::BlockTable)
+    return capacity(table.storage)
+end
+
 "Per-block worst-case scratch-and-state allowance of `W` (plan §4.9; job peaks are gated against `W`)."
 const SCRATCH_STATE_MAX = 8 * MiB
 
@@ -22,7 +45,7 @@ const SCRATCH_STATE_MAX = 8 * MiB
 const WORKER_STATE = 16 * 1024
 
 struct PrescanResult
-    entries::Vector{BlockEntry}
+    entries::BlockTable
     totalrows::Int
     pending::Union{Nothing,Exception}   # a stage-1 structural failure, pending at index nblocks + 1
 end
@@ -32,8 +55,8 @@ function prescanblocks(r::Reader)
     src = r.source::BytesSource
     tablecap = 64
     reserve!(r.budget, blocktablecharge(tablecap))     # the block table grows by reserved exact-capacity replacement (§4.4)
-    entries = BlockEntry[]
-    sizehint!(entries, tablecap)
+    entries = Vector{BlockEntry}(undef, tablecap)
+    nentries = 0
     rows = 0
     pending = nothing
     startpos = src.pos
@@ -47,26 +70,29 @@ function prescanblocks(r::Reader)
             (0 <= size <= r.limits.max_block_bytes) ||
                 (size < 0 ? throw(DataError("negative block size $size", position(src))) :
                  throw(LimitError(:max_block_bytes, Int(size), r.limits.max_block_bytes, :max_block_bytes, :decode)))
-            length(entries) < r.limits.max_blocks ||
-                throw(LimitError(:max_blocks, length(entries) + 1, r.limits.max_blocks, :max_blocks, :decode))
+            nentries < r.limits.max_blocks ||
+                throw(LimitError(:max_blocks, nentries + 1, r.limits.max_blocks, :max_blocks, :decode))
             off = src.pos
             Int(size) <= src.stop - off + 1 || throw(DataError("truncated file", off))
             src.pos = off + Int(size)
             for i in 1:16
                 (sourceeof(src) ? throw(DataError("truncated file", src.pos)) : sourcebyte(src)) == r.sync[i] ||
-                    throw(DataError("sync marker mismatch after block $(length(entries) + 1)", src.pos))
+                    throw(DataError("sync marker mismatch after block $(nentries + 1)", src.pos))
             end
             newrows = checked_add(rows, Int(count))
             newrows <= r.limits.max_rows ||
                 throw(LimitError(:max_rows, newrows, r.limits.max_rows, :max_rows, :decode))
-            if length(entries) == tablecap
-                newcap = 2 * tablecap
+            if nentries == tablecap
+                newcap = checked_mul(2, tablecap)
                 reserve!(r.budget, blocktablecharge(newcap))
+                replacement = Vector{BlockEntry}(undef, newcap)
+                copyto!(replacement, 1, entries, 1, nentries)
                 release!(r.budget, blocktablecharge(tablecap))
+                entries = replacement
                 tablecap = newcap
-                sizehint!(entries, tablecap)
             end
-            push!(entries, BlockEntry(length(entries) + 1, off, Int(size), Int(count), rows + 1))
+            nentries += 1
+            entries[nentries] = BlockEntry(nentries, off, Int(size), Int(count), rows + 1)
             rows = newrows
         end
     catch e
@@ -74,7 +100,7 @@ function prescanblocks(r::Reader)
         pending = e
     end
     src.pos = startpos
-    return PrescanResult(entries, rows, pending)
+    return PrescanResult(BlockTable(entries, nentries), rows, pending)
 end
 
 """
@@ -193,7 +219,6 @@ function decodedirect!(r::Reader, e::BlockEntry, plan, builders::Vector{ColumnBu
     addinput!(b, varintlength(e.count) + varintlength(e.size) + 16)
     out = decompressblock(r.codecname, r.codec, payload, r.limits, b)
     n = e.count
-    before = b.reserved
     if r.validate === :strict && r.legacy === :avrojl1
         d0 = Decoder(out, b)
         for _ in 1:n
@@ -210,20 +235,14 @@ function decodedirect!(r::Reader, e::BlockEntry, plan, builders::Vector{ColumnBu
     end
     d = Decoder(out, b; validate=r.validate)
     cells = plan isa RecordPlan ? fuseskips(builders) : builders
+    outputbase = b.reserved
     cap = r.limits.max_block_output_bytes
-    done = 0
-    for _ in 1:n
+    for done in 1:n
         countvalues!(b)
         decoderow!(cells, d, plan)
-        done += 1                                       # the cap is enforced per row, so the error kind
-        rowout = checked_add(max(b.reserved - before, 0), checked_mul(done, slotrow))
-        rowout <= cap ||                                # never depends on remaining ceiling headroom (R06)
-            throw(LimitError(:max_block_output_bytes, rowout, cap, :max_block_output_bytes, :decode))
+        checkblockoutput(b, outputbase, done, slotrow, cap)
     end
     d.pos == length(out) + 1 || throw(DataError("block datums did not consume the block exactly", d.pos))
-    blockout = checked_add(max(b.reserved - before, 0), checked_mul(n, slotrow))
-    blockout <= r.limits.max_block_output_bytes ||
-        throw(LimitError(:max_block_output_bytes, blockout, r.limits.max_block_output_bytes, :max_block_output_bytes, :decode))
     addrows!(b, n)
     release!(b, bytesbytes(length(out)))
     return nothing
@@ -232,7 +251,7 @@ end
 # ---- worker decode ----------------------------------------------------------------------------------
 
 "Decode one admitted higher block into per-block chunk columns under its own full reservation."
-function decodejob!(job::BlockJob, r::Reader, plan, sel::Union{Nothing,Vector{Int}}, fail::FailBox)
+function decodejob!(job::BlockJob, r::Reader, plan, sel::Union{Nothing,Vector{Int}}, fail::FailBox, slotrow::Int)
     e = job.entry
     if (@atomic fail.idx) < e.index
         @atomic job.state = :abandoned
@@ -248,7 +267,6 @@ function decodejob!(job::BlockJob, r::Reader, plan, sel::Union{Nothing,Vector{In
         addinput!(b, varintlength(e.count) + varintlength(e.size) + 16)
         out = decompressblock(cname, codec, payload, r.limits, b)
         n = e.count
-        before = b.reserved
         if r.validate === :strict && r.legacy === :avrojl1
             d0 = Decoder(out, b)
             for _ in 1:n
@@ -260,16 +278,16 @@ function decodejob!(job::BlockJob, r::Reader, plan, sel::Union{Nothing,Vector{In
         cols = columnbuilders(plan, sel, n, b)
         cells = plan isa RecordPlan ? fuseskips(cols) : cols
         d = Decoder(out, b; validate=r.validate)
+        outputbase = b.reserved
         cap = r.limits.max_block_output_bytes
-        for _ in 1:n
+        blockout = 0
+        for done in 1:n
             countvalues!(b)
             decoderow!(cells, d, plan)
-            rowout = max(b.reserved - before, 0)
-            rowout <= cap ||
-                throw(LimitError(:max_block_output_bytes, rowout, cap, :max_block_output_bytes, :decode))
+            blockout = checkblockoutput(b, outputbase, done, slotrow, cap)
         end
         d.pos == length(out) + 1 || throw(DataError("block datums did not consume the block exactly", d.pos))
-        job.outputbytes = max(b.reserved - before, 0)
+        job.outputbytes = blockout
         release!(b, bytesbytes(length(out)))
         job.cols = cols
         @atomic job.state = :done
@@ -284,9 +302,9 @@ function decodejob!(job::BlockJob, r::Reader, plan, sel::Union{Nothing,Vector{In
     return nothing
 end
 
-function workerloop(ch::Channel{BlockJob}, r::Reader, plan, sel::Union{Nothing,Vector{Int}}, fail::FailBox)
+function workerloop(ch::Channel{BlockJob}, r::Reader, plan, sel::Union{Nothing,Vector{Int}}, fail::FailBox, slotrow::Int)
     for job in ch
-        decodejob!(job, r, plan, sel, fail)
+        decodejob!(job, r, plan, sel, fail, slotrow)
     end
     return nothing
 end
@@ -388,7 +406,7 @@ function decodeblocks!(r::Reader, plan, sel::Union{Nothing,Vector{Int}}, finals:
     poolstate = checked_add(poolstate, STORAGE[].vector + 8 * nblocks)   # jobs vector rides the wave charge
     jobs = Vector{Union{Nothing,BlockJob}}(nothing, nblocks)
     ch = Channel{BlockJob}(nblocks)
-    workers = Task[Threads.@spawn workerloop(ch, r, plan, sel, fail) for _ in 1:nworkers]
+    workers = Task[Threads.@spawn workerloop(ch, r, plan, sel, fail, slotrow) for _ in 1:nworkers]
     foreach(errormonitor, workers)
     inflight = 0
     wavecharged = false                                # the settled 16 KiB per-worker state, charged per

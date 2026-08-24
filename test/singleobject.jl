@@ -106,6 +106,14 @@
             Avro.register!(c2, s)
         end
         @test length(c2.fingerprints) == length(c2.schemas) == 2                          # exact-capacity replacement
+        peakbounded = Avro.SchemaCache(max_bytes=172)
+        nullfp = Avro.register!(peakbounded, P("\"null\""))
+        @test_throws Avro.LimitError Avro.register!(peakbounded, P("\"long\""))        # old and new index vectors overlap
+        @test length(peakbounded) == 1 && Avro.lookup(peakbounded, nullfp) isa Avro.NullSchema
+        exactpeak = Avro.SchemaCache(max_bytes=188)
+        Avro.register!(exactpeak, P("\"null\""))
+        Avro.register!(exactpeak, P("\"long\""))
+        @test length(exactpeak) == 2 && exactpeak.bytes == 172
         msg = Avro.encodesingle(s1, (a=Int64(7),))
         @test Avro.decodesingle(msg, c2).a === Int64(7)
         big = Avro.encodesingle(s1, (a=typemax(Int64),))

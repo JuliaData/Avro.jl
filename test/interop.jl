@@ -33,7 +33,7 @@ function deterministic(s::Avro.Schema, seen=Set{UInt}())
 end
 
 function decodeall(s::Avro.Schema, bytes::Vector{UInt8})
-    out = Any[]
+    out = []
     pos = 1
     while pos <= length(bytes)
         v, pos = Avro.decode(s, bytes, pos)
@@ -109,7 +109,9 @@ function javaharness(dir::String, class::String, args...)
     return read(outpath)
 end
 
-javaharnesstext(dir::String, class::String, args...) = String(javaharness(dir, class, args...))
+function javaharnesstext(dir::String, class::String, args...)
+    return String(javaharness(dir, class, args...))
+end
 
 @testset "§8.5 matrix: containers, canonical, resolution, single-object, sort order, negatives" begin
     gen = joinpath(FIXTURES, "generated")
@@ -123,17 +125,32 @@ javaharnesstext(dir::String, class::String, args...) = String(javaharness(dir, c
             endswith(f, ".avsc") && push!(schemacases, f)
         end
     end
-    # fastavro re-encodes union values under its own branch selection (enum -> string, int/float ->
-    # wider branches; recorded in Phase 4a), so its round trip compares semantically: union identity
-    # unwrapped and numeric branches promoted.
-    looseeq(a, b) = isequal(a, b)
-    looseeq(a::Avro.UnionValue, b) = looseeq(a.value, b)
-    looseeq(a, b::Avro.UnionValue) = looseeq(a, b.value)
-    looseeq(a::Avro.UnionValue, b::Avro.UnionValue) = looseeq(a.value, b.value)
-    looseeq(a::Real, b::Real) = a isa Bool || b isa Bool ? isequal(a, b) : (isequal(a, b) || Float64(a) == Float64(b))
-    looseeq(a::Avro.EnumValue, b::AbstractString) = String(a) == b
-    looseeq(a::AbstractString, b::Avro.EnumValue) = a == String(b)
-    looseeq(a::AbstractVector, b::AbstractVector) = length(a) == length(b) && all(looseeq(x, y) for (x, y) in zip(a, b))
+    # fastavro does not expose union branch identity after reading, so comparisons against that oracle
+    # are value-semantic. Numeric equality remains exact.
+    function looseeq(a, b)
+        return isequal(a, b)
+    end
+    function looseeq(a::Avro.UnionValue, b)
+        return looseeq(a.value, b)
+    end
+    function looseeq(a, b::Avro.UnionValue)
+        return looseeq(a, b.value)
+    end
+    function looseeq(a::Avro.UnionValue, b::Avro.UnionValue)
+        return looseeq(a.value, b.value)
+    end
+    function looseeq(a::Real, b::Real)
+        return a isa Bool || b isa Bool ? isequal(a, b) : (isequal(a, b) || a == b)
+    end
+    function looseeq(a::Avro.EnumValue, b::AbstractString)
+        return String(a) == b
+    end
+    function looseeq(a::AbstractString, b::Avro.EnumValue)
+        return a == String(b)
+    end
+    function looseeq(a::AbstractVector, b::AbstractVector)
+        return length(a) == length(b) && all(looseeq(x, y) for (x, y) in zip(a, b))
+    end
     function looseeq(a::Avro.Record, b::Avro.Record)
         ka, kb = keys(a), keys(b)
         ka == kb || return false
@@ -143,18 +160,73 @@ javaharnesstext(dir::String, class::String, args...) = String(javaharness(dir, c
         Set(keys(a)) == Set(keys(b)) || return false
         return all(looseeq(a[k], b[k]) for k in keys(a))
     end
+    @test !looseeq(Int64(2)^53 + 1, Float64(Int64(2)^53))
+
+    # A type-preserving value tree for the Python oracle. fastavro does not expose union branch identity,
+    # so unions compare by value; numeric kinds and every numeric bit remain distinct.
+    function oraclevalue(::Avro.Schema, v, j)
+        return j
+    end
+    function oraclevalue(::Union{Avro.IntSchema,Avro.LongSchema}, v, j)
+        return Dict("\$integer" => string(j))
+    end
+    function oraclevalue(::Union{Avro.FloatSchema,Avro.DoubleSchema}, v, j)
+        return Dict("\$float" => string(reinterpret(UInt64, Float64(v)); base=16, pad=16))
+    end
+    function oraclevalue(::Union{Avro.BytesSchema,Avro.FixedSchema}, v, j)
+        return Dict("\$bytes" => bytes2hex(UInt8[UInt8(c) for c in j]))
+    end
+    function oraclevalue(s::Avro.ArraySchema, v, j)
+        return Any[oraclevalue(s.items, x, y) for (x, y) in zip(v, j)]
+    end
+    function oraclevalue(s::Avro.MapSchema, v, j)
+        return Dict(k => oraclevalue(s.values, v[k], value) for (k, value) in j)
+    end
+    function oraclevalue(s::Avro.RecordSchema, v, j)
+        return Dict(f.name => oraclevalue(f.schema, v[f.name], j[f.name]) for f in s.fields)
+    end
+    function oraclevalue(s::Avro.UnionSchema, v, j)
+        j === nothing && return j
+        i, inner = if v isa Avro.UnionValue
+            (v.index, v.value)
+        else
+            (3 - Avro.nullablebranch(s), v)
+        end
+        branch = s.branches[i]
+        label = Avro.unionlabel(branch)
+        return oraclevalue(branch, inner, j[label])
+    end
+    function oraclejson(s::Avro.Schema, v)
+        tree = Avro.JSON.parse(Avro.tojson(s, v))
+        return Avro.JSON.json(oraclevalue(s, v, tree))
+    end
 
     @testset "(1) Julia-written containers read by both oracles, every codec" begin
-        pyreencode = tempname() * ".py"
-        write(pyreencode, """
-import sys, fastavro
-inp, outp = sys.argv[1], sys.argv[2]
+        availablecodecs = Set(Avro.codecs())
+        requiredcodecs = (:null, :deflate, :snappy, :zstandard)
+        @test all(in(availablecodecs), requiredcodecs)
+        containercodecs = filter(in(availablecodecs), (:null, :deflate, :snappy, :zstandard, :bzip2, :xz))
+        testedcodecs = Set{Symbol}()
+        pycheck = tempname() * ".py"
+        write(pycheck, """
+import json, struct, sys, fastavro
+fastavro.read.LOGICAL_READERS.clear()
+inp, expectedp = sys.argv[1], sys.argv[2]
 with open(inp, "rb") as f:
     r = fastavro.reader(f)
     records = list(r)
-    schema = r.writer_schema
-with open(outp, "wb") as f:
-    fastavro.writer(f, schema, records, codec="null")
+with open(expectedp, "r", encoding="utf-8") as f:
+    expected = [json.loads(line) for line in f if line.strip()]
+def normalise(value):
+    if value is None or isinstance(value, (bool, str)): return value
+    if isinstance(value, int): return {"\$integer": str(value)}
+    if isinstance(value, float): return {"\$float": struct.pack(">d", value).hex()}
+    if isinstance(value, (bytes, bytearray)): return {"\$bytes": bytes(value).hex()}
+    if isinstance(value, dict): return {key: normalise(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)): return [normalise(item) for item in value]
+    raise TypeError(f"unsupported fastavro value {type(value)!r}")
+if normalise(records) != expected:
+    raise AssertionError("fastavro container values differ from Julia's Avro JSON values")
 """)
         for avsc in schemacases
             s = Avro.parseschema(read(avsc, String))
@@ -163,7 +235,7 @@ with open(outp, "wb") as f:
             isfile(jsonl) || continue
             vs = [Avro.fromjson(s, line) for line in filter(!isempty, readlines(jsonl))]
             isempty(vs) && continue
-            for codec in (:null, :deflate, :snappy, :zstandard)
+            for codec in containercodecs
                 dir = mktempdir()
                 file = joinpath(dir, "j.avro")
                 w = Avro.Writer(file, s; codec=codec)
@@ -173,13 +245,23 @@ with open(outp, "wb") as f:
                 back = [Avro.fromjson(s, line) for line in filter(!isempty, split(jout, '\n'))]
                 @test isequal(back, vs)                                     # Java reads every codec semantically
                 if haspy
-                    reenc = joinpath(dir, "p.avro")
-                    ok = success(run(pipeline(`$py $pyreencode $file $reenc`; stdout=devnull, stderr=devnull)))
+                    expected = joinpath(dir, "expected.jsonl")
+                    open(expected, "w") do expectedio
+                        for v in vs
+                            println(expectedio, oraclejson(s, v))
+                        end
+                    end
+                    pyerr = joinpath(dir, "fastavro.err")
+                    pyproc = run(pipeline(`$py $pycheck $file $expected`; stdout=devnull, stderr=pyerr); wait=false)
+                    wait(pyproc)
+                    ok = success(pyproc)
+                    ok || @info "fastavro semantic comparison failed" schema=basename(avsc) codec stderr=read(pyerr, String)
                     @test ok
-                    ok && @test looseeq(collect(Avro.eachdatum(Avro.Reader(reenc))), vs)   # fastavro round-trips the values (semantic)
                 end
+                push!(testedcodecs, codec)
             end
         end
+        @test testedcodecs == Set(containercodecs)
     end
     @testset "(3) canonical form and fingerprints vs avro-tools" begin
         for avsc in schemacases
@@ -188,28 +270,34 @@ with open(outp, "wb") as f:
             @test jc == Avro.canonical(s)
             jf = split(strip(String(javatool("fingerprint", avsc))))[1]
             @test bswap(parse(UInt64, jf; base=16)) == Avro.fingerprint(s)   # avro-tools prints the CRC little-endian
+            for (javaalgorithm, juliaalgorithm) in (("MD5", :md5), ("SHA-256", :sha256))
+                digest = split(strip(String(javatool("fingerprint", "--fingerprint", javaalgorithm, avsc))))[1]
+                @test digest == bytes2hex(Avro.fingerprint(s; algorithm=juliaalgorithm))
+            end
         end
     end
     if hd !== nothing
         @testset "(4) schema resolution vs the Java reader" begin
             pairsdir = joinpath(gen, "evolution")
-            if isdir(pairsdir)
-                for wf in filter(f -> endswith(f, ".writer.avsc"), readdir(pairsdir; join=true))
-                    rf = replace(wf, ".writer.avsc" => ".reader.avsc")
-                    data = replace(wf, ".writer.avsc" => ".avro")
-                    (isfile(rf) && isfile(data)) || continue
-                    ws, rs = Avro.parseschema(read(wf, String)), Avro.parseschema(read(rf, String))
-                    jout = javaharnesstext(hd, "ReadWithReader", data, rf)
-                    jvals = [Avro.fromjson(rs, line) for line in filter(!isempty, split(jout, '\n'))]
-                    t = Avro.Reader(data; limits=Avro.Limits()) do r
-                        collect(Avro.eachdatum(r))
-                    end
-                    resolved = Avro.Rows(data; reader_schema=rs, union_resolution=:java)
-                    rvals = Any[Avro.record(row) for row in resolved]
-                    close(resolved)
-                    @test isequal([Avro.tojson(rs, v) for v in rvals], [Avro.tojson(rs, v) for v in jvals])
-                end
+            resolutionfixtures = [
+                (joinpath(gen, "data", "everything-null.avro"), joinpath(pairsdir, "everything_readerA.avsc")),
+                (joinpath(gen, "data", "everything-null.avro"), joinpath(pairsdir, "everything_readerB.avsc")),
+                (joinpath(FIXTURES, "apache", "weather.avro"), joinpath(pairsdir, "weather_reader.avsc")),
+            ]
+            resolutioncases = 0
+            for (data, rf) in resolutionfixtures
+                @test isfile(data) && isfile(rf)
+                rs = Avro.parseschema(read(rf, String))
+                jout = javaharnesstext(hd, "ReadWithReader", data, rf)
+                jvals = [Avro.fromjson(rs, line) for line in filter(!isempty, split(jout, '\n'))]
+                resolved = Avro.Rows(data; reader_schema=rs, union_resolution=:java)
+                rvals = Any[Avro.record(row) for row in resolved]
+                close(resolved)
+                @test !isempty(rvals)
+                @test looseeq(rvals, jvals)
+                resolutioncases += 1
             end
+            @test resolutioncases == length(resolutionfixtures)
         end
         @testset "(5) single-object bytes cross-decoded" begin
             s = Avro.parseschema("{\"type\":\"record\",\"name\":\"SO\",\"fields\":[{\"name\":\"a\",\"type\":\"long\"},{\"name\":\"b\",\"type\":\"string\"}]}")

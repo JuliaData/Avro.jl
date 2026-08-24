@@ -12,6 +12,51 @@
         @test r.budget.reserved == w.preflightbase              # the same graph, metadata and read plan
         close(r)
     end
+    @testset "byte and stream headers have identical near-ceiling acceptance" begin
+        maxmetadata = (40 << 20) - 6
+        smallkeys = ["k$(lpad(i, 4, '0'))" for i in 1:1024]
+        largekeybytes = maxmetadata - sizeof("avro.schema") - sizeof("\"null\"") - sum(sizeof, smallkeys)
+        limits = Avro.Limits(max_total_bytes=80 << 20, max_codec_memory=16 << 20,
+                             max_block_bytes=1 << 20, max_block_output_bytes=1 << 20,
+                             max_bytes=1 << 20, max_datum_bytes=1 << 20,
+                             max_schema_bytes=6, max_metadata_bytes=maxmetadata)
+        long = Avro.LongSchema()
+        function varint(n)
+            return Avro.encode(long, Int64(n))
+        end
+        header = IOBuffer()
+        write(header, b"Obj\x01")
+        write(header, varint(length(smallkeys) + 2))
+        write(header, varint(sizeof("avro.schema")), codeunits("avro.schema"),
+              varint(sizeof("\"null\"")), codeunits("\"null\""))
+        for key in smallkeys
+            write(header, varint(sizeof(key)), codeunits(key), varint(0))
+        end
+        write(header, varint(largekeybytes))
+        chunk = fill(UInt8('z'), 1 << 20)
+        whole, remainder = divrem(largekeybytes, length(chunk))
+        for _ in 1:whole
+            write(header, chunk)
+        end
+        write(header, view(chunk, 1:remainder), varint(0), varint(0), zeros(UInt8, 16))
+        bytes = take!(header)
+        path = joinpath(dir, "header-source-equivalence.avro")
+        write(path, bytes)
+
+        function outcome(src; kw...)
+            try
+                r = Avro.Reader(src; limits=limits, kw...)
+                close(r)
+                return :accepted
+            catch e
+                return (typeof(e), e isa Avro.LimitError ? e.limit : nothing, sprint(showerror, e))
+            end
+        end
+        frombytes = outcome(bytes)
+        fromstream = outcome(path; mmap=false)
+        @test frombytes === :accepted
+        @test fromstream == frombytes
+    end
     @testset "strict consumers charge each datum once" begin
         lim = Avro.Limits(max_total_values=100, work_allowance=1000)
         nullio = IOBuffer()
@@ -36,6 +81,61 @@
         emptybytes = take!(emptyio)
         @test length(Avro.Table(IOBuffer(emptybytes); limits=lim, ntasks=1)) == 60
         Threads.nthreads() > 1 && @test length(Avro.Table(emptybytes; limits=lim, ntasks=2)) == 60
+    end
+    @testset "writer and reader use identical container work counters" begin
+        limits = Avro.Limits(max_total_values=16)
+        schema = Avro.StringSchema()
+        for codec in Avro.codecs()
+            io = IOBuffer()
+            writer = Avro.Writer(io, schema; codec=codec, limits=limits)
+            push!(writer, "x")
+            close(writer)
+            bytes = take!(io)
+            writerstate = (values=writer.budget.values, input_bytes=writer.budget.input_bytes,
+                           rows=writer.budget.rows, blocks=writer.budget.blocks,
+                           members=writer.budget.members, compare_bytes=writer.budget.compare_bytes,
+                           allowance_used=Avro.allowanceused(writer.budget))
+            values, readerstate = Avro.Reader(IOBuffer(bytes); limits=limits) do reader
+                decoded = collect(Avro.eachdatum(reader))
+                state = (values=reader.budget.values, input_bytes=reader.budget.input_bytes,
+                         rows=reader.budget.rows, blocks=reader.budget.blocks,
+                         members=reader.budget.members, compare_bytes=reader.budget.compare_bytes,
+                         allowance_used=Avro.allowanceused(reader.budget))
+                return decoded, state
+            end
+            @test values == ["x"]
+            @test writerstate == readerstate
+        end
+
+        tight = Avro.Limits(max_total_values=3)
+        tightio = IOBuffer()
+        tightwriter = Avro.Writer(tightio, schema; limits=tight)
+        headersize = position(tightio)
+        err = try
+            push!(tightwriter, "x")
+            close(tightwriter)
+            nothing
+        catch e
+            close(tightwriter; abort=true)
+            e
+        end
+        @test err isa Avro.LimitError && err.limit === :max_total_values && err.observed == 4
+        @test position(tightio) == headersize                         # no unreadable data block was emitted
+    end
+    @testset "schema printing does not subsidise datum work" begin
+        dense = fill(nothing, 67_000)
+        dense_schema = Avro.ArraySchema(Avro.NullSchema())
+        dense_io = IOBuffer()
+        dense_writer = Avro.Writer(dense_io, dense_schema)
+        err = try
+            push!(dense_writer, dense)
+            close(dense_writer)
+            nothing
+        catch e
+            e
+        end
+        err === nothing || close(dense_writer; abort=true)
+        @test err isa Avro.LimitError && err.limit === :max_values_per_byte
     end
     @testset "writer and reader enforce cumulative row and block limits" begin
         for limits in (Avro.Limits(max_block_count=0), Avro.Limits(max_rows=0))

@@ -22,7 +22,9 @@ end
 
 Row(record::Record; names=DEFAULT_ADMISSION) = Row(record, admission(names))
 
-admitnames(s::RecordSchema, adm, budget::Union{Nothing,Budget}=nothing) = Symbol[admit!(adm, f.name; budget=budget) for f in s.fields]
+function admitnames(s::RecordSchema, adm, budget::Union{Nothing,Budget}=nothing)
+    return Symbol[admit!(adm, f.name; budget=budget) for f in s.fields]
+end
 
 Tables.columnnames(r::Row) = admitnames(getfield(getfield(r, :record), :schema), getfield(r, :admission))
 Tables.getcolumn(r::Row, i::Int) = getfield(getfield(r, :record), :values)[i]
@@ -201,26 +203,22 @@ function decodestreamed!(r::Reader, plan, sel::Union{Nothing,Vector{Int}}, colst
     counts = Int[]
     chunkcols = Vector{Vector{AbstractVector}}()
     reserve!(r.budget, blocktablecharge(0))
+    slotrow = sum(slotbytes, colstypes; init=0)
     while (blk = nextblock!(r; walk=false)) !== nothing
         reserve!(r.budget, 40 + STORAGE[].vector + 8 * length(colstypes))   # the block-table entry and outer chunk container (R06)
         count, bytes = blk
         reserve!(r.budget, bytesbytes(length(bytes)))
-        before = r.budget.reserved
         d = Decoder(bytes, r.budget; validate=r.validate)
         cols = columnbuilders(plan, sel, count, r.budget)
         cells = plan isa RecordPlan ? fuseskips(cols) : cols
+        outputbase = r.budget.reserved
         cap = r.limits.max_block_output_bytes
-        for _ in 1:count
+        for done in 1:count
             countvalues!(r.budget)
             decoderow!(cells, d, plan)
-            rowout = max(r.budget.reserved - before, 0)
-            rowout <= cap ||
-                throw(LimitError(:max_block_output_bytes, rowout, cap, :max_block_output_bytes, :decode))
+            checkblockoutput(r.budget, outputbase, done, slotrow, cap)
         end
         d.pos == length(bytes) + 1 || throw(DataError("block datums did not consume the block exactly", d.pos))
-        blockout = max(r.budget.reserved - before, 0)   # chunk slots and payload the block produced
-        blockout <= r.limits.max_block_output_bytes ||
-            throw(LimitError(:max_block_output_bytes, blockout, r.limits.max_block_output_bytes, :max_block_output_bytes, :decode))
         release!(r.budget, bytesbytes(length(bytes)))
         keep = AbstractVector[]
         for i in (sel === nothing ? eachindex(cols) : sel)
@@ -354,10 +352,21 @@ function nextpow2rows(n::Int)
     return cap
 end
 
-Base.IteratorSize(::Type{<:Rows}) = Base.SizeUnknown()
-Base.IteratorSize(::Type{Rows{true}}) = Base.HasLength()
-Base.length(rows::Rows{true}) = getfield(rows, :nrows)
-Base.IteratorEltype(::Type{<:Rows}) = Base.EltypeUnknown()
+function Base.IteratorSize(::Type{<:Rows})
+    return Base.SizeUnknown()
+end
+
+function Base.IteratorSize(::Type{Rows{true}})
+    return Base.HasLength()
+end
+
+function Base.length(rows::Rows{true})
+    return getfield(rows, :nrows)
+end
+
+function Base.IteratorEltype(::Type{<:Rows})
+    return Base.EltypeUnknown()
+end
 
 function Base.iterate(rows::Rows, ::Nothing=nothing)
     r = rows.reader
