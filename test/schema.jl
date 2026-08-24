@@ -450,6 +450,9 @@ end
             end
             @test e isa Avro.LimitError && e.limit === :max_schema_bytes
         end
+        exactwork = Avro.Limits(work_allowance=0)
+        @test Avro.json(Avro.NullSchema(); limits=exactwork) == "\"null\""
+        @test Avro.canonical(Avro.NullSchema(); limits=exactwork) == "\"null\""
         @test Avro.json(s) == Avro.json(Avro.parseschema(Avro.json(s)))                  # recorded-limits default round-trips
         @test occursin("BP", sprint(show, s))                                            # show never throws for admitted schemas
     end

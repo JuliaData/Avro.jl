@@ -869,15 +869,16 @@ BoundedWriter(budget::Budget, maxbytes::Int) = BoundedWriter(IOBuffer(), budget,
 const PRINT_CHUNK = 4096
 
 function boundedgrow!(w::BoundedWriter, n::Int)
-    w.written += n
-    w.written <= w.maxbytes ||
-        throw(LimitError(:max_schema_bytes, w.written, w.maxbytes, :max_schema_bytes, :encode))
-    if w.written > w.charged
-        step = max(PRINT_CHUNK, w.written - w.charged)
+    written = checked_add(w.written, n)
+    written <= w.maxbytes ||
+        throw(LimitError(:max_schema_bytes, written, w.maxbytes, :max_schema_bytes, :encode))
+    if written > w.charged
+        step = max(PRINT_CHUNK, written - w.charged)
         reserve!(w.budget, step)
-        addinput!(w.budget, step)                      # produced text is the work-rule denominator
-        w.charged += step
+        w.charged = checked_add(w.charged, step)
     end
+    w.written = written
+    addinput!(w.budget, n)                             # produced text, not reserved capacity, is the denominator
     return nothing
 end
 
@@ -973,7 +974,6 @@ function printprops(io::IO, p::Props, pretty::Bool, level::Int, first::Bool)
 end
 
 function printschema(io::IO, s::Schema, enclosing::String, seen::FrozenDict{String,Bool}, pretty::Bool, level::Int)
-    countnode!(io)
     if s isa PrimitiveSchema
         if isempty(s.props)
             print(io, '"', kind(s), '"')
@@ -1008,12 +1008,14 @@ function printschema(io::IO, s::Schema, enclosing::String, seen::FrozenDict{Stri
         full = fullname(s)
         if haskey(seen, full)
             escapejson(io, s.name.namespace == enclosing ? s.name.name : full)
+            countnode!(io)
             return nothing
         end
         seen[full] = true
         chargeseen!(io, 32 + sizeof(full))
         printnamed(io, s, enclosing, seen, pretty, level)
     end
+    countnode!(io)
     return nothing
 end
 

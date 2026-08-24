@@ -18,7 +18,6 @@ function canonical(s::Schema; limits::Limits=graphlimits(s))
 end
 
 function canonicalprint(io::IO, s::Schema, seen::FrozenDict{String,Bool})
-    countnode!(io)
     if s isa PrimitiveSchema
         print(io, '"', kind(s), '"')
     elseif s isa UnionSchema
@@ -40,6 +39,7 @@ function canonicalprint(io::IO, s::Schema, seen::FrozenDict{String,Bool})
         full = fullname(s)
         if haskey(seen, full)
             escapejson(io, full)
+            countnode!(io)
             return nothing
         end
         seen[full] = true
@@ -68,6 +68,7 @@ function canonicalprint(io::IO, s::Schema, seen::FrozenDict{String,Bool})
             print(io, "]}")
         end
     end
+    countnode!(io)
     return nothing
 end
 

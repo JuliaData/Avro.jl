@@ -37,6 +37,21 @@
         @test length(Avro.Table(IOBuffer(emptybytes); limits=lim, ntasks=1)) == 60
         Threads.nthreads() > 1 && @test length(Avro.Table(emptybytes; limits=lim, ntasks=2)) == 60
     end
+    @testset "schema printing does not subsidise datum work" begin
+        dense = fill(nothing, 67_000)
+        dense_schema = Avro.ArraySchema(Avro.NullSchema())
+        dense_io = IOBuffer()
+        dense_writer = Avro.Writer(dense_io, dense_schema)
+        err = try
+            push!(dense_writer, dense)
+            close(dense_writer)
+            nothing
+        catch e
+            e
+        end
+        err === nothing || close(dense_writer; abort=true)
+        @test err isa Avro.LimitError && err.limit === :max_values_per_byte
+    end
     @testset "writer and reader enforce cumulative row and block limits" begin
         for limits in (Avro.Limits(max_block_count=0), Avro.Limits(max_rows=0))
             writer = Avro.Writer(IOBuffer(), Avro.NullSchema(); limits=limits)
