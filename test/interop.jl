@@ -120,10 +120,13 @@ end
     haspy = !isempty(py) && success(run(pipeline(`$py -c "import fastavro"`; stdout=devnull, stderr=devnull)))
     haspy || @info "fastavro oracle not available (set AVRO_PYTHON); the Python halves are skipped"
     schemacases = String[]
-    for d in ("roots", "schemas")
+    for d in ("roots", "schemas", "evolution")
         for f in readdir(joinpath(gen, d); join=true)
             endswith(f, ".avsc") && push!(schemacases, f)
         end
+    end
+    for f in readdir(joinpath(FIXTURES, "apache"); join=true)
+        endswith(f, ".avsc") && push!(schemacases, f)
     end
     # fastavro does not expose union branch identity after reading, so comparisons against that oracle
     # are value-semantic. Numeric equality remains exact.
@@ -243,7 +246,12 @@ if normalise(records) != expected:
                 close(w)
                 jout = String(javatool("tojson", file))
                 back = [Avro.fromjson(s, line) for line in filter(!isempty, split(jout, '\n'))]
+                @test length(back) == length(vs)                            # the datum count survives
                 @test isequal(back, vs)                                     # Java reads every codec semantically
+                jschema = Avro.parseschema(String(javatool("getschema", file)))
+                @test Avro.parsingequivalent(jschema, s)                    # the schema survives
+                jmeta = String(javatool("getmeta", file))
+                @test occursin(String(codec), jmeta)                        # the codec name survives in the metadata
                 if haspy
                     expected = joinpath(dir, "expected.jsonl")
                     open(expected, "w") do expectedio
@@ -333,6 +341,132 @@ if normalise(records) != expected:
     else
         @info "javac unavailable; the harness categories (4)-(6) are skipped"
     end
+    function samplesort(ss::Avro.Schema, rng)
+        ss isa Avro.RecordSchema || error("record shapes only")
+        vals = Any[]
+        for f in ss.fields
+            fs = f.schema
+            push!(vals, fs isa Avro.DoubleSchema ? rand(rng, (-0.0, 0.0, 1.5, -2.5, Inf, -Inf, NaN)) :
+                        fs isa Avro.LongSchema ? rand(rng, Int64(-5):Int64(5)) :
+                        fs isa Avro.StringSchema ? String(rand(rng, 'a':'c', rand(rng, 0:3))) :
+                        fs isa Avro.EnumSchema ? String(rand(rng, fs.symbols)) :
+                        fs isa Avro.UnionSchema ? (rand(rng, Bool) ? Avro.UnionValue(1, Int32(rand(rng, -3:3))) : Avro.UnionValue(2, String(rand(rng, 'a':'c', 2)))) :
+                        error("unhandled sort shape"))
+        end
+        nt = NamedTuple{Tuple(Symbol(f.name) for f in ss.fields)}(Tuple(vals))
+        return nt
+    end
+
+    @testset "(2b) positive and sized collection block forms as independent oracle cases" begin
+        arr = Avro.parseschema("{\"type\":\"array\",\"items\":\"long\"}")
+        avsc = tempname() * ".avsc"
+        write(avsc, Avro.json(arr))
+        positive = Avro.encode(arr, Int64[3, 4, 5])                       # the writer's positive-count form
+        items = reduce(vcat, [Avro.encode(Avro.parseschema("\"long\""), Int64(v)) for v in (3, 4, 5)])
+        sized = vcat(Avro.encode(Avro.parseschema("\"long\""), -3)[1:0], UInt8[0x05], UInt8[UInt8(2 * length(items))], items, UInt8[0x00])
+        # zigzag(-3) = 5 = 0x05; the sized form declares its byte size after the negative count
+        for (label, bytes) in (("positive", positive), ("sized", sized))
+            f = tempname()
+            write(f, bytes)
+            jout = strip(String(javatool("fragtojson", "--no-pretty", "--schema-file", avsc, f)))
+            @test Avro.fromjson(arr, jout) == Int64[3, 4, 5]              # Java decodes both wire forms
+            @test Avro.decode(arr, bytes) == Int64[3, 4, 5]               # and so does Julia
+        end
+    end
+    @testset "(4b) resolution: both policies, both oracles, constructed pairs" begin
+        wsrc = "{\"type\":\"record\",\"name\":\"RP\",\"fields\":[{\"name\":\"a\",\"type\":\"int\"},{\"name\":\"old\",\"type\":\"string\"},{\"name\":\"u\",\"type\":[\"null\",\"long\"]}]}"
+        rsrc = "{\"type\":\"record\",\"name\":\"RP\",\"fields\":[{\"name\":\"a\",\"type\":\"double\"},{\"name\":\"renamed\",\"type\":\"string\",\"aliases\":[\"old\"]},{\"name\":\"u\",\"type\":[\"null\",\"long\"]},{\"name\":\"z\",\"type\":\"int\",\"default\":5}]}"
+        ws, rs = Avro.parseschema(wsrc), Avro.parseschema(rsrc)
+        rows = [(a=Int32(i), old="o$i", u=isodd(i) ? Int64(i) : missing) for i in 1:50]
+        dir = mktempdir()
+        data = joinpath(dir, "rp.avro")
+        wtr = Avro.Writer(data, ws)
+        foreach(v -> push!(wtr, v), rows)
+        close(wtr)
+        rf = joinpath(dir, "rp-reader.avsc")
+        write(rf, rsrc)
+        for policy in (:spec, :java)
+            resolved = Avro.Rows(data; reader_schema=rs, union_resolution=policy)
+            vals = Any[Avro.record(row) for row in resolved]
+            close(resolved)
+            @test length(vals) == 50 && vals[1].a === 1.0 && vals[1].renamed == "o1" && vals[1].z === Int32(5)
+            if policy === :java && hd !== nothing
+                jout = javaharnesstext(hd, "ReadWithReader", data, rf)
+                jvals = [Avro.fromjson(rs, line) for line in filter(!isempty, split(jout, '\n'))]
+                @test isequal([Avro.tojson(rs, v) for v in vals], [Avro.tojson(rs, v) for v in jvals])
+            end
+        end
+        if haspy
+            pyres = tempname() * ".py"
+            write(pyres, """
+import sys, json, fastavro
+data, readerf = sys.argv[1], sys.argv[2]
+reader_schema = json.load(open(readerf))
+with open(data, "rb") as f:
+    for rec in fastavro.reader(f, reader_schema=reader_schema):
+        rec["u"] = None if rec["u"] is None else {"long": rec["u"]}   # fastavro strips union wrapping; restore Avro JSON encoding
+        print(json.dumps(rec, sort_keys=True))
+""")
+            out = read(`$py $pyres $data $rf`, String)
+            plines = filter(!isempty, split(out, '\n'))
+            @test length(plines) == 50                                    # fastavro resolves the same pairs
+            first = Avro.fromjson(rs, plines[1])
+            @test first.a === 1.0 && first.renamed == "o1" && first.z === Int32(5)
+        end
+    end
+    if hd !== nothing
+        @testset "(6b) sort order: committed Java vectors run live; diverse shapes" begin
+            sortdir = joinpath(gen, "sortorder")
+            ran = 0
+            for line in filter(!isempty, readlines(joinpath(sortdir, "verdicts.tsv")))
+                name, _, expectbytes = split(line, '\t')
+                av = joinpath(sortdir, "$name.avsc")
+                fa = joinpath(sortdir, "$name.a.json")
+                fb = joinpath(sortdir, "$name.b.json")
+                (isfile(av) && isfile(fa) && isfile(fb)) || continue
+                ss = Avro.parseschema(read(av, String))
+                # compare the same wire bytes Java compared: fromjson/encode would canonicalise
+                # logical surface forms (non-minimal decimal, mixed-case uuid) and mask deviations
+                wa = Vector{UInt8}(javatool("jsontofrag", "--schema-file", av, fa))
+                wb = Vector{UInt8}(javatool("jsontofrag", "--schema-file", av, fb))
+                if startswith(expectbytes, "ERROR")
+                    jok = try
+                        javaharnesstext(hd, "CompareBytes", av, fa, fb)
+                        true
+                    catch
+                        false
+                    end
+                    @test !jok                                            # Java rejects live, as recorded (maps have no sort order)
+                    @test_throws ArgumentError Avro.comparebytes(ss, wa, wb)
+                    ran += 1
+                    continue
+                end
+                jv = parse(Int, strip(javaharnesstext(hd, "CompareBytes", av, fa, fb)))
+                @test jv == parse(Int, expectbytes)                       # the committed vectors reproduce live
+                @test sign(jv) == sign(Avro.comparebytes(ss, wa, wb))
+                ran += 1
+            end
+            @test ran >= 40
+            shapes = ("{\"type\":\"record\",\"name\":\"S1\",\"fields\":[{\"name\":\"d\",\"type\":\"double\"}]}",
+                      "{\"type\":\"record\",\"name\":\"S2\",\"fields\":[{\"name\":\"k\",\"type\":\"long\",\"order\":\"descending\"},{\"name\":\"s\",\"type\":\"string\"}]}",
+                      "{\"type\":\"record\",\"name\":\"S3\",\"fields\":[{\"name\":\"e\",\"type\":{\"type\":\"enum\",\"name\":\"EE6\",\"symbols\":[\"z\",\"a\",\"m\"]}}]}",
+                      "{\"type\":\"record\",\"name\":\"S4\",\"fields\":[{\"name\":\"u\",\"type\":[\"int\",\"string\"]}]}")
+            rng6 = Random.Xoshiro(20260824)
+            for shape in shapes
+                ss = Avro.parseschema(shape)
+                av = tempname() * ".avsc"
+                write(av, Avro.json(ss))
+                for _ in 1:10
+                    va, vb = samplesort(ss, rng6), samplesort(ss, rng6)
+                    fa, fb = tempname() * ".json", tempname() * ".json"
+                    write(fa, Avro.tojson(ss, va))
+                    write(fb, Avro.tojson(ss, vb))
+                    jv = parse(Int, strip(javaharnesstext(hd, "CompareBytes", av, fa, fb)))
+                    @test sign(jv) == sign(Avro.comparebytes(ss, Avro.encode(ss, va), Avro.encode(ss, vb)))
+                end
+            end
+        end
+    end
     @testset "(7) negative oracles: consensus rejections" begin
         s = Avro.parseschema("{\"type\":\"record\",\"name\":\"NG\",\"fields\":[{\"name\":\"a\",\"type\":\"long\"},{\"name\":\"b\",\"type\":\"boolean\"}]}")
         good = take!(Avro.tobuffer([(a=Int64(1), b=true)]; schema=s))
@@ -380,8 +514,80 @@ if normalise(records) != expected:
         for (i, c) in enumerate(cases)
             jv, uv, pv = verdicts(c)
             @test !uv                                                       # Julia rejects each malformed case
-            @test !jv || i in javatolerated
-            pv === nothing || @test !pv || i in pytolerated
+            @test jv == (i in javatolerated)                                # each recorded tolerance occurs, exactly
+            pv === nothing || @test pv == (i in pytolerated)
+        end
+        # malformed schemas: each oracle's parse verdict, two-way
+        badschemas = [
+            ("truncated json", "{\"type\":\"record\",\"name\":\"B\""),
+            ("duplicate field", "{\"type\":\"record\",\"name\":\"B\",\"fields\":[{\"name\":\"a\",\"type\":\"int\"},{\"name\":\"a\",\"type\":\"int\"}]}"),
+            ("invalid name", "{\"type\":\"record\",\"name\":\"9bad\",\"fields\":[]}"),
+            ("unknown type", "{\"type\":\"wibble\"}"),
+        ]
+        for (label, src) in badschemas
+            uok = try
+                Avro.parseschema(src)
+                true
+            catch
+                false
+            end
+            @test !uok
+            f = tempname() * ".avsc"
+            write(f, src)
+            jok = try
+                javatool("canonical", f, "-")
+                true
+            catch
+                false
+            end
+            @test !jok                                                      # Java rejects each malformed schema
+        end
+        # malformed raw datums: fragtojson verdicts, two-way
+        ls = Avro.parseschema("\"string\"")
+        lavsc = tempname() * ".avsc"
+        write(lavsc, "\"string\"")
+        baddatums = [
+            ("negative length", UInt8[0x01]),
+            ("truncated payload", UInt8[0x06, 0x61]),
+            ("overlong length", vcat(UInt8[0xac, 0x02], fill(UInt8('a'), 3))),
+        ]
+        for (label, bytes) in baddatums
+            uok = try
+                Avro.decode(ls, bytes)
+                true
+            catch
+                false
+            end
+            @test !uok
+            f = tempname()
+            write(f, bytes)
+            jok = try
+                javatool("fragtojson", "--schema-file", lavsc, f)
+                true
+            catch
+                false
+            end
+            @test !jok                                                      # Java rejects each malformed datum
+        end
+        # malformed JSON datums: jsontofrag verdicts, two-way
+        badjson = [("bare word", "notjson"), ("wrong type", "{\"a\": 1}"), ("trailing", "\"x\" garbage")]
+        for (label, txt) in badjson
+            uok = try
+                Avro.fromjson(ls, txt)
+                true
+            catch
+                false
+            end
+            @test !uok
+            f = tempname() * ".json"
+            write(f, txt)
+            jok = try
+                javatool("jsontofrag", "--schema-file", lavsc, f)
+                true
+            catch
+                false
+            end
+            @test !jok                                                      # Java rejects each malformed JSON datum
         end
         jv, uv, pv = verdicts(good)
         @test jv && uv && (pv === nothing || pv)                            # and all accept the valid file
