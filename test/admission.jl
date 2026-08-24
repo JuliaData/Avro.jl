@@ -133,6 +133,19 @@
     @test admissionstate(transactional) == before
     @test !Avro.contains_unlocked(transactional, admissionname(4_097))
 
+    # round-3 item 5: the recent buffer is prebuilt at exact RUN_BASE capacity, and a live merge's
+    # output slots are held in `bytes` (replacement overlap) until its sources are dropped
+    ov = Avro.SymbolAdmission(max_names=1 << 16, max_bytes=1 << 24)
+    VERSION >= v"1.11" && @test Avro.capacity(ov.recent) == Avro.RUN_BASE
+    for i in 1:2 * Avro.RUN_BASE
+        Avro.admit!(ov, "o$(lpad(i, 5, '0'))")
+    end
+    ovnames = sum(sizeof("o$(lpad(i, 5, '0'))") + 8 for i in 1:2 * Avro.RUN_BASE)
+    @test ov.merge !== nothing && ov.bytes == ovnames + 8 * 2 * Avro.RUN_BASE  # overlap held while live
+    Avro.admit!(ov, "o$(lpad(1, 5, '0'))")                                     # a repeat completes the merge
+    @test ov.merge === nothing && ov.bytes == ovnames                          # the overlap returned
+    VERSION >= v"1.11" && @test Avro.capacity(ov.recent) == Avro.RUN_BASE      # reused, never regrown
+
     # the admitting operation's lookup and merge-step work charges its own budget (§4.4, R07)
     ab = Avro.SymbolAdmission(max_names=1 << 16, max_bytes=1 << 24)
     bud = Avro.Budget(Avro.Limits())
