@@ -679,7 +679,7 @@ function Writer(dst::Union{AbstractString,IO}, schema::Schema; codec::Symbol=:nu
         allowance0 = budget.allowance_used
         workcap0 = budget.workcap
         jw = BoundedWriter(budget, limits.max_schema_bytes)       # the schema JSON is produced charged and bounded
-        printschema(jw, schema, "", FrozenDict{String,Bool}(), false, 0)
+        printschema(jw, schema, "", schemaseen(schema, budget), false, 0)
         schemajson = boundedtake!(jw)
         # Printing is bounded in this operation, but the container counters must start with the exact
         # header work that its Reader performs. Keep all printer reservations and rebase only work.

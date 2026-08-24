@@ -12,12 +12,12 @@ function canonical(s::Schema; limits::Limits=graphlimits(s))
     graphinfo(s).repaired_names && throw(ArgumentError("a schema with repaired invalid names has no Parsing Canonical Form"))
     return withbudget(limits) do budget
         w = BoundedWriter(budget, limits.max_schema_bytes)
-        canonicalprint(w, s, FrozenDict{String,Bool}())
+        canonicalprint(w, s, schemaseen(s, budget))
         return boundedtake!(w)
     end
 end
 
-function canonicalprint(io::IO, s::Schema, seen::FrozenDict{String,Bool})
+function canonicalprint(io::IO, s::Schema, seen::Vector{Bool})
     if s isa PrimitiveSchema
         print(io, '"', kind(s), '"')
     elseif s isa UnionSchema
@@ -36,16 +36,15 @@ function canonicalprint(io::IO, s::Schema, seen::FrozenDict{String,Bool})
         canonicalprint(io, s.values, seen)
         print(io, '}')
     else
-        full = fullname(s)
-        if haskey(seen, full)
-            escapejson(io, full)
+        seenindex = Int(nodeid(s)) + 1
+        if seen[seenindex]
+            escapefullname(io, s)
             countnode!(io)
             return nothing
         end
-        chargeseen!(io, 32 + sizeof(full))
-        seen[full] = true
+        seen[seenindex] = true
         print(io, "{\"name\":")
-        escapejson(io, full)
+        escapefullname(io, s)
         if s isa FixedSchema
             print(io, ",\"type\":\"fixed\",\"size\":", s.size, '}')
         elseif s isa EnumSchema
@@ -104,6 +103,27 @@ end
 
 crc64avro(s::AbstractString) = crc64avro(codeunits(s))
 
+"Hash canonical bytes after reserving the exact retained digest and pinned-library workspace."
+function hashfingerprint(pcf::AbstractVector{UInt8}, algorithm::Symbol, budget::Budget)
+    # MD5 retains a 16-byte state vector behind a 16-byte ReinterpretArray shell. SHA-256
+    # retains its 32-byte output vector. Their pinned implementations also allocate one
+    # context object, one state vector and one 64-byte block buffer while hashing.
+    retained = algorithm === :md5 ? checked_add(bytesbytes(16), 16) : bytesbytes(32)
+    transient = algorithm === :md5 ? checked_add(32, bytesbytes(64)) :
+                checked_add(32, checked_add(bytesbytes(32), bytesbytes(64)))
+    peak = checked_add(retained, transient)
+    reserve!(budget, peak)
+    try
+        digest = algorithm === :md5 ? MD5.md5(pcf) : SHA.sha256(pcf)
+        allocated!(budget, peak)
+        release!(budget, transient)
+        return digest
+    catch
+        release!(budget, peak)
+        rethrow()
+    end
+end
+
 """
     Avro.fingerprint(schema; algorithm=:crc64avro, limits=Limits()) -> UInt64 | Vector{UInt8}
 
@@ -115,11 +135,10 @@ function fingerprint(s::Schema; algorithm::Symbol=:crc64avro, limits::Limits=gra
         throw(ArgumentError("unknown fingerprint algorithm :$algorithm (use :crc64avro, :md5 or :sha256)"))
     return withbudget(limits) do budget                # one operation: print and hash in the same scope (D02)
         w = BoundedWriter(budget, limits.max_schema_bytes)
-        canonicalprint(w, s, FrozenDict{String,Bool}())
+        canonicalprint(w, s, schemaseen(s, budget))
         pcf = boundedview(w)
         algorithm === :crc64avro && return crc64avro(pcf)
-        algorithm === :md5 && return MD5.md5(pcf)
-        return SHA.sha256(pcf)
+        return hashfingerprint(pcf, algorithm, budget)
     end
 end
 
@@ -134,9 +153,9 @@ function parsingequivalent(a::Schema, b::Schema; limits::Limits=Limits())
     end
     return withbudget(limits) do budget                # one operation for both canonical forms (D02)
         wa = BoundedWriter(budget, limits.max_schema_bytes)
-        canonicalprint(wa, a, FrozenDict{String,Bool}())
+        canonicalprint(wa, a, schemaseen(a, budget))
         wb = BoundedWriter(budget, limits.max_schema_bytes)
-        canonicalprint(wb, b, FrozenDict{String,Bool}())
+        canonicalprint(wb, b, schemaseen(b, budget))
         return boundedview(wa) == boundedview(wb)
     end
 end

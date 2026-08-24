@@ -74,7 +74,8 @@ end
 
 function effectiveplan(r::Reader, reader_schema, union_resolution::Symbol, limits::Limits, decimal_byteorder::Symbol)
     reader_schema === nothing && return (r.schema, r.plan)
-    plan = resolvingplan(r.schema, reader_schema; union_resolution=union_resolution, limits=limits)
+    plan = resolvingplan(r.schema, reader_schema; union_resolution=union_resolution, limits=limits,
+                         budget=r.budget)
     decimal_byteorder === :little && (plan = littledecimals(plan))
     return (reader_schema, plan)
 end
@@ -354,7 +355,7 @@ function Rows(src; T=nothing, reader_schema::Union{Nothing,Schema}=nothing, unio
             throw(ArgumentError("select= applies to the generic record mode only (no typed T, record root)"))
         sel = select === nothing ? nothing : selectindices(effective, select)
         outschema = mode === :generic ? (sel === nothing ? effective : projectschema(effective, sel, limits)) : nothing
-        rowplan = mode === :typed ? typedplan(T, effective, plan, limits) : plan
+        rowplan = mode === :typed ? typedplan(T, effective, plan, limits; budget=r.budget) : plan
         nrows = -1
         if r.source isa BytesSource
             pre = prescanblocks(r)                      # headers only; the table charge is transient

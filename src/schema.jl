@@ -897,9 +897,17 @@ mutable struct BoundedWriter <: IO
 end
 
 function BoundedWriter(budget::Budget, maxbytes::Int)
-    cap = min(256, max(maxbytes, 1))
-    reserve!(budget, bytesbytes(cap))
-    return BoundedWriter(Vector{UInt8}(undef, cap), 0, budget, maxbytes)
+    cap = min(256, maxbytes)
+    charge = bytesbytes(cap)
+    reserve!(budget, charge)
+    try
+        buf = Vector{UInt8}(undef, cap)
+        allocated!(budget, charge)
+        return BoundedWriter(buf, 0, budget, maxbytes)
+    catch
+        release!(budget, charge)
+        rethrow()
+    end
 end
 
 function boundedgrow!(w::BoundedWriter, n::Int)
@@ -908,9 +916,18 @@ function boundedgrow!(w::BoundedWriter, n::Int)
         throw(LimitError(:max_schema_bytes, written, w.maxbytes, :max_schema_bytes, :encode))
     cap = length(w.buf)
     if written > cap
-        newcap = max(2 * cap, written)
-        reserve!(w.budget, bytesbytes(newcap))         # reserved exact-capacity replacement (§4.4)
-        nb = Vector{UInt8}(undef, newcap)
+        grown = cap > w.maxbytes - cap ? w.maxbytes : 2 * cap
+        newcap = max(grown, written)
+        newcharge = bytesbytes(newcap)
+        reserve!(w.budget, newcharge)                  # reserved exact-capacity replacement (§4.4)
+        nb = try
+            out = Vector{UInt8}(undef, newcap)
+            allocated!(w.budget, newcharge)
+            out
+        catch
+            release!(w.budget, newcharge)
+            rethrow()
+        end
         copyto!(nb, 1, w.buf, 1, w.len)
         release!(w.budget, bytesbytes(cap))
         w.buf = nb
@@ -935,23 +952,79 @@ end
 
 "The finished text: charged as its String before the buffer's charge is released."
 function boundedtake!(w::BoundedWriter)
-    reserve!(w.budget, stringbytes(w.len))
-    out = unsafe_string(pointer(w.buf), w.len)
-    release!(w.budget, bytesbytes(length(w.buf)))
-    w.buf = UInt8[]
+    stringcharge = stringbytes(w.len)
+    reserve!(w.budget, stringcharge)
+    out = try
+        text = unsafe_string(pointer(w.buf), w.len)
+        allocated!(w.budget, stringcharge)
+        text
+    catch
+        release!(w.budget, stringcharge)
+        rethrow()
+    end
+    emptycharge = bytesbytes(0)
+    reserve!(w.budget, emptycharge)
+    emptybuf = try
+        buf = UInt8[]
+        allocated!(w.budget, emptycharge)
+        buf
+    catch
+        release!(w.budget, emptycharge)
+        rethrow()
+    end
+    oldcharge = bytesbytes(length(w.buf))
+    w.buf = emptybuf
     w.len = 0
+    release!(w.budget, oldcharge)
     return out
 end
 
-"The finished bytes without a String copy (single-object fingerprinting hashes these directly)."
-boundedview(w::BoundedWriter) = view(w.buf, 1:w.len)
-
-function chargeseen!(::IO, ::Int)
-    return nothing
+"Compact the finished bytes to exact capacity before hashing or comparing them."
+function boundedview(w::BoundedWriter)
+    length(w.buf) == w.len && return w.buf
+    charge = bytesbytes(w.len)
+    reserve!(w.budget, charge)
+    exact = try
+        buf = Vector{UInt8}(undef, w.len)
+        allocated!(w.budget, charge)
+        buf
+    catch
+        release!(w.budget, charge)
+        rethrow()
+    end
+    copyto!(exact, 1, w.buf, 1, w.len)
+    oldcharge = bytesbytes(length(w.buf))
+    w.buf = exact
+    release!(w.budget, oldcharge)
+    return exact
 end
 
-function chargeseen!(w::BoundedWriter, n::Int)
-    reserve!(w.budget, n)
+"Allocate the exact node-indexed seen table used by schema printers."
+function schemaseen(s::Schema, budget::Budget)
+    n = graphinfo(s).nodes
+    charge = vectorbytes(Bool, n)
+    reserve!(budget, charge)
+    seen = try
+        values = Vector{Bool}(undef, n)
+        allocated!(budget, charge)
+        values
+    catch
+        release!(budget, charge)
+        rethrow()
+    end
+    fill!(seen, false)
+    return seen
+end
+
+"Write a named schema's escaped fullname without constructing a joined String."
+function escapefullname(io::IO, s::NamedSchema)
+    print(io, '"')
+    if !isempty(s.name.namespace)
+        escapejsoncontents(io, s.name.namespace)
+        print(io, '.')
+    end
+    escapejsoncontents(io, s.name.name)
+    print(io, '"')
     return nothing
 end
 
@@ -979,7 +1052,7 @@ verbatim, strings re-escaped), and defaults by their exact source text.
 function json(s::Schema; pretty::Bool=false, limits::Limits=graphlimits(s))
     return withbudget(limits) do budget
         w = BoundedWriter(budget, limits.max_schema_bytes)
-        printschema(w, s, "", FrozenDict{String,Bool}(), pretty, 0)
+        printschema(w, s, "", schemaseen(s, budget), pretty, 0)
         return boundedtake!(w)
     end
 end
@@ -1041,7 +1114,7 @@ function printprops(io::IO, p::Props, pretty::Bool, level::Int, first::Bool)
     return first
 end
 
-function printschema(io::IO, s::Schema, enclosing::String, seen::FrozenDict{String,Bool}, pretty::Bool, level::Int)
+function printschema(io::IO, s::Schema, enclosing::String, seen::Vector{Bool}, pretty::Bool, level::Int)
     if s isa PrimitiveSchema
         if isempty(s.props)
             print(io, '"', kind(s), '"')
@@ -1073,14 +1146,17 @@ function printschema(io::IO, s::Schema, enclosing::String, seen::FrozenDict{Stri
         indent(io, pretty, level)
         print(io, '}')
     else
-        full = fullname(s)
-        if haskey(seen, full)
-            escapejson(io, s.name.namespace == enclosing ? s.name.name : full)
+        seenindex = Int(nodeid(s)) + 1
+        if seen[seenindex]
+            if s.name.namespace == enclosing
+                escapejson(io, s.name.name)
+            else
+                escapefullname(io, s)
+            end
             countnode!(io)
             return nothing
         end
-        seen[full] = true
-        chargeseen!(io, 32 + sizeof(full))
+        seen[seenindex] = true
         printnamed(io, s, enclosing, seen, pretty, level)
     end
     countnode!(io)
@@ -1362,7 +1438,7 @@ end
 "Charge and bound the exact schema text retained properties and defaults will produce."
 function checkpublicprint!(s::Schema, limits::Limits, budget::Budget)
     writer = BoundedWriter(budget, limits.max_schema_bytes)
-    printschema(writer, s, "", FrozenDict{String,Bool}(), false, 0)
+    printschema(writer, s, "", schemaseen(s, budget), false, 0)
     return nothing
 end
 
