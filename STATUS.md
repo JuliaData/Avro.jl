@@ -1,5 +1,45 @@
 # Avro.jl 2.0 rewrite — status record
 
+## Round-4 response (2026-08-25)
+
+Every point of the round-four required revision list is addressed on `jq/v2-rewrite` (base:
+`ccce5a5`, the merge of the four round-four review commits). The round-four report is
+`reviews/codex-implementation-review-4.md`.
+
+| Round-4 item | Commit(s) |
+|---|---|
+| 1 — exact-capacity/replacement builders for every charged construction, derivation and plan path | `d704da0`: `FrozenVector`/`FrozenDict` carry their prebuilt capacity (`emptywithcapacity`) and grow only through `budgetedpush!`/`budgetedinsert!` exact replacement; `BuildBuf` is the construction-side replacement-growth builder for unknown counts. The JSON reader, the schema parser (prebuilt branch/symbol/field containers, charged-replacement metas and named tables, the pending stack prebuilt at `max_depth`, node shells settled by `settlednode` right after each node exists), the public constructors, derivation, `makeprops`/`tojsonvalue`, the read/write plan families (charged-and-released construction memos, exact record/union vectors, charged node boxes) and resolution (prebuilt per-writer memo tables with tracked capacities, charged-replacement partner vectors, exact result vectors, charged-and-released matching scratch) all follow the discipline |
+| 2 — no pre-allocation settlement; native codec init; a real concurrent regression | `d704da0`: `charge!` is deleted. Allocation sites reserve before the allocation and settle after it; `retain!` marks the one legitimate immediate-settlement case — storage that already exists and is being retained (tree references a schema node keeps, slot shifts inside prebuilt capacity). `transcodemember!` settles each native workspace the moment `TranscodingStreams.initialize` has malloc'd it (deflate, zstandard, xz, bzip2). A new overlapping-task regression in `test/limits.jl` drives the guard with real `available_memory()`: a pending reservation on another task lowers the figure, its settlement with real backing pages does not lower it a second time, and identical failing admissions beside the resident holder observe stable values |
+| 3 — release abandoned typed-plan nodes and defaults on fallback | `0169fed`: `TypedMemo` carries a fresh-node ledger — `memostore!` transfers a stored node's ownership to the memo, inline captures deduct, and every fallback frame (failed union-member attempts, record and resolved-record fast-route fallbacks, the resolving eligibility analysis) releases exactly its abandoned fresh subtree while memoised nodes stay owned. All node and pair construction is reserve → construct → settle (`reservenode!`/`settlenode!`) |
+| 4 — `max_bytes` covers the admission table's complete memory; publish-last | `7b5cd62` + `7b465c2`: `admissionbasebytes()` — the prebuilt recent buffer, the `MAX_RUNS` runs table and the fixed carry workspace (staging buffer, sort permutation, merge scratch) — is counted in `bytes` from construction and validated by the constructor; the carried run is fully built and sorted (package merge sort through the fixed workspace, compares charged) before any mutation; every test recalibrated to the base-inclusive model with constructor and construction-bytes regressions |
+| 5 — the unchanged Julia 1.10 stand-alone gate reliably below 50 MB | `6cc3060`: the warm-up gains a deterministic sweep — one array, one map and one single-field record over every `E` leaf schema, separately seeded — covering the closed (container kind, element) context space the random batch would otherwise first-encounter inside the measurement. No random pre-batch; the protocol (two harness iterations, the same 1,000-random-schema measured batch, the <50 MB bound, the zero-new-specializations assertion) is unchanged |
+| 6 — split `decodeblocks!`; remove the no-op layer | `f0f602e`: a `BlockPool` owns the reserved pool state; `startpool`/`retirepool!`/`runpool!`/`directpath!`/`teardownpool!` split the coordinator to 21 lines preserving pool lifetime, lowest-index poisoning, ordered commits and exact teardown; the split surfaced a latent partial-startup unwind fixed to `unreserve!`; `withplanbudget` removed |
+| 7 — full matrix from one final head | this section (all legs at `44d71d1`) + `44d71d1` (the exact-capacity contract had pushed `parseschema(interop.avsc)` from 2,062 to 2,416 allocations, past the calibrated ≤2,300 regression bound — found by this matrix; prop-free and alias-free nodes now share one frozen empty `Props`/string list, measuring 2,254 with the bound unchanged) |
+
+### Item-5 adjudication note
+
+The fix is a finite, deterministic extension of the warm-up's closed-kind coverage — the same class
+as the deterministic `extras` list accepted in round 2 (`85289de`) — not an unmeasured random batch.
+The measured batch's containers narrow their elements (via `narrowelement`) to members of `E`, so
+warming each (container kind, `E` element) pair is "one warm schema for each member of `E`" extended
+to each closed composition kind. Before the sweep, the round-4 exact-allocation rework measured
+93.3 MB stand-alone on 1.10 (first-encounter inference over composition contexts landing inside the
+measurement); with it: 18.2, 22.4, 19.4 and 21.9 MB across four 1.10 runs.
+
+### Verification at the final head (`44d71d1`)
+
+| Gate | Result |
+|---|---|
+| Julia 1.12.6 full suite + Aqua/JET + smoke (`AVRO_QUALITY_GATES=true AVRO_SMOKE=true`, `-t4`) | 61,412/61,412 in 16m37s; in-suite compile gate 0 new specializations |
+| Julia 1.10.11 full suite (`-t4`) | 61,394/61,394 in 10m57s; 0 new specializations, 15.4 MB |
+| Julia 1.11.9 full suite (`-t4`, `--compiled-modules=no`) | 61,396/61,396 in 16m03s; 0 new specializations, 15.4 MB |
+| §8.5 live interop (avro-tools 1.12.2 jar, fastavro 1.12.2 venv; `AVRO_INTEROP=true`, `-t4`) | 63,040/63,040 |
+| `AVRO_PERF=true` (`-t8`) | 61,412/61,412 in 15m32s: write 9.7× vs 1.1.2, `Table` 60.3×, 8-task ratio 4.09, codec overheads zstd 1.01/deflate 1.03/snappy 0.99, projection 2.3×, prepared decode 1 alloc/29 ns, prepared encode 0 allocs/37 ns, `parseschema` 53.9 µs/2,254 allocs, load 0.16 s, TTFT 0.41 s |
+| `AVRO_RSS_GATE=true` (`-t8`) | 61,402/61,402; baseline 314.3 MB, peak 3,065.5 MB against the 4,096 MB ceiling |
+| Stand-alone cold compile gates | 1.10: 21.9 MB, 1.11: 17.2 MB, 1.12: 11.7 MB — each 1,175/1,175, 0 new specializations |
+| Docs | strict Documenter HTML build clean |
+| Cross-version | 32/32 for 1.10.11→1.12.6 and 32/32 for 1.12.6→1.10.11 |
+
 ## Round-3 response (2026-08-24)
 
 Every point of the round-three required revision list is addressed on `jq/v2-rewrite` (base:
