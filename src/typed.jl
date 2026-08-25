@@ -128,6 +128,19 @@ function typedplan(::Type{T}, reader::Schema, plan::ReadPlan, limits::Limits;
             return typedplan(T, reader, plan, limits; budget=operation_budget)
         end
     end
+    checkpoint = budgetcheckpoint(budget)
+    try
+        root, dead = buildtypedroot(T, reader, plan, budget)
+        release!(budget, dead)
+        return root
+    catch
+        rollbackreservations!(budget, checkpoint)
+        rethrow()
+    end
+end
+
+"Build a typed plan and return its construction-only memo charge after the memo frame has unwound."
+function buildtypedroot(::Type{T}, reader::Schema, plan::ReadPlan, budget::Budget) where {T}
     nodes = graphinfo(reader).nodes
     memocharge = checked_add(vectorbytes(Vector{Pair{Any,TypedPlan}}, nodes),
                              checked_mul(STORAGE[].vector, nodes))
@@ -144,8 +157,7 @@ function typedplan(::Type{T}, reader::Schema, plan::ReadPlan, limits::Limits;
     for v in entries
         dead = checked_add(dead, vectorbytes(Pair{Any,TypedPlan}, length(v)) + memopairbytes() * length(v))
     end
-    release!(budget, dead)
-    return root
+    return (root, dead)
 end
 
 function memolookup(memo::TypedMemo, s::Schema, ::Type{T}) where {T}
@@ -686,13 +698,24 @@ function resolvedsteptargets(::Type{T}, s::RecordSchema, p::ResolvedRecordPlan, 
 end
 
 function checkedreaderdefault(::Type{T}, dp::DefaultPlan, budget::Budget) where {T}
-    v = jsonvalue(dp.schema, dp.json, budget)
-    v2 = v isa T ? v : try
-        convertleaf(T, v)
-    catch
-        nothing
+    checkpoint = budgetcheckpoint(budget)
+    valid = false
+    v = nothing
+    v2 = nothing
+    try
+        v = jsonvalue(dp.schema, dp.json, budget)
+        v2 = v isa T ? v : try
+            convertleaf(T, v)
+        catch
+            nothing
+        end
+        valid = v2 isa T
+    finally
+        v = nothing
+        v2 = nothing
+        rollbackreservations!(budget, checkpoint)
     end
-    v2 isa T || return nothing
+    valid || return nothing
     charge!(budget, nodebytes(ResolvedReaderDefault{T}))   # the retained default node, before it is built (D06)
     return ResolvedReaderDefault{T}(dp)
 end
@@ -868,6 +891,7 @@ end
 function typedvalue(p::SymbolTarget{StringPlan}, d::Decoder, names)
     return admit!(names, readstring(d); budget=d.budget)
 end
+
 function typedvalue(p::RefTarget{T}, d::Decoder, names) where {T}
     return typedvalue(p.plan::TypedPlan, d, names)::T
 end

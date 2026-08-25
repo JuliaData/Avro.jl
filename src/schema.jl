@@ -399,6 +399,7 @@ stops after `maxbytes + 1` bytes.
 function sourcebytes(src::Union{String,SubString{String}}, maxbytes::Int, budget::Budget, ::Type{E}) where {E}
     return codeunits(src)
 end
+
 function sourcebytes(src::Vector{UInt8}, maxbytes::Int, budget::Budget, ::Type{E}) where {E}
     return src
 end
@@ -890,6 +891,7 @@ end
 function structuralhash(s::PrimitiveSchema, inprogress)
     return propshash(s.props, logicalhash(logical(s), hash(kind(s), UInt(0xa7))))
 end
+
 function structuralhash(s::ArraySchema, inprogress)
     return propshash(s.props, hash(schemahash(s.items, inprogress), hash(:array, UInt(0xa7))))
 end
@@ -910,6 +912,7 @@ function structuralhash(s::FixedSchema, inprogress)
     h = hash(s.aliases.data, hash(s.size, h))
     return propshash(s.props, logicalhash(s.logical, h))
 end
+
 function defaulthash(::NoDefault, h::UInt)
     return hash(:nodefault, h)
 end
@@ -951,27 +954,94 @@ function Base.:(==)(a::Schema, b::Schema)
     typeof(a) === typeof(b) || return false
     limits = larger(graphinfo(a).limits, graphinfo(b).limits)
     budget = Budget(limits; available=typemax(Int) ÷ 4)
-    visited = Vector{Int32}[]   # per a-node sorted partner ids
-    return schemaequal(a, b, visited, budget)
+    try
+        return budgetedschemaequal(a, b, budget)
+    finally
+        close!(budget)
+    end
 end
 
 function larger(a::Limits, b::Limits)
     return a.max_resolution_work >= b.max_resolution_work ? a : b
 end
 
-function visitpair!(visited::Vector{Vector{Int32}}, a::Schema, b::Schema, budget::Budget)
-    ia = Int(nodeid(a)) + 1
-    while length(visited) < ia
-        push!(visited, Int32[])
+"An exact outer table of sorted partner ids used only during one structural comparison."
+mutable struct SchemaEqualityMemo
+    partners::Union{Nothing,Vector{Vector{Int32}}}
+    budget::Budget
+    charge::Int
+end
+
+function schemaequalitymemo(a::Schema, budget::Budget)
+    checkpoint = budgetcheckpoint(budget)
+    try
+        n = graphinfo(a).nodes
+        outercharge = vectorbytes(Vector{Int32}, n)
+        reserve!(budget, outercharge)
+        partners = Vector{Vector{Int32}}(undef, n)
+        allocated!(budget, outercharge)
+        total = outercharge
+        for i in eachindex(partners)
+            innercharge = vectorbytes(Int32, 0)
+            reserve!(budget, innercharge)
+            partners[i] = Int32[]
+            allocated!(budget, innercharge)
+            total = checked_add(total, innercharge)
+        end
+        return SchemaEqualityMemo(partners, budget, total)
+    catch
+        rollbackreservations!(budget, checkpoint)
+        rethrow()
     end
+end
+
+function releaseequalitymemo!(memo::SchemaEqualityMemo)
+    charge = memo.charge
+    memo.partners = nothing
+    memo.charge = 0
+    release!(memo.budget, charge)
+    return nothing
+end
+
+function visitpair!(memo::SchemaEqualityMemo, a::Schema, b::Schema, budget::Budget)
+    visited = memo.partners::Vector{Vector{Int32}}
+    ia = Int(nodeid(a)) + 1
     partners = visited[ia]
     ib = nodeid(b)
     i = searchsortedfirst(partners, ib)
     addresolution!(budget, 1 + (i <= length(partners) ? 1 : 0))
     i <= length(partners) && partners[i] == ib && return true
-    insert!(partners, i, ib)
-    addresolution!(budget, length(partners) - i + 1)
+    n = checked_add(length(partners), 1)
+    replacementcharge = vectorbytes(Int32, n)
+    checkpoint = budgetcheckpoint(budget)
+    try
+        reserve!(budget, replacementcharge)
+        replacement = Vector{Int32}(undef, n)
+        allocated!(budget, replacementcharge)
+        copyto!(replacement, 1, partners, 1, i - 1)
+        replacement[i] = ib
+        copyto!(replacement, i + 1, partners, i, n - i)
+        visited[ia] = replacement
+    catch
+        rollbackreservations!(budget, checkpoint)
+        rethrow()
+    end
+    oldcharge = vectorbytes(Int32, n - 1)
+    release!(budget, oldcharge)
+    memo.charge = checked_add(memo.charge, replacementcharge - oldcharge)
+    addresolution!(budget, n - i + 1)
     return false
+end
+
+function budgetedschemaequal(a::Schema, b::Schema, budget::Budget)
+    a === b && return true
+    typeof(a) === typeof(b) || return false
+    memo = schemaequalitymemo(a, budget)
+    try
+        return schemaequal(a, b, memo, budget)
+    finally
+        releaseequalitymemo!(memo)
+    end
 end
 
 function schemaequal(a::Schema, b::Schema, visited, budget)
@@ -1004,6 +1074,7 @@ function structuralequal(a::UnionSchema, b::UnionSchema, visited, budget)
     end
     return true
 end
+
 function structuralequal(a::FixedSchema, b::FixedSchema, visited, budget)
     return a.name == b.name && a.size == b.size && a.aliases.data == b.aliases.data && a.logical == b.logical && propsequal(a.props, b.props)
 end

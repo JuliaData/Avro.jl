@@ -333,7 +333,8 @@ resident pages, so leaving them pending would subtract them twice from `availabl
 more bytes than are pending is a settlement mismatch and throws instead of clamping.
 """
 function allocated!(b::Budget, n::Int)
-    n <= 0 && return b
+    n >= 0 || throw(ArgumentError("settlement must be non-negative"))
+    n == 0 && return b
     n <= b.pending || throw(ArgumentError("settlement of $n bytes exceeds the pending reservation $(b.pending)"))
     return settlepending!(b, n)
 end
@@ -357,7 +358,8 @@ handed to the caller). Reservations that never became resident are returned with
 asking to release more than the resident portion is a settlement mismatch and throws.
 """
 function release!(b::Budget, n::Int)
-    n <= 0 && return b
+    n >= 0 || throw(ArgumentError("release must be non-negative"))
+    n == 0 && return b
     n <= b.reserved || throw(ArgumentError("release of $n bytes exceeds the live reservation $(b.reserved)"))
     resident = b.reserved - b.pending
     n <= resident || throw(ArgumentError("release of $n bytes exceeds the resident portion $resident ($(b.pending) of $(b.reserved) reserved bytes are pending; unfulfilled reservations return through unreserve!)"))
@@ -372,7 +374,8 @@ Return `n` reserved bytes that never became resident (worst-case headroom, or th
 allocation) to the guard and the budget.
 """
 function unreserve!(b::Budget, n::Int)
-    n <= 0 && return b
+    n >= 0 || throw(ArgumentError("unreserve must be non-negative"))
+    n == 0 && return b
     n <= b.pending || throw(ArgumentError("unreserve of $n bytes exceeds the pending reservation $(b.pending)"))
     settlepending!(b, n)
     b.reserved -= n
@@ -387,6 +390,28 @@ Return every pending reservation to the guard (called in the `finally` of every 
 function close!(b::Budget)
     settlepending!(b, b.pending)
     return b
+end
+
+"Capture the counters `rollbackreservations!` needs to unwind an operation exactly."
+function budgetcheckpoint(b::Budget)
+    return (b.reserved, b.pending)
+end
+
+"""
+Unwind every reservation acquired after `checkpoint` (a `budgetcheckpoint`) on a failed ownership
+transfer. The pending delta since the checkpoint is this operation's in-flight remainder and returns
+through `unreserve!`; the settled rest — storage that dies with the failed operation — is released.
+The budget may carry unrelated pending headroom, so the split must come from the checkpoint.
+"""
+function rollbackreservations!(budget::Budget, checkpoint::NTuple{2,Int})
+    reserved0, pending0 = checkpoint
+    delta = budget.reserved - reserved0
+    delta <= 0 && return nothing
+    pend = budget.pending - pending0
+    pend > 0 && unreserve!(budget, pend)
+    resident = delta - max(pend, 0)
+    resident > 0 && release!(budget, resident)
+    return nothing
 end
 
 "Zero a budget for reuse by a prepared per-call path (guard bookkeeping settled first)."

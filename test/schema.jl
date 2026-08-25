@@ -146,6 +146,10 @@
         rec = P("""{"type":"record","name":"LongList","fields":[{"name":"value","type":"long"},{"name":"next","type":["null","LongList"]}]}""")
         @test rec.fields[2].schema.branches[2] === rec
         @test rec == P(Avro.json(rec))
+        equalbudget = Avro.Budget(Avro.Limits(); available=1 << 40)
+        @test Avro.budgetedschemaequal(rec, P(Avro.json(rec)), equalbudget)
+        @test equalbudget.pending == equalbudget.reserved == 0              # equality memo is operation scratch
+        Avro.close!(equalbudget)
         @test Avro.canonical(rec) == "{\"name\":\"LongList\",\"type\":\"record\",\"fields\":[{\"name\":\"value\",\"type\":\"long\"},{\"name\":\"next\",\"type\":[\"null\",\"LongList\"]}]}"
         # a bare reference may name a null-namespace type from inside a namespace
         s2 = P("""{"type":"record","name":"R","fields":[{"name":"e","type":{"type":"fixed","name":"F","size":1}},{"name":"n","type":{"type":"record","name":"ns.Inner","fields":[{"name":"f","type":"F"}]}}]}""")

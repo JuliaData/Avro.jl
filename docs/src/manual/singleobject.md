@@ -21,7 +21,8 @@ end
 ```
 
 [`Avro.SchemaStore`](@ref) is the interface for custom registries: implement
-[`Avro.lookup`](@ref)`(store, fingerprint)` and [`Avro.register!`](@ref).
+[`Avro.lookup`](@ref)`(store, fingerprint)`, `Avro.lookup(store, fingerprint, budget)`, and
+[`Avro.register!`](@ref). The three-argument lookup must charge the supplied operation budget.
 
 Unknown fingerprints raise [`Avro.UnknownSchemaError`](@ref); a registry may map one fingerprint to
 several parsing-equivalent schemas, and ambiguity raises [`Avro.AmbiguousSchemaError`](@ref).

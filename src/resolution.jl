@@ -184,7 +184,7 @@ function resolvenode(ctx::ResolveContext, w::Schema, r::Schema, wp::String, rp::
     addresolution!(ctx.budget, 1)
     cached = memolookup(ctx, w, r)
     cached === nothing || return cached
-    schemaequal(w, r, Vector{Int32}[], ctx.budget) && return memostore!(ctx, w, r, readerplan(ctx, r))   # identical subtree: the plain reader plan
+    budgetedschemaequal(w, r, ctx.budget) && return memostore!(ctx, w, r, readerplan(ctx, r))   # identical subtree: the plain reader plan
     return memostore!(ctx, w, r, resolvekinds(ctx, w, r, wp, rp))
 end
 
@@ -416,6 +416,7 @@ function fromraw(::TimeMicrosPlan, d::Decoder, raw::Int32)
     0 <= v < 86_400_000_000 || dataerror(d, "time-micros value $v out of range")
     return Time(Nanosecond(v * 1_000))
 end
+
 function fromraw(::TimestampPlan{P}, d::Decoder, raw::Int32) where {P}
     return Timestamp{P}(Int64(raw))
 end
@@ -458,6 +459,7 @@ function fromraw(p::DecimalPlan, d::Decoder, raw::String)
     release!(d.budget, bytesbytes(n))                     # the transient copy dies with this frame
     return v
 end
+
 function fromraw(p::ReadPlan, d::Decoder, raw)
     return dataerror(d, "internal error: no promotion of $(typeof(raw)) into $(typeof(p))")
 end
@@ -487,6 +489,7 @@ function decodevalue(p::EnumRemapPlan, d::Decoder)
     allocated!(d.budget, enumvaluebytes())
     return v
 end
+
 function skipvalue(p::EnumRemapPlan, d::Decoder)
     return (readindex(d, length(p.writer.symbols)); nothing)
 end
