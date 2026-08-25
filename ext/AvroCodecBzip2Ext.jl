@@ -23,9 +23,8 @@ function Avro.decompressblock(name::Symbol, ::Bzip2Reader, payload::AbstractVect
         pos = 1
         members = 0
         while pos <= total
-            Avro.reserve!(budget, BZIP2_DECODER_BYTES)
-            Avro.allocated!(budget, BZIP2_DECODER_BYTES)      # the native workspace is malloc'd by initialize inside transcodemember!
-            consumed, out, outlen = Avro.transcodemember!(:bzip2, Bzip2Decompressor(), payload, pos, total, out, outlen, limits.max_block_bytes, budget)
+            Avro.reserve!(budget, BZIP2_DECODER_BYTES)        # settled inside transcodemember! once initialize runs
+            consumed, out, outlen = Avro.transcodemember!(:bzip2, Bzip2Decompressor(), payload, pos, total, out, outlen, limits.max_block_bytes, budget, BZIP2_DECODER_BYTES)
             Avro.release!(budget, BZIP2_DECODER_BYTES)
             consumed == 0 && throw(Avro.CodecError(:bzip2, :decompress, "invalid bzip2 stream at payload byte $pos"))
             members = Avro.checked_add(members, 1)

@@ -58,14 +58,28 @@ mutable struct RecordPlan <: ReadPlan
     const boxes::Vector{Int}         # boxed-value charge per field (0 for reference types)
 end
 
+"Build one plan node under §4.4 order: reserve its box, construct, settle."
+function plannode(f, budget::Union{Nothing,Budget}, bytes::Int=64)
+    budget === nothing || reserve!(budget, bytes)
+    p = f()
+    budget === nothing || allocated!(budget, bytes)
+    return p
+end
+
 """
     readplan(schema) -> ReadPlan
 
 The generic read plan of a schema (memoised per node id; recursion through shared `RecordPlan`s).
 """
 function readplan(s::Schema; budget::Union{Nothing,Budget}=nothing)
-    memo = Vector{Union{Nothing,ReadPlan}}(nothing, graphinfo(s).nodes)
-    return readplan(s, memo, budget)
+    nodes = graphinfo(s).nodes
+    mbytes = vectorbytes(Union{Nothing,ReadPlan}, nodes)
+    budget === nothing || reserve!(budget, mbytes)     # the construction memo, released once the root is built
+    memo = Vector{Union{Nothing,ReadPlan}}(nothing, nodes)
+    budget === nothing || allocated!(budget, mbytes)
+    p = readplan(s, memo, budget)
+    budget === nothing || release!(budget, mbytes)     # the memo dies here; the plan graph stays charged
+    return p
 end
 
 function readplan(s::Schema, memo::Vector{Union{Nothing,ReadPlan}}, budget)
@@ -113,7 +127,7 @@ end
 
 function buildreadplan(s::BytesSchema, memo, budget)
     l = s.logical
-    l isa DecimalLogical && return DecimalPlan(0, l.precision, l.scale, l.precision > 38)
+    l isa DecimalLogical && return plannode(() -> DecimalPlan(0, l.precision, l.scale, l.precision > 38), budget)
     return BytesPlan()
 end
 function buildreadplan(s::StringSchema, memo, budget)
@@ -122,29 +136,49 @@ function buildreadplan(s::StringSchema, memo, budget)
 end
 function buildreadplan(s::FixedSchema, memo, budget)
     l = s.logical
-    l isa DecimalLogical && return DecimalPlan(s.size, l.precision, l.scale, l.precision > 38)
+    l isa DecimalLogical && return plannode(() -> DecimalPlan(s.size, l.precision, l.scale, l.precision > 38), budget)
     l isa UUIDLogical && return UUIDFixedPlan()
     l isa DurationLogical && return DurationPlan()
-    return FixedPlan(s)
+    return plannode(() -> FixedPlan(s), budget)
 end
 
 function buildreadplan(s::EnumSchema, memo, budget)
-    return EnumPlan(s)
+    return plannode(() -> EnumPlan(s), budget)
 end
 
 function buildreadplan(s::ArraySchema, memo, budget)
-    return ArrayPlan(readplan(s.items, memo, budget), elementtype(s.items), budget === nothing ? minsize(s.items) : minsize(s.items, budget))
+    items = readplan(s.items, memo, budget)
+    ms = budget === nothing ? minsize(s.items) : minsize(s.items, budget)
+    return plannode(() -> ArrayPlan(items, elementtype(s.items), ms), budget)
 end
 
 function buildreadplan(s::MapSchema, memo, budget)
-    return MapPlan(readplan(s.values, memo, budget), elementtype(s.values), budget === nothing ? minsize(s.values) : minsize(s.values, budget))
+    values = readplan(s.values, memo, budget)
+    ms = budget === nothing ? minsize(s.values) : minsize(s.values, budget)
+    return plannode(() -> MapPlan(values, elementtype(s.values), ms), budget)
 end
 
 function buildreadplan(s::UnionSchema, memo, budget)
-    return UnionPlan(ReadPlan[readplan(b, memo, budget) for b in s.branches], nullablebranch(s))
+    n = length(s.branches)
+    vb = vectorbytes(ReadPlan, n) + 48
+    budget === nothing || reserve!(budget, vb)         # the exact branch vector and node box (§4.4)
+    branches = Vector{ReadPlan}(undef, n)
+    budget === nothing || allocated!(budget, vb)
+    for (i, b) in enumerate(s.branches)
+        branches[i] = readplan(b, memo, budget)
+    end
+    return UnionPlan(branches, nullablebranch(s))
 end
 function buildreadplan(s::RecordSchema, memo, budget)
-    p = RecordPlan(s, ReadPlan[], Int[])
+    nf = length(s.fields)
+    slots = vectorbytes(ReadPlan, nf) + vectorbytes(Int, nf) + 64
+    budget === nothing || reserve!(budget, slots)      # the exact field vectors and node shell (§4.4)
+    fields = Vector{ReadPlan}(undef, nf)
+    resize!(fields, 0)
+    boxes = Vector{Int}(undef, nf)
+    resize!(boxes, 0)
+    p = RecordPlan(s, fields, boxes)
+    budget === nothing || allocated!(budget, slots)
     memo[Int(nodeid(s)) + 1] = p
     for f in s.fields
         push!(p.fields, readplan(f.schema, memo, budget))

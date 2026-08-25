@@ -91,8 +91,18 @@ mutable struct ResolveContext
     const policy::Symbol
     const memokeys::Vector{Vector{Int32}}          # per writer node id: sorted reader node ids
     const memoplans::Vector{Vector{ReadPlan}}
+    const memocaps::Vector{Int32}                  # prebuilt capacity per slot (§4.4 replacement growth)
     const readermemo::Vector{Union{Nothing,ReadPlan}}
     const writermemo::Vector{Union{Nothing,ReadPlan}}
+end
+
+"The bytes of the resolution memo tables at their current capacities (charged storage)."
+function memotablebytes(ctx::ResolveContext)
+    total = 2 * vectorbytes(Vector{Int32}, length(ctx.memokeys)) + vectorbytes(Int32, length(ctx.memocaps))
+    for c in ctx.memocaps
+        total += vectorbytes(Int32, Int(c)) + vectorbytes(ReadPlan, Int(c))
+    end
+    return total
 end
 
 """
@@ -110,10 +120,24 @@ function resolve(writer::Schema, reader::Schema; union_resolution::Symbol=:spec,
     union_resolution in (:spec, :java) || throw(ArgumentError("union_resolution must be :spec or :java"))
     budget === nothing &&
         return withbudget(b -> resolve(writer, reader; union_resolution=union_resolution, limits=limits, budget=b), limits)
-    ctx = ResolveContext(budget, union_resolution, Vector{Int32}[], Vector{ReadPlan}[],
-                         Vector{Union{Nothing,ReadPlan}}(nothing, graphinfo(reader).nodes),
-                         Vector{Union{Nothing,ReadPlan}}(nothing, graphinfo(writer).nodes))
+    wnodes = graphinfo(writer).nodes
+    rnodes = graphinfo(reader).nodes
+    tables = 2 * vectorbytes(Vector{Int32}, wnodes) + vectorbytes(Int32, wnodes) + 2 * wnodes * STORAGE[].vector +
+             vectorbytes(Union{Nothing,ReadPlan}, rnodes) + vectorbytes(Union{Nothing,ReadPlan}, wnodes)
+    reserve!(budget, tables)                           # the memo tables, released once the plan is built (§4.4)
+    memokeys = Vector{Vector{Int32}}(undef, wnodes)
+    memoplans = Vector{Vector{ReadPlan}}(undef, wnodes)
+    for i in 1:wnodes
+        memokeys[i] = Int32[]
+        memoplans[i] = ReadPlan[]
+    end
+    ctx = ResolveContext(budget, union_resolution, memokeys, memoplans, zeros(Int32, wnodes),
+                         Vector{Union{Nothing,ReadPlan}}(nothing, rnodes),
+                         Vector{Union{Nothing,ReadPlan}}(nothing, wnodes))
+    allocated!(budget, tables)
     plan = resolvenode(ctx, writer, reader, "\$", "\$")
+    release!(budget, memotablebytes(ctx) + vectorbytes(Union{Nothing,ReadPlan}, rnodes) +
+                     vectorbytes(Union{Nothing,ReadPlan}, wnodes))     # construction memos die here
     return ResolvedSchema(writer, reader, union_resolution, plan)
 end
 
@@ -140,12 +164,7 @@ function writerplan(ctx::ResolveContext, s::Schema)
 end
 
 function memoslot(ctx::ResolveContext, w::Schema)
-    iw = Int(nodeid(w)) + 1
-    while length(ctx.memokeys) < iw
-        push!(ctx.memokeys, Int32[])
-        push!(ctx.memoplans, ReadPlan[])
-    end
-    return iw
+    return Int(nodeid(w)) + 1                          # the tables are prebuilt over every writer node
 end
 
 function memolookup(ctx::ResolveContext, w::Schema, r::Schema)
@@ -166,6 +185,24 @@ function memostore!(ctx::ResolveContext, w::Schema, r::Schema, p::ReadPlan)
     if i <= length(keys) && keys[i] == ir
         ctx.memoplans[iw][i] = p
         return p
+    end
+    if length(keys) == ctx.memocaps[iw]
+        newcap = max(2 * Int(ctx.memocaps[iw]), 4)
+        growth = vectorbytes(Int32, newcap) + vectorbytes(ReadPlan, newcap)
+        reserve!(ctx.budget, growth)                   # the replacement partner vectors (§4.4)
+        nk = Vector{Int32}(undef, newcap)
+        np = Vector{ReadPlan}(undef, newcap)
+        allocated!(ctx.budget, growth)
+        resize!(nk, length(keys))
+        resize!(np, length(keys))
+        copyto!(nk, 1, keys, 1, length(keys))
+        copyto!(np, 1, ctx.memoplans[iw], 1, length(keys))
+        old = vectorbytes(Int32, Int(ctx.memocaps[iw])) + vectorbytes(ReadPlan, Int(ctx.memocaps[iw]))
+        ctx.memokeys[iw] = nk                          # the old vectors are unreachable only after the rebind
+        ctx.memoplans[iw] = np
+        ctx.memocaps[iw] = Int32(newcap)
+        release!(ctx.budget, old)
+        keys = nk
     end
     insert!(keys, i, ir)
     insert!(ctx.memoplans[iw], i, p)
@@ -292,8 +329,14 @@ function resolvebranch(ctx::ResolveContext, w::Schema, r::Schema, wp::String, rp
 end
 
 function resolvewriterunion(ctx::ResolveContext, w::UnionSchema, r::Schema, wp::String, rp::String)
-    branches = ReadPlan[]
-    rindex = Int[]
+    n = length(w.branches)
+    slots = vectorbytes(ReadPlan, n) + vectorbytes(Int, n) + 64
+    reserve!(ctx.budget, slots)                        # the exact branch/index vectors and node shell (§4.4)
+    branches = Vector{ReadPlan}(undef, n)
+    resize!(branches, 0)
+    rindex = Vector{Int}(undef, n)
+    resize!(rindex, 0)
+    allocated!(ctx.budget, slots)
     for (i, b) in enumerate(w.branches)
         bp = string(wp, "[", i - 1, "]")
         if r isa UnionSchema
@@ -320,7 +363,10 @@ end
 
 function resolveenum(ctx::ResolveContext, w::EnumSchema, r::EnumSchema, wp::String, rp::String)
     w.symbols.data == r.symbols.data && return readerplan(ctx, r)
+    mapbytes = vectorbytes(Int32, length(w.symbols)) + 64
+    reserve!(ctx.budget, mapbytes)                     # the remap table and node shell (§4.4)
     map = Vector{Int32}(undef, length(w.symbols))
+    allocated!(ctx.budget, mapbytes)
     for (i, sym) in enumerate(w.symbols)
         addresolution!(ctx.budget, 1)
         map[i] = Int32(get(r.symbolindex, sym, 0))
@@ -330,9 +376,20 @@ function resolveenum(ctx::ResolveContext, w::EnumSchema, r::EnumSchema, wp::Stri
 end
 
 function resolverecord(ctx::ResolveContext, w::RecordSchema, r::RecordSchema, wp::String, rp::String)
-    plan = ResolvedRecordPlan(r, Pair{Int,ReadPlan}[], Pair{Int,DefaultPlan}[], Int[])
-    memostore!(ctx, w, r, plan)                        # before the fields, so recursive references resolve
     nw, nr = length(w.fields), length(r.fields)
+    slots = vectorbytes(Pair{Int,ReadPlan}, nw) + vectorbytes(Pair{Int,DefaultPlan}, nr) + vectorbytes(Int, nr) + 64
+    reserve!(ctx.budget, slots)                        # exact step/default/box capacity and node shell (§4.4)
+    steps = Vector{Pair{Int,ReadPlan}}(undef, nw)
+    resize!(steps, 0)
+    defaults = Vector{Pair{Int,DefaultPlan}}(undef, nr)
+    resize!(defaults, 0)
+    boxes = Vector{Int}(undef, nr)
+    resize!(boxes, 0)
+    plan = ResolvedRecordPlan(r, steps, defaults, boxes)
+    allocated!(ctx.budget, slots)
+    memostore!(ctx, w, r, plan)                        # before the fields, so recursive references resolve
+    scratch = vectorbytes(Int, nr) + vectorbytes(UInt64, cld(nr, 64)) + vectorbytes(Int, nw) + 64
+    reserve!(ctx.budget, scratch)                      # the matching scratch, released when the plan is filled
     cand = zeros(Int, nr)                              # the writer field each reader field names
     viaalias = falses(nr)
     for (j, rf) in enumerate(r.fields)
@@ -346,6 +403,7 @@ function resolverecord(ctx::ResolveContext, w::RecordSchema, r::RecordSchema, wp
         end
     end
     claimed = zeros(Int, nw)                           # reader field per writer field; aliases claim first
+    allocated!(ctx.budget, scratch)
     for pass in (true, false), (j, rf) in enumerate(r.fields)
         (cand[j] != 0 && viaalias[j] == pass) || continue
         i = cand[j]
@@ -368,6 +426,7 @@ function resolverecord(ctx::ResolveContext, w::RecordSchema, r::RecordSchema, wp
         (d isa DefaultValue && d.valid) || reserror("reader field \"$(rf.name)\" has no writer field and no valid default", wp, string(rp, ".", rf.name))
         push!(plan.defaults, j => DefaultPlan(rf.schema, d.json))
     end
+    release!(ctx.budget, scratch)                      # the matching scratch dies here
     return plan
 end
 

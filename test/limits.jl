@@ -208,6 +208,57 @@
         Avro.close!(db)
     end
 
+    @testset "overlapping guard residency under real memory (round-4 item 2)" begin
+        if Threads.nthreads() > 1
+            N = 64 << 20
+            tol = 24 << 20                             # host free-memory noise allowance
+            ready = Channel{Nothing}(1)
+            settle = Channel{Nothing}(1)
+            done = Channel{Nothing}(1)
+            base0 = Avro.available_memory()
+            holder = Threads.@spawn begin
+                hb = Avro.Budget(Avro.Limits(max_total_bytes=1 << 30); available=1 << 40)
+                Avro.reserve!(hb, Avro.bytesbytes(N))
+                put!(ready, nothing)
+                take!(settle)
+                block = fill(0x5a, N)                  # the real backing storage, then the settlement
+                Avro.allocated!(hb, Avro.bytesbytes(N))
+                put!(ready, nothing)
+                take!(done)
+                Avro.release!(hb, Avro.bytesbytes(N))
+                Avro.close!(hb)
+                block[1]
+            end
+            errormonitor(holder)
+            take!(ready)                               # N bytes pending on the overlapping task
+            pending_avail = Avro.available_memory()
+            @test base0 - pending_avail > N - Avro.GUARD_CHUNK - tol   # the guard subtracts pending reservations
+            put!(settle, nothing)
+            take!(ready)                               # the holder allocated the block and settled it
+            resident_avail = Avro.available_memory()
+            # settled bytes leave the guard while their pages enter the OS figure: available_memory()
+            # does not fall by another N (a leaked pending counter would subtract the storage twice)
+            @test pending_avail - resident_avail < tol
+            # identical failing admissions beside the resident holder observe the live figure, stably:
+            # a real pending wall collapses available_memory() below the first unit of progress
+            need = 2 * Avro.first_unit_bytes(Avro.Limits())
+            wall = resident_avail - need + (8 << 20)
+            if wall > 0
+                squeeze = Avro.Budget(Avro.Limits(max_total_bytes=1 << 40); available=1 << 60)
+                Avro.reserve!(squeeze, wall)
+                e1 = try Avro.Budget(Avro.Limits()); nothing catch err; err end
+                e2 = try Avro.Budget(Avro.Limits()); nothing catch err; err end
+                @test e1 isa Avro.LimitError && e1.limit === :available_memory
+                @test e2 isa Avro.LimitError && e2.limit === :available_memory
+                @test abs(e1.observed - e2.observed) < tol
+                Avro.unreserve!(squeeze, wall)
+                Avro.close!(squeeze)
+            end
+            put!(done, nothing)
+            @test fetch(holder) == 0x5a
+        end
+    end
+
     @testset "prepared reader restores guard after failure" begin
         schema = Avro.parseschema("""{"type":"record","name":"Guarded","fields":[{"name":"payload","type":"bytes"},{"name":"valid","type":"boolean"}]}""")
         bytes = Avro.encode(schema, (payload=zeros(UInt8, 1 << 20), valid=true))

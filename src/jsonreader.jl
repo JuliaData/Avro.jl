@@ -365,8 +365,8 @@ function decodestring(buf::AbstractVector{UInt8}, i::Int, j::Int)
         end
     end
     hasescape || return String(buf[i + 1:j - 1])
-    out = UInt8[]
-    sizehint!(out, j - i)
+    out = Vector{UInt8}(undef, j - i)                # decoded text never exceeds the raw span (§4.4)
+    resize!(out, 0)
     k = i + 1
     while k < j
         b = buf[k]
@@ -455,10 +455,18 @@ function skipws!(r::JSONReader)
     return nothing
 end
 
-function charge!(r::JSONReader, n::Int)
-    # Amortized per-token charges: the corresponding storage is allocated in the same breath, so the
-    # reservation settles immediately (no pending window is left behind on the guard).
-    r.budget === nothing || (reserve!(r.budget, n); allocated!(r.budget, n))
+function reservecharge!(r::JSONReader, n::Int)
+    r.budget === nothing || reserve!(r.budget, n)
+    return nothing
+end
+
+function settlecharge!(r::JSONReader, n::Int)
+    r.budget === nothing || allocated!(r.budget, n)
+    return nothing
+end
+
+function releasecharge!(r::JSONReader, n::Int)
+    r.budget === nothing || release!(r.budget, n)
     return nothing
 end
 
@@ -506,10 +514,12 @@ function parsevalue!(r::JSONReader)
     elseif b == UInt8('-') || isdigit8(b)
         start = r.pos
         r.pos = scannumber(r.buf, r.pos, r.n, r.errfn)
-        charge!(r, (r.pos - start) + 8)                  # before the token copy it covers
+        toklen = (r.pos - start) + 8
+        reservecharge!(r, toklen)
         tok = String(r.buf[start:r.pos - 1])
+        settlecharge!(r, toklen)
         iv = parseinteger(tok)
-        iv === nothing || return iv
+        iv === nothing || (releasecharge!(r, toklen); return iv)   # the token dies with its integer value
         return JSONNumber(tok)
     else
         r.errfn("unexpected byte 0x$(string(b; base=16, pad=2))", r.pos)
@@ -520,8 +530,11 @@ function parsestring!(r::JSONReader)
     start = r.pos
     j = scanstring(r.buf, r.pos, r.n, r.errfn) - 1   # closing quote
     r.pos = j + 1
-    charge!(r, j - start + 16)
-    return decodestring(r.buf, start, j)
+    n = j - start + 16
+    reservecharge!(r, n)
+    s = decodestring(r.buf, start, j)
+    settlecharge!(r, n)
+    return s
 end
 
 function enter!(r::JSONReader)
@@ -530,21 +543,24 @@ function enter!(r::JSONReader)
     return nothing
 end
 
+jsonarrayshell() = shellbytes(FrozenVector{Any}) + 16     # the frozen wrapper and the JSONArray box
+
 function parsearray!(r::JSONReader)
     enter!(r)
     r.pos += 1
-    items = FrozenVector{Any}()
-    charge!(r, 64)
     skipws!(r)
     if r.pos <= r.n && r.buf[r.pos] == UInt8(']')
         r.pos += 1
         r.depth -= 1
-        return JSONArray(freeze!(items))
+        reservecharge!(r, jsonarrayshell() + vectorbytes(Any, 0))
+        a = JSONArray(freeze!(FrozenVector{Any}()))
+        settlecharge!(r, jsonarrayshell() + vectorbytes(Any, 0))
+        return a
     end
+    items = BuildBuf{Any}(r.budget, 4)
     while true
         skipws!(r)
-        charge!(r, 8)
-        push!(items, parsevalue!(r))
+        push!(items, r.budget, parsevalue!(r))
         skipws!(r)
         r.pos <= r.n || r.errfn("unterminated array", r.pos)
         b = r.buf[r.pos]
@@ -558,22 +574,31 @@ function parsearray!(r::JSONReader)
         end
     end
     r.depth -= 1
-    return JSONArray(freeze!(items))
+    data = finishbuild!(items, r.budget)
+    reservecharge!(r, jsonarrayshell())
+    a = JSONArray(freeze!(FrozenVector{Any}(data, false)))
+    settlecharge!(r, jsonarrayshell())
+    return a
 end
+
+jsonobjectshell() = shellbytes(FrozenDict{String,Any}) + 2 * shellbytes(FrozenVector{Any}) + 32   # frozen shells and the JSONObject box
 
 function parseobject!(r::JSONReader)
     enter!(r)
     r.pos += 1
-    keys = String[]
-    vals = []
-    spans = UnitRange{Int}[]
-    charge!(r, 128)
     skipws!(r)
     if r.pos <= r.n && r.buf[r.pos] == UInt8('}')
         r.pos += 1
         r.depth -= 1
-        return JSONObject(freeze!(FrozenDict{String,Any}()), freeze!(FrozenVector{String}()), freeze!(FrozenVector{UnitRange{Int}}()))
+        empties = jsonobjectshell() + 2 * vectorbytes(Any, 0) + vectorbytes(String, 0) + vectorbytes(UnitRange{Int}, 0)
+        reservecharge!(r, empties)
+        o = JSONObject(freeze!(FrozenDict{String,Any}()), freeze!(FrozenVector{String}()), freeze!(FrozenVector{UnitRange{Int}}()))
+        settlecharge!(r, empties)
+        return o
     end
+    keys = BuildBuf{String}(r.budget, 4)
+    vals = BuildBuf{Any}(r.budget, 4)
+    spans = BuildBuf{UnitRange{Int}}(r.budget, 4)
     while true
         skipws!(r)
         (r.pos <= r.n && r.buf[r.pos] == UInt8('"')) || r.errfn("expected a string key", r.pos)
@@ -582,11 +607,10 @@ function parseobject!(r::JSONReader)
         (r.pos <= r.n && r.buf[r.pos] == UInt8(':')) || r.errfn("expected ':' after object key", r.pos)
         r.pos += 1
         skipws!(r)
-        charge!(r, 32)
-        push!(keys, k)
+        push!(keys, r.budget, k)
         vstart = r.pos
-        push!(vals, parsevalue!(r))
-        push!(spans, vstart:r.pos - 1)
+        push!(vals, r.budget, parsevalue!(r))
+        push!(spans, r.budget, vstart:r.pos - 1)
         skipws!(r)
         r.pos <= r.n || r.errfn("unterminated object", r.pos)
         b = r.buf[r.pos]
@@ -600,7 +624,8 @@ function parseobject!(r::JSONReader)
         end
     end
     r.depth -= 1
-    return buildobject(r, keys, vals, spans)
+    return buildobject(r, finishbuild!(keys, r.budget), finishbuild!(vals, r.budget),
+                       finishbuild!(spans, r.budget))
 end
 
 """
@@ -611,24 +636,32 @@ comparison rule) and build the sorted member dictionary plus the source order.
 """
 function buildobject(r::JSONReader, keys::Vector{String}, vals::Vector{Any}, spans::Vector{UnitRange{Int}})
     n = length(keys)
-    perm = collect(1:n)
-    charge!(r, 8 * n)
-    cmp = Ref(0)
-    sort!(perm; alg=MergeSort, lt=(a, b) -> begin
-        ka = keys[a]; kb = keys[b]
-        cmp[] += min(sizeof(ka), sizeof(kb)) + 1
-        isless(ka, kb)
-    end)
-    r.budget === nothing || addcompare!(r.budget, cmp[])
+    scratchbytes = vectorbytes(Int32, n) + vectorbytes(Int32, cld(n, 2))
+    reservecharge!(r, scratchbytes)                    # the sort permutation and merge scratch, transient
+    perm = Vector{Int32}(undef, n)
+    for i in 1:n
+        perm[i] = Int32(i)
+    end
+    scratch = Vector{Int32}(undef, cld(n, 2))
+    settlecharge!(r, scratchbytes)
+    compared = mergesort!(perm, scratch, keys)
+    r.budget === nothing || addcompare!(r.budget, compared)
     for i in 2:n
         keys[perm[i]] == keys[perm[i - 1]] && r.errfn("duplicate object key \"$(keys[perm[i]])\"", r.pos)
     end
+    sortedbytes = vectorbytes(String, n) + vectorbytes(Any, n)
+    reservecharge!(r, sortedbytes)                     # the retained sorted key/value mirrors
     sortedkeys = Vector{String}(undef, n)
     sortedvals = Vector{Any}(undef, n)
+    settlecharge!(r, sortedbytes)
     for (i, p) in enumerate(perm)
         sortedkeys[i] = keys[p]
         sortedvals[i] = vals[p]
     end
+    releasecharge!(r, scratchbytes)                    # the permutation and scratch die here
+    reservecharge!(r, jsonobjectshell())
     d = FrozenDict{String,Any}(sortedkeys, sortedvals, false)
-    return JSONObject(freeze!(d), freeze!(FrozenVector{String}(keys, false)), freeze!(FrozenVector{UnitRange{Int}}(spans, false)))
+    o = JSONObject(freeze!(d), freeze!(FrozenVector{String}(keys, false)), freeze!(FrozenVector{UnitRange{Int}}(spans, false)))
+    settlecharge!(r, jsonobjectshell())
+    return o
 end

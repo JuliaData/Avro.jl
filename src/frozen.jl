@@ -13,8 +13,14 @@ function Base.showerror(io::IO, e::FrozenError)
 end
 
 mutable struct FrozenVector{T} <: AbstractVector{T}
-    const data::Vector{T}
+    data::Vector{T}          # replaceable: §4.4 exact-replacement growth rebinds it
+    cap::Int                 # the prebuilt backing capacity (length(data) may be shorter)
     frozen::Bool
+    FrozenVector{T}(data::Vector{T}, cap::Int, frozen::Bool) where {T} = new(data, cap, frozen)
+end
+
+function FrozenVector{T}(v::Vector{T}, frozen::Bool) where {T}
+    return FrozenVector{T}(v, length(v), frozen)
 end
 
 function FrozenVector{T}() where {T}
@@ -83,6 +89,13 @@ function isfrozen(v::FrozenVector)
     return v.frozen
 end
 
+"An empty frozen vector whose backing storage is prebuilt at exact `capacity` (§4.4 growth rule)."
+function emptywithcapacity(::Type{FrozenVector{T}}, capacity::Int) where {T}
+    data = Vector{T}(undef, max(capacity, 0))
+    resize!(data, 0)
+    return FrozenVector{T}(data, max(capacity, 0), false)
+end
+
 """
     FrozenDict{K,V}
 
@@ -90,13 +103,28 @@ An insertion-free, sorted-key dictionary (binary search on `keys`); no hashing. 
 `isless`/`==` on their `K` values (`String` keys compare by bytes).
 """
 mutable struct FrozenDict{K,V} <: AbstractDict{K,V}
-    const keys::Vector{K}
-    const vals::Vector{V}
+    keys::Vector{K}          # replaceable: §4.4 exact-replacement growth rebinds them
+    vals::Vector{V}
+    cap::Int                 # the prebuilt backing capacity (lengths may be shorter)
     frozen::Bool
+    FrozenDict{K,V}(ks::Vector{K}, vs::Vector{V}, cap::Int, frozen::Bool) where {K,V} = new(ks, vs, cap, frozen)
+end
+
+function FrozenDict{K,V}(ks::Vector{K}, vs::Vector{V}, frozen::Bool) where {K,V}
+    return FrozenDict{K,V}(ks, vs, max(length(ks), length(vs)), frozen)
 end
 
 function FrozenDict{K,V}() where {K,V}
     return FrozenDict{K,V}(K[], V[], false)
+end
+
+"An empty frozen dictionary whose key and value storage is prebuilt at exact `capacity` (§4.4)."
+function emptywithcapacity(::Type{FrozenDict{K,V}}, capacity::Int) where {K,V}
+    ks = Vector{K}(undef, max(capacity, 0))
+    resize!(ks, 0)
+    vs = Vector{V}(undef, max(capacity, 0))
+    resize!(vs, 0)
+    return FrozenDict{K,V}(ks, vs, max(capacity, 0), false)
 end
 
 function FrozenDict{K,V}(pairs) where {K,V}

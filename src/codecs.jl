@@ -153,9 +153,10 @@ under `budget`, capped at `maxout` → `LimitError(:max_block_bytes)`); a member
 and produces none with input exhausted is truncated (`CodecError`).
 """
 function transcodemember!(name::Symbol, codec::TranscodingStreams.Codec, input::AbstractVector{UInt8}, from::Int, to::Int,
-                          out::Vector{UInt8}, outlen::Int, maxout::Int, budget::Budget)
+                          out::Vector{UInt8}, outlen::Int, maxout::Int, budget::Budget, workspace::Int=0)
     err = TranscodingStreams.Error()
     TranscodingStreams.initialize(codec)
+    workspace > 0 && allocated!(budget, workspace)     # the native state initialize just malloc'd (§4.4 order)
     inpos = from
     try
         TranscodingStreams.startproc(codec, :read, err) === :ok || throw(CodecError(name, :decompress, codecmessage(err)))
@@ -214,10 +215,9 @@ end
 function decompressblock(name::Symbol, ::DeflateReader, payload::AbstractVector{UInt8}, limits::Limits, budget::Budget)
     checkpoint = budgetcheckpoint(budget)
     try
-        reserve!(budget, DEFLATE_DECODER_BYTES)
-        allocated!(budget, DEFLATE_DECODER_BYTES)      # the native workspace is malloc'd by initialize inside transcodemember!
+        reserve!(budget, DEFLATE_DECODER_BYTES)        # settled inside transcodemember! once initialize runs
         out = initialoutput(budget, length(payload), limits.max_block_bytes)
-        consumed, out, outlen = transcodemember!(:deflate, DeflateDecompressor(), payload, 1, length(payload), out, 0, limits.max_block_bytes, budget)
+        consumed, out, outlen = transcodemember!(:deflate, DeflateDecompressor(), payload, 1, length(payload), out, 0, limits.max_block_bytes, budget, DEFLATE_DECODER_BYTES)
         release!(budget, DEFLATE_DECODER_BYTES)
         trailing = length(payload) - consumed
         trailing == 0 || throw(CodecError(:deflate, :decompress, "$trailing bytes after the final deflate block"))
@@ -279,9 +279,8 @@ function decompressblock(name::Symbol, z::ZstdReader, payload::AbstractVector{UI
             est = zstd_frameestimate(payload, pos, rem)
             est === nothing && throw(CodecError(:zstandard, :decompress, "unreadable zstandard frame header at payload byte $pos"))
             est <= limits.max_codec_memory || throw(CodecError(:zstandard, :decompress, "the frame at payload byte $pos needs $est bytes of decoder memory; max_codec_memory is $(limits.max_codec_memory)"))
-            reserve!(budget, est)
-            allocated!(budget, est)                    # the native frame workspace is malloc'd by initialize inside transcodemember!
-            consumed, out, outlen = transcodemember!(:zstandard, ZstdDecompressor(windowLogMax=z.windowlogmax), payload, pos, pos + fsz - 1, out, outlen, limits.max_block_bytes, budget)
+            reserve!(budget, est)                      # settled inside transcodemember! once initialize runs
+            consumed, out, outlen = transcodemember!(:zstandard, ZstdDecompressor(windowLogMax=z.windowlogmax), payload, pos, pos + fsz - 1, out, outlen, limits.max_block_bytes, budget, est)
             release!(budget, est)
             consumed == fsz || throw(CodecError(:zstandard, :decompress, "zstandard frame not exactly consumed"))
             pos += fsz

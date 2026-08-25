@@ -50,8 +50,14 @@ mutable struct WRecord <: WritePlan
 end
 
 function writeplan(s::Schema; budget::Union{Nothing,Budget}=nothing)
-    memo = Vector{Union{Nothing,WritePlan}}(nothing, graphinfo(s).nodes)
-    return writeplan(s, memo, budget)
+    nodes = graphinfo(s).nodes
+    mbytes = vectorbytes(Union{Nothing,WritePlan}, nodes)
+    budget === nothing || reserve!(budget, mbytes)     # the construction memo, released once the root is built
+    memo = Vector{Union{Nothing,WritePlan}}(nothing, nodes)
+    budget === nothing || allocated!(budget, mbytes)
+    p = writeplan(s, memo, budget)
+    budget === nothing || release!(budget, mbytes)     # the memo dies here; the plan graph stays charged
+    return p
 end
 
 function writeplan(s::Schema, memo, budget)
@@ -126,10 +132,26 @@ function buildwriteplan(s::MapSchema, memo, budget)
 end
 
 function buildwriteplan(s::UnionSchema, memo, budget)
-    return WUnion(s, WritePlan[writeplan(b, memo, budget) for b in s.branches], nullablebranch(s), Any[juliatype(b) for b in s.branches])
+    n = length(s.branches)
+    vb = 2 * vectorbytes(Any, n) + 64
+    budget === nothing || reserve!(budget, vb)         # the exact branch and type vectors and node shell (§4.4)
+    branches = Vector{WritePlan}(undef, n)
+    jtypes = Vector{Any}(undef, n)
+    budget === nothing || allocated!(budget, vb)
+    for (i, b) in enumerate(s.branches)
+        branches[i] = writeplan(b, memo, budget)
+        jtypes[i] = juliatype(b)
+    end
+    return WUnion(s, branches, nullablebranch(s), jtypes)
 end
 function buildwriteplan(s::RecordSchema, memo, budget)
-    p = WRecord(s, WritePlan[], Pair{Any,Vector{Int}}[])
+    nf = length(s.fields)
+    slots = vectorbytes(WritePlan, nf) + 88            # the exact field vector, the fieldmap cache shell and node shell
+    budget === nothing || reserve!(budget, slots)
+    fields = Vector{WritePlan}(undef, nf)
+    resize!(fields, 0)
+    p = WRecord(s, fields, Pair{Any,Vector{Int}}[])
+    budget === nothing || allocated!(budget, slots)
     memo[Int(nodeid(s)) + 1] = p
     for f in s.fields
         push!(p.fields, writeplan(f.schema, memo, budget))

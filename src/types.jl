@@ -119,7 +119,13 @@ const LOGICAL_LONG = Dict{Type,LogicalType}(
 )
 
 function derive(ctx::DeriveContext, ::Type{T}, name, namespace) where {T}
-    charge!(ctx.budget, 160)
+    reserve!(ctx.budget, 160)                          # the derived node and its meta, settled once built
+    s = deriveimpl(ctx, T, name, namespace)
+    allocated!(ctx.budget, 160)
+    return s
+end
+
+function deriveimpl(ctx::DeriveContext, ::Type{T}, name, namespace) where {T}
     T === Missing && return NullSchema(Props(), NodeMeta())
     T === Nothing && return NullSchema(Props(), NodeMeta())
     T === Bool && return BooleanSchema(Props(), NodeMeta())
@@ -197,17 +203,17 @@ function deriveenum(ctx::DeriveContext, ::Type{E}, name, namespace) where {E<:Ba
     full = derivedname(ctx, E, name, namespace)
     haskey(ctx.named, fullname(full)) && return registerderived!(ctx, ctx.named[fullname(full)], E)
     n = length(instances(E))
-    charge!(ctx.budget, 2 * frozenvectorshell() + frozendictshell() + 32 * n)   # shells and exact slot capacity, before construction (D01)
-    syms = String[]
-    index = FrozenDict{String,Int}()
-    sizehint!(syms, n)
-    sizehint!(index.keys, n)
-    sizehint!(index.vals, n)
+    slots = 2 * frozenvectorshell() + frozendictshell() + vectorbytes(String, n) + vectorbytes(String, n) + vectorbytes(Int, n)
+    reserve!(ctx.budget, slots)                        # shells and exact slot capacity (§4.4)
+    syms = Vector{String}(undef, n)
+    resize!(syms, 0)
+    index = emptywithcapacity(FrozenDict{String,Int}, n)
+    allocated!(ctx.budget, slots)
     for (i, inst) in enumerate(instances(E))
         sym = avrosymbol(E, inst)
+        retain!(ctx.budget, stringbytes(sizeof(sym)))                     # the symbol string the schema keeps
         checkderivedname(sym, "enum symbol \"$sym\"", string(E), "override `Avro.avrosymbol(::Type{$E}, x)`")
         haskey(index, sym) && throw(ArgumentError("enum $E derives the symbol \"$sym\" twice"))
-        charge!(ctx.budget, stringbytes(sizeof(sym)))                     # the retained symbol, before it is stored (D01)
         push!(syms, sym)
         index[sym] = i
     end
@@ -219,13 +225,16 @@ function deriveunion(ctx::DeriveContext, ::Type{U}, namespace) where {U}
     members = Base.uniontypes(U)
     if length(members) == 2 && Missing in members && !(Nothing in members)
         other = members[1] === Missing ? members[2] : members[1]
-        charge!(ctx.budget, frozenvectorshell() + 16)                     # the two-branch vector, before construction (D01)
+        twobranch = frozenvectorshell() + 16
+        reserve!(ctx.budget, twobranch)                # the two-branch vector, built next (§4.4)
         bs = FrozenVector{Schema}(Schema[NullSchema(Props(), NodeMeta()), derive(ctx, other, nothing, namespace)], false)
+        allocated!(ctx.budget, twobranch)
         return UnionSchema(freeze!(bs), NodeMeta())
     end
-    charge!(ctx.budget, frozenvectorshell() + 8 * length(members))       # shell and exact branch slots, before construction (D01)
-    bs = FrozenVector{Schema}()
-    sizehint!(bs.data, length(members))
+    branchbytes = frozenvectorshell() + vectorbytes(Schema, length(members))
+    reserve!(ctx.budget, branchbytes)                  # shell and exact branch capacity (§4.4)
+    bs = emptywithcapacity(FrozenVector{Schema}, length(members))
+    allocated!(ctx.budget, branchbytes)
     for m in members
         s = derive(ctx, m, nothing, namespace)
         s isa UnionSchema && throw(ArgumentError("union member $m derives a union; Avro unions cannot nest"))
@@ -253,18 +262,19 @@ function derivenamedtuple(ctx::DeriveContext, ::Type{T}, name, namespace) where 
     full = FullName(checkderivedname(name, "name \"$name\"", string(T), "pass a valid `name=`"), checkderivednamespace(ns, string(T)))
     haskey(ctx.named, fullname(full)) && throw(ArgumentError("the Avro name \"$(fullname(full))\" is derived twice"))
     nf = length(names)
-    charge!(ctx.budget, frozenvectorshell() + frozendictshell() + 128 + 32 * nf)   # record shells and exact field capacity (D01)
-    fields = FrozenVector{Field}()
-    index = FrozenDict{String,Int}()
-    sizehint!(fields.data, nf)
-    sizehint!(index.keys, nf)
-    sizehint!(index.vals, nf)
+    slots = frozenvectorshell() + frozendictshell() + 128 + vectorbytes(Field, nf) + vectorbytes(String, nf) + vectorbytes(Int, nf)
+    reserve!(ctx.budget, slots)                        # record shells and exact field capacity (§4.4)
+    fields = emptywithcapacity(FrozenVector{Field}, nf)
+    index = emptywithcapacity(FrozenDict{String,Int}, nf)
+    allocated!(ctx.budget, slots)
     rec = RecordSchema(full, freeze!(FrozenVector{String}()), freeze!(FrozenVector{String}()), nothing, false, Props(), fields, index, NodeMeta())
     registerderived!(ctx, rec, T)
     for (i, (fname, ftype)) in enumerate(zip(names, types))
         fn = checkderivedname(string(fname), "field name \"$fname\"", string(T), "rename the field")
-        charge!(ctx.budget, stringbytes(sizeof(fn)) + 2 * frozenvectorshell() + 128)   # the field name, wrappers and Field shell, before construction (D01)
+        fbytes = stringbytes(sizeof(fn)) + 2 * frozenvectorshell() + 128
+        reserve!(ctx.budget, fbytes)                   # the field name, wrappers and Field shell, built next
         push!(fields, Field(fn, derive(ctx, ftype, nothing, full.namespace), nothing, nodefault, :ascending, freeze!(FrozenVector{String}()), Props()))
+        allocated!(ctx.budget, fbytes)
         index[fn] = i
     end
     freeze!(fields)
@@ -289,12 +299,11 @@ function derivestruct(ctx::DeriveContext, ::Type{T}, name, namespace) where {T}
     tags = StructUtils.fieldtags(AvroStyle(), T)
     defaults = StructUtils.fielddefaults(AvroStyle(), T)
     nf = fieldcount(T)
-    charge!(ctx.budget, frozenvectorshell() + frozendictshell() + 128 + 32 * nf)   # record shells and exact field capacity (D01)
-    fields = FrozenVector{Field}()
-    index = FrozenDict{String,Int}()
-    sizehint!(fields.data, nf)
-    sizehint!(index.keys, nf)
-    sizehint!(index.vals, nf)
+    slots = frozenvectorshell() + frozendictshell() + 128 + vectorbytes(Field, nf) + vectorbytes(String, nf) + vectorbytes(Int, nf)
+    reserve!(ctx.budget, slots)                        # record shells and exact field capacity (§4.4)
+    fields = emptywithcapacity(FrozenVector{Field}, nf)
+    index = emptywithcapacity(FrozenDict{String,Int}, nf)
+    allocated!(ctx.budget, slots)
     rec = RecordSchema(full, freeze!(FrozenVector{String}()), freeze!(FrozenVector{String}()), nothing, false, Props(), fields, index, NodeMeta())
     registerderived!(ctx, rec, T)
     for (i, fname) in enumerate(fieldnames(T))
@@ -326,8 +335,10 @@ function derivestruct(ctx::DeriveContext, ::Type{T}, name, namespace) where {T}
             printjson(jw, j, false, 0)
             d = DefaultValue(j, branch, boundedtake!(jw), 0, true)
         end
-        charge!(ctx.budget, stringbytes(sizeof(fn)) + 2 * frozenvectorshell() + 128)   # the field name, wrappers and Field shell, before construction (D01)
+        fbytes = stringbytes(sizeof(fn)) + 2 * frozenvectorshell() + 128
+        reserve!(ctx.budget, fbytes)                   # the field name, wrappers and Field shell, built next
         push!(fields, Field(fn, fs, nothing, d, :ascending, freeze!(FrozenVector{String}()), Props()))
+        allocated!(ctx.budget, fbytes)
         index[fn] = i
     end
     freeze!(fields)

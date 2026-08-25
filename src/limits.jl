@@ -340,14 +340,18 @@ function allocated!(b::Budget, n::Int)
 end
 
 """
-    charge!(budget, n)
+    retain!(budget, n)
 
-Reserve `n` bytes and settle them immediately: the shorthand for storage allocated in the same
-breath as its charge (amortized parser and construction charges). A bare `reserve!` without a
-matching `allocated!`/`unreserve!` is reserved for worst-case headroom that never materialises.
+Charge `n` bytes of storage that already exists and is being retained beyond the structure that
+allocated it — tree references a schema node keeps alive, or slot shifts inside prebuilt capacity.
+Nothing is allocated at the call site, so the reservation settles immediately: the storage is
+already resident. Storage allocated at the call site must use `reserve!` before the allocation and
+`allocated!` after it instead (round-4 item 2).
 """
-function charge!(b::Budget, n::Int)
-    return (reserve!(b, n); allocated!(b, n); b)
+function retain!(b::Budget, n::Int)
+    reserve!(b, n)
+    allocated!(b, n)
+    return b
 end
 
 """
@@ -412,6 +416,105 @@ function rollbackreservations!(budget::Budget, checkpoint::NTuple{2,Int})
     resident = delta - max(pend, 0)
     resident > 0 && release!(budget, resident)
     return nothing
+end
+
+"""
+Construction-side exact-replacement growth (plan §4.4): the backing vector starts at a reserved exact
+capacity, grows only by reserving the doubled replacement before allocating it, and shrinks to its
+exact final length in `finishbuild!`. `budget === nothing` builds without accounting (unbudgeted
+public constructors account elsewhere).
+"""
+mutable struct BuildBuf{T}
+    data::Vector{T}
+    len::Int
+end
+
+function BuildBuf{T}(budget::Union{Nothing,Budget}, cap::Int) where {T}
+    cap = max(cap, 0)
+    budget === nothing || reserve!(budget, vectorbytes(T, cap))
+    data = Vector{T}(undef, cap)
+    budget === nothing || allocated!(budget, vectorbytes(T, cap))
+    return BuildBuf{T}(data, 0)
+end
+
+function Base.push!(bb::BuildBuf{T}, budget::Union{Nothing,Budget}, x) where {T}
+    if bb.len == length(bb.data)
+        newcap = max(2 * length(bb.data), 4)
+        budget === nothing || reserve!(budget, vectorbytes(T, newcap))
+        nd = Vector{T}(undef, newcap)
+        budget === nothing || allocated!(budget, vectorbytes(T, newcap))
+        copyto!(nd, 1, bb.data, 1, bb.len)
+        oldbytes = vectorbytes(T, length(bb.data))
+        bb.data = nd                                   # the old storage is unreachable only after the rebind
+        budget === nothing || release!(budget, oldbytes)
+    end
+    bb.len += 1
+    @inbounds bb.data[bb.len] = x
+    return bb
+end
+
+"Shrink to the exact final length by replacement and hand the backing vector to the caller."
+function finishbuild!(bb::BuildBuf{T}, budget::Union{Nothing,Budget}) where {T}
+    out = bb.data
+    if bb.len != length(out)
+        budget === nothing || reserve!(budget, vectorbytes(T, bb.len))
+        out = Vector{T}(undef, bb.len)
+        budget === nothing || allocated!(budget, vectorbytes(T, bb.len))
+        copyto!(out, 1, bb.data, 1, bb.len)
+        oldbytes = vectorbytes(T, length(bb.data))
+        bb.data = out
+        budget === nothing || release!(budget, oldbytes)
+    end
+    return out
+end
+
+"Push with §4.4 exact-replacement growth when the prebuilt capacity is exhausted."
+function budgetedpush!(v::FrozenVector{T}, x, budget::Union{Nothing,Budget}) where {T}
+    v.frozen && throw(FrozenError("vector"))
+    if length(v.data) == v.cap
+        newcap = max(2 * v.cap, 4)
+        budget === nothing || reserve!(budget, vectorbytes(T, newcap))
+        nd = Vector{T}(undef, newcap)
+        budget === nothing || allocated!(budget, vectorbytes(T, newcap))
+        resize!(nd, length(v.data))
+        copyto!(nd, 1, v.data, 1, length(v.data))
+        oldbytes = vectorbytes(T, v.cap)
+        v.data = nd                                    # the old storage is unreachable only after the rebind
+        v.cap = newcap
+        budget === nothing || release!(budget, oldbytes)
+    end
+    push!(v.data, x)
+    return v
+end
+
+"Sorted insert (or overwrite) with §4.4 exact-replacement growth when the capacity is exhausted."
+function budgetedinsert!(d::FrozenDict{K,V}, k, v, budget::Union{Nothing,Budget}) where {K,V}
+    d.frozen && throw(FrozenError("dict"))
+    i = searchsortedfirst(d.keys, k)
+    if i <= length(d.keys) && d.keys[i] == k
+        d.vals[i] = v
+        return d
+    end
+    if length(d.keys) == d.cap
+        newcap = max(2 * d.cap, 4)
+        growth = vectorbytes(K, newcap) + vectorbytes(V, newcap)
+        budget === nothing || reserve!(budget, growth)
+        nk = Vector{K}(undef, newcap)
+        nv = Vector{V}(undef, newcap)
+        budget === nothing || allocated!(budget, growth)
+        resize!(nk, length(d.keys))
+        resize!(nv, length(d.vals))
+        copyto!(nk, 1, d.keys, 1, length(d.keys))
+        copyto!(nv, 1, d.vals, 1, length(d.vals))
+        oldbytes = vectorbytes(K, d.cap) + vectorbytes(V, d.cap)
+        d.keys = nk                                    # the old storage is unreachable only after the rebind
+        d.vals = nv
+        d.cap = newcap
+        budget === nothing || release!(budget, oldbytes)
+    end
+    insert!(d.keys, i, convert(K, k))
+    insert!(d.vals, i, convert(V, v))
+    return d
 end
 
 "Zero a budget for reuse by a prepared per-call path (guard bookkeeping settled first)."

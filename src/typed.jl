@@ -176,12 +176,13 @@ function memostore!(memo::TypedMemo, s::Schema, ::Type{T}, p::TypedPlan) where {
     entries = memo[slot]
     for i in eachindex(entries)
         entries[i].first === T || continue
-        charge!(memo.budget, memopairbytes())          # the replacement pair, before it is built (D06)
+        reserve!(memo.budget, memopairbytes())         # the replacement pair, built next
         entries[i] = T => p
+        allocated!(memo.budget, memopairbytes())
         release!(memo.budget, memopairbytes())         # the replaced pair dies with the overwrite
         return p
     end
-    charge!(memo.budget, memopairbytes())              # the new pair, before it is built (D06)
+    reserve!(memo.budget, memopairbytes())             # the new pair, settled after it is stored
     n = checked_add(length(entries), 1)
     newcharge = vectorbytes(Pair{Any,TypedPlan}, n)
     reserve!(memo.budget, newcharge)
@@ -195,6 +196,7 @@ function memostore!(memo::TypedMemo, s::Schema, ::Type{T}, p::TypedPlan) where {
     end
     copyto!(replacement, 1, entries, 1, n - 1)
     replacement[n] = T => p
+    allocated!(memo.budget, memopairbytes())           # the stored pair exists now
     oldcharge = vectorbytes(Pair{Any,TypedPlan}, n - 1)
     memo.entries[slot] = replacement
     entries = nothing
@@ -216,8 +218,15 @@ function nodebytes(::Type{P}) where {P}
     return isbitstype(P) ? boxbytes(P) : shellbytes(P)
 end
 
-function chargenode!(memo::TypedMemo, ::Type{P}) where {P}
-    return (charge!(memo.budget, nodebytes(P)); nothing)
+"Reserve one node's box before it is built; `settlenode!` settles it right after construction (§4.4)."
+function reservenode!(memo::TypedMemo, ::Type{P}) where {P}
+    reserve!(memo.budget, nodebytes(P))
+    return nothing
+end
+
+function settlenode!(memo::TypedMemo, ::Type{P}) where {P}
+    allocated!(memo.budget, nodebytes(P))
+    return nothing
 end
 
 "Release the transient box of a freshly built node its parent just captured inline (mutable: a reference, nothing to release)."
@@ -246,12 +255,17 @@ function chargedtuple(memo::TypedMemo, parts::Vector)
 end
 
 function chargedgeneric(p::ReadPlan, memo::TypedMemo)
-    return (chargenode!(memo, GenericTarget{typeof(p)}); GenericTarget(p))
+    reservenode!(memo, GenericTarget{typeof(p)})
+    g = GenericTarget(p)
+    settlenode!(memo, GenericTarget{typeof(p)})
+    return g
 end
 
 function chargedsemantic(::Type{T}, p::ReadPlan, memo::TypedMemo) where {T}
-    chargenode!(memo, SemanticTarget{T})
-    return SemanticTarget{T}(p)
+    reservenode!(memo, SemanticTarget{T})
+    t = SemanticTarget{T}(p)
+    settlenode!(memo, SemanticTarget{T})
+    return t
 end
 
 function buildtyped(::Type{T}, s::Schema, p::ReadPlan, memo::TypedMemo) where {T}
@@ -324,8 +338,9 @@ function builduniontarget(::Type{T}, s::UnionSchema, p::UnionPlan, memo::TypedMe
         inner === nothing && return chargedsemantic(T, p, memo)
         ip = buildtyped(inner, other, op, memo)
         ip isa SemanticTarget && return chargedsemantic(T, p, memo)
-        chargenode!(memo, NullableTarget{N,typeof(ip)})
+        reservenode!(memo, NullableTarget{N,typeof(ip)})
         out = NullableTarget{N,typeof(ip)}(ip, nb)
+        settlenode!(memo, NullableTarget{N,typeof(ip)})
         releasecapture!(memo, ip)
         return out
     end
@@ -352,19 +367,25 @@ function builduniontarget(::Type{T}, s::UnionSchema, p::UnionPlan, memo::TypedMe
         branches[i] = found
     end
     release!(memo.budget, memberscharge)               # the member-type scratch dies here; `branches` is retained
-    chargenode!(memo, UnionTarget{T})
-    return UnionTarget{T}(branches)
+    reservenode!(memo, UnionTarget{T})
+    out = UnionTarget{T}(branches)
+    settlenode!(memo, UnionTarget{T})
+    return out
 end
 
 function buildleaftarget(::Type{T}, p::ReadPlan, memo::TypedMemo) where {T}
     if T === Symbol && p isa Union{StringPlan,EnumPlan}
-        chargenode!(memo, SymbolTarget{typeof(p)})
-        return SymbolTarget(p)
+        reservenode!(memo, SymbolTarget{typeof(p)})
+        out = SymbolTarget(p)
+        settlenode!(memo, SymbolTarget{typeof(p)})
+        return out
     end
     T <: Base.Enum && p isa EnumPlan && return enumtarget(T, p, memo)
     if leafcompatible(T, p)
-        chargenode!(memo, LeafTarget{T,typeof(p)})
-        return LeafTarget{T,typeof(p)}(p)
+        reservenode!(memo, LeafTarget{T,typeof(p)})
+        out = LeafTarget{T,typeof(p)}(p)
+        settlenode!(memo, LeafTarget{T,typeof(p)})
+        return out
     end
     return chargedsemantic(T, p, memo)
 end
@@ -378,8 +399,10 @@ function enumtarget(::Type{T}, p::EnumPlan, memo::TypedMemo) where {T<:Base.Enum
         haskey(p.schema.symbolindex, name) || continue
         members[p.schema.symbolindex[name]] = e
     end
-    chargenode!(memo, EnumTarget{T})
-    return EnumTarget{T}(p, members)
+    reservenode!(memo, EnumTarget{T})
+    out = EnumTarget{T}(p, members)
+    settlenode!(memo, EnumTarget{T})
+    return out
 end
 
 function leafcompatible(::Type{T}, ::NullPlan) where {T}
@@ -422,8 +445,9 @@ function buildrecordtarget(::Type{T}, s::RecordSchema, p::RecordPlan, memo::Type
     cached = memolookup(memo, s, T)
     cached === nothing || return cached
     fastroute(T) || return memostore!(memo, s, T, chargedsemantic(T, p, memo))
-    chargenode!(memo, RefTarget{T})
+    reservenode!(memo, RefTarget{T})
     ref = RefTarget{T}(nothing)
+    settlenode!(memo, RefTarget{T})
     memostore!(memo, s, T, ref)
     built = buildrecordplan(T, s, p, memo)
     if built === nothing
@@ -490,8 +514,9 @@ function buildrecordplan(::Type{T}, s::RecordSchema, p::RecordPlan, memo::TypedM
     for (j, f) in enumerate(s.fields)
         k = findfirst(==(f.name), avronames)
         if k === nothing
-            chargenode!(memo, SkipTarget{typeof(p.fields[j])})
+            reservenode!(memo, SkipTarget{typeof(p.fields[j])})
             plans[j] = SkipTarget(p.fields[j])
+            settlenode!(memo, SkipTarget{typeof(p.fields[j])})
             continue
         end
         tp = buildtyped(fieldtype(T, k), f.schema, p.fields[j], memo)
@@ -510,8 +535,10 @@ function buildrecordplan(::Type{T}, s::RecordSchema, p::RecordPlan, memo::TypedM
                 release!(memo.budget, scratch + vectorbytes(Any, length(names)))   # `defaults` dies with the fallback
                 return nothing
             end
-            isbits(v) && charge!(memo.budget, boxbytes(typeof(v)))   # the retained Any-slot box
+            bb = isbits(v) ? boxbytes(typeof(v)) : 0
+            bb > 0 && reserve!(memo.budget, bb)        # the retained Any-slot box, made at the assignment
             defaults[k] = v
+            bb > 0 && allocated!(memo.budget, bb)
         elseif Missing <: ft
             defaults[k] = missing
         elseif Nothing <: ft
@@ -525,8 +552,9 @@ function buildrecordplan(::Type{T}, s::RecordSchema, p::RecordPlan, memo::TypedM
         releasecapture!(memo, x)
     end
     mp, mpbox = chargedtuple(memo, map)
-    chargenode!(memo, RecordTarget{T,typeof(ps),mp})
+    reservenode!(memo, RecordTarget{T,typeof(ps),mp})
     out = RecordTarget{T,typeof(ps),mp}(s, ps, defaults, measuredshell(T, memo.budget))
+    settlenode!(memo, RecordTarget{T,typeof(ps),mp})
     release!(memo.budget, psbox + mpbox + scratch)     # the tuple boxes and construction-only scratch die here
     return out
 end
@@ -545,8 +573,10 @@ function buildresolvedtyped(::Type{T}, s::Schema, p::ReadPlan, memo::TypedMemo) 
         inner === nothing && return nothing
         if p.readerindex == p.nullable
             N === Union{} && return nothing
-            chargenode!(memo, ResolvedNullTarget{N,typeof(p.inner)})
-            return ResolvedNullTarget{N,typeof(p.inner)}(p.inner)
+            reservenode!(memo, ResolvedNullTarget{N,typeof(p.inner)})
+            out = ResolvedNullTarget{N,typeof(p.inner)}(p.inner)
+            settlenode!(memo, ResolvedNullTarget{N,typeof(p.inner)})
+            return out
         end
         return buildtyped(inner, s.branches[p.readerindex], p.inner, memo)   # the writer never encodes null here
     end
@@ -575,8 +605,9 @@ function buildresolvedtyped(::Type{T}, s::Schema, p::ReadPlan, memo::TypedMemo) 
         for x in branches                              # freshly built immutable nodes now live inline in the tuple
             releasecapture!(memo, x)
         end
-        chargenode!(memo, ResolvedNullableTarget{N === Missing ? Missing : Nothing,typeof(bs)})
+        reservenode!(memo, ResolvedNullableTarget{N === Missing ? Missing : Nothing,typeof(bs)})
         out = ResolvedNullableTarget{N === Missing ? Missing : Nothing,typeof(bs)}(bs, isnull)
+        settlenode!(memo, ResolvedNullableTarget{N === Missing ? Missing : Nothing,typeof(bs)})
         release!(memo.budget, bsbox + branchescharge)  # the tuple box and branch scratch die here; `isnull` is retained
         return out
     end
@@ -585,8 +616,18 @@ function buildresolvedtyped(::Type{T}, s::Schema, p::ReadPlan, memo::TypedMemo) 
 end
 
 function buildenumremaptarget(::Type{T}, p::EnumRemapPlan, memo::TypedMemo) where {T}
-    T === String && (chargenode!(memo, EnumRemapTarget{String}); return EnumRemapTarget{String}(p))
-    T === Symbol && (chargenode!(memo, EnumRemapTarget{Symbol}); return EnumRemapTarget{Symbol}(p))
+    if T === String
+        reservenode!(memo, EnumRemapTarget{String})
+        out = EnumRemapTarget{String}(p)
+        settlenode!(memo, EnumRemapTarget{String})
+        return out
+    end
+    if T === Symbol
+        reservenode!(memo, EnumRemapTarget{Symbol})
+        out = EnumRemapTarget{Symbol}(p)
+        settlenode!(memo, EnumRemapTarget{Symbol})
+        return out
+    end
     T <: Base.Enum || return nothing
     members = typedvector(Union{Nothing,T}, length(p.reader.symbols), memo)
     fill!(members, nothing)
@@ -595,8 +636,10 @@ function buildenumremaptarget(::Type{T}, p::EnumRemapPlan, memo::TypedMemo) wher
         haskey(p.reader.symbolindex, name) || continue
         members[p.reader.symbolindex[name]] = e
     end
-    chargenode!(memo, EnumRemapNativeTarget{T})
-    return EnumRemapNativeTarget{T}(p, members)
+    reservenode!(memo, EnumRemapNativeTarget{T})
+    out = EnumRemapNativeTarget{T}(p, members)
+    settlenode!(memo, EnumRemapNativeTarget{T})
+    return out
 end
 
 "A non-union null writer resolved to the target's nullable convention."
@@ -641,8 +684,9 @@ function buildresolvedrecord(::Type{T}, s::RecordSchema, p::ResolvedRecordPlan, 
     cached = memolookup(memo, s, T)
     cached === nothing || return cached
     fastroute(T) || return memostore!(memo, s, T, chargedsemantic(T, p, memo))
-    chargenode!(memo, RefTarget{T})
+    reservenode!(memo, RefTarget{T})
     ref = RefTarget{T}(nothing)
+    settlenode!(memo, RefTarget{T})
     memostore!(memo, s, T, ref)
     built = buildresolvedrecordplan(T, s, p, memo)
     if built === nothing
@@ -681,8 +725,9 @@ function resolvedsteptargets(::Type{T}, s::RecordSchema, p::ResolvedRecordPlan, 
     for (i, (slot, sp)) in enumerate(p.steps)
         k = slot == 0 ? 0 : slotfor[slot]
         if k == 0
-            chargenode!(memo, SkipTarget{typeof(sp)})
+            reservenode!(memo, SkipTarget{typeof(sp)})
             plans[i] = SkipTarget(sp)
+            settlenode!(memo, SkipTarget{typeof(sp)})
             stepslot[i] = 0
         else
             tp = buildtyped(fieldtype(T, k), s.fields[slot].schema, sp, memo)
@@ -716,8 +761,10 @@ function checkedreaderdefault(::Type{T}, dp::DefaultPlan, budget::Budget) where 
         rollbackreservations!(budget, checkpoint)
     end
     valid || return nothing
-    charge!(budget, nodebytes(ResolvedReaderDefault{T}))   # the retained default node, before it is built (D06)
-    return ResolvedReaderDefault{T}(dp)
+    reserve!(budget, nodebytes(ResolvedReaderDefault{T}))
+    out = ResolvedReaderDefault{T}(dp)
+    allocated!(budget, nodebytes(ResolvedReaderDefault{T}))   # the retained default node
+    return out
 end
 
 function resolvedreaderdefaults!(::Type{T}, defaults::Vector{Any}, covered::Vector{Bool},
@@ -742,8 +789,10 @@ function resolvedstaticdefaults!(::Type{T}, defaults::Vector{Any}, covered::Vect
         if haskey(defs, names[k])
             v = defs[names[k]]
             v isa ft || return false
-            isbits(v) && charge!(budget, boxbytes(typeof(v)))   # the retained Any-slot box
+            bb = isbits(v) ? boxbytes(typeof(v)) : 0
+            bb > 0 && reserve!(budget, bb)             # the retained Any-slot box, made at the assignment
             defaults[k] = v
+            bb > 0 && allocated!(budget, bb)
         elseif Missing <: ft
             defaults[k] = missing
         elseif Nothing <: ft
@@ -782,8 +831,9 @@ function buildresolvedrecordplan(::Type{T}, s::RecordSchema, p::ResolvedRecordPl
         releasecapture!(memo, x)
     end
     sm, smbox = chargedtuple(memo, stepslot)
-    chargenode!(memo, ResolvedRecordTarget{T,typeof(ps),sm})
+    reservenode!(memo, ResolvedRecordTarget{T,typeof(ps),sm})
     out = ResolvedRecordTarget{T,typeof(ps),sm}(s, ps, defaults, measuredshell(T, memo.budget))
+    settlenode!(memo, ResolvedRecordTarget{T,typeof(ps),sm})
     release!(memo.budget, psbox + smbox + scratch)     # the tuple boxes and construction-only scratch die here
     return out
 end
@@ -835,8 +885,9 @@ function buildarraytarget(::Type{T}, s::ArraySchema, p::ArrayPlan, memo::TypedMe
     # Julia 1.10's storage oracle counts an immutable non-isbits element both in its vector slot and
     # as a value shell. Julia 1.11 corrected that duplication, so only newer versions transfer it.
     inlineshell = VERSION >= v"1.11" && inlinestruct(E) ? measuredinlineshell(E, memo.budget) : 0
-    chargenode!(memo, ArrayTarget{E,typeof(ip)})
+    reservenode!(memo, ArrayTarget{E,typeof(ip)})
     out = ArrayTarget{E,typeof(ip)}(ip, p.minsize, inlineshell)
+    settlenode!(memo, ArrayTarget{E,typeof(ip)})
     releasecapture!(memo, ip)
     return out
 end
@@ -854,8 +905,9 @@ function buildmaptarget(::Type{T}, s::MapSchema, p::MapPlan, memo::TypedMemo) wh
     # The same immutable inline-shell transfer as arrays: the decoded value's shell moves into its
     # exact `Vector{V}` slot on Julia 1.11+ (round-3 item 4).
     inlineshell = VERSION >= v"1.11" && inlinestruct(V) ? measuredinlineshell(V, memo.budget) : 0
-    chargenode!(memo, MapTarget{K,V,typeof(vp)})
+    reservenode!(memo, MapTarget{K,V,typeof(vp)})
     out = MapTarget{K,V,typeof(vp)}(vp, p.minsize, dict, inlineshell)
+    settlenode!(memo, MapTarget{K,V,typeof(vp)})
     releasecapture!(memo, vp)
     return out
 end
@@ -1055,26 +1107,34 @@ end
 "Measure the complete immutable shell that becomes part of a concrete vector element slot."
 function measuredinlineshell(::Type{T}, budget::Budget) where {T}
     bound = checked_add(checked_add(sizeof(T), checked_mul(8, fieldcount(T))), 64)
-    charge!(budget, bound)                             # covers the transient probe object
+    reserve!(budget, bound)                            # the transient probe object, built next
+    settled = false
     try
-        return try
-            max(Int(Base.summarysize(emptyprobe(T))), 8)
+        shell = try
+            probe = emptyprobe(T)
+            allocated!(budget, bound)
+            settled = true
+            max(Int(Base.summarysize(probe)), 8)
         catch
+            settled || (allocated!(budget, bound); settled = true)
             bound
         end
+        return shell
     finally
-        release!(budget, bound)
+        settled ? release!(budget, bound) : unreserve!(budget, bound)
     end
 end
 
 function measuredshell(::Type{T}, budget::Union{Nothing,Budget}=nothing) where {T}
     isbitstype(T) && return 0
     bound = checked_add(checked_add(sizeof(T), checked_mul(8, fieldcount(T))), 64)
-    budget === nothing || charge!(budget, bound)       # covers the transient probe object
+    budget === nothing || reserve!(budget, bound)      # the transient probe object, built next
+    settled = false
     try
         shell = if ismutabletype(T) || isstructtype(T)
             try
                 probe = emptyprobe(T)
+                budget === nothing || settled || (allocated!(budget, bound); settled = true)
                 marginal = Int(Base.summarysize(probe))
                 for i in 1:fieldcount(T)                   # inline nested structs charge their own shells
                     F = fieldtype(T, i)
@@ -1092,7 +1152,9 @@ function measuredshell(::Type{T}, budget::Union{Nothing,Budget}=nothing) where {
         end
         return shell
     finally
-        budget === nothing || release!(budget, bound)
+        if budget !== nothing
+            settled ? release!(budget, bound) : unreserve!(budget, bound)
+        end
     end
 end
 
