@@ -128,6 +128,20 @@ end
         runone(sw, vw)
         warmentries(sw, vw)
     end
+    # every closed composition context, deterministically: the measured batch draws containers whose
+    # elements narrow to members of E (narrowelement), so warming each (container kind, E element)
+    # pair covers the runtime dispatch and inference contexts the random batch would otherwise
+    # first-encounter inside the measurement. A separate seed leaves the measured stream untouched.
+    let wrng = Random.Xoshiro(11)
+        for (wi, leafsrc) in enumerate(leaves)
+            for shape in ("{\"type\":\"array\",\"items\":" * leafsrc * "}",
+                          "{\"type\":\"map\",\"values\":" * leafsrc * "}",
+                          "{\"type\":\"record\",\"name\":\"WC$(wi)\",\"fields\":[{\"name\":\"f\",\"type\":" * leafsrc * "}]}")
+                sw = Avro.parseschema(shape)
+                runone(sw, samplevalue(sw, wrng))
+            end
+        end
+    end
     for extra in ("{\"type\":\"array\",\"items\":[\"int\",\"string\",\"boolean\"]}",
                   "{\"type\":\"map\",\"values\":[\"long\",\"null\",\"double\"]}",
                   "{\"type\":\"array\",\"items\":{\"type\":\"array\",\"items\":[\"null\",\"bytes\"]}}",
