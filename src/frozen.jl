@@ -16,7 +16,9 @@ mutable struct FrozenVector{T} <: AbstractVector{T}
     data::Vector{T}          # replaceable: §4.4 exact-replacement growth rebinds it
     cap::Int                 # the prebuilt backing capacity (length(data) may be shorter)
     frozen::Bool
-    FrozenVector{T}(data::Vector{T}, cap::Int, frozen::Bool) where {T} = new(data, cap, frozen)
+    function FrozenVector{T}(data::Vector{T}, cap::Int, frozen::Bool) where {T}
+        return new(data, cap, frozen)
+    end
 end
 
 function FrozenVector{T}(v::Vector{T}, frozen::Bool) where {T}
@@ -107,7 +109,9 @@ mutable struct FrozenDict{K,V} <: AbstractDict{K,V}
     vals::Vector{V}
     cap::Int                 # the prebuilt backing capacity (lengths may be shorter)
     frozen::Bool
-    FrozenDict{K,V}(ks::Vector{K}, vs::Vector{V}, cap::Int, frozen::Bool) where {K,V} = new(ks, vs, cap, frozen)
+    function FrozenDict{K,V}(ks::Vector{K}, vs::Vector{V}, cap::Int, frozen::Bool) where {K,V}
+        return new(ks, vs, cap, frozen)
+    end
 end
 
 function FrozenDict{K,V}(ks::Vector{K}, vs::Vector{V}, frozen::Bool) where {K,V}

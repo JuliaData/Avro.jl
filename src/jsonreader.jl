@@ -543,7 +543,9 @@ function enter!(r::JSONReader)
     return nothing
 end
 
-jsonarrayshell() = shellbytes(FrozenVector{Any}) + 16     # the frozen wrapper and the JSONArray box
+function jsonarrayshell()
+    return shellbytes(FrozenVector{Any}) + 16             # the frozen wrapper and the JSONArray box
+end
 
 function parsearray!(r::JSONReader)
     enter!(r)
@@ -581,7 +583,9 @@ function parsearray!(r::JSONReader)
     return a
 end
 
-jsonobjectshell() = shellbytes(FrozenDict{String,Any}) + 2 * shellbytes(FrozenVector{Any}) + 32   # frozen shells and the JSONObject box
+function jsonobjectshell()
+    return shellbytes(FrozenDict{String,Any}) + 2 * shellbytes(FrozenVector{Any}) + 32   # frozen shells and the JSONObject box
+end
 
 function parseobject!(r::JSONReader)
     enter!(r)
