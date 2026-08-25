@@ -3,11 +3,12 @@
 # of sorted runs (no hashing): a recent buffer scanned linearly, sorted into a run when full. Merges
 # are deamortised: an in-progress merge advances by at most MERGE_STEP moved entries per admission,
 # the source runs stay searchable until the completed output replaces them (a partially built run is
-# never consulted). `max_bytes` accounts the table's memory — string bytes plus an 8-byte index slot
-# per name, plus the staged merge's output slots while the merge is live (replacement overlap) — and
-# every allocation is exact and precedes any mutation (round-3 item 5): the recent buffer is prebuilt
-# at RUN_BASE capacity, the carried run and the next merge's output are built before the admission
-# publishes, so a failed admission leaves the table unchanged.
+# never consulted). `max_bytes` accounts the table's complete memory (round-4 item 4): the fixed
+# deterministic structure (`admissionbasebytes()` — the recent buffer, the runs table, and the carry
+# workspace, all prebuilt once at exact capacity), the admitted strings' bytes plus an 8-byte run slot
+# per name, and the staged merge's output slots while the merge is live (replacement overlap). Every
+# fallible allocation, copy and sort happens before any maintenance or accepted-name state is
+# published, so a failed admission leaves the table unchanged.
 
 const RUN_BASE = 1024
 const MERGE_STEP = 2048
@@ -21,34 +22,56 @@ mutable struct RunMerge
     j::Int
 end
 
+const MAX_RUNS = 48                     # runs of geometrically increasing size: 48 covers any max_names
+
 """
     Avro.SymbolAdmission(; max_names=1_000_000, max_bytes=64 << 20)
 
 A caller-owned symbol-admission table: decides which untrusted strings may be interned as `Symbol`s
 (Tables column names; typed `Symbol` values). Strings already admitted do not count twice. `max_bytes`
-bounds the table's memory: the admitted strings' bytes plus an 8-byte index slot per name, plus the
-staged merge's output slots while a merge is in progress. Exceeding `max_names` or `max_bytes` raises
-`LimitError` and leaves the table unchanged. `Avro.DEFAULT_ADMISSION` is the process-wide default;
-pass `names=:trusted` to bypass admission for trusted sources.
+bounds the table's complete memory: the fixed prebuilt structure (`Avro.admissionbasebytes()` — the
+recent buffer, the runs table and the carry workspace, ≈ 30 KB), the admitted strings' bytes plus an
+8-byte run slot per name, and the staged merge's output slots while a merge is in progress. Exceeding
+`max_names` or `max_bytes` raises `LimitError` and leaves the table unchanged; `max_bytes` below the
+fixed structure is an `ArgumentError`. `Avro.DEFAULT_ADMISSION` is the process-wide default; pass
+`names=:trusted` to bypass admission for trusted sources.
 """
 mutable struct SymbolAdmission
     const lock::ReentrantLock
     const max_names::Int
     const max_bytes::Int
     const recent::Vector{String}          # unsorted, ≤ RUN_BASE entries; prebuilt at RUN_BASE capacity
-    const runs::Vector{Vector{String}}    # sorted runs; merged pairwise as sizes match
+    const runs::Vector{Vector{String}}    # sorted runs; prebuilt at MAX_RUNS capacity
+    const carrybuf::Vector{String}        # fixed carry staging (unsorted copy of a full recent buffer)
+    const carryperm::Vector{Int32}        # fixed carry sort permutation
+    const carryscratch::Vector{Int32}     # fixed merge-sort scratch
     merge::Union{Nothing,RunMerge}
     mergeat::Int                          # runs index of the active merge's x (y sits at mergeat + 1)
     count::Int
-    bytes::Int                            # string bytes + 8 per admitted name + the live merge's output slots
+    bytes::Int                            # base + string bytes + 8 per admitted name + live merge output slots
+end
+
+"The fixed deterministic storage every table holds: prebuilt buffers, table capacities and shells."
+function admissionbasebytes()
+    return 8 * RUN_BASE + 40 +            # the recent buffer at exact RUN_BASE capacity
+           8 * MAX_RUNS + 40 +            # the runs table at exact MAX_RUNS capacity
+           8 * RUN_BASE + 40 +            # the carry staging buffer
+           4 * RUN_BASE + 40 +            # the carry sort permutation
+           4 * cld(RUN_BASE, 2) + 40 +    # the merge-sort scratch
+           64                             # the table object and lock
 end
 
 function SymbolAdmission(; max_names::Integer=1_000_000, max_bytes::Integer=64 << 20)
     max_names >= 0 || throw(ArgumentError("max_names must be ≥ 0"))
-    max_bytes >= 0 || throw(ArgumentError("max_bytes must be ≥ 0"))
+    max_bytes >= admissionbasebytes() ||
+        throw(ArgumentError("max_bytes must cover the table's fixed structure ($(admissionbasebytes()) bytes)"))
     recent = Vector{String}(undef, RUN_BASE)           # exact capacity once, never grown (§4.4 growth rule)
     resize!(recent, 0)
-    return SymbolAdmission(ReentrantLock(), Int(max_names), Int(max_bytes), recent, Vector{String}[], nothing, 0, 0, 0)
+    runs = Vector{Vector{String}}(undef, MAX_RUNS)
+    resize!(runs, 0)
+    return SymbolAdmission(ReentrantLock(), Int(max_names), Int(max_bytes), recent, runs,
+                           Vector{String}(undef, RUN_BASE), Vector{Int32}(undef, RUN_BASE),
+                           Vector{Int32}(undef, cld(RUN_BASE, 2)), nothing, 0, 0, admissionbasebytes())
 end
 
 const DEFAULT_ADMISSION = SymbolAdmission()
@@ -121,21 +144,35 @@ function step_unlocked!(a::SymbolAdmission, prebuilt::Union{Nothing,Vector{Strin
     return nothing
 end
 
-"Publish the prebuilt carried run (built and sorted before the admission mutated anything)."
+"Publish the prebuilt, presorted carried run (all fallible work happened before any mutation)."
 function carry_unlocked!(a::SymbolAdmission, run::Union{Nothing,Vector{String}},
                          prebuilt::Union{Nothing,Vector{String}})
     run === nothing && return nothing
     resize!(a.recent, 0)                  # capacity RUN_BASE is retained; the buffer is never grown
-    push!(a.runs, run)
+    push!(a.runs, run)                    # within the prebuilt MAX_RUNS capacity
     schedule_unlocked!(a, prebuilt)
     return nothing
 end
 
-"Build the carried run before any mutation: an exact-capacity sorted copy of the full recent buffer."
-function buildcarry(a::SymbolAdmission)
+"""
+Build the carried run before any mutation: the full recent buffer plus the incoming name staged into
+the fixed carry workspace, sorted through the package merge sort (no hidden allocation), and written
+into a fresh exact-capacity run whose slots the admitted names' per-name charges already cover.
+"""
+function buildcarry(a::SymbolAdmission, retained::String, budget::Union{Nothing,Budget})
+    n0 = length(a.recent)
+    copyto!(a.carrybuf, 1, a.recent, 1, n0)
+    a.carrybuf[n0 + 1] = retained
+    for i in 1:RUN_BASE
+        a.carryperm[i] = Int32(i)
+    end
+    compared = mergesort!(a.carryperm, a.carryscratch, a.carrybuf)
+    budget === nothing || addcompare!(budget, compared)
     run = Vector{String}(undef, RUN_BASE)
-    copyto!(run, 1, a.recent, 1, RUN_BASE)
-    return sort!(run)
+    for i in 1:RUN_BASE
+        run[i] = a.carrybuf[a.carryperm[i]]
+    end
+    return run
 end
 
 "The run length at `i` after the active merge completes, without mutating the run table."
@@ -215,22 +252,18 @@ function admit!(a::SymbolAdmission, s::AbstractString; budget::Union{Nothing,Bud
         nextlen, released = nextmergeplan(a, carry)
         need = checked_add(nbytes, 8 * nextlen - released)
         need <= a.max_bytes || throw(LimitError(:max_bytes, need, a.max_bytes, :max_bytes, :decode))
-        # Every allocation precedes any mutation (round-3 item 5): the retained copy, the carried run's
-        # buffer and the next merge's output exist before the table changes, so a failure here leaves
-        # the table unchanged.
+        # Every fallible allocation, copy and sort precedes any mutation (round-4 item 4): the retained
+        # copy, the fully sorted carried run and the next merge's output exist before the table changes,
+        # so a failure here leaves the table unchanged.
         retained = String(s)
-        carrybuf = carry ? Vector{String}(undef, RUN_BASE) : nothing
+        run = carry ? buildcarry(a, retained, budget) : nothing
         willstage = nextlen > 0 && (released > 0 || (carry && a.merge === nothing))
         scratch = willstage ? Vector{String}(undef, nextlen) : nothing
         step_unlocked!(a, scratch)                     # maintenance advances only for accepted admissions
         push!(a.recent, retained)                      # into the prebuilt RUN_BASE capacity: never grows
         a.count = ncount
         a.bytes += nbytes0 + 8                         # increment: a completion in the step above released its overlap
-        if carrybuf !== nothing
-            copyto!(carrybuf, 1, a.recent, 1, RUN_BASE)
-            sort!(carrybuf)
-            carry_unlocked!(a, carrybuf, scratch)
-        end
+        run === nothing || carry_unlocked!(a, run, scratch)
         return nothing
     end
     return Symbol(s)
