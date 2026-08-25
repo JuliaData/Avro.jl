@@ -329,13 +329,58 @@ function selectbranch(ctx::ResolveContext, w::Schema, r::UnionSchema)
     return 0
 end
 
+"Snapshot which plain-plan memo slots existed before a fallible union-member attempt."
+function plansnapshot(ctx::ResolveContext, memo::Vector{Union{Nothing,ReadPlan}})
+    charge = vectorbytes(Bool, length(memo))
+    reserve!(ctx.budget, charge)
+    present = Vector{Bool}(undef, length(memo))
+    allocated!(ctx.budget, charge)
+    for i in eachindex(memo)
+        present[i] = memo[i] !== nothing
+    end
+    return (present, charge)
+end
+
+"Drop plain plans first built by a failed branch, while preserving plans owned before the frame."
+function restoreplans!(memo::Vector{Union{Nothing,ReadPlan}}, present::Vector{Bool})
+    for i in eachindex(memo)
+        present[i] || (memo[i] = nothing)
+    end
+    return nothing
+end
+
+"Roll back a failed branch but keep exact replacement growth in its reusable pair memo tables."
+function rollbackbranch!(budget::Budget, checkpoint::NTuple{2,Int}, keep::Int)
+    reserved0, pending0 = checkpoint
+    pend = budget.pending - pending0
+    pend > 0 && unreserve!(budget, pend)
+    resident = budget.reserved - reserved0 - max(pend, 0)
+    discard = resident - keep
+    discard >= 0 || throw(ArgumentError("branch rollback retained $keep bytes from only $resident resident bytes"))
+    discard > 0 && release!(budget, discard)
+    return nothing
+end
+
 function resolvebranch(ctx::ResolveContext, w::Schema, r::Schema, wp::String, rp::String)
+    readerpresent, readercharge = plansnapshot(ctx, ctx.readermemo)
+    writerpresent, writercharge = plansnapshot(ctx, ctx.writermemo)
+    checkpoint = budgetcheckpoint(ctx.budget)
+    tables0 = memotablebytes(ctx)
     try
-        return resolvenode(ctx, w, r, wp, rp)
+        out = resolvenode(ctx, w, r, wp, rp)
+        release!(ctx.budget, readercharge + writercharge)
+        return out
     catch e
-        e isa ResolutionError || rethrow()
+        if !(e isa ResolutionError)
+            release!(ctx.budget, readercharge + writercharge)
+            rethrow()
+        end
+        restoreplans!(ctx.readermemo, readerpresent)
+        restoreplans!(ctx.writermemo, writerpresent)
         memoclear!(ctx)
-        skipper = writerplan(ctx, w)
+        rollbackbranch!(ctx.budget, checkpoint, memotablebytes(ctx) - tables0)
+        release!(ctx.budget, readercharge + writercharge)
+        skipper = writerplan(ctx, w)                  # built after rollback because the returned branch owns it
         return plannode(() -> UnresolvableBranch(e.msg, e.writerpath, e.readerpath, skipper), ctx.budget)
     end
 end

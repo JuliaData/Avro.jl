@@ -18,6 +18,19 @@
         @test array_budget.pending == 0
         @test array_budget.reserved == 128
         Avro.close!(array_budget)
+
+        union_writer = P("[{\"type\":\"record\",\"name\":\"BranchRecord\",\"fields\":[{\"name\":\"a\",\"type\":\"int\"}]}]")
+        late_reader = P("{\"type\":\"record\",\"name\":\"BranchRecord\",\"fields\":[{\"name\":\"a\",\"type\":\"long\"},{\"name\":\"z\",\"type\":\"int\"}]}")
+        early_reader = P("{\"type\":\"record\",\"name\":\"OtherRecord\",\"fields\":[{\"name\":\"a\",\"type\":\"long\"},{\"name\":\"z\",\"type\":\"int\"}]}")
+        branchcharges = Int[]
+        for branchreader in (late_reader, early_reader)
+            branchbudget = Avro.Budget(Avro.Limits(); available=1 << 40)
+            branchplan = Avro.resolve(union_writer, branchreader; budget=branchbudget).plan
+            @test branchplan.branches[1] isa Avro.UnresolvableBranch
+            push!(branchcharges, branchbudget.reserved)
+            Avro.close!(branchbudget)
+        end
+        @test branchcharges[1] == branchcharges[2]
         @test_throws ArgumentError Avro.resolve(w, w; union_resolution=:odd)
         @test Avro.resolvingplan(w, w) isa Avro.IntPlan                        # writer == reader: the plain reader plan
     end
