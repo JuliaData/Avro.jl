@@ -61,9 +61,14 @@ end
 "Build one plan node under §4.4 order: reserve its box, construct, settle."
 function plannode(f, budget::Union{Nothing,Budget}, bytes::Int=64)
     budget === nothing || reserve!(budget, bytes)
-    p = f()
-    budget === nothing || allocated!(budget, bytes)
-    return p
+    try
+        p = f()
+        budget === nothing || allocated!(budget, bytes)
+        return p
+    catch
+        budget === nothing || unreserve!(budget, bytes)
+        rethrow()
+    end
 end
 
 """

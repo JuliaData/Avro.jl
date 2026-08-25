@@ -46,7 +46,8 @@ end
 mutable struct WRecord <: WritePlan
     const schema::RecordSchema
     const fields::Vector{WritePlan}
-    const fieldmaps::Vector{Pair{Any,Vector{Int}}}   # per source type: Julia field positions for each Avro field (0 = absent)
+    fieldmaptype::Any
+    const fieldmap::Vector{Int}       # one exact, bounded source-type map (0 = absent)
 end
 
 function writeplan(s::Schema; budget::Union{Nothing,Budget}=nothing)
@@ -104,7 +105,8 @@ function buildwriteplan(::DoubleSchema, memo, budget)
 end
 
 function buildwriteplan(s::BytesSchema, memo, budget)
-    s.logical isa DecimalLogical && return WDecimal(0, s.logical.precision, s.logical.scale)
+    s.logical isa DecimalLogical &&
+        return plannode(() -> WDecimal(0, s.logical.precision, s.logical.scale), budget)
     return WBytes()
 end
 function buildwriteplan(s::StringSchema, memo, budget)
@@ -113,22 +115,24 @@ function buildwriteplan(s::StringSchema, memo, budget)
 end
 function buildwriteplan(s::FixedSchema, memo, budget)
     l = s.logical
-    l isa DecimalLogical && return WDecimal(s.size, l.precision, l.scale)
+    l isa DecimalLogical && return plannode(() -> WDecimal(s.size, l.precision, l.scale), budget)
     l isa UUIDLogical && return WUUIDFixed()
     l isa DurationLogical && return WDuration()
-    return WFixed(s)
+    return plannode(() -> WFixed(s), budget)
 end
 
 function buildwriteplan(s::EnumSchema, memo, budget)
-    return WEnum(s)
+    return plannode(() -> WEnum(s), budget)
 end
 
 function buildwriteplan(s::ArraySchema, memo, budget)
-    return WArray(writeplan(s.items, memo, budget))
+    items = writeplan(s.items, memo, budget)
+    return plannode(() -> WArray(items), budget)
 end
 
 function buildwriteplan(s::MapSchema, memo, budget)
-    return WMap(writeplan(s.values, memo, budget))
+    values = writeplan(s.values, memo, budget)
+    return plannode(() -> WMap(values), budget)
 end
 
 function buildwriteplan(s::UnionSchema, memo, budget)
@@ -146,11 +150,11 @@ function buildwriteplan(s::UnionSchema, memo, budget)
 end
 function buildwriteplan(s::RecordSchema, memo, budget)
     nf = length(s.fields)
-    slots = vectorbytes(WritePlan, nf) + 88            # the exact field vector, the fieldmap cache shell and node shell
+    slots = vectorbytes(WritePlan, nf) + vectorbytes(Int, nf) + 64
     budget === nothing || reserve!(budget, slots)
     fields = Vector{WritePlan}(undef, nf)
     resize!(fields, 0)
-    p = WRecord(s, fields, Pair{Any,Vector{Int}}[])
+    p = WRecord(s, fields, nothing, zeros(Int, nf))
     budget === nothing || allocated!(budget, slots)
     memo[Int(nodeid(s)) + 1] = p
     for f in s.fields
@@ -825,26 +829,24 @@ end
     fieldpositions(plan, T) -> Vector{Int}
 
 For each Avro field of the record plan, the position of the Julia field of `T` with the same name
-(honouring StructUtils `name` tags); computed once per `T` by comparing field-name strings (no
-interning of schema names).
+(honouring StructUtils `name` tags). The plan owns one exact-length map and replaces its contents for
+the current source type, so the cache cannot grow with the number of types (no schema-name interning).
 """
 function fieldpositions(p::WRecord, ::Type{T}) where {T}
-    for (t, v) in p.fieldmaps
-        t === T && return v
-    end
-    names = String[]
+    p.fieldmaptype === T && return p.fieldmap
+    fill!(p.fieldmap, 0)
     tags = T <: NamedTuple ? (;) : StructUtils.fieldtags(AvroStyle(), T)
-    for fname in fieldnames(T)
-        tagged = T <: NamedTuple ? nothing : fieldtag(tags, fname, :name)
-        push!(names, tagged === nothing ? string(fname) : String(tagged))
+    for (i, f) in enumerate(p.schema.fields)
+        for (j, fname) in enumerate(fieldnames(T))
+            tagged = T <: NamedTuple ? nothing : fieldtag(tags, fname, :name)
+            candidate = tagged === nothing ? string(fname) : String(tagged)
+            candidate == f.name || continue
+            p.fieldmap[i] = j
+            break
+        end
     end
-    positions = Int[]
-    for f in p.schema.fields
-        j = findfirst(==(f.name), names)
-        push!(positions, j === nothing ? 0 : j)
-    end
-    push!(p.fieldmaps, T => positions)
-    return positions
+    p.fieldmaptype = T                                 # publish the completed map last
+    return p.fieldmap
 end
 
 # ---- the aligned-NamedTuple fast path (Phase 4d performance work) ------------------------------------

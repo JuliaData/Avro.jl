@@ -1,6 +1,27 @@
 @testset "Writer/Reader invariant: consumers and source modes (plan §4.4)" begin
     P = Avro.parseschema
     dir = mktempdir()
+    @testset "write plan nodes and field cache are fully bounded" begin
+        for json in (
+                "{\"type\":\"array\",\"items\":\"long\"}",
+                "{\"type\":\"map\",\"values\":\"long\"}",
+                "{\"type\":\"fixed\",\"name\":\"PlanFixed\",\"size\":4}",
+                "{\"type\":\"enum\",\"name\":\"PlanEnum\",\"symbols\":[\"A\"]}",
+                "{\"type\":\"bytes\",\"logicalType\":\"decimal\",\"precision\":4,\"scale\":2}")
+            budget = Avro.Budget(Avro.Limits(); available=1 << 40)
+            plan = Avro.writeplan(P(json); budget=budget)
+            @test budget.pending == 0
+            @test budget.reserved >= 64
+            Avro.close!(budget)
+        end
+        record = P("{\"type\":\"record\",\"name\":\"FieldCache\",\"fields\":[{\"name\":\"a\",\"type\":\"long\"}]}")
+        recordplan = Avro.writeplan(record)
+        Avro.fieldpositions(recordplan, @NamedTuple{a::Int64})
+        fieldmap = recordplan.fieldmap
+        Avro.fieldpositions(recordplan, @NamedTuple{a::Float64})
+        @test recordplan.fieldmap === fieldmap
+        @test length(recordplan.fieldmap) == length(record.fields)
+    end
     @testset "the writer preflight equals a stream reader's construction retention" begin
         s = P("{\"type\":\"record\",\"name\":\"R\",\"namespace\":\"inv\",\"fields\":[{\"name\":\"a\",\"type\":\"long\"},{\"name\":\"b\",\"type\":\"string\"},{\"name\":\"c\",\"type\":[\"null\",{\"type\":\"array\",\"items\":\"double\"}]}]}")
         path = joinpath(dir, "pf.avro")

@@ -120,25 +120,31 @@ function resolve(writer::Schema, reader::Schema; union_resolution::Symbol=:spec,
     union_resolution in (:spec, :java) || throw(ArgumentError("union_resolution must be :spec or :java"))
     budget === nothing &&
         return withbudget(b -> resolve(writer, reader; union_resolution=union_resolution, limits=limits, budget=b), limits)
-    wnodes = graphinfo(writer).nodes
-    rnodes = graphinfo(reader).nodes
-    tables = 2 * vectorbytes(Vector{Int32}, wnodes) + vectorbytes(Int32, wnodes) + 2 * wnodes * STORAGE[].vector +
-             vectorbytes(Union{Nothing,ReadPlan}, rnodes) + vectorbytes(Union{Nothing,ReadPlan}, wnodes)
-    reserve!(budget, tables)                           # the memo tables, released once the plan is built (§4.4)
-    memokeys = Vector{Vector{Int32}}(undef, wnodes)
-    memoplans = Vector{Vector{ReadPlan}}(undef, wnodes)
-    for i in 1:wnodes
-        memokeys[i] = Int32[]
-        memoplans[i] = ReadPlan[]
+    checkpoint = budgetcheckpoint(budget)
+    try
+        wnodes = graphinfo(writer).nodes
+        rnodes = graphinfo(reader).nodes
+        tables = 2 * vectorbytes(Vector{Int32}, wnodes) + vectorbytes(Int32, wnodes) + 2 * wnodes * STORAGE[].vector +
+                 vectorbytes(Union{Nothing,ReadPlan}, rnodes) + vectorbytes(Union{Nothing,ReadPlan}, wnodes)
+        reserve!(budget, tables)                           # the memo tables, released once the plan is built (§4.4)
+        memokeys = Vector{Vector{Int32}}(undef, wnodes)
+        memoplans = Vector{Vector{ReadPlan}}(undef, wnodes)
+        for i in 1:wnodes
+            memokeys[i] = Int32[]
+            memoplans[i] = ReadPlan[]
+        end
+        ctx = ResolveContext(budget, union_resolution, memokeys, memoplans, zeros(Int32, wnodes),
+                             Vector{Union{Nothing,ReadPlan}}(nothing, rnodes),
+                             Vector{Union{Nothing,ReadPlan}}(nothing, wnodes))
+        allocated!(budget, tables)
+        plan = resolvenode(ctx, writer, reader, "\$", "\$")
+        release!(budget, memotablebytes(ctx) + vectorbytes(Union{Nothing,ReadPlan}, rnodes) +
+                         vectorbytes(Union{Nothing,ReadPlan}, wnodes))     # construction memos die here
+        return ResolvedSchema(writer, reader, union_resolution, plan)
+    catch
+        rollbackreservations!(budget, checkpoint)
+        rethrow()
     end
-    ctx = ResolveContext(budget, union_resolution, memokeys, memoplans, zeros(Int32, wnodes),
-                         Vector{Union{Nothing,ReadPlan}}(nothing, rnodes),
-                         Vector{Union{Nothing,ReadPlan}}(nothing, wnodes))
-    allocated!(budget, tables)
-    plan = resolvenode(ctx, writer, reader, "\$", "\$")
-    release!(budget, memotablebytes(ctx) + vectorbytes(Union{Nothing,ReadPlan}, rnodes) +
-                     vectorbytes(Union{Nothing,ReadPlan}, wnodes))     # construction memos die here
-    return ResolvedSchema(writer, reader, union_resolution, plan)
 end
 
 """
@@ -260,11 +266,15 @@ function resolvekinds(ctx::ResolveContext, w::Schema, r::Schema, wp::String, rp:
     end
     if r isa ArraySchema
         w isa ArraySchema || reserror("writer $(describe(w)) does not resolve to reader array", wp, rp)
-        return ArrayPlan(resolvenode(ctx, w.items, r.items, wp * "[items]", rp * "[items]"), elementtype(r.items), minsize(w.items, ctx.budget))
+        items = resolvenode(ctx, w.items, r.items, wp * "[items]", rp * "[items]")
+        ms = minsize(w.items, ctx.budget)
+        return plannode(() -> ArrayPlan(items, elementtype(r.items), ms), ctx.budget)
     end
     if r isa MapSchema
         w isa MapSchema || reserror("writer $(describe(w)) does not resolve to reader map", wp, rp)
-        return MapPlan(resolvenode(ctx, w.values, r.values, wp * "[values]", rp * "[values]"), elementtype(r.values), minsize(w.values, ctx.budget))
+        values = resolvenode(ctx, w.values, r.values, wp * "[values]", rp * "[values]")
+        ms = minsize(w.values, ctx.budget)
+        return plannode(() -> MapPlan(values, elementtype(r.values), ms), ctx.budget)
     end
     return resolveleaf(ctx, w, r, wp, rp)
 end
@@ -284,7 +294,8 @@ function resolveleaf(ctx::ResolveContext, w::Schema, r::Schema, wp::String, rp::
     checkdecimal(w, r, wp, rp)
     kw == kr && return readerplan(ctx, r)                        # same encoding; the reader's interpretation wins
     kr in get(PROMOTIONS, kw, ()) || reserror("writer $(describe(w)) does not resolve to reader $(describe(r))", wp, rp)
-    return PromotePlan(kw, readerplan(ctx, r))
+    reader = readerplan(ctx, r)
+    return plannode(() -> PromotePlan(kw, reader), ctx.budget)
 end
 
 "Whether writer `w` matches reader branch `c` at the top level (the spec's matching rules, with promotion)."
@@ -324,7 +335,8 @@ function resolvebranch(ctx::ResolveContext, w::Schema, r::Schema, wp::String, rp
     catch e
         e isa ResolutionError || rethrow()
         memoclear!(ctx)
-        return UnresolvableBranch(e.msg, e.writerpath, e.readerpath, writerplan(ctx, w))
+        skipper = writerplan(ctx, w)
+        return plannode(() -> UnresolvableBranch(e.msg, e.writerpath, e.readerpath, skipper), ctx.budget)
     end
 end
 
@@ -342,7 +354,8 @@ function resolvewriterunion(ctx::ResolveContext, w::UnionSchema, r::Schema, wp::
         if r isa UnionSchema
             j = selectbranch(ctx, b, r)
             if j == 0
-                push!(branches, UnresolvableBranch("writer union branch $(describe(b)) matches no reader branch", bp, rp, writerplan(ctx, b)))
+                skipper = writerplan(ctx, b)
+                push!(branches, plannode(() -> UnresolvableBranch("writer union branch $(describe(b)) matches no reader branch", bp, rp, skipper), ctx.budget))
             else
                 push!(branches, resolvebranch(ctx, b, r.branches[j], bp, string(rp, "[", j - 1, "]")))
             end
@@ -358,7 +371,8 @@ end
 function resolvereaderunion(ctx::ResolveContext, w::Schema, r::UnionSchema, wp::String, rp::String)
     j = selectbranch(ctx, w, r)
     j == 0 && reserror("writer $(describe(w)) matches no branch of the reader union", wp, rp)
-    return WrapPlan(resolvenode(ctx, w, r.branches[j], wp, string(rp, "[", j - 1, "]")), j, nullablebranch(r))
+    inner = resolvenode(ctx, w, r.branches[j], wp, string(rp, "[", j - 1, "]"))
+    return plannode(() -> WrapPlan(inner, j, nullablebranch(r)), ctx.budget)
 end
 
 function resolveenum(ctx::ResolveContext, w::EnumSchema, r::EnumSchema, wp::String, rp::String)
@@ -388,46 +402,61 @@ function resolverecord(ctx::ResolveContext, w::RecordSchema, r::RecordSchema, wp
     plan = ResolvedRecordPlan(r, steps, defaults, boxes)
     allocated!(ctx.budget, slots)
     memostore!(ctx, w, r, plan)                        # before the fields, so recursive references resolve
-    scratch = vectorbytes(Int, nr) + vectorbytes(UInt64, cld(nr, 64)) + vectorbytes(Int, nw) + 64
+    candcharge = vectorbytes(Int, nr)
+    aliascharge = vectorbytes(UInt64, cld(nr, 64)) + 64
+    claimedcharge = vectorbytes(Int, nw)
+    scratch = candcharge + aliascharge + claimedcharge
     reserve!(ctx.budget, scratch)                      # the matching scratch, released when the plan is filled
-    cand = zeros(Int, nr)                              # the writer field each reader field names
-    viaalias = falses(nr)
-    for (j, rf) in enumerate(r.fields)
-        for name in Iterators.flatten(((rf.name,), rf.aliases))
-            addresolution!(ctx.budget, 1)
-            i = get(w.fieldindex, name, 0)
-            (i == 0 || i == cand[j]) && continue
-            cand[j] != 0 && reserror("reader field \"$(rf.name)\" matches more than one writer field", wp, string(rp, ".", rf.name))
-            cand[j] = i
-            viaalias[j] = name != rf.name
+    settled = 0
+    try
+        cand = zeros(Int, nr)                          # the writer field each reader field names
+        allocated!(ctx.budget, candcharge)
+        settled += candcharge
+        viaalias = falses(nr)
+        allocated!(ctx.budget, aliascharge)
+        settled += aliascharge
+        for (j, rf) in enumerate(r.fields)
+            for name in Iterators.flatten(((rf.name,), rf.aliases))
+                addresolution!(ctx.budget, 1)
+                i = get(w.fieldindex, name, 0)
+                (i == 0 || i == cand[j]) && continue
+                cand[j] != 0 && reserror("reader field \"$(rf.name)\" matches more than one writer field", wp, string(rp, ".", rf.name))
+                cand[j] = i
+                viaalias[j] = name != rf.name
+            end
         end
-    end
-    claimed = zeros(Int, nw)                           # reader field per writer field; aliases claim first
-    allocated!(ctx.budget, scratch)
-    for pass in (true, false), (j, rf) in enumerate(r.fields)
-        (cand[j] != 0 && viaalias[j] == pass) || continue
-        i = cand[j]
-        if claimed[i] != 0
-            pass && reserror("writer field \"$(w.fields[i].name)\" is claimed by two reader field aliases", string(wp, ".", w.fields[i].name), rp)
-            cand[j] = 0                                # consumed by an alias: this reader field needs its default
-            continue
+        claimed = zeros(Int, nw)                       # reader field per writer field; aliases claim first
+        allocated!(ctx.budget, claimedcharge)
+        settled += claimedcharge
+        for pass in (true, false), (j, rf) in enumerate(r.fields)
+            (cand[j] != 0 && viaalias[j] == pass) || continue
+            i = cand[j]
+            if claimed[i] != 0
+                pass && reserror("writer field \"$(w.fields[i].name)\" is claimed by two reader field aliases", string(wp, ".", w.fields[i].name), rp)
+                cand[j] = 0                            # consumed by an alias: this reader field needs its default
+                continue
+            end
+            claimed[i] = j
         end
-        claimed[i] = j
+        for (i, wf) in enumerate(w.fields)
+            j = claimed[i]
+            fp = string(wp, ".", wf.name)
+            push!(plan.steps, j == 0 ? (0 => writerplan(ctx, wf.schema)) : (j => resolvenode(ctx, wf.schema, r.fields[j].schema, fp, string(rp, ".", r.fields[j].name))))
+        end
+        for (j, rf) in enumerate(r.fields)
+            push!(plan.boxes, boxcharge(juliatype(rf.schema)))
+            cand[j] == 0 || continue
+            d = rf.default
+            (d isa DefaultValue && d.valid) || reserror("reader field \"$(rf.name)\" has no writer field and no valid default", wp, string(rp, ".", rf.name))
+            default = plannode(() -> DefaultPlan(rf.schema, d.json), ctx.budget)
+            push!(plan.defaults, j => default)
+        end
+        return plan
+    finally
+        unsettled = scratch - settled
+        unsettled > 0 && unreserve!(ctx.budget, unsettled)
+        settled > 0 && release!(ctx.budget, settled)
     end
-    for (i, wf) in enumerate(w.fields)
-        j = claimed[i]
-        fp = string(wp, ".", wf.name)
-        push!(plan.steps, j == 0 ? (0 => writerplan(ctx, wf.schema)) : (j => resolvenode(ctx, wf.schema, r.fields[j].schema, fp, string(rp, ".", r.fields[j].name))))
-    end
-    for (j, rf) in enumerate(r.fields)
-        push!(plan.boxes, boxcharge(juliatype(rf.schema)))
-        cand[j] == 0 || continue
-        d = rf.default
-        (d isa DefaultValue && d.valid) || reserror("reader field \"$(rf.name)\" has no writer field and no valid default", wp, string(rp, ".", rf.name))
-        push!(plan.defaults, j => DefaultPlan(rf.schema, d.json))
-    end
-    release!(ctx.budget, scratch)                      # the matching scratch dies here
-    return plan
 end
 
 # ---- decoding and skipping --------------------------------------------------------------------------

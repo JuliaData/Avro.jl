@@ -5,6 +5,19 @@
         w = P("\"int\"")
         rs = Avro.resolve(w, P("\"long\""))
         @test rs isa Avro.ResolvedSchema && rs.union_resolution === :spec && rs.plan isa Avro.PromotePlan
+        promote_budget = Avro.Budget(Avro.Limits(); available=1 << 40)
+        @test Avro.resolve(w, P("\"long\""); budget=promote_budget).plan isa Avro.PromotePlan
+        @test promote_budget.pending == 0
+        @test promote_budget.reserved == 64
+        Avro.close!(promote_budget)
+
+        array_budget = Avro.Budget(Avro.Limits(); available=1 << 40)
+        array_writer = P("{\"type\":\"array\",\"items\":\"int\"}")
+        array_reader = P("{\"type\":\"array\",\"items\":\"long\"}")
+        @test Avro.resolve(array_writer, array_reader; budget=array_budget).plan isa Avro.ArrayPlan
+        @test array_budget.pending == 0
+        @test array_budget.reserved == 128
+        Avro.close!(array_budget)
         @test_throws ArgumentError Avro.resolve(w, w; union_resolution=:odd)
         @test Avro.resolvingplan(w, w) isa Avro.IntPlan                        # writer == reader: the plain reader plan
     end
