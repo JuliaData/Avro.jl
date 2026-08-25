@@ -257,7 +257,7 @@
     @testset "admission across repeated files; exhausted admission" begin
         s = P("{\"type\":\"record\",\"name\":\"A\",\"fields\":[{\"name\":\"p\",\"type\":\"long\"},{\"name\":\"q\",\"type\":\"long\"}]}")
         buf() = Avro.tobuffer([(p=Int64(1), q=Int64(2))]; schema=s)
-        adm = Avro.SymbolAdmission(max_names=2, max_bytes=64)
+        adm = Avro.SymbolAdmission(max_names=2, max_bytes=Avro.admissionbasebytes() + 64)
         @test Tables.columnnames(Avro.Table(buf(); names=adm)) == [:p, :q]
         @test Tables.columnnames(Avro.Table(buf(); names=adm)) == [:p, :q]     # already-admitted names do not count twice
         s2 = P("{\"type\":\"record\",\"name\":\"A2\",\"fields\":[{\"name\":\"r\",\"type\":\"long\"}]}")

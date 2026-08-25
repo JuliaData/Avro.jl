@@ -217,12 +217,12 @@ import DataAPI
         close(rn)
         seekstart(out)
         @test isequal(Avro.Reader(rr -> collect(Avro.eachdatum(rr)), out), Any[[1, 2], Int64[]])
-        adm = Avro.SymbolAdmission(max_names=3, max_bytes=100)
+        adm = Avro.SymbolAdmission(max_names=3, max_bytes=Avro.admissionbasebytes() + 100)
         @test_throws Avro.LimitError Avro.Table(buf(); names=adm)
-        t3 = Avro.Table(buf(); names=Avro.SymbolAdmission(max_names=100, max_bytes=1000))
+        t3 = Avro.Table(buf(); names=Avro.SymbolAdmission(max_names=100, max_bytes=Avro.admissionbasebytes() + 1000))
         @test Tables.columnnames(t3) == [:a, :b, :c, :e]
         @test Tables.columnnames(Avro.Table(buf(); names=:trusted)) == [:a, :b, :c, :e]
-        adm3 = Avro.SymbolAdmission(max_names=2, max_bytes=100)
+        adm3 = Avro.SymbolAdmission(max_names=2, max_bytes=Avro.admissionbasebytes() + 100)
         r3 = Avro.Rows(buf(); names=adm3)
         v3, _ = iterate(r3)
         @test Avro.record(v3).a === Int64(1)                                    # iteration interned nothing
