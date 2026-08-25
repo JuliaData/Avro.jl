@@ -322,10 +322,8 @@ function Reader(src; limits::Limits=Limits(), legacy::Union{Nothing,Symbol}=noth
     r = try
         h = readheader(source, limits, budget; legacy=legacy, allow_invalid_names=allow_invalid_names, allow_invalid_defaults=allow_invalid_defaults)
         cname, codec = readercodec(h.codecname, limits, legacy)
-        plan = withplanbudget(budget) do
-            p = readplan(h.schema; budget=budget)
-            decimal_byteorder === :little ? littledecimals(p) : p
-        end
+        p = readplan(h.schema; budget=budget)
+        plan = decimal_byteorder === :little ? littledecimals(p) : p
         Reader(source, h.schema, plan, cname, codec, h.metadata, h.sync, limits, budget, validate, legacy, 0, false, false)
     catch
         closesource(source)
@@ -336,10 +334,6 @@ function Reader(src; limits::Limits=Limits(), legacy::Union{Nothing,Symbol}=noth
         x.closed || (closesource(x.source); close!(x.budget); x.closed = true)
     end
     return r
-end
-
-function withplanbudget(f, budget)
-    return f()
 end
 
 function Reader(f::Function, src; kw...)
@@ -874,9 +868,7 @@ function writerpreflight(schemajson::String, entries, plan, limits::Limits, budg
         pfvals[j] = v
     end
     buildmap(Vector{UInt8}, pfkeys, pfvals, budget)
-    withplanbudget(budget) do
-        readplan(pfschema; budget=budget)
-    end
+    readplan(pfschema; budget=budget)
     preflightbase = budget.reserved - base0
     preflight = pfschema isa RecordSchema ? TablePreflight(pfschema, plan::WRecord) : nothing
     return (preflightbase, preflight)

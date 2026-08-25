@@ -426,10 +426,20 @@ function poolplan(r::Reader, cols::Vector{Type}, entries::BlockTable, ntasks::In
     return (slotrow, inflightcap, nworkers, poolstate)
 end
 
+"The live parallel pool: its reserved state charge, its objects, and liveness (round-4 item 6)."
+mutable struct BlockPool
+    fail::Union{Nothing,FailBox}
+    jobs::Union{Nothing,Vector{Union{Nothing,BlockJob}}}
+    ch::Union{Nothing,Channel{BlockJob}}
+    workers::Union{Nothing,Vector{Task}}
+    const poolstate::Int
+    alive::Bool
+end
+
 """
 Reserve the complete pool before its first package-owned object, then start the workers. A partial
 startup drains started workers and returns the never-resident reservation through `unreserve!`.
-Returns `(fail, jobs, ch, workers)` with the pool-state charge settled resident.
+Returns a live `BlockPool` with the pool-state charge settled resident.
 """
 function startpool(r::Reader, plan, sel::Union{Nothing,Vector{Int}}, slotrow::Int, nblocks::Int,
                    inflightcap::Int, nworkers::Int, poolstate::Int)
@@ -450,7 +460,7 @@ function startpool(r::Reader, plan, sel::Union{Nothing,Vector{Int}}, slotrow::In
             nstarted = i
         end
         allocated!(b, poolstate)
-        return (fail, jobs, ch, workers)
+        return BlockPool(fail, jobs, ch, workers, poolstate, true)
     catch
         if ch !== nothing
             workers === nothing ? close(ch) : settleworkers!(ch, workers, nstarted)
@@ -460,6 +470,91 @@ function startpool(r::Reader, plan, sel::Union{Nothing,Vector{Int}}, slotrow::In
         unreserve!(b, poolstate)                     # never settled: the pool objects die with this frame
         rethrow()
     end
+end
+
+"""
+Retire a live pool: settle the workers, drop every pool object so nothing outlives the reservation,
+then release the settled pool-state charge. All in-flight jobs have committed (the ordered commit
+wave drains every admitted job before the loop re-enters), so nothing is abandoned here.
+"""
+function retirepool!(pool::BlockPool, b::Budget)
+    settleworkers!(pool.ch::Channel{BlockJob}, pool.workers::Vector{Task})
+    pool.fail = nothing
+    pool.jobs = nothing
+    pool.ch = nothing
+    pool.workers = nothing
+    release!(b, pool.poolstate)
+    pool.alive = false
+    return nothing
+end
+
+"Tear the pool down on every exit: settle workers, abandon queued jobs, release the state charge."
+function teardownpool!(pool::BlockPool, b::Budget, stats::ParallelStats)
+    if pool.alive
+        settleworkers!(pool.ch::Channel{BlockJob}, pool.workers::Vector{Task})
+    end
+    pool.jobs === nothing || abandonjobs!(pool.jobs::Vector{Union{Nothing,BlockJob}}, b, stats)
+    pool.fail = nothing
+    pool.jobs = nothing
+    pool.ch = nothing
+    pool.workers = nothing
+    if pool.alive
+        release!(b, pool.poolstate)
+        pool.alive = false
+    end
+    return nothing
+end
+
+"The `ntasks = 1` sequential path: every block decoded directly into the finals in order."
+function directpath!(r::Reader, plan, sel::Union{Nothing,Vector{Int}}, finals::Vector{AbstractVector},
+                     keptidx::Vector{Int}, slotrow::Int, pre::PrescanResult, stats::ParallelStats)
+    for e in pre.entries
+        builders = directbuilders(plan, sel, finals, keptidx, e.rowstart - 1)
+        decodedirect!(r, e, plan, builders, slotrow)
+    end
+    pre.pending === nothing || throw(pre.pending)
+    finalcounters!(stats, r.budget)
+    return stats
+end
+
+"""
+The coordinator loop over a live pool: retire it when the head's worst case no longer fits beside
+it, admit higher blocks into headroom, decode the head under the sequential rule (its failure is the
+lowest and poisons queued blocks), then commit completed jobs in order.
+"""
+function runpool!(r::Reader, plan, sel::Union{Nothing,Vector{Int}}, finals::Vector{AbstractVector},
+                  keptidx::Vector{Int}, cols::Vector{Type}, entries::BlockTable,
+                  stats::ParallelStats, pool::BlockPool, inflightcap::Int, slotrow::Int)
+    b = r.budget
+    inflight = 0
+    next = 1
+    tocommit = 1
+    while tocommit <= length(entries)
+        head = entries[next]
+        headidx = next
+        next += 1
+        Whead = blockworstcase(r.limits, head, cols)
+        pool.alive && checked_add(b.reserved, Whead) > b.ceiling && retirepool!(pool, b)
+        if pool.alive
+            next, inflight = admitjobs!(r, entries, cols, pool.jobs::Vector{Union{Nothing,BlockJob}},
+                                        pool.ch::Channel{BlockJob}, stats, Whead, next, inflight, inflightcap)
+        end
+        builders = directbuilders(plan, sel, finals, keptidx, head.rowstart - 1)
+        try
+            decodedirect!(r, head, plan, builders, slotrow)
+        catch
+            pool.alive && recordfailure!(pool.fail::FailBox, headidx)    # queued higher blocks abandon
+            rethrow()
+        end
+        tocommit = headidx + 1
+        phook(:headdone, headidx)
+        if pool.alive
+            tocommit, inflight = commitwave!(r, pool.jobs::Vector{Union{Nothing,BlockJob}}, finals,
+                                             keptidx, stats, pool.fail::FailBox, tocommit, inflight)
+        end
+        next = tocommit
+    end
+    return nothing
 end
 
 "Admit higher blocks in order into ceiling headroom with complete worst-case reservations."
@@ -511,84 +606,21 @@ rule, higher blocks in order into headroom, ordered cumulative commits, lowest f
 function decodeblocks!(r::Reader, plan, sel::Union{Nothing,Vector{Int}}, finals::Vector{AbstractVector},
                        keptidx::Vector{Int}, cols::Vector{Type}, pre::PrescanResult, ntasks::Int)
     entries = pre.entries
-    nblocks = length(entries)
     stats = ParallelStats()
     LAST_PARALLEL_STATS[] = stats
-    b = r.budget
     slotrow, inflightcap, nworkers, poolstate = poolplan(r, cols, entries, ntasks)
     stats.nworkers = nworkers
-    if nworkers == 0
-        for e in entries                             # the ntasks = 1 direct path
-            builders = directbuilders(plan, sel, finals, keptidx, e.rowstart - 1)
-            decodedirect!(r, e, plan, builders, slotrow)
-        end
-        pre.pending === nothing || throw(pre.pending)
-        finalcounters!(stats, b)
-        return stats
-    end
-    # Locals become `nothing` before the pool reservation is released, so no job index, channel,
-    # task, or fail box outlives it.
-    fail::Union{Nothing,FailBox} = nothing
-    jobs::Union{Nothing,Vector{Union{Nothing,BlockJob}}} = nothing
-    ch::Union{Nothing,Channel{BlockJob}} = nothing
-    workers::Union{Nothing,Vector{Task}} = nothing
-    fail, jobs, ch, workers = startpool(r, plan, sel, slotrow, nblocks, inflightcap, nworkers, poolstate)
-    poolalive = true
-    inflight = 0
-    next = 1
-    tocommit = 1
+    nworkers == 0 && return directpath!(r, plan, sel, finals, keptidx, slotrow, pre, stats)
+    pool = startpool(r, plan, sel, slotrow, length(entries), inflightcap, nworkers, poolstate)
     try
-        while tocommit <= nblocks
-            head = entries[next]
-            headidx = next
-            next += 1
-            Whead = blockworstcase(r.limits, head, cols)
-            if poolalive && checked_add(b.reserved, Whead) > b.ceiling
-                settleworkers!(ch::Channel{BlockJob}, workers::Vector{Task})
-                fail = nothing
-                jobs = nothing
-                ch = nothing
-                workers = nothing
-                release!(b, poolstate)
-                poolalive = false
-            end
-            if poolalive
-                next, inflight = admitjobs!(r, entries, cols, jobs::Vector{Union{Nothing,BlockJob}},
-                                            ch::Channel{BlockJob}, stats, Whead, next, inflight, inflightcap)
-            end
-            builders = directbuilders(plan, sel, finals, keptidx, head.rowstart - 1)
-            try
-                decodedirect!(r, head, plan, builders, slotrow)
-            catch
-                poolalive && recordfailure!(fail::FailBox, headidx)    # queued higher blocks abandon
-                rethrow()
-            end
-            tocommit = headidx + 1
-            phook(:headdone, headidx)
-            if poolalive
-                tocommit, inflight = commitwave!(r, jobs::Vector{Union{Nothing,BlockJob}}, finals, keptidx,
-                                                 stats, fail::FailBox, tocommit, inflight)
-            end
-            next = tocommit
-        end
+        runpool!(r, plan, sel, finals, keptidx, cols, entries, stats, pool, inflightcap, slotrow)
         pre.pending === nothing || throw(pre.pending)
-        finalcounters!(stats, b)
+        finalcounters!(stats, r.budget)
         return stats
-    catch err
-        poolalive && recordfailure!(fail::FailBox, nblocks + 1)        # abandon everything still queued
+    catch
+        pool.alive && recordfailure!(pool.fail::FailBox, length(entries) + 1)   # abandon everything still queued
         rethrow()
     finally
-        if poolalive
-            settleworkers!(ch::Channel{BlockJob}, workers::Vector{Task})
-        end
-        jobs === nothing || abandonjobs!(jobs, b, stats)
-        fail = nothing
-        jobs = nothing
-        ch = nothing
-        workers = nothing
-        if poolalive
-            release!(b, poolstate)
-            poolalive = false
-        end
+        teardownpool!(pool, r.budget, stats)
     end
 end
