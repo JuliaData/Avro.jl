@@ -78,6 +78,20 @@ struct DeriveContext
     anonymous::Base.RefValue{Int}             # counter for nested NamedTuple records
 end
 
+"Create the two derivation memos under the shared construction budget."
+function derivecontext(limits::Limits, budget::Budget, anonymous::Int)
+    charge = 2 * frozendictshell()
+    reserve!(budget, charge)
+    ctx = DeriveContext(limits, budget, FrozenDict{String,Schema}(), FrozenDict{String,Type}(), Ref(anonymous))
+    allocated!(budget, charge)
+    return ctx
+end
+
+function releasederivecontext!(ctx::DeriveContext)
+    release!(ctx.budget, frozendictbytes(ctx.named) + frozendictbytes(ctx.origins))
+    return nothing
+end
+
 function nameerror(what, julia, remedy)
     throw(ArgumentError("invalid Avro $what derived from $julia; $remedy"))
 end
@@ -106,9 +120,13 @@ be a valid Avro name (no transliteration); `name=`/`namespace=` override the roo
 """
 function schema(::Type{T}; name=nothing, namespace=nothing, limits::Limits=Limits()) where {T}
     return withconstruction(limits; direction=:encode) do budget   # finalize and defaults share this scope (D01)
-        ctx = DeriveContext(limits, budget, FrozenDict{String,Schema}(), FrozenDict{String,Type}(), Ref(0))
-        s = withbuilder(() -> derive(ctx, T, name === nothing ? nothing : String(name), namespace === nothing ? nothing : String(namespace)))
-        finalizepublic!(s, limits, 0, 0)
+        ctx = derivecontext(limits, budget, 0)
+        try
+            s = withbuilder(() -> derive(ctx, T, name === nothing ? nothing : String(name), namespace === nothing ? nothing : String(namespace)))
+            return finalizepublic!(s, limits, 0, 0)
+        finally
+            releasederivecontext!(ctx)
+        end
     end
 end
 
@@ -119,9 +137,24 @@ const LOGICAL_LONG = Dict{Type,LogicalType}(
 )
 
 function derive(ctx::DeriveContext, ::Type{T}, name, namespace) where {T}
+    existing = nothing
+    for (full, origin) in ctx.origins
+        origin === T || continue
+        existing = ctx.named[full]
+        break
+    end
     reserve!(ctx.budget, 160)                          # the derived node and its meta, settled once built
-    s = deriveimpl(ctx, T, name, namespace)
-    allocated!(ctx.budget, 160)
+    s = try
+        deriveimpl(ctx, T, name, namespace)
+    catch
+        unreserve!(ctx.budget, 160)
+        rethrow()
+    end
+    if existing !== nothing && s === existing
+        unreserve!(ctx.budget, 160)                    # named memo reuse allocated no new node
+    else
+        allocated!(ctx.budget, 160)
+    end
     return s
 end
 
@@ -175,8 +208,8 @@ function registerderived!(ctx::DeriveContext, s::NamedSchema, ::Type{T}) where {
         throw(ArgumentError("Julia types $origin and $T both derive the Avro fullname \"$full\"; override `Avro.avroname` for one of them"))
     end
     length(ctx.named) < ctx.limits.max_named_types || throw(LimitError(:max_named_types, length(ctx.named) + 1, ctx.limits.max_named_types, :max_named_types, :encode))
-    ctx.named[full] = s
-    ctx.origins[full] = T
+    budgetedinsert!(ctx.named, full, s, ctx.budget)
+    budgetedinsert!(ctx.origins, full, T, ctx.budget)
     return s
 end
 
@@ -273,9 +306,9 @@ function derivenamedtuple(ctx::DeriveContext, ::Type{T}, name, namespace) where 
         fn = checkderivedname(string(fname), "field name \"$fname\"", string(T), "rename the field")
         fbytes = stringbytes(sizeof(fn)) + 2 * frozenvectorshell() + 128
         reserve!(ctx.budget, fbytes)                   # the field name, wrappers and Field shell, built next
-        push!(fields, Field(fn, derive(ctx, ftype, nothing, full.namespace), nothing, nodefault, :ascending, freeze!(FrozenVector{String}()), Props()))
+        budgetedpush!(fields, Field(fn, derive(ctx, ftype, nothing, full.namespace), nothing, nodefault, :ascending, EMPTY_STRING_LIST, EMPTY_PROPS), ctx.budget)
         allocated!(ctx.budget, fbytes)
-        index[fn] = i
+        budgetedinsert!(index, fn, i, ctx.budget)
     end
     freeze!(fields)
     freeze!(index)
@@ -337,9 +370,9 @@ function derivestruct(ctx::DeriveContext, ::Type{T}, name, namespace) where {T}
         end
         fbytes = stringbytes(sizeof(fn)) + 2 * frozenvectorshell() + 128
         reserve!(ctx.budget, fbytes)                   # the field name, wrappers and Field shell, built next
-        push!(fields, Field(fn, fs, nothing, d, :ascending, freeze!(FrozenVector{String}()), Props()))
+        budgetedpush!(fields, Field(fn, fs, nothing, d, :ascending, freeze!(FrozenVector{String}()), Props()), ctx.budget)
         allocated!(ctx.budget, fbytes)
-        index[fn] = i
+        budgetedinsert!(index, fn, i, ctx.budget)
     end
     freeze!(fields)
     freeze!(index)
@@ -353,24 +386,33 @@ A record schema from a `Tables.Schema` (column names and types); `names` renames
 """
 function schema(ts::Tables.Schema; name::AbstractString="Record", namespace::AbstractString="", names=Dict{Symbol,String}(), limits::Limits=Limits())
     return withconstruction(limits; direction=:encode) do budget   # finalize and defaults share this scope (D01)
-        ctx = DeriveContext(limits, budget, FrozenDict{String,Schema}(), FrozenDict{String,Type}(), Ref(1))
-        s = withbuilder() do
-            full = FullName(checkderivedname(name, "name \"$name\"", "Tables.Schema", "pass a valid `name=`"), checkderivednamespace(namespace, "Tables.Schema"))
-            fields = FrozenVector{Field}()
-            index = FrozenDict{String,Int}()
-            rec = RecordSchema(full, freeze!(FrozenVector{String}()), freeze!(FrozenVector{String}()), nothing, false, Props(), fields, index, NodeMeta())
-            registerderived!(ctx, rec, Tables.Schema)
-            for (i, (col, ct)) in enumerate(zip(ts.names, ts.types))
-                fn = String(get(names, col, string(col)))
-                checkderivedname(fn, "column name \"$fn\"", "Tables.Schema column $col", "rename it with `names=Dict(:$col => \"…\")`")
-                haskey(index, fn) && throw(ArgumentError("column name \"$fn\" derived twice"))
-                push!(fields, Field(fn, derive(ctx, ct, nothing, full.namespace), nothing, nodefault, :ascending, freeze!(FrozenVector{String}()), Props()))
-                index[fn] = i
+        ctx = derivecontext(limits, budget, 1)
+        try
+            s = withbuilder() do
+                full = FullName(checkderivedname(name, "name \"$name\"", "Tables.Schema", "pass a valid `name=`"), checkderivednamespace(namespace, "Tables.Schema"))
+                nf = length(ts.names)
+                slots = vectorbytes(Field, nf) + vectorbytes(String, nf) + vectorbytes(Int, nf) + 128
+                reserve!(budget, slots)
+                fields = emptywithcapacity(FrozenVector{Field}, nf)
+                index = emptywithcapacity(FrozenDict{String,Int}, nf)
+                rec = RecordSchema(full, EMPTY_STRING_LIST, EMPTY_STRING_LIST, nothing, false, EMPTY_PROPS, fields, index, NodeMeta())
+                allocated!(budget, slots)
+                registerderived!(ctx, rec, Tables.Schema)
+                for (i, (col, ct)) in enumerate(zip(ts.names, ts.types))
+                    fn = String(get(names, col, string(col)))
+                    checkderivedname(fn, "column name \"$fn\"", "Tables.Schema column $col", "rename it with `names=Dict(:$col => \"…\")`")
+                    haskey(index, fn) && throw(ArgumentError("column name \"$fn\" derived twice"))
+                    budgetedpush!(fields, Field(fn, derive(ctx, ct, nothing, full.namespace), nothing, nodefault, :ascending, EMPTY_STRING_LIST, EMPTY_PROPS), budget)
+                    budgetedinsert!(index, fn, i, budget)
+                end
+                freeze!(fields)
+                freeze!(index)
+                return rec
             end
-            freeze!(fields); freeze!(index)
-            rec
+            return finalizepublic!(s, limits, 0, 0)
+        finally
+            releasederivecontext!(ctx)
         end
-        finalizepublic!(s, limits, 0, 0)
     end
 end
 

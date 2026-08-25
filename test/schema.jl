@@ -459,6 +459,21 @@ end
     @test_throws MethodError Avro.parseschema(legacy_fixed_json; legacy_fixed_names=true)
 
     @testset "construction scope enforces graph limits (plan §4.4, amendment round 1)" begin
+        parse_limits = Avro.Limits(max_depth=1, max_schema_depth=7)
+        parse_budget = Avro.Budget(parse_limits; available=1 << 40)
+        parse_ctx = Avro.ParseContext(parse_limits, parse_budget, false, false)
+        expected_parse_state = Avro.vectorbytes(Avro.RecordSchema, parse_limits.max_schema_depth) +
+                               Avro.vectorbytes(Avro.NodeMeta, 16) + 128
+        @test parse_budget.reserved == expected_parse_state
+        Avro.close!(parse_budget)
+
+        generated_union = Avro.UnionSchema((Avro.FixedSchema("Generated_$i", 1) for i in 1:5))
+        @test generated_union.branches.cap == length(generated_union.branches) == 5
+        child = Avro.RecordSchema("Copied"; fields=[Avro.Field("x", Avro.LongSchema())])
+        copied = Avro.ArraySchema(child).items
+        @test copied isa Avro.RecordSchema
+        @test copied.fields.cap == length(copied.fields) == 1
+
         tight = Avro.Limits(max_schema_nodes=1)
         @test_throws Avro.LimitError Avro.ArraySchema(Avro.LongSchema(); limits=tight)
         @test_throws Avro.LimitError Avro.NullSchema(; limits=Avro.Limits(max_schema_nodes=0))

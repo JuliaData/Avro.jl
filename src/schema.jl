@@ -271,9 +271,9 @@ end
 
 function ParseContext(limits::Limits, budget::Budget, allow_invalid_names::Bool, allow_invalid_defaults::Bool, legacyfixednames::Bool=false)
     metascap = 16
-    state = vectorbytes(RecordSchema, limits.max_depth) + vectorbytes(NodeMeta, metascap) + 128   # pending, metas, context and table shells
+    state = vectorbytes(RecordSchema, limits.max_schema_depth) + vectorbytes(NodeMeta, metascap) + 128   # pending, metas, context and table shells
     reserve!(budget, state)
-    pending = Vector{RecordSchema}(undef, limits.max_depth)   # the fill stack never exceeds max_depth (§4.4)
+    pending = Vector{RecordSchema}(undef, limits.max_schema_depth)   # the fill stack never exceeds max_schema_depth (§4.4)
     resize!(pending, 0)
     metas = Vector{NodeMeta}(undef, metascap)
     resize!(metas, 0)
@@ -1661,6 +1661,11 @@ function frozendictshell()
     return 2 * STORAGE[].vector + 48
 end
 
+"The charged storage of a frozen dictionary at its current exact replacement capacity."
+function frozendictbytes(d::FrozenDict{K,V}) where {K,V}
+    return 48 + vectorbytes(K, d.cap) + vectorbytes(V, d.cap)
+end
+
 function frozenvectorshell()
     return STORAGE[].vector + 24
 end
@@ -1802,12 +1807,22 @@ end
 function withbuilder(f)
     outer = builderdepth() == 0
     task_local_storage(:avro_builder_depth, builderdepth() + 1)
-    outer && task_local_storage(:avro_import_memo, FrozenDict{String,Tuple{Schema,Schema}}())
+    memo = nothing
+    if outer
+        b = constructionbudget()
+        reserve!(b, frozendictshell())
+        memo = FrozenDict{String,Tuple{Schema,Schema}}()
+        allocated!(b, frozendictshell())
+        task_local_storage(:avro_import_memo, memo)
+    end
     try
         return f()
     finally
         task_local_storage(:avro_builder_depth, builderdepth() - 1)
-        outer && task_local_storage(:avro_import_memo, nothing)
+        if outer
+            task_local_storage(:avro_import_memo, nothing)
+            release!(constructionbudget(), frozendictbytes(memo::FrozenDict{String,Tuple{Schema,Schema}}))
+        end
     end
 end
 
@@ -1828,7 +1843,7 @@ function finalizepublic!(s::Schema, limits::Limits, nodes::Int, named::Int)
         walk = MetaWalk(walkmetas, 16)
         namedtypes = FrozenDict{String,Schema}()
         allocated!(budget, walkstate)
-        collectmetas!(s, walk, namedtypes, IdDict{NodeMeta,Nothing}(), limits, budget, 1)
+        collectmetas!(s, walk, namedtypes, limits, budget, 1)
         metas = walk.metas
         length(namedtypes) <= limits.max_named_types ||
             throw(LimitError(:max_named_types, length(namedtypes), limits.max_named_types, :max_named_types, :decode))
@@ -1840,6 +1855,7 @@ function finalizepublic!(s::Schema, limits::Limits, nodes::Int, named::Int)
         end
         checkpublicprint!(s, limits, budget)
         computehashes!(s, metas)
+        release!(budget, vectorbytes(NodeMeta, walk.cap) + frozendictbytes(namedtypes) + 64)
         return s
     end
 end
@@ -1874,11 +1890,11 @@ mutable struct MetaWalk
 end
 
 function collectmetas!(s::Schema, walk::MetaWalk, namedtypes::FrozenDict{String,Schema},
-                       visited::IdDict{NodeMeta,Nothing}, limits::Limits, budget::Budget, depth::Int)
+                       limits::Limits, budget::Budget, depth::Int)
     depth <= limits.max_schema_depth ||
         throw(LimitError(:max_schema_depth, depth, limits.max_schema_depth, :max_schema_depth, :decode))
     countvalues!(budget)
-    haskey(visited, s.meta) && return walk
+    any(m -> m === s.meta, walk.metas) && return walk
     length(walk.metas) < limits.max_schema_nodes ||
         throw(LimitError(:max_schema_nodes, length(walk.metas) + 1, limits.max_schema_nodes, :max_schema_nodes, :decode))
     retain!(budget, 160)                              # the caller-built node this graph keeps (parser parity)
@@ -1894,7 +1910,6 @@ function collectmetas!(s::Schema, walk::MetaWalk, namedtypes::FrozenDict{String,
         walk.cap = newcap
         release!(budget, oldbytes)
     end
-    visited[s.meta] = nothing
     push!(walk.metas, s.meta)
     if s isa NamedSchema
         checkgraphnames(s, limits)
@@ -1902,17 +1917,17 @@ function collectmetas!(s::Schema, walk::MetaWalk, namedtypes::FrozenDict{String,
         if haskey(namedtypes, full)
             namedtypes[full] === s || throw(ArgumentError("named schema \"$full\" is defined more than once"))
         else
-            namedtypes[full] = s
+            budgetedinsert!(namedtypes, full, s, budget)
         end
     end
     if s isa ArraySchema
-        collectmetas!(s.items, walk, namedtypes, visited, limits, budget, depth + 1)
+        collectmetas!(s.items, walk, namedtypes, limits, budget, depth + 1)
     elseif s isa MapSchema
-        collectmetas!(s.values, walk, namedtypes, visited, limits, budget, depth + 1)
+        collectmetas!(s.values, walk, namedtypes, limits, budget, depth + 1)
     elseif s isa UnionSchema
         length(s.branches) <= limits.max_union_branches ||
             throw(LimitError(:max_union_branches, length(s.branches), limits.max_union_branches, :max_union_branches, :decode))
-        foreach(b -> collectmetas!(b, walk, namedtypes, visited, limits, budget, depth + 1), s.branches)
+        foreach(b -> collectmetas!(b, walk, namedtypes, limits, budget, depth + 1), s.branches)
     elseif s isa RecordSchema
         length(s.fields) <= limits.max_fields ||
             throw(LimitError(:max_fields, length(s.fields), limits.max_fields, :max_fields, :decode))
@@ -1921,7 +1936,7 @@ function collectmetas!(s::Schema, walk::MetaWalk, namedtypes::FrozenDict{String,
             for a in f.aliases
                 checkgraphnamebytes(a, limits)
             end
-            collectmetas!(f.schema, walk, namedtypes, visited, limits, budget, depth + 1)
+            collectmetas!(f.schema, walk, namedtypes, limits, budget, depth + 1)
         end
     elseif s isa EnumSchema
         length(s.symbols) <= limits.max_enum_symbols ||
@@ -2065,18 +2080,24 @@ end
 """
 function UnionSchema(branches; limits::Limits=Limits())
     return withconstruction(limits) do _
-        bs = FrozenVector{Schema}()
+        b = constructionbudget()
+        bs = BuildBuf{Schema}(b, 0)
         withbuilder() do
-            for b in branches
-                b isa Schema || throw(ArgumentError("union branches must be schemas"))
-                b isa UnionSchema && throw(ArgumentError("unions may not immediately contain other unions"))
-                ident = branchidentity(b)
-                any(x -> branchidentity(x) == ident, bs) && throw(ArgumentError("duplicate union branch $(ident[6:end])"))
-                push!(bs, importchild(b))
+            for branch in branches
+                branch isa Schema || throw(ArgumentError("union branches must be schemas"))
+                branch isa UnionSchema && throw(ArgumentError("unions may not immediately contain other unions"))
+                ident = branchidentity(branch)
+                any(i -> branchidentity(bs.data[i]) == ident, 1:bs.len) &&
+                    throw(ArgumentError("duplicate union branch $(ident[6:end])"))
+                push!(bs, b, importchild(branch))
             end
         end
-        length(bs) <= limits.max_union_branches || throw(LimitError(:max_union_branches, length(bs), limits.max_union_branches, :max_union_branches, :encode))
-        return finalizepublic!(UnionSchema(freeze!(bs), NodeMeta()), limits, 0, 0)
+        bs.len <= limits.max_union_branches || throw(LimitError(:max_union_branches, bs.len, limits.max_union_branches, :max_union_branches, :encode))
+        data = finishbuild!(bs, b)
+        reserve!(b, 24)
+        frozen = freeze!(FrozenVector{Schema}(data, false))
+        allocated!(b, 24)
+        return finalizepublic!(UnionSchema(frozen, NodeMeta()), limits, 0, 0)
     end
 end
 
@@ -2181,7 +2202,16 @@ same constructor call) and deep-copied into the new graph otherwise, so every gr
 function importchild(s::Schema)
     isfilled(s.meta.id) || return s
     memo = importmemo()
-    return deepcopyschema(s, memo === nothing ? FrozenDict{String,Tuple{Schema,Schema}}() : memo)
+    memo !== nothing && return deepcopyschema(s, memo)
+    b = constructionbudget()
+    reserve!(b, frozendictshell())
+    localmemo = FrozenDict{String,Tuple{Schema,Schema}}()
+    allocated!(b, frozendictshell())
+    try
+        return deepcopyschema(s, localmemo)
+    finally
+        release!(b, frozendictbytes(localmemo))
+    end
 end
 
 function memocopy(s::Schema, memo::FrozenDict{String,Schema})
@@ -2195,12 +2225,12 @@ function memocopy(s::Schema, memo::FrozenDict{String,Tuple{Schema,Schema}})
 end
 
 function remembercopy!(memo::FrozenDict{String,Schema}, s::Schema, copy::Schema)
-    memo[fullname(s)] = copy
+    budgetedinsert!(memo, fullname(s), copy, constructionbudget())
     return copy
 end
 
 function remembercopy!(memo::FrozenDict{String,Tuple{Schema,Schema}}, s::Schema, copy::Schema)
-    memo[fullname(s)] = (s, copy)
+    budgetedinsert!(memo, fullname(s), (s, copy), constructionbudget())
     return copy
 end
 
@@ -2230,9 +2260,13 @@ function deepcopyschema(s::Schema, memo::Union{FrozenDict{String,Schema},FrozenD
     elseif s isa MapSchema
         return MapSchema(deepcopyschema(s.values, memo), s.props, NodeMeta())
     elseif s isa UnionSchema
-        bs = FrozenVector{Schema}()
+        n = length(s.branches)
+        charge = vectorbytes(Schema, n) + 24
+        reserve!(constructionbudget(), charge)
+        bs = emptywithcapacity(FrozenVector{Schema}, n)
+        allocated!(constructionbudget(), charge)
         for b in s.branches
-            push!(bs, deepcopyschema(b, memo))
+            budgetedpush!(bs, deepcopyschema(b, memo), constructionbudget())
         end
         return UnionSchema(freeze!(bs), NodeMeta())
     elseif s isa FixedSchema
@@ -2244,11 +2278,15 @@ function deepcopyschema(s::Schema, memo::Union{FrozenDict{String,Schema},FrozenD
         remembercopy!(memo, s, c)
         return c
     else
-        fields = FrozenVector{Field}()
+        n = length(s.fields)
+        charge = vectorbytes(Field, n) + 24
+        reserve!(constructionbudget(), charge)
+        fields = emptywithcapacity(FrozenVector{Field}, n)
+        allocated!(constructionbudget(), charge)
         c = RecordSchema(s.name, s.aliases, s.rawaliases, s.doc, s.iserror, s.props, fields, s.fieldindex, NodeMeta())
         remembercopy!(memo, s, c)
         for f in s.fields
-            push!(fields, Field(f.name, deepcopyschema(f.schema, memo), f.doc, f.default, f.order, f.aliases, f.props))
+            budgetedpush!(fields, Field(f.name, deepcopyschema(f.schema, memo), f.doc, f.default, f.order, f.aliases, f.props), constructionbudget())
         end
         freeze!(fields)
         return c

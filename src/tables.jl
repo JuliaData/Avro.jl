@@ -70,19 +70,29 @@ The derived effective schema of a projection: the selected fields in the selecte
 types, defaults, aliases, order, docs and props unchanged; a recursive root is substituted graph-wide.
 """
 function projectschema(s::RecordSchema, sel::Vector{Int}, limits::Limits)
-    memo = FrozenDict{String,Schema}()
-    fields = FrozenVector{Field}()
-    index = FrozenDict{String,Int}()
-    out = RecordSchema(s.name, s.aliases, s.rawaliases, s.doc, s.iserror, s.props, fields, index, NodeMeta())
-    memo[fullname(s)] = out
-    for (k, i) in enumerate(sel)
-        f = s.fields[i]
-        push!(fields, Field(f.name, deepcopyschema(f.schema, memo), f.doc, f.default, f.order, f.aliases, f.props))
-        index[f.name] = k
+    return withconstruction(limits) do budget
+        n = length(sel)
+        charge = frozendictshell() + vectorbytes(Field, n) + vectorbytes(String, n) + vectorbytes(Int, n) + 128
+        reserve!(budget, charge)
+        memo = FrozenDict{String,Schema}()
+        fields = emptywithcapacity(FrozenVector{Field}, n)
+        index = emptywithcapacity(FrozenDict{String,Int}, n)
+        out = RecordSchema(s.name, s.aliases, s.rawaliases, s.doc, s.iserror, s.props, fields, index, NodeMeta())
+        allocated!(budget, charge)
+        try
+            budgetedinsert!(memo, fullname(s), out, budget)
+            for (k, i) in enumerate(sel)
+                f = s.fields[i]
+                budgetedpush!(fields, Field(f.name, deepcopyschema(f.schema, memo), f.doc, f.default, f.order, f.aliases, f.props), budget)
+                budgetedinsert!(index, f.name, k, budget)
+            end
+            freeze!(fields)
+            freeze!(index)
+            return finalizepublic!(out, limits, 0, 0)
+        finally
+            release!(budget, frozendictbytes(memo))
+        end
     end
-    freeze!(fields)
-    freeze!(index)
-    return finalizepublic!(out, limits, 0, 0)
 end
 
 # ---- the effective schema and plan of a container operation ------------------------------------------

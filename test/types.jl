@@ -93,10 +93,23 @@ end
     @test_throws ArgumentError Avro.schema(typeof((var"my col"=1,)))
     # Tables.Schema
     ts = Tables.Schema((:a, :b), (Int64, Union{Missing,String}))
-    @test Avro.json(Avro.schema(ts)) == "{\"type\":\"record\",\"name\":\"Record\",\"fields\":[{\"name\":\"a\",\"type\":\"long\"},{\"name\":\"b\",\"type\":[\"null\",\"string\"]}]}"
+    tables_schema = Avro.schema(ts)
+    @test Avro.json(tables_schema) == "{\"type\":\"record\",\"name\":\"Record\",\"fields\":[{\"name\":\"a\",\"type\":\"long\"},{\"name\":\"b\",\"type\":[\"null\",\"string\"]}]}"
+    @test tables_schema.fields.cap == length(tables_schema.fields) == 2
+    @test tables_schema.fieldindex.cap == length(tables_schema.fieldindex) == 2
     @test [f.name for f in Avro.schema(ts; names=Dict(:a => "alpha")).fields] == ["alpha", "b"]
     @test_throws ArgumentError Avro.schema(Tables.Schema((Symbol("my col"),), (Int64,)))
     @test Avro.fullname(Avro.schema(ts; name="T", namespace="n")) == "n.T"
+    derive_budget = Avro.Budget(Avro.Limits(); available=1 << 40)
+    derive_ctx = Avro.derivecontext(Avro.Limits(), derive_budget, 0)
+    first_derived = Avro.derive(derive_ctx, T.SelfRef, nothing, nothing)
+    first_charge = derive_budget.reserved
+    @test derive_ctx.named.cap >= length(derive_ctx.named) > 0
+    @test derive_ctx.origins.cap >= length(derive_ctx.origins) > 0
+    @test Avro.derive(derive_ctx, T.SelfRef, nothing, nothing) === first_derived
+    @test derive_budget.reserved == first_charge
+    Avro.releasederivecontext!(derive_ctx)
+    Avro.close!(derive_budget)
     # value-level schema(x)
     rec = Avro.Record(pt, Any[1.0, missing, String[], DateTime(2020)])
     @test Avro.schema(rec) === pt
