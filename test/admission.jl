@@ -1,7 +1,9 @@
 @testset "Symbol admission" begin
     base = Avro.admissionbasebytes()
     @test_throws ArgumentError Avro.SymbolAdmission(max_bytes=base - 1)   # the fixed structure must fit
-    @test Avro.SymbolAdmission(max_bytes=base).bytes == base              # counted from construction (round-4 item 4)
+    emptytable = Avro.SymbolAdmission(max_bytes=base)
+    @test emptytable.bytes == base                                        # counted from construction (round-4 item 4)
+    @test emptytable.bytes >= Base.summarysize(emptytable)
     a = Avro.SymbolAdmission(max_names=3, max_bytes=base + 100)
     @test Avro.admit!(a, "x") === :x
     @test Avro.admit!(a, "x") === :x      # already admitted: counted once
@@ -10,10 +12,10 @@
     @test Avro.admit!(a, "z") === :z
     e = try Avro.admit!(a, "w"); nothing catch err; err end
     @test e isa Avro.LimitError && e.limit == :max_names && e.observed == 4 && e.value == 3
-    b = Avro.SymbolAdmission(max_names=10, max_bytes=base + 15)   # base covers the fixed structure; 15 the strings
+    b = Avro.SymbolAdmission(max_names=10, max_bytes=base + 19)   # base covers the fixed structure; 19 one string and slot
     Avro.admit!(b, "abc")
     e2 = try Avro.admit!(b, "def"); nothing catch err; err end
-    @test e2 isa Avro.LimitError && e2.limit == :max_bytes && e2.observed == base + 22
+    @test e2 isa Avro.LimitError && e2.limit == :max_bytes && e2.observed == base + 38
     @test length(b) == 1 && Avro.admit!(b, "abc") === :abc  # the failed admission left the table unchanged
     @test Avro.admit!(:trusted, "anything") === :anything
     @test Avro.admission(:trusted) === :trusted
@@ -101,7 +103,7 @@
     # A maintenance cascade that cannot reserve its next merge must fail before it moves
     # a cursor, replaces a run, or commits the new name. The same retry must fail with the
     # same observation; a failed call cannot make its own retry admissible.
-    transactional = Avro.SymbolAdmission(max_names=10_000, max_bytes=base + 70_000)
+    transactional = Avro.SymbolAdmission(max_names=10_000, max_bytes=base + 103_000)
     function admissionname(i)
         return "x$(lpad(i, 4, '0'))"
     end
@@ -143,10 +145,13 @@
     for i in 1:2 * Avro.RUN_BASE
         Avro.admit!(ov, "o$(lpad(i, 5, '0'))")
     end
-    ovnames = sum(sizeof("o$(lpad(i, 5, '0'))") + 8 for i in 1:2 * Avro.RUN_BASE)
-    @test ov.merge !== nothing && ov.bytes == base + ovnames + 8 * 2 * Avro.RUN_BASE  # overlap held while live
+    ovnames = sum(Avro.stringbytes(sizeof("o$(lpad(i, 5, '0'))")) for i in 1:2 * Avro.RUN_BASE)
+    liveoverlap = 8 * 2 * Avro.RUN_BASE + Avro.STORAGE[].vector + Avro.shellbytes(Avro.RunMerge)
+    @test ov.merge !== nothing && ov.bytes == base + ovnames + 2 * Avro.STORAGE[].vector + liveoverlap
+    @test ov.bytes >= Base.summarysize(ov)
     Avro.admit!(ov, "o$(lpad(1, 5, '0'))")                                     # a repeat completes the merge
-    @test ov.merge === nothing && ov.bytes == base + ovnames                   # the overlap returned
+    @test ov.merge === nothing && ov.bytes == base + ovnames + Avro.STORAGE[].vector
+    @test ov.bytes >= Base.summarysize(ov)
     VERSION >= v"1.11" && @test Avro.capacity(ov.recent) == Avro.RUN_BASE      # reused, never regrown
 
     # the admitting operation's lookup and merge-step work charges its own budget (§4.4, R07)
