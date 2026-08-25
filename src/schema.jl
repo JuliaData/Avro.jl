@@ -287,6 +287,11 @@ function schemaerror(msg::AbstractString, path::AbstractString)
     throw(SchemaError(String(msg), String(path)))
 end
 
+# Shared frozen empties: frozen containers are immutable by contract, so every node may reference the
+# same empty instance instead of allocating one (uncharged: process-global constants, plan §4.6).
+const EMPTY_PROPS = freeze!(Props())
+const EMPTY_STRING_LIST = freeze!(FrozenVector{String}())
+
 const NODE_META_BYTES = 96    # the NodeMeta object and its three write-once refs
 const NODE_SHELL_BYTES = 64   # the schema node object, settled by `settlednode` after construction
 
@@ -340,6 +345,7 @@ function collectprops(ctx::ParseContext, obj::JSONObject, grammar, path::Abstrac
     for k in obj.order
         k in grammar || (n += 1)
     end
+    n == 0 && return EMPTY_PROPS
     slots = vectorbytes(String, n) + vectorbytes(Any, n) + 32
     reserve!(ctx.budget, slots)                    # the exact key/value capacity and dict shell (§4.4)
     p = emptywithcapacity(Props, n)
@@ -529,7 +535,7 @@ end
 
 function parsereference(ctx::ParseContext, name::String, enclosing::String, path::String)
     if name in PRIMITIVE_NAMES
-        return primitive(ctx, name, Props(), path)
+        return primitive(ctx, name, EMPTY_PROPS, path)
     end
     checknamebytes(ctx, name, "name", path)
     full = resolvereference(name, enclosing)
@@ -620,7 +626,10 @@ function parsenamed(ctx::ParseContext, obj::JSONObject, enclosing::String, path:
     ctx.namedcount[] += 1
     ctx.namedcount[] <= ctx.limits.max_named_types ||
         throw(LimitError(:max_named_types, ctx.namedcount[], ctx.limits.max_named_types, :max_named_types, :decode))
-    raw = something(stringarrayattr(ctx, obj, "aliases", path), String[])
+    raw = stringarrayattr(ctx, obj, "aliases", path)
+    if raw === nothing || isempty(raw)
+        return full, EMPTY_STRING_LIST, EMPTY_STRING_LIST
+    end
     aliases = BuildBuf{String}(ctx.budget, length(raw))
     for (i, a) in enumerate(raw)
         checknamebytes(ctx, a, "alias", string(path, ".aliases[", i - 1, "]"))
@@ -774,7 +783,10 @@ function parsefield(ctx::ParseContext, obj::JSONObject, ns::String, path::String
         o isa String && o in ("ascending", "descending", "ignore") || schemaerror("\"order\" must be \"ascending\", \"descending\" or \"ignore\"", string(path, ".order"))
         order = Symbol(o)
     end
-    rawaliases = something(stringarrayattr(ctx, obj, "aliases", path), String[])
+    rawaliases = stringarrayattr(ctx, obj, "aliases", path)
+    if rawaliases === nothing || isempty(rawaliases)
+        rawaliases = String[]
+    end
     aliases = BuildBuf{String}(ctx.budget, length(rawaliases))
     for (i, a) in enumerate(rawaliases)
         checknamebytes(ctx, a, "field alias", string(path, ".aliases[", i - 1, "]"))
@@ -790,6 +802,9 @@ function parsefield(ctx::ParseContext, obj::JSONObject, ns::String, path::String
         default = makedefault(ctx, schema, obj["default"], spanof(obj, "default", buf), string(path, ".default"))
     end
     p = collectprops(ctx, obj, FIELD_GRAMMAR, path)
+    if aliases.len == 0
+        return Field(name, schema, doc, default, order, EMPTY_STRING_LIST, p)
+    end
     reserve!(ctx.budget, 24)                                   # the frozen wrapper (the Field shell is retained by its record)
     f = Field(name, schema, doc, default, order, freeze!(FrozenVector{String}(finishbuild!(aliases, ctx.budget), false)), p)
     allocated!(ctx.budget, 24)
@@ -1654,6 +1669,7 @@ function makeprops(propsin, structural, logical, budget::Budget)
     sized = Base.IteratorSize(propsin) isa Union{Base.HasLength,Base.HasShape}
     extra = logical === nothing ? 0 : (logical isa DecimalLogical ? 3 : 1)
     cap = (sized ? length(propsin) : 0) + extra
+    sized && cap == 0 && return EMPTY_PROPS
     slots = frozendictshell() + 16 * cap
     reserve!(budget, slots)                            # the shell and exact slot capacity (§4.4)
     p = emptywithcapacity(Props, cap)

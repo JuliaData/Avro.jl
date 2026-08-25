@@ -59,7 +59,9 @@
     # allocations figure sits in the informational column. Reaching it needs an arena-style parser
     # rewrite (the profile: ~287 boxed Ints, ~138 heap name tuples, per-token Strings), which is out of
     # proportion for an informational number this late. The assertion below is a calibrated regression
-    # bound around the measured 2,062 so parser-allocation regressions still fail loudly.
+    # bound so parser-allocation regressions still fail loudly: measured 2,062 before the round-4
+    # exact-capacity contract, 2,254 after it (prebuilt containers and replacement growth cost a few
+    # vectors per node; shared frozen empties reclaim the alias-free and prop-free cases).
     @test parseallocs <= 2300
     tload = only(coldmetric("load"))
     @test tload <= 0.5
