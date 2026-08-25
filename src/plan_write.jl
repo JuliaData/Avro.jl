@@ -88,6 +88,7 @@ function buildwriteplan(s::LongSchema, memo, budget)
     l isa LocalTimestampNanos && return WLocalTimestamp{Nanosecond}()
     return WLong()
 end
+
 function buildwriteplan(::FloatSchema, memo, budget)
     return WFloat()
 end
@@ -111,6 +112,7 @@ function buildwriteplan(s::FixedSchema, memo, budget)
     l isa DurationLogical && return WDuration()
     return WFixed(s)
 end
+
 function buildwriteplan(s::EnumSchema, memo, budget)
     return WEnum(s)
 end
@@ -180,6 +182,7 @@ function encodevalue(::WInt, e::Encoder, x::Integer)
     writeint!(e, Int32(x))
     return nothing
 end
+
 function encodevalue(::WInt, e::Encoder, x::Bool)
     return encodeerror("expected an integer", x)
 end
@@ -193,6 +196,7 @@ function encodevalue(::WLong, e::Encoder, x::Integer)
     writelong!(e, Int64(x))
     return nothing
 end
+
 function encodevalue(::WLong, e::Encoder, x::Bool)
     return encodeerror("expected an integer", x)
 end
@@ -239,6 +243,7 @@ function encodevalue(::WString, e::Encoder, x::AbstractString)
     writestring!(e, s)
     return nothing
 end
+
 function encodevalue(p::WString, e::Encoder, x::Symbol)
     return encodevalue(p, e, String(x))
 end
@@ -270,6 +275,7 @@ function encodevalue(p::WFixed, e::Encoder, x::NTuple{N,UInt8}) where {N}
     end
     return nothing
 end
+
 function encodevalue(p::WFixed, e::Encoder, x)
     return encodeerror("expected $(p.schema.size) fixed bytes", x)
 end
@@ -281,6 +287,7 @@ function encodevalue(p::WEnum, e::Encoder, x::EnumValue)
     end
     return encodesymbol(p, e, String(x))
 end
+
 function encodevalue(p::WEnum, e::Encoder, x::AbstractString)
     return encodesymbol(p, e, String(x))
 end
@@ -318,6 +325,7 @@ function encodevalue(::WTimeMillis, e::Encoder, x::Time)
     writeint!(e, Int32(ns ÷ 1_000_000))
     return nothing
 end
+
 function encodevalue(::WTimeMillis, e::Encoder, x)
     return encodeerror("expected a Time", x)
 end
@@ -328,6 +336,7 @@ function encodevalue(::WTimeMicros, e::Encoder, x::Time)
     writelong!(e, ns ÷ 1_000)
     return nothing
 end
+
 function encodevalue(::WTimeMicros, e::Encoder, x)
     return encodeerror("expected a Time", x)
 end
@@ -366,6 +375,7 @@ function encodevalue(p::WDecimal, e::Encoder, x::WideDecimal)
     ndigits(abs(x.unscaled)) <= p.precision || encodeerror("decimal exceeds precision $(p.precision)", x)
     return writetwoscomplement!(e, p, x.unscaled)
 end
+
 function encodevalue(p::WDecimal, e::Encoder, x)
     return encodeerror("expected an Avro.Decimal/WideDecimal with scale $(p.scale)", x)
 end
@@ -430,6 +440,7 @@ function encodevalue(::WUUIDString, e::Encoder, x::AbstractString)
     writestring!(e, x)
     return nothing
 end
+
 function encodevalue(::WUUIDString, e::Encoder, x)
     return encodeerror("expected a UUID", x)
 end
@@ -451,6 +462,7 @@ function encodevalue(::WDuration, e::Encoder, x::Duration)
     end
     return nothing
 end
+
 function encodevalue(::WDuration, e::Encoder, x)
     return encodeerror("expected an Avro.Duration", x)
 end

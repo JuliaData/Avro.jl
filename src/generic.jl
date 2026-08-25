@@ -257,6 +257,7 @@ function Base.getindex(m::Map, k::AbstractString)
     i == 0 && throw(KeyError(k))
     return m.vals[i]
 end
+
 function Base.getindex(m::Map, k::Symbol)
     return m[String(k)]
 end
@@ -266,6 +267,7 @@ function Base.get(m::Map, k::AbstractString, default)
     i == 0 && return default
     return m.vals[i]
 end
+
 function Base.get(m::Map, k::Symbol, default)
     return get(m, String(k), default)
 end
@@ -367,6 +369,7 @@ function Base.getproperty(r::Record, name::Symbol)
     name === :values && return getfield(r, :values)
     return r[String(name)]
 end
+
 function Base.propertynames(r::Record, private::Bool=false)
     return (:schema, :values)
 end
@@ -565,6 +568,7 @@ function juliatype(s::LongSchema)
     l isa LocalTimestampNanos && return LocalTimestamp{Nanosecond}
     return Int64
 end
+
 function juliatype(::FloatSchema)
     return Float32
 end
@@ -587,6 +591,7 @@ function juliatype(s::FixedSchema)
     s.logical isa DurationLogical && return Duration
     return Fixed
 end
+
 function juliatype(::EnumSchema)
     return EnumValue
 end

@@ -102,6 +102,7 @@ function buildreadplan(s::LongSchema, memo, budget)
     l isa LocalTimestampNanos && return LocalTimestampPlan{Nanosecond}()
     return LongPlan()
 end
+
 function buildreadplan(::FloatSchema, memo, budget)
     return FloatPlan()
 end
@@ -126,6 +127,7 @@ function buildreadplan(s::FixedSchema, memo, budget)
     l isa DurationLogical && return DurationPlan()
     return FixedPlan(s)
 end
+
 function buildreadplan(s::EnumSchema, memo, budget)
     return EnumPlan(s)
 end
@@ -603,6 +605,7 @@ function skipvalue(p::DecimalPlan, d::Decoder)
     d.pos += n
     return nothing
 end
+
 function skipvalue(p::FixedPlan, d::Decoder)
     return skipfixed(d, p.schema.size)
 end

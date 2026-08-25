@@ -149,6 +149,7 @@ function storagebytes(x::Map{V}) where {V}
     shell = STORAGE[].map + vectorbytes(Int32, capacity(x.perm)) + vectorbytes(String, capacity(x.keys)) + vectorbytes(V, capacity(x.vals))
     return shell + sum(storagebytes, x.keys; init=0) + sum(v -> elementbytes(V, v), x.vals; init=0)
 end
+
 function storagebytes(x)
     return isbits(x) ? 0 : throw(ArgumentError("no storage formula for $(typeof(x))"))
 end
