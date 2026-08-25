@@ -141,29 +141,6 @@ function shrinkexact(budget::Budget, buf::Vector{UInt8}, len::Int)
     return out
 end
 
-"Capture the counters `rollbackreservations!` needs to unwind an operation exactly."
-function budgetcheckpoint(b::Budget)
-    return (b.reserved, b.pending)
-end
-
-"""
-Unwind every reservation acquired after `checkpoint` (a `budgetcheckpoint`) on a failed ownership
-transfer. The pending delta since the checkpoint is this operation's in-flight remainder and returns
-through `unreserve!`; the settled rest — storage that dies with the failed operation — is released.
-The budget may carry unrelated pending headroom (parallel worst-case reservations), so the split
-must come from the checkpoint, not from the counters alone.
-"""
-function rollbackreservations!(budget::Budget, checkpoint::NTuple{2,Int})
-    reserved0, pending0 = checkpoint
-    delta = budget.reserved - reserved0
-    delta <= 0 && return nothing
-    pend = budget.pending - pending0
-    pend > 0 && unreserve!(budget, pend)
-    resident = delta - max(pend, 0)
-    resident > 0 && release!(budget, resident)
-    return nothing
-end
-
 function codecmessage(err::TranscodingStreams.Error)
     return TranscodingStreams.haserror(err) ? sprint(showerror, err.error) : "codec failure"
 end

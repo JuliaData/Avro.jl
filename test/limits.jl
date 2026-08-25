@@ -131,6 +131,10 @@
         b = Avro.Budget(l; available=1 << 40)
         Avro.reserve!(b, 1000)
         @test b.pending == 1000 && b.reserved == 1000
+        @test_throws ArgumentError Avro.allocated!(b, -1)               # negative settlements are mismatches too
+        @test_throws ArgumentError Avro.release!(b, -1)
+        @test_throws ArgumentError Avro.unreserve!(b, -1)
+        @test b.pending == 1000 && b.reserved == 1000
         @test_throws ArgumentError Avro.allocated!(b, 1001)              # settlement mismatch fails, no clamp
         @test_throws ArgumentError Avro.release!(b, 1)                   # nothing resident yet
         Avro.allocated!(b, 600)

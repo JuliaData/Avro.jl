@@ -208,6 +208,7 @@ function Tables.getcolumn(t::Table, nm::Symbol)
     i === nothing && throw(ArgumentError("no column $nm"))
     return getfield(t, :columns)[i]
 end
+
 function Tables.partitions(t::Table)
     return (subtable(t, r) for r in getfield(t, :blockranges))
 end

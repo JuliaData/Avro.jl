@@ -77,18 +77,31 @@
     @testset "custom stores" begin
         struct DictStore <: Avro.SchemaStore
             d::Dict{UInt64,Avro.Schema}
+            seen::Base.RefValue{Union{Nothing,Avro.Budget}}
         end
         Avro.lookup(s::DictStore, fp::UInt64; limits=Avro.Limits()) = haskey(s.d, fp) ? s.d[fp] : throw(Avro.UnknownSchemaError(fp))
+        function Avro.lookup(s::DictStore, fp::UInt64, budget::Avro.Budget)
+            s.seen[] = budget
+            return Avro.lookup(s, fp; limits=budget.limits)
+        end
         Avro.register!(s::DictStore, schema::Avro.Schema; limits=Avro.Limits()) = (fp = Avro.fingerprint(schema); s.d[fp] = schema; fp)
-        ds = DictStore(Dict{UInt64,Avro.Schema}())
+        ds = DictStore(Dict{UInt64,Avro.Schema}(), Ref{Union{Nothing,Avro.Budget}}(nothing))
         Avro.register!(ds, ws)
         @test Avro.decodesingle(wbin, ds) == w1
+        @test ds.seen[] isa Avro.Budget
         # a store returning a schema under the wrong fingerprint is rejected
-        liar = DictStore(Dict(Avro.fingerprint(ws) => P("\"int\"")))
+        liar = DictStore(Dict(Avro.fingerprint(ws) => P("\"int\"")), Ref{Union{Nothing,Avro.Budget}}(nothing))
         @test_throws Avro.DataError Avro.decodesingle(wbin, liar)
-        e = try Avro.decodesingle(wbin, DictStore(Dict{UInt64,Avro.Schema}())); nothing catch x; x end
+        e = try Avro.decodesingle(wbin, DictStore(Dict{UInt64,Avro.Schema}(), Ref{Union{Nothing,Avro.Budget}}(nothing))); nothing catch x; x end
         @test e isa Avro.UnknownSchemaError && e.fingerprint == Avro.fingerprint(ws)
         @test occursin("fingerprint", sprint(showerror, e))
+
+        struct LegacyStore <: Avro.SchemaStore
+            d::Dict{UInt64,Avro.Schema}
+        end
+        Avro.lookup(s::LegacyStore, fp::UInt64; limits=Avro.Limits()) = haskey(s.d, fp) ? s.d[fp] : throw(Avro.UnknownSchemaError(fp))
+        legacy = LegacyStore(Dict(Avro.fingerprint(ws) => ws))
+        @test_throws ArgumentError Avro.decodesingle(wbin, legacy)              # no nested operation budget fallback
     end
 
     @testset "one operation budget; transactional exact-capacity cache (plan §4.4, amendment round 1)" begin

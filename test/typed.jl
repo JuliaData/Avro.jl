@@ -455,6 +455,21 @@ end
         tiny = Avro.Limits(max_total_values=2)
         @test_throws Avro.LimitError Avro.DatumReader(wdflt; reader_schema=rdflt, limits=tiny)(UInt8[])
         @test_throws Avro.LimitError Avro.DatumReader(wdflt, TD; reader_schema=rdflt, limits=tiny)(UInt8[])
+        resolveddefault = Avro.resolve(wdflt, rdflt).plan.defaults[1].second
+        defaultbudget = Avro.Budget(Avro.Limits(); available=1 << 40)
+        defaultnode = Avro.checkedreaderdefault(Vector{Int64}, resolveddefault, defaultbudget)
+        defaultnodecharge = Avro.nodebytes(typeof(defaultnode))
+        @test defaultbudget.pending == 0
+        @test defaultbudget.reserved == defaultnodecharge                    # validation value is construction scratch
+        Avro.release!(defaultbudget, defaultnodecharge)
+        Avro.close!(defaultbudget)
+
+        failedplanbudget = Avro.Budget(Avro.Limits(); available=1 << 40)
+        onlya = P("{\"type\":\"record\",\"name\":\"OnlyA\",\"fields\":[{\"name\":\"a\",\"type\":\"long\"}]}")
+        @test_throws ArgumentError Avro.typedplan(NoDefault, onlya, Avro.readplan(onlya), Avro.Limits();
+            budget=failedplanbudget)
+        @test failedplanbudget.pending == failedplanbudget.reserved == 0     # failed construction releases all scratch
+        Avro.close!(failedplanbudget)
         # a null writer resolves through either nullable reader position and null target convention
         wnull = P("\"null\"")
         for rnull in (P("[\"null\",\"long\"]"), P("[\"long\",\"null\"]"))

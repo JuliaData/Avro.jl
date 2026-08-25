@@ -109,6 +109,7 @@ function decoderow!(cols::Vector{ColumnBuilder}, d::Decoder)
     leave!(d)
     return nothing
 end
+
 function decodecell!(c::SkipColumn, d::Decoder)
     return skip(c.plan, d)
 end

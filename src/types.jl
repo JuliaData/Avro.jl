@@ -390,6 +390,7 @@ end
 function schema(x::Fixed; limits::Limits=Limits())
     return identityschema(x.schema, limits)
 end
+
 function schema(::UnionValue; limits::Limits=Limits())
     throw(ArgumentError("a bare Avro.UnionValue has no schema of its own: use `Avro.encode(schema, x)`"))
 end

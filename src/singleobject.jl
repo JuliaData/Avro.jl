@@ -7,10 +7,12 @@ const SINGLE_OBJECT_MARKER = (0xC3, 0x01)
     Avro.SchemaStore
 
 The interface of a schema store used by `Avro.decodesingle`: `Avro.lookup(store, fingerprint::UInt64;
-limits) -> Schema` (throwing `Avro.UnknownSchemaError`) and `Avro.register!(store, schema; limits) ->
-UInt64`. A custom store owns its own table budget and ambiguity policy; the built-in `Avro.SchemaCache`
-is bounded and rejects any second schema under an existing fingerprint that is not structurally equal
-to the stored one. Fingerprints are identifiers, not authentication.
+limits) -> Schema`, `Avro.lookup(store, fingerprint, budget::Avro.Budget) -> Schema`, and
+`Avro.register!(store, schema; limits) -> UInt64`. The shared-budget lookup must charge the supplied
+budget and throw `Avro.UnknownSchemaError` for an unknown fingerprint. A custom store owns its own
+table budget and ambiguity policy; the built-in `Avro.SchemaCache` is bounded and rejects any second
+schema under an existing fingerprint that is not structurally equal to the stored one. Fingerprints
+are identifiers, not authentication.
 """
 abstract type SchemaStore end
 
@@ -60,8 +62,7 @@ function register!(c::SchemaCache, s::Schema; limits::Limits=Limits())
         i = searchsortedfirst(c.fingerprints, fp)
         if i <= length(c.fingerprints) && c.fingerprints[i] == fp
             existing = c.schemas[i]
-            charge!(budget, STORAGE[].vector)          # the equality memo, before it is allocated (D03)
-            same = schemaequal(existing, s, Vector{Int32}[], budget)
+            same = budgetedschemaequal(existing, s, budget)
             same || throw(AmbiguousSchemaError(fp, existing, s))
             return fp
         end
@@ -71,17 +72,27 @@ function register!(c::SchemaCache, s::Schema; limits::Limits=Limits())
         retained = checked_add(c.bytes, cost)
         peak = checked_add(retained, checked_mul(16, n - 1))   # old index vectors overlap their replacements
         peak <= c.max_bytes || throw(LimitError(:max_bytes, peak, c.max_bytes, :max_bytes, :decode))
-        replcharge = vectorbytes(UInt64, n) + vectorbytes(Schema, n)
-        reserve!(budget, replcharge)                   # the replacement vectors, charged to the caller operation (D03)
-        nf = Vector{UInt64}(undef, n)                  # exact-capacity replacement (§4.4 growth rule):
-        ns = Vector{Schema}(undef, n)                  # capacity equals length, and a failure above
-        allocated!(budget, replcharge)                 # ownership transfers to the cache at return
-        copyto!(nf, 1, c.fingerprints, 1, i - 1)       # leaves the table untouched (transactional)
-        copyto!(ns, 1, c.schemas, 1, i - 1)
-        nf[i] = fp
-        ns[i] = s
-        copyto!(nf, i + 1, c.fingerprints, i, n - i)
-        copyto!(ns, i + 1, c.schemas, i, n - i)
+        checkpoint = budgetcheckpoint(budget)
+        nf, ns = try
+            fingerprintcharge = vectorbytes(UInt64, n)
+            reserve!(budget, fingerprintcharge)
+            newfingerprints = Vector{UInt64}(undef, n)     # exact-capacity replacement (§4.4 growth rule)
+            allocated!(budget, fingerprintcharge)
+            schemacharge = vectorbytes(Schema, n)
+            reserve!(budget, schemacharge)
+            newschemas = Vector{Schema}(undef, n)
+            allocated!(budget, schemacharge)
+            copyto!(newfingerprints, 1, c.fingerprints, 1, i - 1)
+            copyto!(newschemas, 1, c.schemas, 1, i - 1)
+            newfingerprints[i] = fp
+            newschemas[i] = s
+            copyto!(newfingerprints, i + 1, c.fingerprints, i, n - i)
+            copyto!(newschemas, i + 1, c.schemas, i, n - i)
+            (newfingerprints, newschemas)
+        catch
+            rollbackreservations!(budget, checkpoint)
+            rethrow()
+        end
         c.fingerprints = nf
         c.schemas = ns
         c.bytes = retained
@@ -104,16 +115,15 @@ end
 """
     Avro.lookup(store, fingerprint, budget::Avro.Budget) -> Schema
 
-The shared-budget route `decodesingle` uses: the lookup's work is charged to the caller's operation
-budget instead of opening a second one. The fallback calls the two-argument form (its own budget);
-custom stores may extend this method to share the operation budget (D03).
+The shared-budget route `decodesingle` uses. Custom stores must implement it so lookup work is charged
+to the caller's operation budget instead of opening a second budget (D03).
 """
-function lookup(store::SchemaStore, fp::UInt64, budget::Budget)
-    return lookup(store, fp; limits=budget.limits)
+function lookup(::SchemaStore, ::UInt64, ::Budget)
+    throw(ArgumentError("a custom Avro.SchemaStore used by decodesingle must implement Avro.lookup(store, fingerprint, budget)"))
 end
 
 function lookup(c::SchemaCache, fp::UInt64, budget::Budget)
-    lock(c.lock) do
+    return lock(c.lock) do
         n = length(c.fingerprints)
         addcompare!(budget, 8 * (64 - leading_zeros(max(n, 1)) + 1))
         i = searchsortedfirst(c.fingerprints, fp)

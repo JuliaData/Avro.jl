@@ -253,6 +253,7 @@ function admission(s::Symbol)
     s === :trusted || throw(ArgumentError("`names` must be an Avro.SymbolAdmission or :trusted, got :$s"))
     return s
 end
+
 function admission(x)
     throw(ArgumentError("`names` must be an Avro.SymbolAdmission or :trusted"))
 end
