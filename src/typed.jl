@@ -92,10 +92,24 @@ end
 
 # ---- construction -----------------------------------------------------------------------------------
 
-"Per-node (target type => plan) entries, no hashing, plus the construction budget (round-2 D06)."
+"""
+Per-node (target type => plan) entries, no hashing, plus the construction budget (round-2 D06).
+`fresh` tracks the settled boxes of nodes not yet owned by the memo or released by an inline capture,
+so a fallback frame can release exactly its abandoned subtree (round-4 item 3).
+"""
 struct TypedMemo
     entries::Vector{Vector{Pair{Any,TypedPlan}}}
     budget::Budget
+    fresh::Base.RefValue{Int}
+end
+
+"Release every fresh node settled since `mark`: the frame that built them abandoned its output."
+function releasefresh!(memo::TypedMemo, mark::Int)
+    delta = memo.fresh[] - mark
+    delta <= 0 && return nothing
+    release!(memo.budget, delta)
+    memo.fresh[] = mark
+    return nothing
 end
 
 function Base.getindex(m::TypedMemo, i::Int)
@@ -150,7 +164,7 @@ function buildtypedroot(::Type{T}, reader::Schema, plan::ReadPlan, budget::Budge
         entries[i] = Pair{Any,TypedPlan}[]
     end
     allocated!(budget, memocharge)
-    root = buildtyped(T, reader, plan, TypedMemo(entries, budget))
+    root = buildtyped(T, reader, plan, TypedMemo(entries, budget, Ref(0)))
     # The memo table is construction-only: the slot vectors, their pairs and the outer table die here.
     # Memoised nodes stay charged — the plan graph (or a recursive reference) may hold them (item 4).
     dead = vectorbytes(Vector{Pair{Any,TypedPlan}}, nodes)
@@ -172,6 +186,7 @@ function memopairbytes()
 end
 
 function memostore!(memo::TypedMemo, s::Schema, ::Type{T}, p::TypedPlan) where {T}
+    memo.fresh[] = max(memo.fresh[] - nodebytes(typeof(p)), 0)   # the memo owns this node now (item 3)
     slot = Int(nodeid(s)) + 1
     entries = memo[slot]
     for i in eachindex(entries)
@@ -226,12 +241,16 @@ end
 
 function settlenode!(memo::TypedMemo, ::Type{P}) where {P}
     allocated!(memo.budget, nodebytes(P))
+    memo.fresh[] += nodebytes(P)
     return nothing
 end
 
 "Release the transient box of a freshly built node its parent just captured inline (mutable: a reference, nothing to release)."
 function releasecapture!(memo::TypedMemo, node)
-    return (ismutabletype(typeof(node)) || release!(memo.budget, nodebytes(typeof(node))); nothing)
+    ismutabletype(typeof(node)) && return nothing
+    release!(memo.budget, nodebytes(typeof(node)))
+    memo.fresh[] -= nodebytes(typeof(node))
+    return nothing
 end
 
 """
@@ -273,8 +292,10 @@ function buildtyped(::Type{T}, s::Schema, p::ReadPlan, memo::TypedMemo) where {T
     T === juliatype(s) && return chargedgeneric(p, memo)
     customhooks(T) && return chargedsemantic(T, p, memo)
     if isresolving(p)                                        # the settled eligibility analysis applies to
+        mark = memo.fresh[]
         t = buildresolvedtyped(T, s, p, memo)                # resolved plans too (plan §4.8, R18); anything
         t === nothing || return t                            # ineligible converts through the semantic route
+        releasefresh!(memo, mark)                            # the abandoned attempt's fresh nodes die here
         return chargedsemantic(T, p, memo)
     end
     s isa UnionSchema && return builduniontarget(T, s, p::UnionPlan, memo)
@@ -355,8 +376,12 @@ function builduniontarget(::Type{T}, s::UnionSchema, p::UnionPlan, memo::TypedMe
     for (i, (b, bp)) in enumerate(zip(s.branches, p.branches))
         found = nothing
         for m in members
+            mark = memo.fresh[]
             tp = buildtyped(m, b, bp, memo)
-            tp isa SemanticTarget && continue
+            if tp isa SemanticTarget
+                releasefresh!(memo, mark)              # the failed attempt's fresh subtree is abandoned
+                continue
+            end
             found = tp
             break
         end
@@ -449,8 +474,10 @@ function buildrecordtarget(::Type{T}, s::RecordSchema, p::RecordPlan, memo::Type
     ref = RefTarget{T}(nothing)
     settlenode!(memo, RefTarget{T})
     memostore!(memo, s, T, ref)
+    mark = memo.fresh[]
     built = buildrecordplan(T, s, p, memo)
     if built === nothing
+        releasefresh!(memo, mark)                      # the abandoned field plans die with the fallback
         # Recursive references captured `ref` already: they convert semantically where they occur.
         sem = chargedsemantic(T, p, memo)
         ref.plan = sem
@@ -688,8 +715,10 @@ function buildresolvedrecord(::Type{T}, s::RecordSchema, p::ResolvedRecordPlan, 
     ref = RefTarget{T}(nothing)
     settlenode!(memo, RefTarget{T})
     memostore!(memo, s, T, ref)
+    mark = memo.fresh[]
     built = buildresolvedrecordplan(T, s, p, memo)
     if built === nothing
+        releasefresh!(memo, mark)                      # the abandoned step plans die with the fallback
         sem = chargedsemantic(T, p, memo)
         ref.plan = sem
         return memostore!(memo, s, T, sem)
