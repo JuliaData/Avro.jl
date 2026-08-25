@@ -170,7 +170,7 @@ end
 "The last operation's parallel counters (test and gate introspection only)."
 const LAST_PARALLEL_STATS = Ref{Any}(nothing)
 
-"Test-only schedule forcing: `PARALLEL_HOOK[] = (event, index) -> ...` (`:admitted`, `:headdone`, `:workerstart`, `:workerdone`, `:commit`)."
+"Test-only schedule forcing: `PARALLEL_HOOK[] = (event, index) -> ...` (`:poolwrap`, `:admitted`, `:headdone`, `:workerstart`, `:workerdone`, `:commit`)."
 const PARALLEL_HOOK = Ref{Any}(nothing)
 
 function phook(event::Symbol, index::Int)
@@ -459,8 +459,10 @@ function startpool(r::Reader, plan, sel::Union{Nothing,Vector{Int}}, slotrow::In
             errormonitor(workers[i])
             nstarted = i
         end
-        allocated!(b, poolstate)
-        return BlockPool(fail, jobs, ch, workers, poolstate, true)
+        phook(:poolwrap, 0)
+        pool = BlockPool(fail, jobs, ch, workers, poolstate, true)
+        allocated!(b, poolstate)                      # publish only after the complete pool exists
+        return pool
     catch
         if ch !== nothing
             workers === nothing ? close(ch) : settleworkers!(ch, workers, nstarted)

@@ -141,6 +141,22 @@
             @test all(isequal(recovered[name], reference[name]) for name in keys(reference))
         end
     end
+    @testset "pool wrapper failure returns the pending startup reservation" begin
+        if Threads.nthreads() > 1
+            pending0 = @atomic Avro.GUARD.pending
+            Avro.PARALLEL_HOOK[] = (event, _) -> begin
+                event === :poolwrap && error("pool wrapper failure")
+                return nothing
+            end
+            err = try
+                geterr(() -> Avro.Table(IOBuffer(bytes); ntasks=4, limits=raised))
+            finally
+                Avro.PARALLEL_HOOK[] = nothing
+            end
+            @test err isa ErrorException && err.msg == "pool wrapper failure"
+            @test (@atomic Avro.GUARD.pending) == pending0
+        end
+    end
     @testset "failure selection: the lowest failing index wins for every kind pairing" begin
         entries = entriesof(nullbytes)
         @test length(entries) > 15
