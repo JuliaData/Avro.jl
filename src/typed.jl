@@ -88,6 +88,7 @@ end
 "Recursion through the user's own recursive types (filled after construction; a function barrier)."
 mutable struct RefTarget{T} <: TypedPlan
     plan::Union{Nothing,TypedPlan}
+    used::Bool
 end
 
 # ---- construction -----------------------------------------------------------------------------------
@@ -176,7 +177,10 @@ end
 
 function memolookup(memo::TypedMemo, s::Schema, ::Type{T}) where {T}
     for (t, p) in memo[Int(nodeid(s)) + 1]
-        t === T && return p
+        if t === T
+            p isa RefTarget && (p.used = true)
+            return p
+        end
     end
     return nothing
 end
@@ -471,7 +475,7 @@ function buildrecordtarget(::Type{T}, s::RecordSchema, p::RecordPlan, memo::Type
     cached === nothing || return cached
     fastroute(T) || return memostore!(memo, s, T, chargedsemantic(T, p, memo))
     reservenode!(memo, RefTarget{T})
-    ref = RefTarget{T}(nothing)
+    ref = RefTarget{T}(nothing, false)
     settlenode!(memo, RefTarget{T})
     memostore!(memo, s, T, ref)
     mark = memo.fresh[]
@@ -481,10 +485,14 @@ function buildrecordtarget(::Type{T}, s::RecordSchema, p::RecordPlan, memo::Type
         # Recursive references captured `ref` already: they convert semantically where they occur.
         sem = chargedsemantic(T, p, memo)
         ref.plan = sem
-        return memostore!(memo, s, T, sem)
+        out = memostore!(memo, s, T, sem)
+        ref.used || release!(memo.budget, nodebytes(RefTarget{T}))
+        return out
     end
     ref.plan = built
-    return memostore!(memo, s, T, built)
+    out = memostore!(memo, s, T, built)
+    ref.used || release!(memo.budget, nodebytes(RefTarget{T}))
+    return out
 end
 
 """
@@ -553,19 +561,21 @@ function buildrecordplan(::Type{T}, s::RecordSchema, p::RecordPlan, memo::TypedM
     end
     defaults = typedvector(Any, length(names), memo)
     defs = StructUtils.fielddefaults(AvroStyle(), T)
+    defaultcharge = 0
     for k in eachindex(names)
         map[k] == 0 || continue
         ft = fieldtype(T, k)
         if haskey(defs, names[k])
             v = defs[names[k]]
             if !(v isa ft)
-                release!(memo.budget, scratch + vectorbytes(Any, length(names)))   # `defaults` dies with the fallback
+                release!(memo.budget, scratch + vectorbytes(Any, length(names)) + defaultcharge)   # `defaults` dies with the fallback
                 return nothing
             end
             bb = isbits(v) ? boxbytes(typeof(v)) : 0
             bb > 0 && reserve!(memo.budget, bb)        # the retained Any-slot box, made at the assignment
             defaults[k] = v
             bb > 0 && allocated!(memo.budget, bb)
+            defaultcharge += bb
         elseif Missing <: ft
             defaults[k] = missing
         elseif Nothing <: ft
@@ -712,7 +722,7 @@ function buildresolvedrecord(::Type{T}, s::RecordSchema, p::ResolvedRecordPlan, 
     cached === nothing || return cached
     fastroute(T) || return memostore!(memo, s, T, chargedsemantic(T, p, memo))
     reservenode!(memo, RefTarget{T})
-    ref = RefTarget{T}(nothing)
+    ref = RefTarget{T}(nothing, false)
     settlenode!(memo, RefTarget{T})
     memostore!(memo, s, T, ref)
     mark = memo.fresh[]
@@ -721,10 +731,14 @@ function buildresolvedrecord(::Type{T}, s::RecordSchema, p::ResolvedRecordPlan, 
         releasefresh!(memo, mark)                      # the abandoned step plans die with the fallback
         sem = chargedsemantic(T, p, memo)
         ref.plan = sem
-        return memostore!(memo, s, T, sem)
+        out = memostore!(memo, s, T, sem)
+        ref.used || release!(memo.budget, nodebytes(RefTarget{T}))
+        return out
     end
     ref.plan = built
-    return memostore!(memo, s, T, built)
+    out = memostore!(memo, s, T, built)
+    ref.used || release!(memo.budget, nodebytes(RefTarget{T}))
+    return out
 end
 
 function resolvedslotmap(::Type{T}, s::RecordSchema, memo::TypedMemo) where {T}
@@ -796,12 +810,19 @@ function checkedreaderdefault(::Type{T}, dp::DefaultPlan, budget::Budget) where 
     return out
 end
 
+"Build a retained reader default and add its box to the current fallback ledger."
+function checkedreaderdefault(::Type{T}, dp::DefaultPlan, memo::TypedMemo) where {T}
+    out = checkedreaderdefault(T, dp, memo.budget)
+    out === nothing || (memo.fresh[] += nodebytes(ResolvedReaderDefault{T}))
+    return out
+end
+
 function resolvedreaderdefaults!(::Type{T}, defaults::Vector{Any}, covered::Vector{Bool},
-                                 slotfor::Vector{Int}, p::ResolvedRecordPlan, budget::Budget) where {T}
+                                 slotfor::Vector{Int}, p::ResolvedRecordPlan, memo::TypedMemo) where {T}
     for (slot, dp) in p.defaults
         k = slotfor[slot]
         k == 0 && continue
-        dflt = checkedreaderdefault(fieldtype(T, k), dp, budget)
+        dflt = checkedreaderdefault(fieldtype(T, k), dp, memo)
         dflt === nothing && return false
         defaults[k] = dflt
         covered[k] = true
@@ -810,7 +831,7 @@ function resolvedreaderdefaults!(::Type{T}, defaults::Vector{Any}, covered::Vect
 end
 
 function resolvedstaticdefaults!(::Type{T}, defaults::Vector{Any}, covered::Vector{Bool}, names,
-                                 budget::Budget) where {T}
+                                 budget::Budget, retained::Base.RefValue{Int}) where {T}
     defs = StructUtils.fielddefaults(AvroStyle(), T)
     for k in eachindex(names)
         covered[k] && continue
@@ -822,6 +843,7 @@ function resolvedstaticdefaults!(::Type{T}, defaults::Vector{Any}, covered::Vect
             bb > 0 && reserve!(budget, bb)             # the retained Any-slot box, made at the assignment
             defaults[k] = v
             bb > 0 && allocated!(budget, bb)
+            retained[] += bb
         elseif Missing <: ft
             defaults[k] = missing
         elseif Nothing <: ft
@@ -846,13 +868,14 @@ function buildresolvedrecordplan(::Type{T}, s::RecordSchema, p::ResolvedRecordPl
               vectorbytes(Bool, length(names))         # construction-only storage, released on every exit
     defaults = typedvector(Any, length(names), memo)
     covered = typedvector(Bool, length(names), memo)
+    defaultcharge = Ref(0)
     fill!(covered, false)
     for k in stepslot
         k == 0 || (covered[k] = true)
     end
-    if !(resolvedreaderdefaults!(T, defaults, covered, slotfor, p, memo.budget) &&
-         resolvedstaticdefaults!(T, defaults, covered, names, memo.budget))
-        release!(memo.budget, scratch + vectorbytes(Any, length(names)))   # `defaults` dies with the fallback
+    if !(resolvedreaderdefaults!(T, defaults, covered, slotfor, p, memo) &&
+         resolvedstaticdefaults!(T, defaults, covered, names, memo.budget, defaultcharge))
+        release!(memo.budget, scratch + vectorbytes(Any, length(names)) + defaultcharge[])   # `defaults` dies with the fallback
         return nothing
     end
     ps, psbox = chargedtuple(memo, plans)

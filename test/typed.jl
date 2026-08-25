@@ -470,6 +470,42 @@ end
             budget=failedplanbudget)
         @test failedplanbudget.pending == failedplanbudget.reserved == 0     # failed construction releases all scratch
         Avro.close!(failedplanbudget)
+
+        directschema = P("{\"type\":\"record\",\"name\":\"DirectCharge\",\"fields\":[{\"name\":\"a\",\"type\":\"long\"}]}")
+        directbudget = Avro.Budget(Avro.Limits(); available=1 << 40)
+        directplan = Avro.typedplan(@NamedTuple{a::Int64}, directschema, Avro.readplan(directschema),
+            Avro.Limits(); budget=directbudget)
+        directreachable = Avro.nodebytes(typeof(directplan)) + Avro.vectorbytes(Any, length(directplan.defaults))
+        @test directbudget.pending == 0
+        @test directbudget.reserved == directreachable
+        Avro.close!(directbudget)
+
+        resolvedwriter = P("{\"type\":\"record\",\"name\":\"ResolvedCharge\",\"fields\":[{\"name\":\"a\",\"type\":\"int\"}]}")
+        resolvedreader = P("{\"type\":\"record\",\"name\":\"ResolvedCharge\",\"fields\":[{\"name\":\"a\",\"type\":\"long\"}]}")
+        resolvedplan = Avro.resolve(resolvedwriter, resolvedreader).plan
+        resolvedbudget = Avro.Budget(Avro.Limits(); available=1 << 40)
+        resolvedtarget = Avro.typedplan(@NamedTuple{a::Int64}, resolvedreader, resolvedplan,
+            Avro.Limits(); budget=resolvedbudget)
+        resolvedreachable = Avro.nodebytes(typeof(resolvedtarget)) + Avro.vectorbytes(Any, length(resolvedtarget.defaults))
+        @test resolvedbudget.pending == 0
+        @test resolvedbudget.reserved == resolvedreachable
+        Avro.close!(resolvedbudget)
+
+        fallbackwriter = P("{\"type\":\"record\",\"name\":\"FallbackDefaults\",\"fields\":[]}")
+        FallbackTarget = @NamedTuple{x::Int32,y::Int64}
+        fallbackcharges = Int[]
+        for fieldsjson in (
+                "[{\"name\":\"x\",\"type\":\"int\",\"default\":1},{\"name\":\"y\",\"type\":\"string\",\"default\":\"a\"}]",
+                "[{\"name\":\"y\",\"type\":\"string\",\"default\":\"a\"},{\"name\":\"x\",\"type\":\"int\",\"default\":1}]")
+            fallbackreader = P("{\"type\":\"record\",\"name\":\"FallbackDefaults\",\"fields\":" * fieldsjson * "}")
+            fallbackplan = Avro.resolve(fallbackwriter, fallbackreader).plan
+            fallbackbudget = Avro.Budget(Avro.Limits(); available=1 << 40)
+            @test Avro.typedplan(FallbackTarget, fallbackreader, fallbackplan, Avro.Limits();
+                budget=fallbackbudget) isa Avro.SemanticTarget
+            push!(fallbackcharges, fallbackbudget.reserved)
+            Avro.close!(fallbackbudget)
+        end
+        @test fallbackcharges[1] == fallbackcharges[2]
         # a null writer resolves through either nullable reader position and null target convention
         wnull = P("\"null\"")
         for rnull in (P("[\"null\",\"long\"]"), P("[\"long\",\"null\"]"))
