@@ -45,6 +45,8 @@ workaround parses through `Float64` and can double-round. Fixture paths and line
 semantically.
 The fuzz sample freezes the Julia 1.10–1.12 permutation algorithm because Julia 1.13 changed
 `randperm`; resource workers disable inherited coverage and now propagate their RSS exit code.
+Linux fuzz workers read their executable-image `VmHWM`; `getrusage` can retain the large test
+parent's pre-exec high-water mark and falsely reject every fresh worker.
 One dedicated Ubuntu leg records informational coverage. High-window 1 GiB codec success probes are
 explicitly enabled with `AVRO_BIG_MEMORY=true`; their default rejection gates remain unconditional.
 The instrumented coverage leg skips only the timing gate; all 18 uninstrumented operating-matrix legs

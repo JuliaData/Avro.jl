@@ -348,6 +348,24 @@ function runentry(fixtures, e::FuzzEntry, iterations::Int, limits, faildir)
     return (cases=cases, failures=failures)
 end
 
+function fuzzmaxrss()
+    @static if Sys.islinux()
+        # getrusage keeps the parent's resident high-water mark across fork/exec on Linux. VmHWM is
+        # scoped to this executable image, so it measures the fuzz worker instead of the test parent.
+        return open("/proc/self/status") do io
+            for line in eachline(io)
+                startswith(line, "VmHWM:") || continue
+                fields = split(line)
+                length(fields) == 3 && fields[3] == "kB" || error("invalid VmHWM in /proc/self/status")
+                return parse(Int, fields[2]) << 10
+            end
+            return error("VmHWM is missing from /proc/self/status")
+        end
+    else
+        return Sys.maxrss()
+    end
+end
+
 function main(args)
     length(args) == 9 || error("usage: worker.jl <fixtures> <sample.tsv> <from> <to> <iterations> <results.tsv> <failures dir> <rss MiB> <cpu s>")
     fixtures, sample, results, faildir = args[1], args[2], args[6], args[7]
@@ -360,7 +378,8 @@ function main(args)
             c = runentry(fixtures, e, iterations, limits, faildir)
             println(io, e.kind, '\t', e.source, '\t', e.index, '\t', e.seed, '\t', c.cases, '\t', c.failures)
             flush(io)
-            Sys.maxrss() > rssmib << 20 && (println(stderr, "RSS limit exceeded: ", Sys.maxrss() >> 20, " MiB"); return 3)
+            rss = fuzzmaxrss()
+            rss > rssmib << 20 && (println(stderr, "RSS limit exceeded: ", rss >> 20, " MiB"); return 3)
         end
         return 0
     end
