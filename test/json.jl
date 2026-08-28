@@ -53,6 +53,8 @@
         @test Avro.parseinteger("99999999999999999999") === nothing && Avro.parseinteger("") === nothing && Avro.parseinteger("-") === nothing
         @test Avro.parsefloat(Float32, "1.000000059604644775390625827180612553027674871408692069962853565812110900878906") === reinterpret(Float32, 0x3f800001)
         @test Float32(Avro.parsefloat(Float64, "1.000000059604644775390625827180612553027674871408692069962853565812110900878906")) === reinterpret(Float32, 0x3f800000)
+        @test Avro.parsefloat(Float32, "1e100") == Inf32 && Avro.parsefloat(Float32, "-1e100") == -Inf32
+        @test Avro.parsefloat(Float32, "1e-100") == 0.0f0 && Avro.parsefloat(Float32, "-1e-100") === -0.0f0
         @test Avro.parsefloat(Float64, "1e400") == Inf && Avro.parsefloat(Float64, "-1e400") == -Inf
         @test Avro.parsefloat(Float64, "1e-400") == 0.0 && Avro.parsefloat(Float64, "-1e-400") === -0.0
         @test Avro.parsefloat(Float64, "4.9e-324") == 5.0e-324 && Avro.parsefloat(Float64, "-0.0") === -0.0

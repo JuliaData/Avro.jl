@@ -312,7 +312,7 @@ import Logging
         @test length(highwindowcontrols) == 2 && length(overlimit) == 2
         @test length(recordfiles) == 81
         @test allfiles == sort!(vcat(recordfiles, rejected, rootfiles, overlimit))
-        @test sort([relpath(f, apache) for f in apachefiles]) == [
+        @test sort([replace(relpath(f, apache), '\\' => '/') for f in apachefiles]) == [
             "schemas/simple/data.avro", "schemas/withUnion/data.avro", "syncInMeta.avro",
             "weather-deflate.avro", "weather-snappy.avro", "weather-sorted.avro",
             "weather-zstd.avro", "weather.avro"]

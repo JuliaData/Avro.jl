@@ -1299,7 +1299,7 @@ end
         end
         @test !isempty(readall(joinpath(hw, "zstd-default.avro")))
         @test !isempty(readall(joinpath(hw, "xz-default.avro")))
-        if get(ENV, "AVRO_BIG_MEMORY", "true") == "true"
+        if get(ENV, "AVRO_BIG_MEMORY", "false") == "true"
             raised = Avro.Limits(max_codec_memory=2 << 30, max_total_bytes=16 << 30, max_block_bytes=1 << 30, max_block_output_bytes=8 << 30, max_bytes=1 << 30, max_datum_bytes=1 << 30)
             @test !isempty(readall(joinpath(hw, "zstd-window1g.avro"); limits=raised))
             @test !isempty(readall(joinpath(hw, "xz-dict1g.avro"); limits=raised))

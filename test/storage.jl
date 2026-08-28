@@ -5,7 +5,9 @@
         @test sizeof(Avro.Record) == 16 && sizeof(Avro.EnumValue) == 16 && sizeof(Avro.Fixed) == 16 && sizeof(Avro.UnionValue) == 16
         @test Avro.slotbytes(Int32) == 4 && Avro.slotbytes(Union{Missing,Int64}) == 9 && Avro.slotbytes(Union{Missing,String}) == 8 && Avro.slotbytes(Any) == 8
         @test Avro.vectorbytes(Union{Missing,Int32}, 1000) == 40 + 5000 && Avro.bytesbytes(3) == 43 && Avro.stringbytes(3) == 19
-        @test Avro.boxbytes(Int64) == 24 && Avro.boxbytes(Avro.Decimal) == 48 && Avro.recordbytes(3) == 80 && Avro.fixedbytes(3) == 59
+        @test Avro.boxbytes(Int64) == 24
+        @test Avro.boxbytes(Avro.Decimal) == 16 + sizeof(Avro.Decimal)
+        @test Avro.recordbytes(3) == 80 && Avro.fixedbytes(3) == 59
         @test Avro.boxcharge(Int32) == 20 && Avro.boxcharge(Union{Missing,Int32}) == 20 && Avro.boxcharge(String) == 0 && Avro.boxcharge(Union{Missing,String}) == 0
         @test Avro.mapbytes(Int64, 2) == 24 + 3 * 40 + 2 * (4 + 8 + 8)
     end

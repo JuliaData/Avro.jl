@@ -151,9 +151,10 @@ end
     @test hd0 !== nothing
     hd0 === nothing && error("javac is required for the complete §8.5 matrix")
     hd = hd0::String
-    py = AVRO_PYTHON
-    @test isfile(py)
-    isfile(py) || error("AVRO_PYTHON must name the pinned fastavro environment")
+    py0 = Sys.which(AVRO_PYTHON)
+    @test py0 !== nothing
+    py0 === nothing && error("AVRO_PYTHON must name the pinned fastavro environment")
+    py = py0::String
     haspy = success(run(pipeline(`$py -c "import fastavro"`; stdout=devnull, stderr=devnull)))
     @test haspy
     haspy || error("AVRO_PYTHON cannot import fastavro")

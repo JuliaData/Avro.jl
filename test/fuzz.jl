@@ -6,7 +6,7 @@ include(joinpath(@__DIR__, "fuzz", "worker.jl"))
 
 @testset "Fuzz: the recorded sample in sandboxed batches" begin
     sample = joinpath(@__DIR__, "fuzz", "sample.tsv")
-    @test samplefile(fuzzsample(FIXTURES)) == read(sample, String)            # the recorded sample is reproducible
+    @test samplefile(fuzzsample(FIXTURES)) == samplefile(readsample(sample)) # the recorded sample is reproducible
     rng = Random.Xoshiro(1)
     ops = Set{Symbol}()
     for it in 1:300
@@ -34,7 +34,7 @@ include(joinpath(@__DIR__, "fuzz", "worker.jl"))
     function launch(k)
         r = ranges[k]
         log = joinpath(logdir, "batch$k.log")
-        cmd = `$(Base.julia_cmd()) --startup-file=no --project=$(Base.active_project()) $worker $FIXTURES $sample $(first(r)) $(last(r)) $iterations $(joinpath(logdir, "batch$k.tsv")) $faildir 4096 900`
+        cmd = `$(Base.julia_cmd()) --startup-file=no --code-coverage=none --track-allocation=none --project=$(Base.active_project()) $worker $FIXTURES $sample $(first(r)) $(last(r)) $iterations $(joinpath(logdir, "batch$k.tsv")) $faildir 4096 900`
         return run(pipeline(cmd; stdout=log, stderr=log); wait=false)
     end
     cases = 0

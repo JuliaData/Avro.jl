@@ -185,6 +185,8 @@ end
     end
 else
     function capacity(v::Vector)
-        return length(v)
+        # Julia 1.10 stores a Vector's retained capacity in the pseudo second dimension.
+        # Its own array tests read that value through the exported C API.
+        return Int(ccall(:jl_array_size, Csize_t, (Any, Cint), v, 1))
     end
 end

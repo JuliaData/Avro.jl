@@ -77,10 +77,32 @@ function fuzzcorpus(fixtures::AbstractString)
     return entries
 end
 
+"The Julia 1.10–1.12 permutation algorithm, frozen so the recorded sample is version-stable."
+function recordedperm(rng::AbstractRNG, n::Int)
+    permutation = Vector{Int}(undef, n)
+    n == 0 && return permutation
+    permutation[1] = 1
+    mask = 3
+    @inbounds for i in 2:n
+        candidate = 0
+        while true
+            candidate = Int((rand(rng, UInt64) >> 12) & UInt64(mask))
+            candidate < i && break
+        end
+        j = candidate + 1
+        if i != j
+            permutation[i] = permutation[j]
+        end
+        permutation[j] = i
+        i == mask + 1 && (mask = 2 * mask + 1)
+    end
+    return permutation
+end
+
 "The recorded sample: `n` entries drawn by a fixed seed from the corpus order."
 function fuzzsample(fixtures::AbstractString; n::Int=200)
     entries = fuzzcorpus(fixtures)
-    perm = randperm(Xoshiro(20260822), length(entries))
+    perm = recordedperm(Xoshiro(20260822), length(entries))
     return entries[perm[1:min(n, end)]]
 end
 
@@ -333,15 +355,15 @@ function main(args)
     Sys.isunix() && ccall(:setrlimit, Cint, (Cint, Ptr{UInt64}), 0, UInt64[cpus, cpus + 60])   # RLIMIT_CPU
     entries = readsample(sample)[from:to]
     limits = Avro.Limits()
-    open(results, "w") do io
+    return open(results, "w") do io
         for e in entries
             c = runentry(fixtures, e, iterations, limits, faildir)
             println(io, e.kind, '\t', e.source, '\t', e.index, '\t', e.seed, '\t', c.cases, '\t', c.failures)
             flush(io)
             Sys.maxrss() > rssmib << 20 && (println(stderr, "RSS limit exceeded: ", Sys.maxrss() >> 20, " MiB"); return 3)
         end
+        return 0
     end
-    return 0
 end
 
 if abspath(PROGRAM_FILE) == @__FILE__

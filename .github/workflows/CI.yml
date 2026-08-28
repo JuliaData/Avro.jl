@@ -25,12 +25,29 @@ jobs:
       - uses: julia-actions/cache@v2
       - uses: julia-actions/julia-buildpkg@v1
       - uses: julia-actions/julia-runtest@v1
+        with:
+          coverage: false
         env:
           JULIA_NUM_THREADS: ${{ matrix.threads }}
+
+  coverage:
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
+    name: Source coverage (informational)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: '1'
+      - uses: julia-actions/cache@v2
+      - uses: julia-actions/julia-buildpkg@v1
+      - uses: julia-actions/julia-runtest@v1
+        with:
+          coverage: true
+        env:
+          AVRO_SKIP_LATENCY: 'true'
       - uses: julia-actions/julia-processcoverage@v1
-        if: matrix.version == '1' && matrix.os == 'ubuntu-latest' && matrix.threads == '1'
       - uses: codecov/codecov-action@v4
-        if: matrix.version == '1' && matrix.os == 'ubuntu-latest' && matrix.threads == '1'
         with:
           files: lcov.info
           fail_ci_if_error: false   # coverage is informational (plan §9.14)
@@ -50,6 +67,8 @@ jobs:
           version: ${{ matrix.version }}
       - uses: julia-actions/julia-buildpkg@v1
       - uses: julia-actions/julia-runtest@v1
+        with:
+          coverage: false
   quality:
     if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
     name: Aqua + JET + Arrow 2 smoke
@@ -61,6 +80,8 @@ jobs:
           version: '1'
       - uses: julia-actions/julia-buildpkg@v1
       - uses: julia-actions/julia-runtest@v1
+        with:
+          coverage: false
         env:
           AVRO_QUALITY_GATES: 'true'
           AVRO_SMOKE: 'true'
@@ -88,6 +109,8 @@ jobs:
           echo "AVRO_TOOLS_JAR=$PWD/avro-tools.jar" >> "$GITHUB_ENV"
       - uses: julia-actions/julia-buildpkg@v1
       - uses: julia-actions/julia-runtest@v1
+        with:
+          coverage: false
         env:
           AVRO_INTEROP: 'true'
           AVRO_PYTHON: python3

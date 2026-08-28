@@ -35,6 +35,27 @@ interop passed 58/58 datum checks and 1,586/1,586 complete-matrix checks. The st
 passed. Cross-version exchange passed 32/32 checks from Julia 1.10.11 to 1.12.6 and 32/32 in the
 reverse direction. Hosted matrix results are maintained on the pull request.
 
+The first hosted run at `1b8f438` found portability defects that the local Apple ARM matrix could
+not expose. Julia 1.10 stores retained vector capacity in its pseudo second dimension, x64 Julia 1.10
+uses a smaller `Decimal` layout, and top-level allocation probes include fixed call-site boxes on
+older Julia versions. The storage oracle now reads retained capacity through Julia's exported C API,
+layout checks use `16 + sizeof(Decimal)`, and typed measurement barriers isolate the hot paths.
+Windows now uses the CRT's directly rounded `strtof` result because Julia's Windows workaround parses
+through `Float64` and can double-round. Fixture paths and line endings are compared semantically.
+The fuzz sample freezes the Julia 1.10–1.12 permutation algorithm because Julia 1.13 changed
+`randperm`; resource workers disable inherited coverage and now propagate their RSS exit code.
+One dedicated Ubuntu leg records informational coverage. High-window 1 GiB codec success probes are
+explicitly enabled with `AVRO_BIG_MEMORY=true`; their default rejection gates remain unconditional.
+The instrumented coverage leg skips only the timing gate; all 18 uninstrumented operating-matrix legs
+run it. The interop harness resolves its configured Python command through `PATH` before it checks
+fastavro.
+
+The affected JSON, binary, storage, container and projection suites pass 56,418/56,418 checks on both
+Julia 1.10.11 and 1.12.6. The complete recorded fuzz gate passes 200,000 mutations on each version.
+The sample-selection regression also passes on Julia 1.11.9 and 1.13.0-rc1. A forced zero-MiB worker
+ceiling returns exit code 3 after writing its completed result, which verifies resource-failure
+propagation. Both opt-in 1 GiB codec success probes pass with the raised limits.
+
 ## Round-4 response (2026-08-25)
 
 Every point of the round-four required revision list is addressed on `jq/v2-rewrite` (base:

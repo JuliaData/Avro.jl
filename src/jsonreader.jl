@@ -322,7 +322,7 @@ Correctly rounded, linear-time parse of a JSON number token as `Float32` or `Flo
 ±Inf, underflow ±0.0 or a subnormal, `-0.0` preserved, as Java's `parseDouble`).
 """
 function parsefloat(::Type{T}, tok::AbstractString) where {T<:Union{Float32,Float64}}
-    v = tryparse(T, tok)
+    v = T === Float32 ? tryparsefloat32(tok) : tryparse(Float64, tok)
     v === nothing || return v
     # Julia's parser rejects out-of-range tokens; the pre-scan guarantees the grammar, so classify
     # overflow (±Inf) versus underflow (±0.0) from the effective decimal exponent.
@@ -369,6 +369,24 @@ function parsefloat(::Type{T}, tok::AbstractString) where {T<:Union{Float32,Floa
     effective = intdigits > 0 ? expo + intdigits - 1 : expo - leadingfrac - 1
     effective >= 0 && return neg ? -T(Inf) : T(Inf)
     return neg ? -zero(T) : zero(T)
+end
+
+function tryparsefloat32(tok::AbstractString)
+    @static if Sys.iswindows()
+        # Julia parses Float32 through Float64 on Windows to work around the CRT's incorrect ERANGE.
+        # That route can double-round values. The CRT result is correctly rounded; parsefloat handles
+        # overflow and underflow itself, so it does not depend on ERANGE.
+        text = tok isa String ? tok : String(tok)
+        endpoint = Ref{Ptr{UInt8}}(C_NULL)
+        value = GC.@preserve text begin
+            start = pointer(text)
+            parsed = ccall(:strtof, Cfloat, (Ptr{UInt8}, Ptr{Ptr{UInt8}}), start, endpoint)
+            endpoint[] == start + sizeof(text) ? parsed : nothing
+        end
+        return value
+    else
+        return tryparse(Float32, tok)
+    end
 end
 
 function scannumber_ok(cu)

@@ -79,6 +79,16 @@ function symbollookupalloc(map, record, row, iterations)
     return total
 end
 
+function symbollookupbytes(map::M, record::R, row::W) where {M,R,W}
+    symbollookupalloc(map, record, row, 1)
+    return @allocated symbollookupalloc(map, record, row, 1_000)
+end
+
+function fieldpositionbytes(plan::P, ::Type{T}) where {P,T}
+    fieldpositionalloc(plan, T, 1)
+    return @allocated fieldpositionalloc(plan, T, 1_000)
+end
+
 @testset "Binary core" begin
     P = Avro.parseschema
     function enc(s, x)
@@ -350,8 +360,7 @@ end
         @test rec.a == 1 && rec.b == "z" && rec == Avro.Record(rs, [1, "z"])
         symbolmap = Avro.Map([("a", Int32(2))])
         symbolrow = Avro.Row(rec)
-        symbollookupalloc(symbolmap, rec, symbolrow, 1)
-        @test @allocated(symbollookupalloc(symbolmap, rec, symbolrow, 1_000)) == 0
+        @test symbollookupbytes(symbolmap, rec, symbolrow) == 0
         @test_throws Avro.DataError dec(r, hex2bytes("02"))
         @test dec(r, enc(r, first(Tables.rows((a=[1], b=["q"]))))).b == "q"   # Tables.AbstractRow source
         empty = "{\"type\":\"record\",\"name\":\"E\",\"fields\":[]}"
@@ -592,9 +601,8 @@ end
         @test cachewriter((a=UInt8[2],)) == UInt8[2]
         @test cachewriter.callbudget.peak >=
               Avro.encoderstorage(cachewriter.encoder) + cachedbytes
-        fieldpositionalloc(reorderedwriter.plan, @NamedTuple{a::Int64,b::Int64}, 1)
-        @test @allocated(fieldpositionalloc(reorderedwriter.plan,
-            @NamedTuple{a::Int64,b::Int64}, 1_000)) == 0
+        @test fieldpositionbytes(reorderedwriter.plan,
+            @NamedTuple{a::Int64,b::Int64}) == 0
 
         outputwriter = Avro.DatumWriter(P("\"bytes\""))
         output = outputwriter(fill(UInt8(1), 1_000))
