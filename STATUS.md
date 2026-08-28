@@ -40,8 +40,9 @@ not expose. Julia 1.10 stores retained vector capacity in its pseudo second dime
 uses a smaller `Decimal` layout, and top-level allocation probes include fixed call-site boxes on
 older Julia versions. The storage oracle now reads retained capacity through Julia's exported C API,
 layout checks use `16 + sizeof(Decimal)`, and typed measurement barriers isolate the hot paths.
-Windows now uses the CRT's directly rounded `strtof` result because Julia's Windows workaround parses
-through `Float64` and can double-round. Fixture paths and line endings are compared semantically.
+Windows now uses the Universal CRT's directly rounded `strtof` result because Julia's Windows
+workaround parses through `Float64` and can double-round. Fixture paths and line endings are compared
+semantically.
 The fuzz sample freezes the Julia 1.10–1.12 permutation algorithm because Julia 1.13 changed
 `randperm`; resource workers disable inherited coverage and now propagate their RSS exit code.
 One dedicated Ubuntu leg records informational coverage. High-window 1 GiB codec success probes are

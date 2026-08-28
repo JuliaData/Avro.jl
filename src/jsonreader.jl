@@ -380,7 +380,8 @@ function tryparsefloat32(tok::AbstractString)
         endpoint = Ref{Ptr{UInt8}}(C_NULL)
         value = GC.@preserve text begin
             start = pointer(text)
-            parsed = ccall(:strtof, Cfloat, (Ptr{UInt8}, Ptr{Ptr{UInt8}}), start, endpoint)
+            parsed = ccall((:strtof, "ucrtbase"), Cfloat,
+                           (Ptr{UInt8}, Ptr{Ptr{UInt8}}), start, endpoint)
             endpoint[] == start + sizeof(text) ? parsed : nothing
         end
         return value
