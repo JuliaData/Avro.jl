@@ -1026,6 +1026,28 @@ end
         if afterclose isa Avro.WriterClosedError
             @test afterclose.cause === original
         end
+
+        # The cached aligned path replays only failures through diagnostic frames.
+        enumrecord = P("""{"type":"record","name":"FastFailure","fields":[
+            {"name":"symbol","type":{"type":"enum","name":"FastSymbol",
+             "symbols":["red","blue"]}}]}""")
+        enumwriter = Avro.Writer(IOBuffer(), enumrecord)
+        push!(enumwriter, (symbol=:red,))
+        enumpending = enumwriter.encoder.pos
+        enumerror = try
+            push!(enumwriter, (symbol=:green,))
+            nothing
+        catch err
+            err
+        end
+        @test enumerror isa Avro.EncodeError
+        if enumerror isa Avro.EncodeError
+            @test enumerror.path == "\$.symbol"
+            @test enumerror.schema === enumrecord.fields[1].schema
+        end
+        @test enumwriter.encoder.pos == enumpending
+        close(enumwriter)
+
         limitio = IOBuffer()
         limitwriter = Avro.Writer(limitio, Avro.NullSchema(); limits=Avro.Limits(max_rows=0))
         limitcause = try

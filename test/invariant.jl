@@ -147,6 +147,58 @@
         end
         @test err isa Avro.LimitError && err.limit === :max_total_values && err.observed == 4
         @test position(tightio) == headersize                         # no unreadable data block was emitted
+
+        # The aligned direct-append path preserves shared counters when the next
+        # row crosses a block-count boundary and must be staged during the flush.
+        recordschema = P("""{"type":"record","name":"AlignedWork","fields":[
+            {"name":"id","type":"long"},{"name":"name","type":"string"}]}""")
+        recordlimits = Avro.Limits(max_block_count=1)
+        recordrows = [(id=Int64(1), name="one"), (id=Int64(2), name="two")]
+        recordio = IOBuffer()
+        recordwriter = Avro.Writer(recordio, recordschema; limits=recordlimits)
+        for row in recordrows
+            push!(recordwriter, row)
+        end
+        close(recordwriter)
+        recordbytes = take!(recordio)
+        recordwriterstate = (values=recordwriter.budget.values,
+                             input_bytes=recordwriter.budget.input_bytes,
+                             rows=recordwriter.budget.rows,
+                             blocks=recordwriter.budget.blocks,
+                             members=recordwriter.budget.members,
+                             compare_bytes=recordwriter.budget.compare_bytes,
+                             allowance_used=Avro.allowanceused(recordwriter.budget))
+        recordvalues, recordreaderstate = Avro.Reader(recordbytes;
+                                                       limits=recordlimits) do reader
+            values = collect(Avro.eachdatum(reader))
+            state = (values=reader.budget.values,
+                     input_bytes=reader.budget.input_bytes,
+                     rows=reader.budget.rows,
+                     blocks=reader.budget.blocks,
+                     members=reader.budget.members,
+                     compare_bytes=reader.budget.compare_bytes,
+                     allowance_used=Avro.allowanceused(reader.budget))
+            return values, state
+        end
+        @test getproperty.(recordvalues, :id) == Int64[1, 2]
+        @test getproperty.(recordvalues, :name) == ["one", "two"]
+        function sharedwork(state)
+            return (values=state.values,
+                    input_bytes=state.input_bytes,
+                    rows=state.rows,
+                    blocks=state.blocks,
+                    members=state.members,
+                    allowance_used=state.allowance_used)
+        end
+        @test sharedwork(recordwriterstate) == sharedwork(recordreaderstate)
+        @test recordwriterstate.compare_bytes >= recordreaderstate.compare_bytes
+
+        referencewriter = Avro.Writer(IOBuffer(), recordschema)
+        for row in recordrows
+            push!(referencewriter, row)
+        end
+        close(referencewriter)
+        @test recordwriterstate.compare_bytes == referencewriter.budget.compare_bytes
     end
     @testset "schema printing does not subsidise datum work" begin
         dense = fill(nothing, 67_000)

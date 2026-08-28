@@ -17,15 +17,22 @@ The takeover audit found and fixed these root causes before PR preparation:
   input or output before the complete operation could apply its comparison allowance;
 * the fast inactive sized-map path jumped over encoded keys and could bypass `max_bytes`;
 * `src/span.jl` was included by the module but was not tracked;
-* hosted CI did not enable the required Arrow 2 and DataFrames smoke suite.
+* hosted CI did not enable the required Arrow 2 and DataFrames smoke suite;
+* the transactional container writer encoded every aligned row into a second buffer and copied it,
+  while also opening an empty staging transaction for schemas that need no staging. The cold write
+  regressed to 0.614 seconds. Aligned rows now append transactionally in place, preserve bytes only
+  when a block boundary forces a flush, and replay only failed rows through diagnostic path frames.
 
 Focused validation on the clean tree is green: 5,629/5,629 checks across limits, schema, type
 derivation, binary, JSON encoding, single-object encoding, resolution, sort order and containers.
-The final Julia 1.12.6 four-thread release gate passed 62,481/62,481 checks in 23m23.5s with
+The final Julia 1.12.6 four-thread release gate passed 62,490/62,490 checks in 24m14.4s with
 `AVRO_QUALITY_GATES=true` and `AVRO_SMOKE=true`. Aqua passed 10/10. JET passed 1/1. The compile-cost
-gate created zero new specializations across 45,785 specializations and grew RSS by 14.2 MB. All six
-latency probes passed; the slowest took 4.91 seconds against a 10-second bound. The strict Documenter
-build passed. Cross-version exchange passed 32/32 checks from Julia 1.10.11 to 1.12.6 and 32/32 in the
+gate created zero new specializations across 46,213 specializations and grew RSS by 14.1 MB. All six
+latency probes passed; the slowest took 4.68 seconds against a 10-second bound. The performance gate
+passed 16/16: the one-million-row write took 0.185 seconds, 5.1 times faster than Avro.jl 1.1.2. The
+parallel RSS gate passed 6/6 at 3,035.8 MB against the 4,096 MB ceiling. Live Apache and fastavro
+interop passed 58/58 datum checks and 1,586/1,586 complete-matrix checks. The strict Documenter build
+passed. Cross-version exchange passed 32/32 checks from Julia 1.10.11 to 1.12.6 and 32/32 in the
 reverse direction. Hosted matrix results are maintained on the pull request.
 
 ## Round-4 response (2026-08-25)

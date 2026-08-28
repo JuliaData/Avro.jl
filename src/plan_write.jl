@@ -1585,6 +1585,15 @@ end
     return nothing
 end
 
+@inline function encfieldsfast(e::Encoder, ::Tuple{}, ::Tuple{})
+    return nothing
+end
+
+@inline function encfieldsfast(e::Encoder, plans::Tuple, vals::Tuple)
+    encode(first(plans), e, first(vals))
+    return encfieldsfast(e, Base.tail(plans), Base.tail(vals))
+end
+
 "Encode one statically typed aligned field; the root frame restores diagnostics after any failure."
 @inline function encodealignedchild(plan::P, e::Encoder, value::T,
                                     schema::Schema, name::AbstractString) where {P<:WritePlan,T}
@@ -1618,6 +1627,19 @@ function encodealigned!(plans::Tuple, e::Encoder, x::NamedTuple,
             finally
                 leave!(e)
             end
+        end
+    end
+end
+
+"Encode one aligned row without diagnostic path frames; callers replay failures diagnostically."
+function encodealignedfast!(plans::Tuple, e::Encoder, x::NamedTuple)
+    return encodedwork!(e) do
+        enter!(e)
+        try
+            countvalues!(e.budget)
+            encfieldsfast(e, plans, values(x))
+        finally
+            leave!(e)
         end
     end
 end

@@ -1736,6 +1736,18 @@ function Base.push!(w::Writer, datum)
 end
 
 function pushdatum!(w::Writer, datum)
+    if !w.stagevalues
+        if datum isa NamedTuple && w.fasttype === typeof(datum) &&
+           w.fastplans !== nothing
+            nextrows = checked_add(w.budget.rows, 1)
+            nextrows <= w.limits.max_rows ||
+                throw(limiterror(w.budget, :max_rows, nextrows,
+                                 w.limits.max_rows))
+            return pushaligneddatum!(w, datum, w.fastplans, w.preflight,
+                                     nextrows, 0)
+        end
+        return pushprepareddatum!(w, datum)
+    end
     work = writerworkcheckpoint(w.budget)
     rootcharge = 0
     staged = nothing
@@ -2242,6 +2254,181 @@ function writercandidatefits(w::Writer, count::Int, payload::Int, values::Int,
     return true
 end
 
+@noinline function diagnosealignedestimate!(w::Writer, plans::Tuple,
+                                            datum::NamedTuple,
+                                            pf::Union{Nothing,TablePreflight})
+    checkpoint = writerworkcheckpoint(w.budget)
+    reset!(w.datumencoder)
+    beginworkdefer!(w.budget)
+    try
+        return withencoderroot!(w.datumencoder, w.schema) do
+            estimatealigned(plans, datum, pf === nothing ? nothing : pf.cols,
+                            w.budget, (w.schema::RecordSchema).fields,
+                            w.datumencoder)
+        end
+    finally
+        endworkdefer!(w.budget)
+        restorewriterwork!(w.budget, checkpoint)
+        reset!(w.datumencoder)
+    end
+end
+
+@noinline function diagnosealignedencode!(w::Writer, plans::Tuple,
+                                          datum::NamedTuple)
+    checkpoint = writerworkcheckpoint(w.budget)
+    reset!(w.datumencoder)
+    beginworkdefer!(w.budget)
+    try
+        return encodealigned!(plans, w.datumencoder, datum,
+                              w.schema::RecordSchema)
+    finally
+        endworkdefer!(w.budget)
+        restorewriterwork!(w.budget, checkpoint)
+        reset!(w.datumencoder)
+    end
+end
+
+"Estimate and append one aligned row while its work counters remain deferred."
+@inline function preparealigneddatum!(w::Writer, datum::NamedTuple, plans::Tuple,
+                                      pf::Union{Nothing,TablePreflight},
+                                      stagedcompare::Int)
+    checkpoint = writerworkcheckpoint(w.budget)
+    start = w.encoder.pos
+    credited = w.encoder.credited
+    complete = false
+    beginworkdefer!(w.budget)
+    try
+        eb, ep, ev, pp = estimatealigned(plans, datum,
+                                         pf === nothing ? nothing : pf.cols,
+                                         w.budget)
+        eb <= w.limits.max_block_output_bytes ||
+            throw(LimitError(:max_block_output_bytes, eb,
+                             w.limits.max_block_output_bytes,
+                             :max_block_output_bytes, :encode))
+        # Pending block bytes are accounted when the block is committed. Mark the
+        # existing prefix as settled so `encodedwork!` measures only this datum.
+        w.encoder.credited = start
+        encodealignedfast!(plans, w.encoder, datum)
+        datumbytes = w.encoder.pos - start
+        datumvalues = w.budget.values - checkpoint[1]
+        datumcompare = checked_add(stagedcompare,
+                                   w.budget.compare_bytes - checkpoint[3])
+        datumvalues == ev ||
+            throw(ArgumentError("internal error: datum estimate counted $ev values but encoding counted $datumvalues"))
+        datumbytes <= w.limits.max_block_bytes ||
+            throw(LimitError(:max_block_bytes, datumbytes,
+                             w.limits.max_block_bytes,
+                             :max_block_bytes, :encode))
+        complete = true
+        return (eb, ep, pp, datumbytes, datumvalues, datumcompare)
+    finally
+        endworkdefer!(w.budget)
+        restorewriterwork!(w.budget, checkpoint)
+        if !complete
+            w.encoder.pos = start
+            w.encoder.credited = credited
+        end
+    end
+end
+
+"The aligned NamedTuple path encodes in place and stages bytes only at a block boundary."
+@inline function pushaligneddatum!(w::Writer, datum::NamedTuple, plans::Tuple,
+                                   pf::Union{Nothing,TablePreflight}, nextrows::Int,
+                                   stagedcompare::Int)
+    start = w.encoder.pos
+    credited = w.encoder.credited
+    eb, ep, pp, datumbytes, datumvalues, datumcompare = try
+        preparealigneddatum!(w, datum, plans, pf, stagedcompare)
+    catch err
+        if err isa EncodeError
+            isempty(err.path) ? diagnosealignedestimate!(w, plans, datum, pf) :
+                                diagnosealignedencode!(w, plans, datum)
+        end
+        rethrow()
+    end
+
+    nextcount = nextpayload = nextoutput = nextvalues = nextcompare = 0
+    lowerfits = false
+    try
+        nextcount = checked_add(w.pendingcount, 1)
+        nextpayload = w.encoder.pos
+        nextoutput = checked_add(w.pendingbytes, eb)
+        nextvalues = satadd(w.pendingvalues, datumvalues)
+        nextcompare = checked_add(w.pendingcompare, datumcompare)
+        lowerfits = writercandidatefits(w, nextcount, nextpayload, nextvalues,
+                                        nextcompare)
+    catch
+        w.encoder.pos = start
+        w.encoder.credited = credited
+        rethrow()
+    end
+    boundary = false
+    if w.pendingcount > 0 &&
+       (nextoutput > w.limits.max_block_output_bytes ||
+        nextcount > w.limits.max_block_count ||
+        nextpayload > w.limits.max_block_bytes || !lowerfits)
+        reset!(w.datumencoder)
+        try
+            writeraw!(w.datumencoder, w.encoder.buf, start + 1, datumbytes)
+        catch
+            w.encoder.pos = start
+            w.encoder.credited = credited
+            reset!(w.datumencoder)
+            rethrow()
+        end
+        w.encoder.pos = start
+        w.encoder.credited = credited
+        try
+            flushblock!(w)
+            writeraw!(w.encoder, w.datumencoder.buf, 1, datumbytes)
+            w.encoder.credited = w.encoder.pos
+        finally
+            reset!(w.datumencoder)
+        end
+        start = 0
+        credited = 0
+        nextcount = 1
+        nextpayload = datumbytes
+        nextoutput = eb
+        nextvalues = datumvalues
+        nextcompare = datumcompare
+        boundary = true
+    end
+    nextpendingpayload = 0
+    try
+        boundary &&
+            (lowerfits = writercandidatefits(w, nextcount, nextpayload,
+                                             nextvalues, nextcompare))
+        nextpendingpayload = pf === nothing ? 0 :
+            checked_add(pf.pendingpayload, pp)
+        nextcount <= w.limits.max_block_count ||
+            throw(limiterror(w.budget, :max_block_count, nextcount,
+                             w.limits.max_block_count))
+        nextoutput <= w.limits.max_block_output_bytes ||
+            throw(LimitError(:max_block_output_bytes, nextoutput,
+                             w.limits.max_block_output_bytes,
+                             :max_block_output_bytes, :encode))
+        nextpayload <= w.limits.max_block_bytes ||
+            throw(LimitError(:max_block_bytes, nextpayload,
+                             w.limits.max_block_bytes, :max_block_bytes, :encode))
+    catch
+        w.encoder.pos = start
+        w.encoder.credited = credited
+        rethrow()
+    end
+    w.budget.rows = nextrows
+    w.pendingcount = nextcount
+    w.pendingbytes = nextoutput
+    w.pendingpeak = max(w.pendingpeak, ep)
+    w.pendingvalues = nextvalues
+    w.pendingcompare = nextcompare
+    w.pendingallowance = max(w.pendingallowance,
+                             workdeficit(w.budget, datumvalues, datumbytes))
+    pf === nothing || (pf.pendingpayload = nextpendingpayload)
+    (!lowerfits || w.encoder.pos >= w.blockbytes) && flushblock!(w)
+    return w
+end
+
 function pushprepareddatum!(w::Writer, datum, stagedcompare::Int=0)
     nextrows = checked_add(w.budget.rows, 1)
     nextrows <= w.limits.max_rows || throw(limiterror(w.budget, :max_rows, nextrows, w.limits.max_rows))
@@ -2258,6 +2445,8 @@ function pushprepareddatum!(w::Writer, datum, stagedcompare::Int=0)
             oldcharge > 0 && release!(w.budget, oldcharge)
         end
     end
+    fp !== nothing && !w.stagevalues &&
+        return pushaligneddatum!(w, datum, fp, pf, nextrows, stagedcompare)
     checkpoint = writerworkcheckpoint(w.budget)
     preparedcharge = 0
     eb = ep = ev = pp = datumbytes = datumvalues = datumcompare = 0
