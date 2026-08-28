@@ -1,5 +1,8 @@
 *.jl.*.cov
 *.jl.cov
 *.jl.mem
-/Manifest.toml
+reviews/*.pid
+reviews/codex-run-*.jsonl
+reviews/codex-run-*.err
 /docs/build/
+test/fuzz/failures/

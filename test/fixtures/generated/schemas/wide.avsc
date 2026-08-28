@@ -1,0 +1,491 @@
+{
+ "type": "record",
+ "name": "Wide",
+ "namespace": "avro.jl.test",
+ "fields": [
+  {
+   "name": "f000",
+   "type": "int"
+  },
+  {
+   "name": "f001",
+   "type": "long"
+  },
+  {
+   "name": "f002",
+   "type": "double"
+  },
+  {
+   "name": "f003",
+   "type": "string"
+  },
+  {
+   "name": "f004",
+   "type": "boolean"
+  },
+  {
+   "name": "f005",
+   "type": [
+    "null",
+    "string"
+   ]
+  },
+  {
+   "name": "f006",
+   "type": {
+    "type": "array",
+    "items": "int"
+   }
+  },
+  {
+   "name": "f007",
+   "type": "int"
+  },
+  {
+   "name": "f008",
+   "type": "long"
+  },
+  {
+   "name": "f009",
+   "type": "double"
+  },
+  {
+   "name": "f010",
+   "type": "string"
+  },
+  {
+   "name": "f011",
+   "type": "boolean"
+  },
+  {
+   "name": "f012",
+   "type": [
+    "null",
+    "string"
+   ]
+  },
+  {
+   "name": "f013",
+   "type": {
+    "type": "array",
+    "items": "int"
+   }
+  },
+  {
+   "name": "f014",
+   "type": "int"
+  },
+  {
+   "name": "f015",
+   "type": "long"
+  },
+  {
+   "name": "f016",
+   "type": "double"
+  },
+  {
+   "name": "f017",
+   "type": "string"
+  },
+  {
+   "name": "f018",
+   "type": "boolean"
+  },
+  {
+   "name": "f019",
+   "type": [
+    "null",
+    "string"
+   ]
+  },
+  {
+   "name": "f020",
+   "type": {
+    "type": "array",
+    "items": "int"
+   }
+  },
+  {
+   "name": "f021",
+   "type": "int"
+  },
+  {
+   "name": "f022",
+   "type": "long"
+  },
+  {
+   "name": "f023",
+   "type": "double"
+  },
+  {
+   "name": "f024",
+   "type": "string"
+  },
+  {
+   "name": "f025",
+   "type": "boolean"
+  },
+  {
+   "name": "f026",
+   "type": [
+    "null",
+    "string"
+   ]
+  },
+  {
+   "name": "f027",
+   "type": {
+    "type": "array",
+    "items": "int"
+   }
+  },
+  {
+   "name": "f028",
+   "type": "int"
+  },
+  {
+   "name": "f029",
+   "type": "long"
+  },
+  {
+   "name": "f030",
+   "type": "double"
+  },
+  {
+   "name": "f031",
+   "type": "string"
+  },
+  {
+   "name": "f032",
+   "type": "boolean"
+  },
+  {
+   "name": "f033",
+   "type": [
+    "null",
+    "string"
+   ]
+  },
+  {
+   "name": "f034",
+   "type": {
+    "type": "array",
+    "items": "int"
+   }
+  },
+  {
+   "name": "f035",
+   "type": "int"
+  },
+  {
+   "name": "f036",
+   "type": "long"
+  },
+  {
+   "name": "f037",
+   "type": "double"
+  },
+  {
+   "name": "f038",
+   "type": "string"
+  },
+  {
+   "name": "f039",
+   "type": "boolean"
+  },
+  {
+   "name": "f040",
+   "type": [
+    "null",
+    "string"
+   ]
+  },
+  {
+   "name": "f041",
+   "type": {
+    "type": "array",
+    "items": "int"
+   }
+  },
+  {
+   "name": "f042",
+   "type": "int"
+  },
+  {
+   "name": "f043",
+   "type": "long"
+  },
+  {
+   "name": "f044",
+   "type": "double"
+  },
+  {
+   "name": "f045",
+   "type": "string"
+  },
+  {
+   "name": "f046",
+   "type": "boolean"
+  },
+  {
+   "name": "f047",
+   "type": [
+    "null",
+    "string"
+   ]
+  },
+  {
+   "name": "f048",
+   "type": {
+    "type": "array",
+    "items": "int"
+   }
+  },
+  {
+   "name": "f049",
+   "type": "int"
+  },
+  {
+   "name": "f050",
+   "type": "long"
+  },
+  {
+   "name": "f051",
+   "type": "double"
+  },
+  {
+   "name": "f052",
+   "type": "string"
+  },
+  {
+   "name": "f053",
+   "type": "boolean"
+  },
+  {
+   "name": "f054",
+   "type": [
+    "null",
+    "string"
+   ]
+  },
+  {
+   "name": "f055",
+   "type": {
+    "type": "array",
+    "items": "int"
+   }
+  },
+  {
+   "name": "f056",
+   "type": "int"
+  },
+  {
+   "name": "f057",
+   "type": "long"
+  },
+  {
+   "name": "f058",
+   "type": "double"
+  },
+  {
+   "name": "f059",
+   "type": "string"
+  },
+  {
+   "name": "f060",
+   "type": "boolean"
+  },
+  {
+   "name": "f061",
+   "type": [
+    "null",
+    "string"
+   ]
+  },
+  {
+   "name": "f062",
+   "type": {
+    "type": "array",
+    "items": "int"
+   }
+  },
+  {
+   "name": "f063",
+   "type": "int"
+  },
+  {
+   "name": "f064",
+   "type": "long"
+  },
+  {
+   "name": "f065",
+   "type": "double"
+  },
+  {
+   "name": "f066",
+   "type": "string"
+  },
+  {
+   "name": "f067",
+   "type": "boolean"
+  },
+  {
+   "name": "f068",
+   "type": [
+    "null",
+    "string"
+   ]
+  },
+  {
+   "name": "f069",
+   "type": {
+    "type": "array",
+    "items": "int"
+   }
+  },
+  {
+   "name": "f070",
+   "type": "int"
+  },
+  {
+   "name": "f071",
+   "type": "long"
+  },
+  {
+   "name": "f072",
+   "type": "double"
+  },
+  {
+   "name": "f073",
+   "type": "string"
+  },
+  {
+   "name": "f074",
+   "type": "boolean"
+  },
+  {
+   "name": "f075",
+   "type": [
+    "null",
+    "string"
+   ]
+  },
+  {
+   "name": "f076",
+   "type": {
+    "type": "array",
+    "items": "int"
+   }
+  },
+  {
+   "name": "f077",
+   "type": "int"
+  },
+  {
+   "name": "f078",
+   "type": "long"
+  },
+  {
+   "name": "f079",
+   "type": "double"
+  },
+  {
+   "name": "f080",
+   "type": "string"
+  },
+  {
+   "name": "f081",
+   "type": "boolean"
+  },
+  {
+   "name": "f082",
+   "type": [
+    "null",
+    "string"
+   ]
+  },
+  {
+   "name": "f083",
+   "type": {
+    "type": "array",
+    "items": "int"
+   }
+  },
+  {
+   "name": "f084",
+   "type": "int"
+  },
+  {
+   "name": "f085",
+   "type": "long"
+  },
+  {
+   "name": "f086",
+   "type": "double"
+  },
+  {
+   "name": "f087",
+   "type": "string"
+  },
+  {
+   "name": "f088",
+   "type": "boolean"
+  },
+  {
+   "name": "f089",
+   "type": [
+    "null",
+    "string"
+   ]
+  },
+  {
+   "name": "f090",
+   "type": {
+    "type": "array",
+    "items": "int"
+   }
+  },
+  {
+   "name": "f091",
+   "type": "int"
+  },
+  {
+   "name": "f092",
+   "type": "long"
+  },
+  {
+   "name": "f093",
+   "type": "double"
+  },
+  {
+   "name": "f094",
+   "type": "string"
+  },
+  {
+   "name": "f095",
+   "type": "boolean"
+  },
+  {
+   "name": "f096",
+   "type": [
+    "null",
+    "string"
+   ]
+  },
+  {
+   "name": "f097",
+   "type": {
+    "type": "array",
+    "items": "int"
+   }
+  },
+  {
+   "name": "f098",
+   "type": "int"
+  },
+  {
+   "name": "f099",
+   "type": "long"
+  }
+ ]
+}

@@ -1,0 +1,130 @@
+{
+ "type": "record",
+ "name": "Logical",
+ "namespace": "avro.jl.test",
+ "fields": [
+  {
+   "name": "dec_bytes",
+   "type": {
+    "type": "bytes",
+    "logicalType": "decimal",
+    "precision": 10,
+    "scale": 2
+   }
+  },
+  {
+   "name": "dec_fixed",
+   "type": {
+    "type": "fixed",
+    "name": "Dec8",
+    "size": 8,
+    "logicalType": "decimal",
+    "precision": 18,
+    "scale": 4
+   }
+  },
+  {
+   "name": "uuid_str",
+   "type": {
+    "type": "string",
+    "logicalType": "uuid"
+   }
+  },
+  {
+   "name": "uuid_fixed",
+   "type": {
+    "type": "fixed",
+    "name": "UUID16",
+    "size": 16,
+    "logicalType": "uuid"
+   }
+  },
+  {
+   "name": "d",
+   "type": {
+    "type": "int",
+    "logicalType": "date"
+   }
+  },
+  {
+   "name": "t_ms",
+   "type": {
+    "type": "int",
+    "logicalType": "time-millis"
+   }
+  },
+  {
+   "name": "t_us",
+   "type": {
+    "type": "long",
+    "logicalType": "time-micros"
+   }
+  },
+  {
+   "name": "ts_ms",
+   "type": {
+    "type": "long",
+    "logicalType": "timestamp-millis"
+   }
+  },
+  {
+   "name": "ts_us",
+   "type": {
+    "type": "long",
+    "logicalType": "timestamp-micros"
+   }
+  },
+  {
+   "name": "ts_ns",
+   "type": {
+    "type": "long",
+    "logicalType": "timestamp-nanos"
+   }
+  },
+  {
+   "name": "lts_ms",
+   "type": {
+    "type": "long",
+    "logicalType": "local-timestamp-millis"
+   }
+  },
+  {
+   "name": "lts_us",
+   "type": {
+    "type": "long",
+    "logicalType": "local-timestamp-micros"
+   }
+  },
+  {
+   "name": "lts_ns",
+   "type": {
+    "type": "long",
+    "logicalType": "local-timestamp-nanos"
+   }
+  },
+  {
+   "name": "dur",
+   "type": {
+    "type": "fixed",
+    "name": "Dur",
+    "size": 12,
+    "logicalType": "duration"
+   }
+  },
+  {
+   "name": "bigdec",
+   "type": {
+    "type": "bytes",
+    "logicalType": "big-decimal"
+   }
+  },
+  {
+   "name": "unknown",
+   "type": {
+    "type": "string",
+    "logicalType": "made-up",
+    "custom": 1
+   }
+  }
+ ]
+}
