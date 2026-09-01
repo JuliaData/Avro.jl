@@ -406,6 +406,10 @@ function buildleaftarget(::Type{T}, p::ReadPlan, memo::TypedMemo) where {T}
         return out
     end
     T <: Base.Enum && p isa EnumPlan && return enumtarget(T, p, memo)
+    if T <: Decimals.Decimal && p isa DecimalPlan
+        out = decimaltarget(T, p, memo)
+        out === nothing || return out
+    end
     if leafcompatible(T, p)
         reservenode!(memo, LeafTarget{T,typeof(p)})
         out = LeafTarget{T,typeof(p)}(p)

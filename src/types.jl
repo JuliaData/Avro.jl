@@ -100,7 +100,8 @@ The conventional schema of a Julia type (plan §4.8): `Missing`/`Nothing → nul
 `Vector{UInt8} → bytes`, strings/`Symbol`/`Char → string`, `NTuple{N,UInt8} → fixed_N`,
 `Union{Missing,T} → ["null", T]`, other unions in member order, `Base.Enum` subtypes → enum,
 `DateTime → local-timestamp-millis`, `Date → date`, `Time → time-micros`, `UUID → string uuid`,
-`Avro.Timestamp{P}`/`Avro.LocalTimestamp{P}`, `Avro.Duration → fixed(12) duration`, vectors → array,
+`Avro.Timestamp{P}`/`Avro.LocalTimestamp{P}`, `Avro.Duration → fixed(12) duration`,
+`Decimals.Decimal{P,S} → bytes decimal(P, S)`, vectors → array,
 `Avro.Map`/string-keyed dicts → map, `NamedTuple`s and structs → records. Every derived name must already
 be a valid Avro name (no transliteration); `name=`/`namespace=` override the root.
 """
@@ -141,6 +142,7 @@ function deriveimpl(ctx::DeriveContext, ::Type{T}, name, namespace) where {T}
     T === DateTime && return LongSchema(LocalTimestampMillis(), makeprops((;), ("type",), LocalTimestampMillis()), NodeMeta())
     haskey(LOGICAL_LONG, T) && return LongSchema(LOGICAL_LONG[T], makeprops((;), ("type",), LOGICAL_LONG[T]), NodeMeta())
     T === Duration && return namedfixed(ctx, "Duration", namespace === nothing ? "" : namespace, 12, DurationLogical(), T)
+    T <: Decimals.Decimal && return derivedecimal(T)
     (T === Decimal || T === WideDecimal) && throw(ArgumentError("a decimal needs a precision and scale: pass an explicit `schema=` (e.g. `Avro.BytesSchema(; logical=Avro.DecimalLogical(p, s))`)"))
     T === UnionValue && throw(ArgumentError("a bare Avro.UnionValue has no conventional schema: use `Avro.encode(schema, x)`"))
     if T isa Union

@@ -271,17 +271,27 @@ function decodevalue(::LocalTimestampPlan{P}, d::Decoder) where {P}
     return LocalTimestamp{P}(readlong(d))
 end
 
-function decodevalue(p::DecimalPlan, d::Decoder)
+"""
+    decimalspan(p, d) -> (start, n)
+
+Consume one decimal payload and return the position and length of its unscaled bytes: length-prefixed
+for `bytes` (an empty payload is rejected), exactly `fixedsize` bytes for `fixed`.
+"""
+function decimalspan(p::DecimalPlan, d::Decoder)
     if p.fixedsize == 0
         n = readlen(d, d.budget.limits.max_bytes, :max_bytes)
         n == 0 && dataerror(d, "empty decimal payload")
         start = d.pos
         d.pos += n
-        return decimalfrombytes(d, p, start, n)
+        return (start, n)
     end
-    p.fixedsize == 0 && dataerror(d, "decimal on a zero-size fixed")
     skipfixed(d, p.fixedsize)
-    return decimalfrombytes(d, p, d.pos - p.fixedsize, p.fixedsize)
+    return (d.pos - p.fixedsize, p.fixedsize)
+end
+
+function decodevalue(p::DecimalPlan, d::Decoder)
+    start, n = decimalspan(p, d)
+    return decimalfrombytes(d, p, start, n)
 end
 
 """

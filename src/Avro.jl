@@ -13,6 +13,7 @@ using Dates
 using UUIDs
 using Random: RandomDevice, rand
 using Tables: Tables
+import Decimals
 import MD5
 import SHA
 import JSON
@@ -40,6 +41,7 @@ include("compare.jl")
 include("typed.jl")
 include("prepared.jl")
 include("jsonencoding.jl")
+include("decimals.jl")
 include("singleobject.jl")
 include("codecs.jl")
 include("container.jl")
