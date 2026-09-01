@@ -35,6 +35,11 @@ deferred.
 - Validation modes: `validate=:strict` (default) and `:fast`.
 - Writer safety: atomic file replacement, failure poisoning, and a preflight that guarantees every
   successfully written file is readable by every guaranteed consumer under identical limits.
+- Fixed-scale decimals: `Decimals.Decimal{P,S,T}` reads and writes the `decimal` logical type
+  directly (`Avro.schema(Decimal{P,S,T})` derives `bytes` annotated `decimal(P, S)`), decoding the
+  big-endian two's complement payload into the storage integer with no `BigInt` and no per-value
+  allocation at every precision tier. A target is admitted when its scale matches the schema exactly
+  and its precision covers the schema's.
 - Codecs: `zstandard`, `snappy`, `deflate`, `null` built in; `bzip2` and `xz` via package extensions
   (`using CodecBzip2` / `using CodecXz`); per-frame decoder-memory verification on write.
 - `Avro.inspect`: bounded container header and framing diagnostics (codec, schema, block structure).
