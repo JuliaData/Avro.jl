@@ -2,7 +2,7 @@
 
 julia_version = "1.12.6"
 manifest_format = "2.0"
-project_hash = "9684e0768db5eaa183cc9c82ff0a794a45ee4006"
+project_hash = "1de2bd8f10658e0f92a3f3758e93fef79cb0c410"
 
 [[deps.Artifacts]]
 uuid = "56f22d72-fd6d-98f1-02f0-08ddc0907c33"
@@ -65,9 +65,21 @@ version = "1.11.0"
 
 [[deps.Decimals]]
 deps = ["BitIntegers", "Random"]
-path = "../Decimals.jl"
+path = "/Users/jacob.quinn/.julia/dev/Decimals.jl"
 uuid = "8dc971d1-6768-4187-aca0-432d1dd9b305"
 version = "1.0.0-DEV"
+
+    [deps.Decimals.extensions]
+    DecimalsJSONExt = "JSON"
+    DecimalsLinearAlgebraExt = "LinearAlgebra"
+    DecimalsParsersExt = "Parsers"
+    DecimalsPrintfExt = "Printf"
+
+    [deps.Decimals.weakdeps]
+    JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
+    LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+    Parsers = "69de0a69-1ddd-5017-9359-2bf0b02dc9f0"
+    Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
 
 [[deps.IteratorInterfaceExtensions]]
 git-tree-sha1 = "a3f24677c21f5bbe9d2a714f95dcd58337fb2856"
