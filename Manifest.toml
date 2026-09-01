@@ -9,7 +9,7 @@ uuid = "56f22d72-fd6d-98f1-02f0-08ddc0907c33"
 version = "1.11.0"
 
 [[deps.Avro]]
-deps = ["CodecZlib", "CodecZstd", "DataAPI", "Dates", "JSON", "Libdl", "MD5", "Mmap", "PrecompileTools", "Random", "SHA", "Snappy", "StructUtils", "Tables", "TranscodingStreams", "UUIDs", "Zstd_jll"]
+deps = ["CodecZlib", "CodecZstd", "DataAPI", "Dates", "Decimals", "JSON", "Libdl", "MD5", "Mmap", "PrecompileTools", "Random", "SHA", "Snappy", "StructUtils", "Tables", "TranscodingStreams", "UUIDs", "Zstd_jll"]
 path = "."
 uuid = "65fc3dcb-49af-4f0c-a340-607eef534a14"
 version = "2.0.0-DEV"
@@ -24,6 +24,12 @@ version = "2.0.0-DEV"
     CodecXz = "ba30903b-d9e8-5048-a5ec-d1f5b0d4b47b"
     TimeZones = "f269a46b-ccf7-5d73-abea-4c690281aa53"
     XZ_jll = "ffd25f8a-64ca-5728-b0f7-c24cf3aae800"
+
+[[deps.BitIntegers]]
+deps = ["Random"]
+git-tree-sha1 = "091d591a060e43df1dd35faab3ca284925c48e46"
+uuid = "c3b6d118-76ef-56ca-8cc7-ebb389d030a1"
+version = "0.3.7"
 
 [[deps.CEnum]]
 git-tree-sha1 = "389ad5c84de1ae7cf0e28e381131c98ea87d54fc"
@@ -56,6 +62,12 @@ version = "1.0.0"
 deps = ["Printf"]
 uuid = "ade2ca70-3891-5945-98fb-dc099432e06a"
 version = "1.11.0"
+
+[[deps.Decimals]]
+deps = ["BitIntegers", "Random"]
+path = "../Decimals.jl"
+uuid = "8dc971d1-6768-4187-aca0-432d1dd9b305"
+version = "1.0.0-DEV"
 
 [[deps.IteratorInterfaceExtensions]]
 git-tree-sha1 = "a3f24677c21f5bbe9d2a714f95dcd58337fb2856"
