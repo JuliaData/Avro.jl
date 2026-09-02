@@ -18,7 +18,7 @@ fixeddecschema(size, precision, scale; name="D$(size)_$(precision)_$(scale)") =
     @test Avro.json(s) == "{\"type\":\"bytes\",\"logicalType\":\"decimal\",\"precision\":9,\"scale\":2}"
     @test Avro.json(Avro.schema(Decimal256{40})) ==
           "{\"type\":\"bytes\",\"logicalType\":\"decimal\",\"precision\":76,\"scale\":40}"
-    @test Avro.schema(parse(Decimal64{4}, "1.5")) == Avro.schema(Decimal{18,4,Int64})
+    @test Avro.schema(Decimal64{4}("1.5")) == Avro.schema(Decimal{18,4,Int64})
     # unnamed `bytes` is why two same-shaped decimals can sit in one record (a derived `fixed` would
     # define the same Avro name twice)
     rs = Avro.schema(@NamedTuple{a::Decimal{9,2,Int32}, b::Decimal{9,2,Int32}})
@@ -31,14 +31,14 @@ end
         D = Decimal{P,S,T}
         s = Avro.schema(D)
         for text in ("0", "1", "-1", "12.5", "-12.5", string(typemax(D)), string(typemin(D)))
-            x = parse(D, text)
+            x = D(text)
             @test Avro.decode(s, Avro.encode(s, x), D) === x
         end
     end
     # every tier's extreme values survive the exact byte width they need
-    @test Avro.decode(Avro.schema(Decimal32{0}), Avro.encode(Avro.schema(Decimal32{0}), parse(Decimal32{0}, "999999999")), Decimal32{0}) ===
-          parse(Decimal32{0}, "999999999")
-    d76 = parse(Decimal256{0}, "-" * "9"^76)
+    @test Avro.decode(Avro.schema(Decimal32{0}), Avro.encode(Avro.schema(Decimal32{0}), Decimal32{0}("999999999")), Decimal32{0}) ===
+          Decimal32{0}("999999999")
+    d76 = Decimal256{0}("-" * "9"^76)
     s76 = Avro.schema(Decimal256{0})
     @test Avro.decode(s76, Avro.encode(s76, d76), Decimal256{0}) === d76
     @test length(Avro.encode(s76, d76)) == 33          # one length byte plus the 32-byte coefficient
@@ -49,7 +49,7 @@ end
         D = Decimal{P,S,T}
         s = fixeddecschema(n, P, S)
         for text in ("0", "1", "-1", "12.5", "-12.5", string(typemax(D)), string(typemin(D)))
-            x = parse(D, text)
+            x = D(text)
             enc = Avro.encode(s, x)
             @test length(enc) == n                     # `fixed` is always exactly `size` bytes
             @test Avro.decode(s, enc, D) === x
@@ -57,7 +57,7 @@ end
     end
     # a value that needs more bytes than the fixed holds is an EncodeError, not a truncation
     s = fixeddecschema(2, 4, 0)
-    @test_throws Avro.EncodeError Avro.encode(s, parse(Decimal{9,0,Int32}, "40000"))
+    @test_throws Avro.EncodeError Avro.encode(s, Decimal{9,0,Int32}("40000"))
 end
 
 @testset "minimal-length encoding" begin
@@ -67,19 +67,19 @@ end
              "1.27" => UInt8[0x7f], "1.28" => UInt8[0x00, 0x80], "-1.28" => UInt8[0x80],
              "-1.29" => UInt8[0xff, 0x7f], "99.99" => UInt8[0x27, 0x0f], "-99.99" => UInt8[0xd8, 0xf1]]
     for (text, payload) in cases
-        x = parse(D, text)
+        x = D(text)
         @test Avro.encode(s, x) == bytesdatum(payload)
         @test Avro.decode(s, bytesdatum(payload), D) === x
     end
     # non-minimal payloads are sign-extended on read (the spec only constrains what writers emit)
-    @test Avro.decode(s, bytesdatum(UInt8[0x00, 0x00, 0x64]), D) === parse(D, "1.00")
-    @test Avro.decode(s, bytesdatum(UInt8[0xff, 0xff, 0xff, 0x9c]), D) === parse(D, "-1.00")
-    @test Avro.decode(s, bytesdatum(UInt8[0x00, 0x00, 0x00, 0x00, 0x00, 0x00]), D) === parse(D, "0")
+    @test Avro.decode(s, bytesdatum(UInt8[0x00, 0x00, 0x64]), D) === D("1.00")
+    @test Avro.decode(s, bytesdatum(UInt8[0xff, 0xff, 0xff, 0x9c]), D) === D("-1.00")
+    @test Avro.decode(s, bytesdatum(UInt8[0x00, 0x00, 0x00, 0x00, 0x00, 0x00]), D) === D("0")
     # `fixed` sign-extends to its declared size
     fs = fixeddecschema(4, 4, 2)
-    @test Avro.encode(fs, parse(D, "-1.00")) == UInt8[0xff, 0xff, 0xff, 0x9c]
-    @test Avro.encode(fs, parse(D, "1.00")) == UInt8[0x00, 0x00, 0x00, 0x64]
-    @test Avro.decode(fs, UInt8[0xff, 0xff, 0xff, 0x9c], D) === parse(D, "-1.00")
+    @test Avro.encode(fs, D("-1.00")) == UInt8[0xff, 0xff, 0xff, 0x9c]
+    @test Avro.encode(fs, D("1.00")) == UInt8[0x00, 0x00, 0x00, 0x64]
+    @test Avro.decode(fs, UInt8[0xff, 0xff, 0xff, 0x9c], D) === D("-1.00")
 end
 
 @testset "corrupt payloads" begin
@@ -97,26 +97,26 @@ end
 
 @testset "admission exactness" begin
     s = decschema(9, 2)
-    x = parse(Decimal{9,2,Int32}, "12.34")
+    x = Decimal{9,2,Int32}("12.34")
     enc = Avro.encode(s, x)
     # exact scale, covering precision: the direct route
     @test Avro.decode(s, enc, Decimal{9,2,Int32}) === x
-    @test Avro.decode(s, enc, Decimal{18,2,Int64}) === parse(Decimal{18,2,Int64}, "12.34")
-    @test Avro.decode(s, enc, Decimal{38,2,Int128}) === parse(Decimal{38,2,Int128}, "12.34")
+    @test Avro.decode(s, enc, Decimal{18,2,Int64}) === Decimal{18,2,Int64}("12.34")
+    @test Avro.decode(s, enc, Decimal{38,2,Int128}) === Decimal{38,2,Int128}("12.34")
     # a target that leaves the storage integer out takes Decimals.jl's own tier
     @test Avro.decode(s, enc, Decimal{9,2}) === x
-    @test Avro.decode(s, enc, Decimal{40,2}) === parse(Decimal{40,2}, "12.34")
-    @test Avro.decode(s, enc, Decimal{9,2,Int64}) === parse(Decimal{9,2,Int64}, "12.34")
+    @test Avro.decode(s, enc, Decimal{40,2}) === Decimal{40,2}("12.34")
+    @test Avro.decode(s, enc, Decimal{9,2,Int64}) === Decimal{9,2,Int64}("12.34")
     # a differing scale is a different number: never silently rescaled
     @test_throws Avro.ConversionError Avro.decode(s, enc, Decimal{9,3,Int32})
     @test_throws Avro.ConversionError Avro.decode(s, enc, Decimal{9,0,Int32})
     # a narrower precision is not admitted; the semantic route still converts what fits, per value
-    @test Avro.decode(s, enc, Decimal{6,2,Int32}) === parse(Decimal{6,2,Int32}, "12.34")
-    big = Avro.encode(s, parse(Decimal{9,2,Int32}, "1234567.89"))
+    @test Avro.decode(s, enc, Decimal{6,2,Int32}) === Decimal{6,2,Int32}("12.34")
+    big = Avro.encode(s, Decimal{9,2,Int32}("1234567.89"))
     @test_throws Avro.ConversionError Avro.decode(s, big, Decimal{6,2,Int32})
     # writing checks the schema's scale and precision
-    @test_throws Avro.EncodeError Avro.encode(s, parse(Decimal{9,3,Int32}, "12.345"))
-    @test_throws Avro.EncodeError Avro.encode(decschema(4, 2), parse(Decimal{9,2,Int32}, "12345.67"))
+    @test_throws Avro.EncodeError Avro.encode(s, Decimal{9,3,Int32}("12.345"))
+    @test_throws Avro.EncodeError Avro.encode(decschema(4, 2), Decimal{9,2,Int32}("12345.67"))
 end
 
 @testset "records, arrays and unions" begin
@@ -127,8 +127,8 @@ end
       {"name":"history","type":{"type":"array","items":{"type":"bytes","logicalType":"decimal","precision":18,"scale":4}}}]}""")
     D = Decimal{18,4,Int64}
     R = @NamedTuple{amount::D, fee::Union{Missing,D}, history::Vector{D}}
-    for fee in (parse(D, "-0.5"), missing)
-        v = (amount=parse(D, "1234.5678"), fee=fee, history=[parse(D, "1.0"), parse(D, "-2.25")])
+    for fee in (D("-0.5"), missing)
+        v = (amount=D("1234.5678"), fee=fee, history=[D("1.0"), D("-2.25")])
         out = Avro.decode(rec, Avro.encode(rec, v), R)
         @test out.amount === v.amount
         @test isequal(out.fee, v.fee)
@@ -137,21 +137,21 @@ end
     # a general (non-nullable) union picks the decimal branch by `accepts`
     us = Avro.parseschema("[\"string\",{\"type\":\"bytes\",\"logicalType\":\"decimal\",\"precision\":9,\"scale\":2}]")
     U = Union{String,Decimal{9,2,Int32}}
-    for v in ("hi", parse(Decimal{9,2,Int32}, "-3.14"))
+    for v in ("hi", Decimal{9,2,Int32}("-3.14"))
         @test Avro.decode(us, Avro.encode(us, v), U) === v
     end
     # scale 0 and scale == precision
     zero0 = Avro.schema(Decimal{9,0,Int32})
-    @test Avro.decode(zero0, Avro.encode(zero0, parse(Decimal{9,0,Int32}, "-70")), Decimal{9,0,Int32}) ===
-          parse(Decimal{9,0,Int32}, "-70")
+    @test Avro.decode(zero0, Avro.encode(zero0, Decimal{9,0,Int32}("-70")), Decimal{9,0,Int32}) ===
+          Decimal{9,0,Int32}("-70")
     high = Avro.schema(Decimal{9,9,Int32})
-    hv = parse(Decimal{9,9,Int32}, "0.123456789")
+    hv = Decimal{9,9,Int32}("0.123456789")
     @test Avro.decode(high, Avro.encode(high, hv), Decimal{9,9,Int32}) === hv
 end
 
 @testset "schema resolution" begin
     w = decschema(9, 2)
-    x = parse(Decimal{9,2,Int32}, "12.34")
+    x = Decimal{9,2,Int32}("12.34")
     enc = Avro.encode(w, x)
     # a reader that ignores the logical type still reads the datum as its underlying type
     plain = Avro.parseschema("\"bytes\"")
@@ -172,15 +172,15 @@ end
     # a `string` writer promoted into a `bytes` decimal reader converts through the semantic route
     ss = Avro.parseschema("\"string\"")
     senc = Avro.encode(ss, String(UInt8[0x64]))            # a payload that is also valid UTF-8
-    @test Avro.decode(ss, senc, Decimal{9,2,Int32}; reader_schema=w) === parse(Decimal{9,2,Int32}, "1.00")
+    @test Avro.decode(ss, senc, Decimal{9,2,Int32}; reader_schema=w) === Decimal{9,2,Int32}("1.00")
 end
 
 @testset "json encoding" begin
     s = decschema(4, 2)
     D = Decimal{4,2,Int32}
-    @test Avro.fromjson(s, Avro.tojson(s, parse(D, "-1.00")), D) === parse(D, "-1.00")
+    @test Avro.fromjson(s, Avro.tojson(s, D("-1.00")), D) === D("-1.00")
     fs = fixeddecschema(4, 4, 2)
-    @test Avro.fromjson(fs, Avro.tojson(fs, parse(D, "12.34")), D) === parse(D, "12.34")
+    @test Avro.fromjson(fs, Avro.tojson(fs, D("12.34")), D) === D("12.34")
 end
 
 @testset "allocation gate and little-endian plans" begin
@@ -190,7 +190,7 @@ end
     measure(plan, d, names) = (kernel(plan, d, names); @allocated(kernel(plan, d, names)))
     for D in (Decimal{9,2,Int32}, Decimal{18,2,Int64}, Decimal{38,2,Int128}, Decimal{76,2,Decimals.Int256})
         for s in (Avro.schema(D), fixeddecschema(cld(Base.precision(D), 2) + 1, Base.precision(D), 2))
-            x = parse(D, "-1234.5")
+            x = D("-1234.5")
             reader = Avro.DatumReader(s, D)
             enc = Avro.encode(s, x)
             @test reader(enc) === x
@@ -200,7 +200,7 @@ end
     # the 1.x native-endian recovery (`decimal_byteorder=:little`) reaches the typed route unchanged
     D = Decimal{38,6,Int128}
     s = Avro.schema(D)
-    x = parse(D, "-1234.5")
+    x = D("-1234.5")
     enc = Avro.encode(s, x)
     little = Avro.typedplan(D, s, Avro.littledecimals(Avro.readplan(s)), Avro.Limits())
     flipped = vcat(enc[1], reverse(enc[2:end]))
@@ -209,7 +209,7 @@ end
 
 @testset "container files" begin
     D = Decimal{18,4,Int64}
-    rows = [(id=Int64(i), amount=parse(D, string(i, ".", lpad(i, 4, '0')))) for i in 1:20]
+    rows = [(id=Int64(i), amount=D(string(i, ".", lpad(i, 4, '0')))) for i in 1:20]
     io = IOBuffer()
     Avro.write(io, rows)
     bytes = take!(io)
