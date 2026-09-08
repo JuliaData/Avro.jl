@@ -9,6 +9,8 @@ See `AVRO_REWRITE_PLAN.md` for the design and `STATUS.md` for the implementation
 """
 module Avro
 
+import DataDecimals, Durations
+
 using Dates
 using UUIDs
 using Random: RandomDevice, rand

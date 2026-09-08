@@ -496,8 +496,10 @@ function deriveimpl(ctx::DeriveContext, ::Type{T}, name, namespace) where {T}
     T === Time && return LongSchema(TimeMicros(), makeprops((;), ("type",), TimeMicros()), NodeMeta())
     T === DateTime && return LongSchema(LocalTimestampMillis(), makeprops((;), ("type",), LocalTimestampMillis()), NodeMeta())
     haskey(LOGICAL_LONG, T) && return LongSchema(LOGICAL_LONG[T], makeprops((;), ("type",), LOGICAL_LONG[T]), NodeMeta())
+    T <: DataDecimals.Decimal && return BytesSchema(; logical=DecimalLogical(precision(T), DataDecimals.scale(T)))
+    T === Durations.Duration && return namedfixed(ctx, "Duration", namespace === nothing ? "" : namespace, 12, DurationLogical(), T)
     T === Duration && return namedfixed(ctx, "Duration", namespace === nothing ? "" : namespace, 12, DurationLogical(), T)
-    (T === Decimal || T === WideDecimal) && throw(ArgumentError("a decimal needs a precision and scale: pass an explicit `schema=` (e.g. `Avro.BytesSchema(; logical=Avro.DecimalLogical(p, s))`)"))
+    (T <: DataDecimals.DecimalValue || T === WideDecimal) && throw(ArgumentError("a decimal needs a precision and scale: pass an explicit `schema=` (e.g. `Avro.BytesSchema(; logical=Avro.DecimalLogical(p, s))`)"))
     T === UnionValue && throw(ArgumentError("a bare Avro.UnionValue has no conventional schema: use `Avro.encode(schema, x)`"))
     if T isa Union
         return deriveunion(ctx, T, namespace)

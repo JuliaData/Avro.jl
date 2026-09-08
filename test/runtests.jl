@@ -56,3 +56,5 @@ include("valuegen.jl")
         include("smoke.jl")
     end
 end
+
+include("sharedvalues.jl")

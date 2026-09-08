@@ -863,6 +863,7 @@ function estimatevalue(p::WritePlan, x, budget::Budget,
     end
     p isa WEnum && return OutputEstimate(enumvaluebytes(), 0, 1)
     if p isa WDecimal
+        x isa DataDecimals.AbstractDecimal && !(x isa Decimal) && (x = _decimalinput(x))
         x isa Union{Decimal,WideDecimal} || return OutputEstimate(0, 0, 1)
         n = p.fixedsize == 0 ? twoscomplementlength(x.unscaled) : p.fixedsize
         p.fixedsize == 0 || checkvaluebytes(budget, p.fixedsize)

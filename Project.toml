@@ -4,6 +4,8 @@ authors = ["Jacob Quinn <quinn.jacobd@gmail.com> and contributors"]
 version = "2.0.0-DEV"
 
 [deps]
+DataDecimals = "3e2245cb-6932-498d-a7cf-39d39de8bde3"
+Durations = "41ac09f5-0a95-4810-aa18-c88bf48ee130"
 CodecZlib = "944b1d66-785c-5afd-91f1-9de20f533193"
 CodecZstd = "6b39b394-51ab-5f42-8807-6242bab2b4c2"
 DataAPI = "9a962f9c-6df0-11e9-0e5d-c546b8b5ee8a"
@@ -34,6 +36,8 @@ AvroCodecXzExt = ["CodecXz", "XZ_jll"]
 AvroTimeZonesExt = "TimeZones"
 
 [compat]
+DataDecimals = "1"
+Durations = "1"
 CodecBzip2 = "0.8"
 CodecXz = "0.7"
 CodecZlib = "0.7"

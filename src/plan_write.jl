@@ -1174,7 +1174,7 @@ function accepts(::WLocalTimestamp{P}, x) where {P}
 end
 
 function accepts(p::WDecimal, x)
-    return (x isa Decimal || x isa WideDecimal) && x.scale == p.scale
+    return (x isa DataDecimals.AbstractDecimal ? DataDecimals.scale(x) == p.scale : x isa WideDecimal && x.scale == p.scale)
 end
 
 function accepts(::WUUIDString, x)
@@ -1186,7 +1186,7 @@ function accepts(::WUUIDFixed, x)
 end
 
 function accepts(::WDuration, x)
-    return x isa Duration
+    return x isa Union{Duration,Durations.Duration}
 end
 
 function accepts(::WArray, x)
@@ -1207,7 +1207,7 @@ end
 
 # Plain structs are record-like unless they are one of the scalar/container kinds the other branches own.
 const NOT_RECORDLIKE = Union{Missing,Nothing,Number,AbstractString,Symbol,Char,AbstractArray,Tuple,AbstractSet,Type,Function,
-                             Date,Time,DateTime,UUID,Decimal,WideDecimal,Timestamp,LocalTimestamp,Duration,Fixed,EnumValue,Map,UnionValue,Base.Enum}
+                             Date,Time,DateTime,UUID,Decimal,WideDecimal,Timestamp,LocalTimestamp,Duration,Durations.Duration,Fixed,EnumValue,Map,UnionValue,Base.Enum}
 function isrecordlike(x)
     return isstructtype(typeof(x)) && !(x isa NOT_RECORDLIKE)
 end
@@ -1642,4 +1642,16 @@ function encodealignedfast!(plans::Tuple, e::Encoder, x::NamedTuple)
             leave!(e)
         end
     end
+end
+
+function encodevalue(p::WDecimal, e::Encoder, x::DataDecimals.AbstractDecimal)
+    return encodevalue(p, e, _decimalinput(x))
+end
+function encodevalue(p::WDuration, e::Encoder, x::Durations.Duration)
+    0 <= x.months && 0 <= x.days && 0 <= x.nanoseconds ||
+        encodeerror("Avro duration components must be nonnegative", x)
+    q, r = divrem(x.nanoseconds, 1_000_000)
+    iszero(r) && q <= typemax(UInt32) ||
+        encodeerror("Avro duration requires UInt32 milliseconds without rounding", x)
+    return encodevalue(p, e, Duration(x))
 end

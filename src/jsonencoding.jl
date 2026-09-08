@@ -89,7 +89,7 @@ function printkind(out::JSONOut, ::BytesSchema, v::Vector{UInt8}, depth, budget)
     return printbytestring(out.io, v)
 end
 
-function printkind(out::JSONOut, ::BytesSchema, v::Union{Decimal,WideDecimal}, depth, budget)
+function printkind(out::JSONOut, ::BytesSchema, v::WideDecimal, depth, budget)
     bytes = twoscomplement(v.unscaled, budget)
     try
         return printbytestring(out.io, bytes)
@@ -116,6 +116,8 @@ function printkind(out::JSONOut, s::FixedSchema, v, depth, budget)
     checkvaluebytes(budget, s.size)
     v isa Fixed && return printbytestring(out.io, v.bytes)
     v isa UUID && return printuuidbytestring(out.io, v)
+    v isa Durations.Duration && (v = Duration(v))
+    v isa DataDecimals.AbstractDecimal && !(v isa Decimal) && (v = _decimalinput(v))
     v isa Duration && return printdurationbytestring(out.io, v)
     bytes = twoscomplement(v.unscaled, budget; maxbytes=s.size)
     try
@@ -822,4 +824,8 @@ end
 
 function le32(bytes::Vector{UInt8}, i::Int)
     return UInt32(bytes[i]) | (UInt32(bytes[i + 1]) << 8) | (UInt32(bytes[i + 2]) << 16) | (UInt32(bytes[i + 3]) << 24)
+end
+
+function printkind(out::JSONOut, s::BytesSchema, v::DataDecimals.AbstractDecimal, depth, budget)
+    return printkind(out, s, _decimalinput(v), depth, budget)
 end

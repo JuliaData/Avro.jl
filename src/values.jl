@@ -9,10 +9,7 @@ using Dates: Dates, Millisecond, Microsecond, Nanosecond, DateTime, Date, Time
 A decimal with at most 38 digits: `unscaled × 10^-scale`. Decoded from `decimal` logical types with
 precision ≤ 38; encoding requires `scale` to equal the schema's scale exactly.
 """
-struct Decimal
-    unscaled::Int128
-    scale::Int
-end
+const Decimal = DataDecimals.DecimalValue{Int128}
 
 """
     Avro.WideDecimal(unscaled::BigInt, scale::Int)
@@ -22,14 +19,6 @@ A decimal whose precision exceeds 38 digits.
 struct WideDecimal
     unscaled::BigInt
     scale::Int
-end
-
-function Base.:(==)(a::Decimal, b::Decimal)
-    return a.unscaled == b.unscaled && a.scale == b.scale
-end
-
-function Base.hash(a::Decimal, h::UInt)
-    return hash(a.scale, hash(a.unscaled, hash(:Decimal, h)))
 end
 
 function Base.:(==)(a::WideDecimal, b::WideDecimal)
@@ -149,3 +138,14 @@ function round(t::Time, ::Type{P}) where {P<:Dates.TimePeriod}
     aligned >= 86_400_000_000_000 && (aligned -= unit)
     return Time(Nanosecond(aligned))
 end
+
+function Duration(x::Durations.Duration)
+    iszero(rem(x.nanoseconds, 1_000_000)) || throw(ArgumentError("Avro duration requires exact milliseconds"))
+    return Duration(UInt32(x.months), UInt32(x.days), UInt32(div(x.nanoseconds, 1_000_000)))
+end
+function Durations.Duration(x::Duration)
+    return Durations.Duration(x.months, x.days, Int64(x.millis) * 1_000_000)
+end
+
+_decimalinput(x::DataDecimals.AbstractDecimal) =
+    WideDecimal(BigInt(DataDecimals.unscaled(x)), DataDecimals.scale(x))

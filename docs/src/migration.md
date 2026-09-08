@@ -31,7 +31,7 @@ Avro.jl 2.0 is a rewrite; this page maps every 1.x usage to its 2.0 form. `Avro.
   are 1-based; `Avro.ordinal` is the wire index.
 * Timestamps decode as exact `Avro.Timestamp{P}`/`Avro.LocalTimestamp{P}` wrappers; `DateTime(x)` is
   an explicit, range-checked conversion (or decode typed with a `DateTime` field).
-* `Avro.Decimal` carries its scale at runtime and reads big-endian per the specification (1.x wrote
+* `Avro.Decimal` is an alias for `DataDecimals.DecimalValue{Int128}`. It carries its scale at runtime and reads big-endian per the specification (1.x wrote
   native-endian; see below). `Avro.Duration` fields are `UInt32`.
 * Customisation moved from StructTypes to StructUtils (field tags: `&(avro=(name="…", default=…),)`).
 
@@ -62,3 +62,15 @@ and rewrite once to clean 2.0 output:
 Avro.write("clean.avro", Avro.Rows("old.avro"; legacy=:avrojl1, decimal_byteorder=:little);
            codec=:zstandard)
 ```
+
+## Shared values
+
+The writer accepts `DataDecimals.AbstractDecimal` values with an explicit decimal
+schema. Fixed-scale decimal types can also infer their precision and scale.
+`Avro.WideDecimal` remains the arbitrary-precision fallback for large schemas.
+
+The writer accepts `Durations.Duration` for the duration logical type when all
+components are nonnegative, the time component is an exact number of milliseconds,
+and all three wire fields fit UInt32. `Avro.Duration` preserves the full unsigned
+wire range on reads. `Durations.Duration(x::Avro.Duration)` checks the narrower
+signed month/day range.

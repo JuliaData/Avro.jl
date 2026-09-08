@@ -1996,7 +1996,7 @@ function semanticcompatible(::Type{T}, schema::Schema, st::AvroStyle) where {T}
     end
     schema isa Union{FloatSchema,DoubleSchema} && return T <: AbstractFloat
     if schema isa BytesSchema
-        schema.logical isa DecimalLogical && return T === Decimal || T === WideDecimal
+        schema.logical isa DecimalLogical && return T <: DataDecimals.AbstractDecimal || T === WideDecimal
         return T <: AbstractVector{UInt8}
     end
     if schema isa StringSchema
@@ -2004,9 +2004,9 @@ function semanticcompatible(::Type{T}, schema::Schema, st::AvroStyle) where {T}
         return T <: AbstractString || T === Symbol || T === Char || T === UUID
     end
     if schema isa FixedSchema
-        schema.logical isa DecimalLogical && return T === Decimal || T === WideDecimal
+        schema.logical isa DecimalLogical && return T <: DataDecimals.AbstractDecimal || T === WideDecimal
         schema.logical isa UUIDLogical && return T === UUID
-        schema.logical isa DurationLogical && return T === Duration
+        schema.logical isa DurationLogical && return T === Duration || T === Durations.Duration
         return T === Fixed || T <: AbstractVector{UInt8} || isbytetuple(T, schema.size)
     end
     schema isa EnumSchema && return T === EnumValue || T <: Base.Enum || T <: AbstractString || T === Symbol
@@ -2068,4 +2068,21 @@ end
 
 function StructUtils.lift(::Type{T}, x::Union{Timestamp,LocalTimestamp}) where {T<:Union{Timestamp,LocalTimestamp}}
     return T(x.ticks)
+end
+
+function StructUtils.make(st::AvroStyle, ::Type{Durations.Duration}, x::Duration)
+    return Durations.Duration(x), StructUtils.defaultstate(st)
+end
+
+function StructUtils.make(st::AvroStyle, ::Type{T}, x::DataDecimals.AbstractDecimal) where {T<:DataDecimals.AbstractDecimal}
+    return T(x), StructUtils.defaultstate(st)
+end
+
+function StructUtils.make(st::AvroStyle, ::Type{T}, x::WideDecimal) where {T<:DataDecimals.AbstractDecimal}
+    value = DataDecimals.DecimalValue{DataDecimals.Int256}(x.unscaled, x.scale)
+    return T(value), StructUtils.defaultstate(st)
+end
+
+function StructUtils.make(st::AvroStyle, ::Type{WideDecimal}, x::DataDecimals.AbstractDecimal)
+    return _decimalinput(x), StructUtils.defaultstate(st)
 end
