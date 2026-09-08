@@ -9,6 +9,8 @@ using Random
 const FIXTURES = joinpath(@__DIR__, "fixtures")
 include("valuegen.jl")
 
+include("sharedvalues.jl")
+
 @testset "Avro" begin
     include("limits.jl")
     include("frozen.jl")
@@ -57,4 +59,3 @@ include("valuegen.jl")
     end
 end
 
-include("sharedvalues.jl")

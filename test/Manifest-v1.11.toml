@@ -2,7 +2,7 @@
 
 julia_version = "1.11.9"
 manifest_format = "2.0"
-project_hash = "019b5bb8a51c5ede539a659e5dca77f6d0c58ff4"
+project_hash = "8296c97db718ce5e8f92b2a4dd97e1abdb17003d"
 
 [[deps.Aqua]]
 deps = ["Compat", "Pkg", "Test"]
@@ -119,6 +119,19 @@ git-tree-sha1 = "abe83f3a2f1b857aac70ef8b269080af17764bbe"
 uuid = "9a962f9c-6df0-11e9-0e5d-c546b8b5ee8a"
 version = "1.16.0"
 
+[[deps.DataDecimals]]
+deps = ["Random"]
+git-tree-sha1 = "422ea02632877ba53f4368013e1df6cf4f73c2a2"
+uuid = "3e2245cb-6932-498d-a7cf-39d39de8bde3"
+version = "1.0.0"
+weakdeps = ["JSON", "LinearAlgebra", "Parsers", "Printf"]
+
+    [deps.DataDecimals.extensions]
+    DataDecimalsJSONExt = "JSON"
+    DataDecimalsLinearAlgebraExt = "LinearAlgebra"
+    DataDecimalsParsersExt = "Parsers"
+    DataDecimalsPrintfExt = "Printf"
+
 [[deps.DataFrames]]
 deps = ["Compat", "DataAPI", "DataStructures", "Future", "InlineStrings", "InvertedIndices", "IteratorInterfaceExtensions", "LinearAlgebra", "Markdown", "Missings", "PooledArrays", "PrecompileTools", "PrettyTables", "Printf", "Random", "Reexport", "SentinelArrays", "SortingAlgorithms", "Statistics", "TableTraits", "Tables", "Unicode"]
 git-tree-sha1 = "5fab31e2e01e70ad66e3e24c968c264d1cf166d6"
@@ -145,6 +158,12 @@ version = "1.11.0"
 deps = ["ArgTools", "FileWatching", "LibCURL", "NetworkOptions"]
 uuid = "f43a241f-c20a-4ad4-852c-f6b1247861c6"
 version = "1.6.0"
+
+[[deps.Durations]]
+deps = ["Dates"]
+git-tree-sha1 = "86bac037c37e7a75b1d0326a142b207395109cd9"
+uuid = "41ac09f5-0a95-4810-aa18-c88bf48ee130"
+version = "1.0.0"
 
 [[deps.EnumX]]
 git-tree-sha1 = "c49898e8438c828577f04b92fc9368c388ac783c"
