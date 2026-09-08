@@ -1,53 +1,181 @@
 name: CI
 on:
-  pull_request:
   push:
-    branches: [main]
-    tags: ['*']
+    branches: ['**']
+  pull_request:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   test:
-    name: Julia ${{ matrix.version }} - ${{ matrix.os }} - ${{ matrix.arch }} - ${{ github.event_name }}
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
+    name: Julia ${{ matrix.version }} - ${{ matrix.os }} - ${{ matrix.threads }} threads
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        version:
-          - '1.5'
-          - '1'
-          - 'nightly'
-        os:
-          - ubuntu-latest
-        arch:
-          - x64
+        version: ['1.10', '1.11', '1']
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        threads: ['1', '4']
     steps:
-      - uses: actions/checkout@v2
-      - uses: julia-actions/setup-julia@v1
+      - uses: actions/checkout@v4
+      - uses: julia-actions/setup-julia@v2
         with:
           version: ${{ matrix.version }}
-          arch: ${{ matrix.arch }}
-      - uses: actions/cache@v1
-        env:
-          cache-name: cache-artifacts
-        with:
-          path: ~/.julia/artifacts
-          key: ${{ runner.os }}-test-${{ env.cache-name }}-${{ hashFiles('**/Project.toml') }}
-          restore-keys: |
-            ${{ runner.os }}-test-${{ env.cache-name }}-
-            ${{ runner.os }}-test-
-            ${{ runner.os }}-
+      - uses: julia-actions/cache@v2
       - uses: julia-actions/julia-buildpkg@v1
       - uses: julia-actions/julia-runtest@v1
-      - uses: julia-actions/julia-processcoverage@v1
-      - uses: codecov/codecov-action@v1
         with:
-          file: lcov.info
+          coverage: false
+        env:
+          JULIA_NUM_THREADS: ${{ matrix.threads }}
+
+  coverage:
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
+    name: Source coverage (informational)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: '1'
+      - uses: julia-actions/cache@v2
+      - uses: julia-actions/julia-buildpkg@v1
+      - uses: julia-actions/julia-runtest@v1
+        with:
+          coverage: true
+        env:
+          AVRO_SKIP_LATENCY: 'true'
+      - uses: julia-actions/julia-processcoverage@v1
+      - uses: codecov/codecov-action@v4
+        with:
+          files: lcov.info
+          fail_ci_if_error: false   # coverage is informational (plan §9.14)
+  prerelease:
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
+    name: Julia ${{ matrix.version }} (informational)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ['pre', 'nightly']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: ${{ matrix.version }}
+      - uses: julia-actions/julia-buildpkg@v1
+      - uses: julia-actions/julia-runtest@v1
+        with:
+          coverage: false
+  quality:
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
+    name: Aqua + JET + Arrow 2 smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: '1'
+      - uses: julia-actions/julia-buildpkg@v1
+      - uses: julia-actions/julia-runtest@v1
+        with:
+          coverage: false
+        env:
+          AVRO_QUALITY_GATES: 'true'
+          AVRO_SMOKE: 'true'
+  interop:
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
+    name: Interop (Java 1.12.2 + fastavro 1.12.2)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: '1'
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - name: Install pinned oracles
+        run: |
+          pip install avro==1.12.2 fastavro==1.12.2 cramjam==2.11.0
+          curl -sSfL -o avro-tools.jar https://repo1.maven.org/maven2/org/apache/avro/avro-tools/1.12.2/avro-tools-1.12.2.jar
+          echo "6220e8bc089aaf917cdad4cd358bd651fc0394c0e5ddb8b36da402012c294a68  avro-tools.jar" | sha256sum -c -
+          echo "AVRO_TOOLS_JAR=$PWD/avro-tools.jar" >> "$GITHUB_ENV"
+      - uses: julia-actions/julia-buildpkg@v1
+      - uses: julia-actions/julia-runtest@v1
+        with:
+          coverage: false
+        env:
+          AVRO_INTEROP: 'true'
+          AVRO_PYTHON: python3
+  crossversion:
+    name: Cross-version file exchange (1.10 <-> 1)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
+    steps:
+      - uses: actions/checkout@v4
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: '1.10'
+      - uses: julia-actions/cache@v2
+      - name: Write with 1.10
+        run: |
+          julia --project=. -e 'using Pkg; Pkg.instantiate()'
+          julia --project=. test/crossversion/write.jl /tmp/from110
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: '1'
+      - name: Read 1.10 files with 1, write with 1
+        run: |
+          julia --project=. -e 'using Pkg; Pkg.instantiate()'
+          julia --project=. test/crossversion/read.jl /tmp/from110
+          julia --project=. test/crossversion/write.jl /tmp/from1
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: '1.10'
+      - name: Read 1 files with 1.10
+        run: |
+          julia --project=. test/crossversion/read.jl /tmp/from1
   docs:
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
     name: Documentation
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
-      - uses: julia-actions/julia-buildpkg@latest
-      - uses: julia-actions/julia-docdeploy@latest
+      - uses: actions/checkout@v4
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: '1'
+      - uses: julia-actions/cache@v2
+      - name: Build and deploy docs
+        run: |
+          julia --project=docs -e 'using Pkg; Pkg.develop(PackageSpec(path=pwd())); Pkg.instantiate()'
+          julia --project=docs docs/make.jl
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           DOCUMENTER_KEY: ${{ secrets.DOCUMENTER_KEY }}
+  trim:
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
+    name: juliac --trim smoke (informational)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: '1'
+      - uses: julia-actions/julia-buildpkg@v1
+      - name: Trim-compile the reader program
+        run: julia test/trim/compile.jl
+  arrow3:
+    name: Arrow 3 candidate smoke (informational)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    if: false   # enabled when an Arrow 3 release candidate is registered
+    steps:
+      - uses: actions/checkout@v4

@@ -1,0 +1,285 @@
+{
+ "type": "record",
+ "name": "Everything",
+ "namespace": "avro.jl.test",
+ "doc": "all kinds",
+ "fields": [
+  {
+   "name": "n",
+   "type": "null"
+  },
+  {
+   "name": "b",
+   "type": "boolean"
+  },
+  {
+   "name": "i",
+   "type": "int"
+  },
+  {
+   "name": "l",
+   "type": "long"
+  },
+  {
+   "name": "f",
+   "type": "float"
+  },
+  {
+   "name": "d",
+   "type": "double"
+  },
+  {
+   "name": "by",
+   "type": "bytes"
+  },
+  {
+   "name": "s",
+   "type": "string"
+  },
+  {
+   "name": "e",
+   "type": {
+    "type": "enum",
+    "name": "Color",
+    "symbols": [
+     "RED",
+     "GREEN",
+     "BLUE"
+    ],
+    "default": "RED"
+   }
+  },
+  {
+   "name": "fx",
+   "type": {
+    "type": "fixed",
+    "name": "F4",
+    "size": 4
+   }
+  },
+  {
+   "name": "arr",
+   "type": {
+    "type": "array",
+    "items": "long"
+   }
+  },
+  {
+   "name": "arr_rec",
+   "type": {
+    "type": "array",
+    "items": {
+     "type": "record",
+     "name": "Point",
+     "fields": [
+      {
+       "name": "x",
+       "type": "double"
+      },
+      {
+       "name": "y",
+       "type": "double"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "name": "map",
+   "type": {
+    "type": "map",
+    "values": "string"
+   }
+  },
+  {
+   "name": "map_arr",
+   "type": {
+    "type": "map",
+    "values": {
+     "type": "array",
+     "items": "int"
+    }
+   }
+  },
+  {
+   "name": "opt",
+   "type": [
+    "null",
+    "string"
+   ],
+   "default": null
+  },
+  {
+   "name": "u",
+   "type": [
+    "int",
+    "string",
+    "Point",
+    "Color",
+    "F4",
+    {
+     "type": "array",
+     "items": "boolean"
+    },
+    {
+     "type": "map",
+     "values": "long"
+    },
+    "null",
+    "bytes",
+    "double",
+    "float",
+    "long",
+    "boolean"
+   ]
+  },
+  {
+   "name": "nested",
+   "type": {
+    "type": "record",
+    "name": "Inner",
+    "fields": [
+     {
+      "name": "p",
+      "type": "Point"
+     },
+     {
+      "name": "tags",
+      "type": {
+       "type": "array",
+       "items": "string"
+      }
+     },
+     {
+      "name": "deep",
+      "type": [
+       "null",
+       "Inner"
+      ],
+      "default": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "list",
+   "type": {
+    "type": "record",
+    "name": "LongList",
+    "fields": [
+     {
+      "name": "value",
+      "type": "long"
+     },
+     {
+      "name": "next",
+      "type": [
+       "null",
+       "LongList"
+      ],
+      "default": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "withdefaults",
+   "type": {
+    "type": "record",
+    "name": "Defaults",
+    "fields": [
+     {
+      "name": "a",
+      "type": "int",
+      "default": 42
+     },
+     {
+      "name": "bb",
+      "type": "string",
+      "default": "hi"
+     },
+     {
+      "name": "c",
+      "type": "double",
+      "default": 1.5
+     },
+     {
+      "name": "dd",
+      "type": "bytes",
+      "default": "\u00ff\u0000"
+     },
+     {
+      "name": "ee",
+      "type": "Color",
+      "default": "BLUE"
+     },
+     {
+      "name": "ff",
+      "type": "F4",
+      "default": "\u0000\u0001\u0002\u00ff"
+     },
+     {
+      "name": "g",
+      "type": {
+       "type": "array",
+       "items": "int"
+      },
+      "default": [
+       1,
+       2
+      ]
+     },
+     {
+      "name": "h",
+      "type": {
+       "type": "map",
+       "values": "int"
+      },
+      "default": {
+       "k": 1
+      }
+     },
+     {
+      "name": "ii",
+      "type": "Point",
+      "default": {
+       "x": 1.0,
+       "y": 2.0
+      }
+     },
+     {
+      "name": "j",
+      "type": [
+       "null",
+       "int"
+      ],
+      "default": null
+     },
+     {
+      "name": "k",
+      "type": [
+       "int",
+       "null"
+      ],
+      "default": 7
+     },
+     {
+      "name": "ll",
+      "type": "boolean",
+      "default": true
+     },
+     {
+      "name": "m",
+      "type": "long",
+      "default": -1
+     },
+     {
+      "name": "o",
+      "type": "float",
+      "default": 2.5
+     }
+    ]
+   }
+  }
+ ]
+}
