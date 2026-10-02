@@ -1429,8 +1429,10 @@ end
                 allow_invalid_defaults=false, limits=Limits())
 
 A container writer to a path (atomic by default: a sibling temp file renamed into place on `close`) or a
-caller-owned `IO` (flushed, never closed). Datums are buffered under every reader limit and a block is
-emitted at `block_bytes`, at the block caps, or on `flush`/`close`. The first failure poisons the writer,
+caller-owned `IO` (flushed, never closed). The path's parent directory, including parent symbolic links,
+is resolved when the writer opens. Changing the working directory later does not redirect its output.
+Datums are buffered under every reader limit and a block is emitted at `block_bytes`, at the block
+caps, or on `flush`/`close`. The first failure poisons the writer,
 including a rejected datum or limit failure from `push!`; `WriterClosedError` carries the original cause.
 With `atomic=true`, the temp file is removed and the destination is untouched; `atomic=false` and
 caller-owned streams can retain partial output. `close(w; abort=true)` discards the buffered block. The
@@ -1641,8 +1643,9 @@ function Writer(dst::Union{AbstractString,IO}, schema::Schema; codec::Symbol=:nu
         preflightbase, preflight = writerpreflight(schemajson, entries, plan, limits, budget;
                                                    allow_invalid_names=allow_invalid_names,
                                                    allow_invalid_defaults=allow_invalid_defaults)
-        path = dst isa AbstractString ? String(dst) : nothing
-        sink, temppath, ownsink = openwritersink(dst, atomic)
+        path = dst isa AbstractString ?
+            joinpath(realpath(joinpath(dirname(dst), ".")), basename(dst)) : nothing
+        sink, temppath, ownsink = openwritersink(path === nothing ? dst : path, atomic)
         encoder = Encoder(budget)
         datumencoder = Encoder(budget)
         stagevalues = schemaneedsstaging(schema, budget)

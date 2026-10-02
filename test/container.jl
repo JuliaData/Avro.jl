@@ -1097,6 +1097,62 @@ end
         @test [v.x for v in readall(dest)] == [1]
         @test length(readdir(dir)) == 1                                                          # the temp file is gone
 
+        for (useatomic, abort) in ((true, false), (false, false), (true, true))
+            @testset "relative path (atomic=$useatomic, abort=$abort)" begin
+                mktempdir() do root
+                    original = mkdir(joinpath(root, "original"))
+                    later = mkdir(joinpath(root, "later"))
+                    originalpath = joinpath(original, "out.avro")
+                    laterpath = joinpath(later, "out.avro")
+                    Avro.write(originalpath, [(x=Int64(-1),)]; schema=s)
+                    Avro.write(laterpath, [(x=Int64(-2),)]; schema=s)
+                    relativewriter = cd(original) do
+                        Avro.Writer("out.avro", s; atomic=useatomic)
+                    end
+                    push!(relativewriter, (x=Int64(7),))
+                    cd(later) do
+                        close(relativewriter; abort)
+                    end
+                    @test [v.x for v in readall(originalpath)] == [abort ? -1 : 7]
+                    @test [v.x for v in readall(laterpath)] == [-2]
+                    @test readdir(original) == ["out.avro"]
+                    @test readdir(later) == ["out.avro"]
+                end
+            end
+        end
+
+        if Sys.isunix()
+            @testset "symlink path components" begin
+                mktempdir() do root
+                    original = mkdir(joinpath(root, "original"))
+                    actualparent = mkdir(joinpath(root, "actual"))
+                    nested = mkdir(joinpath(actualparent, "nested"))
+                    symlink(nested, joinpath(original, "alias"))
+                    intended = joinpath(actualparent, "out.avro")
+                    lexical = joinpath(original, "out.avro")
+                    Avro.write(intended, [(x=Int64(-1),)]; schema=s)
+                    Avro.write(lexical, [(x=Int64(-2),)]; schema=s)
+                    cd(original) do
+                        linkwriter = Avro.Writer(joinpath("alias", "..", "out.avro"), s)
+                        @test realpath(dirname(linkwriter.temppath)) == realpath(actualparent)
+                        push!(linkwriter, (x=Int64(7),))
+                        close(linkwriter)
+                    end
+                    @test [v.x for v in readall(intended)] == [7]
+                    @test [v.x for v in readall(lexical)] == [-2]
+                    @test sort(readdir(original)) == ["alias", "out.avro"]
+                    @test sort(readdir(actualparent)) == ["nested", "out.avro"]
+
+                    finalalias = joinpath(root, "final.avro")
+                    symlink(intended, finalalias)
+                    Avro.write(finalalias, [(x=Int64(9),)]; schema=s)
+                    @test !islink(finalalias)
+                    @test [v.x for v in readall(finalalias)] == [9]
+                    @test [v.x for v in readall(intended)] == [7]
+                end
+            end
+        end
+
         constructionschema = Avro.ArraySchema(Avro.IntSchema())
         constructionprobe = Avro.Writer(IOBuffer(), constructionschema)
         constructioncap = constructionprobe.budget.resolution_work - 1

@@ -14,7 +14,9 @@ The schema comes from `schema=`, else from the retained schema of an Avro source
 explicit `schema=`. `Tables.partitions` become block boundaries.
 
 Writing to a path is **atomic by default**: output goes to a temporary file that is renamed over the
-target only on a successful `close`. With `atomic=true`, a failure leaves the target unchanged. With
+target only on a successful `close`. The writer resolves the path's parent directory, including parent
+symbolic links, when it opens. Changing the working directory later does not redirect the output. With
+`atomic=true`, a failure leaves the target unchanged. With
 `atomic=false`, the destination is opened in place, so a failure can leave it truncated or containing
 complete blocks plus a partial final block. `fsync=true` syncs the file before rename, but does not sync
 the directory that contains it.
