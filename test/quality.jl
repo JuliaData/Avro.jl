@@ -9,6 +9,12 @@ using JET
 end
 
 @testset "JET" begin
-    rep = JET.report_package(Avro; target_modules=(Avro,))
-    @test isempty(JET.get_reports(rep))
+    # The package project supplies direct dependencies for JET's virtual module.
+    push!(LOAD_PATH, Base.pkgdir(Avro))
+    try
+        rep = JET.report_package(Avro; target_modules=(Avro,))
+        @test isempty(JET.get_reports(rep))
+    finally
+        pop!(LOAD_PATH)
+    end
 end
