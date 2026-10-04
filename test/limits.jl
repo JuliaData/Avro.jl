@@ -40,8 +40,12 @@
         @test Avro.effective_ceiling(l; available=100 << 20) == 50 << 20
         @test Avro.effective_ceiling(l; available=0) == 0
         @test Avro.available_memory() > 0
-        @test Avro.host_free_memory() >= Int(min(Sys.free_memory(), typemax(Int) % UInt64))
-        Sys.isapple() && @test Avro.darwin_available_memory() > Sys.free_memory()      # inactive pages are reclaimable
+        @test Avro.host_free_memory() > 0
+        @test Avro.host_free_memory(UInt64(1024), nothing) == 1024
+        @test Avro.host_free_memory(UInt64(1024), 512) == 1024
+        @test Avro.host_free_memory(UInt64(1024), 2048) == 2048
+        @test Avro.host_free_memory(typemax(UInt64), nothing) == typemax(Int)
+        Sys.isapple() && @test Avro.darwin_available_memory() > 0
         # injected available memory below the first unit of progress fails before any allocation
         e = try
             Avro.Budget(l; available=2 * Avro.first_unit_bytes(l) - 2)

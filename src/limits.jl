@@ -247,10 +247,10 @@ end
 
 # `Sys.free_memory()`, except on macOS where free + inactive pages (the `vm_stat` convention) is the
 # reclaimable figure: free pages alone routinely fall to a few hundred MB on a busy host.
-function host_free_memory()
-    free = Int(min(Sys.free_memory(), typemax(Int) % UInt64))
-    Sys.isapple() || return free
-    return max(free, something(darwin_available_memory(), 0))
+# Optional samples keep comparisons tied to those readings without resampling the OS.
+function host_free_memory(free::UInt64=Sys.free_memory(),
+                          reclaimable::Union{Nothing,Int}=Sys.isapple() ? darwin_available_memory() : nothing)
+    return max(Int(min(free, typemax(Int) % UInt64)), something(reclaimable, 0))
 end
 
 function darwin_available_memory()
