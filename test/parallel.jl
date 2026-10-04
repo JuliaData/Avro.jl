@@ -2,6 +2,8 @@
     P = Avro.parseschema
     raised = Avro.Limits(max_total_bytes=2 << 30, max_block_bytes=16 << 20, max_block_output_bytes=256 << 20,
                          max_codec_memory=32 << 20, max_bytes=64 << 20, max_datum_bytes=64 << 20)
+    workerlimits = Avro.Limits(max_total_bytes=2 << 30, max_block_bytes=16 << 10,
+                              max_block_output_bytes=1 << 20, max_codec_memory=16 << 20)
     s = P("{\"type\":\"record\",\"name\":\"PD\",\"fields\":[{\"name\":\"a\",\"type\":\"long\"},{\"name\":\"b\",\"type\":\"string\"},{\"name\":\"c\",\"type\":[\"null\",\"double\"]},{\"name\":\"e\",\"type\":{\"type\":\"enum\",\"name\":\"EE\",\"symbols\":[\"X\",\"Y\"]}}]}")
     n = 20_000
     rows = [(a=Int64(i), b="row-$i-payload", c=i % 3 == 0 ? missing : i / 2, e=isodd(i) ? "X" : "Y") for i in 1:n]
@@ -24,6 +26,48 @@
     function entriesof(bs)
         return Avro.Reader(IOBuffer(bs)) do r
             return Avro.prescanblocks(r).entries
+        end
+    end
+    @testset "worker admission at the fixture's minimum budget" begin
+        if Threads.nthreads() > 1
+            pending0 = @atomic Avro.GUARD.pending
+            for limits in (raised, workerlimits)
+                Avro.Reader(bytes; limits) do reader
+                    pre = Avro.prescanblocks(reader)
+                    cols = Type[Avro.juliatype(field.schema) for field in reader.schema.fields]
+                    builderpeak = Avro.columnbuilderpeakstate(reader.plan, nothing)
+                    resident = reader.budget.reserved + Avro.vectorbytes(Int, length(cols)) +
+                        Avro.vectorbytes(Type, length(cols)) + Avro.vectorbytes(AbstractVector, length(cols)) +
+                        sum(Avro.vectorbytes(E, pre.totalrows) for E in cols)
+                    function planned(ceiling)
+                        budget = Avro.Budget(limits; available=2 * ceiling)
+                        Avro.reserve!(budget, resident)
+                        Avro.allocated!(budget, resident)
+                        controlled = Avro.Reader(nothing, reader.schema, reader.plan, reader.span,
+                            reader.codecname, reader.codec, reader.metadata, reader.sync, limits, budget,
+                            reader.validate, reader.legacy, reader.blockindex, true, reader.warned)
+                        try
+                            return Avro.poolplan(controlled, cols, pre.entries, 8, builderpeak)
+                        finally
+                            Avro.close!(budget)
+                        end
+                    end
+                    full = planned(2 << 30)
+                    required = resident + full[4] +
+                        Avro.blockworstcase(limits, pre.entries[1], cols, builderpeak) +
+                        Avro.blockworstcase(limits, pre.entries[2], cols, builderpeak)
+                    if limits === raised
+                        @test planned(required - 1)[3] == 0
+                        @test planned(required)[3] == min(7, Threads.nthreads() - 1)
+                    else
+                        # Every admitted reader has enough headroom for these 8 KiB fixture blocks.
+                        @test required < Avro.first_unit_bytes(limits)
+                        @test planned(Avro.first_unit_bytes(limits))[3] == min(7, Threads.nthreads() - 1)
+                    end
+                    Avro.release!(reader.budget, Avro.blocktablecharge(Avro.capacity(pre.entries)))
+                end
+            end
+            @test (@atomic Avro.GUARD.pending) == pending0
         end
     end
     @testset "block-table growth retains only the charged capacity" begin
@@ -105,10 +149,10 @@
         end
     end
     @testset "deterministic counters equal to sequential" begin
-        Avro.Table(IOBuffer(bytes); ntasks=1, limits=raised)
+        Avro.Table(IOBuffer(bytes); ntasks=1, limits=workerlimits)
         st1 = Avro.LAST_PARALLEL_STATS[]
         c1 = (st1.values, st1.input_bytes, st1.rows, st1.blocks)
-        Avro.Table(IOBuffer(bytes); ntasks=8, limits=raised)
+        Avro.Table(IOBuffer(bytes); ntasks=8, limits=workerlimits)
         st8 = Avro.LAST_PARALLEL_STATS[]
         @test (st8.values, st8.input_bytes, st8.rows, st8.blocks) == c1
         @test st8.rows == n && st8.blocks == length(entriesof(bytes))
@@ -166,7 +210,7 @@
                 return nothing
             end
             try
-                ct = Tables.columntable(Avro.Table(IOBuffer(bytes); ntasks=4, limits=raised))
+                ct = Tables.columntable(Avro.Table(IOBuffer(bytes); ntasks=4, limits=workerlimits))
                 for k in keys(reference)
                     @test isequal(ct[k], reference[k])
                 end
@@ -183,13 +227,13 @@
                 return nothing
             end
             err = try
-                geterr(() -> Avro.Table(IOBuffer(bytes); ntasks=4, limits=raised))
+                geterr(() -> Avro.Table(IOBuffer(bytes); ntasks=4, limits=workerlimits))
             finally
                 Avro.PARALLEL_HOOK[] = nothing
             end
             @test err isa ErrorException && occursin("worker startup failure", err.msg)
             @test (@atomic Avro.GUARD.pending) == pending0
-            recovered = Tables.columntable(Avro.Table(IOBuffer(bytes); ntasks=1, limits=raised))
+            recovered = Tables.columntable(Avro.Table(IOBuffer(bytes); ntasks=1, limits=workerlimits))
             @test all(isequal(recovered[name], reference[name]) for name in keys(reference))
         end
     end
@@ -201,7 +245,7 @@
                 return nothing
             end
             err = try
-                geterr(() -> Avro.Table(IOBuffer(bytes); ntasks=4, limits=raised))
+                geterr(() -> Avro.Table(IOBuffer(bytes); ntasks=4, limits=workerlimits))
             finally
                 Avro.PARALLEL_HOOK[] = nothing
             end
@@ -222,7 +266,7 @@
         # content vs content: two corrupted blocks, the lower one is the error at every ntasks
         bad = corrupt(nullbytes, 5, 12)
         e1 = geterr(() -> Avro.Table(IOBuffer(bad); ntasks=1))
-        e8 = geterr(() -> Avro.Table(IOBuffer(bad); ntasks=8, limits=raised))
+        e8 = geterr(() -> Avro.Table(IOBuffer(bad); ntasks=8, limits=workerlimits))
         @test e1 isa Avro.DataError && e8 isa Avro.DataError
         @test e1.msg == e8.msg && e1.pos == e8.pos                              # the identical error
         st = Avro.LAST_PARALLEL_STATS[]
@@ -236,7 +280,7 @@
                 return nothing
             end
             try
-                eh = geterr(() -> Avro.Table(IOBuffer(bad2); ntasks=8, limits=raised))
+                eh = geterr(() -> Avro.Table(IOBuffer(bad2); ntasks=8, limits=workerlimits))
                 @test eh isa Avro.DataError && eh.msg == geterr(() -> Avro.Table(IOBuffer(bad2); ntasks=1)).msg
             finally
                 Avro.PARALLEL_HOOK[] = nothing
@@ -244,8 +288,8 @@
         end
         # content vs cumulative limit: the corruption at block 5 outranks a max_rows crossing at a later block
         limrows = entries[8].rowstart + entries[8].count - 1                     # crossing inside block 9
-        smallrows = Avro.Limits(max_total_bytes=2 << 30, max_block_bytes=16 << 20, max_block_output_bytes=256 << 20,
-                                max_codec_memory=32 << 20, max_bytes=64 << 20, max_datum_bytes=64 << 20, max_rows=limrows)
+        smallrows = Avro.Limits(max_total_bytes=2 << 30, max_block_bytes=16 << 10,
+                               max_block_output_bytes=1 << 20, max_codec_memory=16 << 20, max_rows=limrows)
         el = geterr(() -> Avro.Table(IOBuffer(corrupt(nullbytes, 5)); ntasks=8, limits=smallrows))
         @test el isa Avro.DataError && el.msg == e1.msg                          # content at 5 wins over the limit at 9
         elim1 = geterr(() -> Avro.Table(IOBuffer(nullbytes); ntasks=1, limits=smallrows))
@@ -255,9 +299,9 @@
         # structural pre-scan failure vs lower content failure
         cut = nullbytes[1:entries[14].offset + 4]                                # truncated inside block 14
         es1 = geterr(() -> Avro.Table(IOBuffer(cut); ntasks=1))
-        es8 = geterr(() -> Avro.Table(IOBuffer(cut); ntasks=8, limits=raised))
+        es8 = geterr(() -> Avro.Table(IOBuffer(cut); ntasks=8, limits=workerlimits))
         @test es1 isa Avro.DataError && es8 isa Avro.DataError && es1.msg == es8.msg
-        both = geterr(() -> Avro.Table(IOBuffer(corrupt(cut, 5)); ntasks=8, limits=raised))
+        both = geterr(() -> Avro.Table(IOBuffer(corrupt(cut, 5)); ntasks=8, limits=workerlimits))
         @test both isa Avro.DataError && both.msg == e1.msg                      # the content failure at 5 wins
         # a file whose total exceeds the default ceiling fails identically before any decode
         bigrows = [(a=Int64(i), b="x"^1500, c=1.0, e="X") for i in 1:250_000]
@@ -270,7 +314,7 @@
     @testset "GC stress" begin
         Avro.PARALLEL_HOOK[] = (ev, i) -> (ev === :commit && GC.gc(false); nothing)
         try
-            ct = Tables.columntable(Avro.Table(IOBuffer(bytes); ntasks=8, limits=raised))
+            ct = Tables.columntable(Avro.Table(IOBuffer(bytes); ntasks=8, limits=workerlimits))
             @test isequal(ct.a, reference.a) && isequal(ct.b, reference.b)
         finally
             Avro.PARALLEL_HOOK[] = nothing
