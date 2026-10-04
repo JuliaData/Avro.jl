@@ -428,7 +428,7 @@ function checkderivednamespace(ctx::DeriveContext, ns; owned::Bool=false)
         throw(LimitError(:max_name_bytes, sizeof(ns), ctx.limits.max_name_bytes,
                          :max_name_bytes, ctx.budget.direction))
     isvalidnamespace(ns) || nameerror("namespace", "override `Avro.avroname` for this type")
-    return owned ? ns::String : ownedstringcopy(ns, ctx.budget)
+    return owned && ns isa String ? ns : ownedstringcopy(ns, ctx.budget)
 end
 
 """

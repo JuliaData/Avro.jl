@@ -352,6 +352,7 @@ end
         @test_throws Avro.EncodeError enc(r, Dict("a" => 1))
         @test_throws Avro.EncodeError enc(r, 5)
         @test_throws Avro.EncodeError enc(r, "s")
+        @test_throws Avro.EncodeError enc(r, (1, "z"))
         struct BinRec; b::String; a::Int32; end
         @test hex(enc(r, BinRec("z", 1))) == "02027a"                # by name, not position
         other = P("{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"b\",\"type\":\"string\"},{\"name\":\"a\",\"type\":\"int\"}]}")

@@ -1387,6 +1387,7 @@ function recordfieldpositions(p::WRecord, ::Type{T}, budget::Budget) where {T}
         tags = T <: NamedTuple ? (;) : StructUtils.fieldtags(AvroStyle(), T)
         for j in 1:fieldcount(T)
             fname = fieldname(T, j)
+            fname isa Symbol || encodeerror("record fields must have names", fname)
             tagged = T <: NamedTuple ? nothing : fieldtag(tags, fname, :name)
             candidate = tagged === nothing ? fname : tagged
             (candidate isa Symbol || candidate isa AbstractString) ||

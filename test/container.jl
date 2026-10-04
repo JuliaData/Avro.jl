@@ -1263,6 +1263,7 @@ end
         @test [v.x for v in readall(dest2)] == [4]
         # reserved metadata and option validation
         @test_throws ArgumentError Avro.Writer(IOBuffer(), s; metadata=Dict("avro.codec" => UInt8[]))
+        @test_throws Avro.EncodeError Avro.Writer(w -> push!(w, (Int64(1),)), IOBuffer(), s)
         @test_throws ArgumentError Avro.Writer(IOBuffer(), s; sync=UInt8[1, 2])
         @test_throws ArgumentError Avro.Writer(IOBuffer(), s; block_bytes=0)
         @test_throws ArgumentError Avro.Writer(IOBuffer(), s; codec=:snappy, level=3)

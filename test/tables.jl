@@ -67,6 +67,7 @@ import DataAPI
         @test length(vals) == 250 && vals[1].a == 1 && vals[1].e == "X" && vals[2].e == "Y"
         rt2 = Avro.Rows(buf(); T=NamedTuple{(:a,),Tuple{Int64}})
         @test_throws ArgumentError Tables.partitions(rt2)
+        @test_throws ArgumentError Tables.columns(rt2)
         close(rt2)
         arrio = IOBuffer()
         w = Avro.Writer(arrio, P("\"long\""))
@@ -76,6 +77,7 @@ import DataAPI
         seekstart(arrio)
         rn = Avro.Rows(arrio)
         @test !Tables.istable(rn)
+        @test_throws ArgumentError Tables.columns(rn)
         @test collect(rn) == [1, 2]
         close(rn)
         rp = Avro.Rows(buf())

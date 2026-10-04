@@ -2197,10 +2197,11 @@ function printnamedheader(io::IO, s::NamedSchema, enclosing::String, pretty::Boo
             print(io, ']')
         end
     end
-    if s isa Union{RecordSchema,EnumSchema} && s.doc !== nothing
+    doc = s isa Union{RecordSchema,EnumSchema} ? s.doc : nothing
+    if doc !== nothing
         print(io, ',')
         member = printattribute(io, members, "doc", pretty, level)
-        printrawvalue(io, member) || escapejson(io, s.doc)
+        printrawvalue(io, member) || escapejson(io, doc)
     end
     return members
 end
@@ -3019,10 +3020,10 @@ function EnumSchema(name::AbstractString, symbols; namespace::AbstractString="",
         end
         doccopy = doc === nothing ? nothing : ownedstringcopy(doc, b)
         reserve!(b, 24)                                # the symbol wrapper, made next
-        symbols = freeze!(FrozenVector{String}(syms, false))
+        frozen_symbols = freeze!(FrozenVector{String}(syms, false))
         allocated!(b, 24)
         meta = publicmeta()
-        s = publicnode(EnumSchema(full, norm, raw, doccopy, symbols, d,
+        s = publicnode(EnumSchema(full, norm, raw, doccopy, frozen_symbols, d,
                                   freeze!(index), p, meta))
         return finalizepublic!(s, limits, 1, 1)
     end

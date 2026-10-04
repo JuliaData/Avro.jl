@@ -1528,6 +1528,7 @@ function writerheaderentries(schema::Schema, codec::Symbol, metadata, limits::Li
         throw(LimitError(:max_metadata_bytes, total, limits.max_metadata_bytes,
                          :max_metadata_bytes, :encode))
     for (k, v) in metadata
+        k isa AbstractString || throw(ArgumentError("metadata must map strings to byte vectors"))
         startswith(k, "avro.") && throw(ArgumentError("metadata keys in the avro.* namespace are reserved; avro.schema and avro.codec come from the constructor"))
         isstrictutf8(k) || throw(ArgumentError("metadata keys must be valid UTF-8"))
         total = checked_add(total, checked_add(sizeof(k), length(v)))
@@ -3139,8 +3140,9 @@ function inspect(src; limits::Limits=Limits())
                         if decoder.pos != length(decoded) + 1
                             if cname === :null
                                 trailing = length(decoded) - decoder.pos + 1
+                                blocknumber = blocks + 1
                                 dynamicinspectissue!(issues, budget, limits) do writer
-                                    print(writer, "block ", blocks + 1, " has ",
+                                    print(writer, "block ", blocknumber, " has ",
                                           trailing, " trailing payload bytes after ", n,
                                           " datums (Avro.jl ≤ 1.1.2 null-codec padding; read with legacy=:avrojl1)")
                                 end

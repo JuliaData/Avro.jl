@@ -34,6 +34,9 @@ jobs:
     if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
     name: Source coverage (informational)
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v4
       - uses: julia-actions/setup-julia@v2
@@ -47,10 +50,11 @@ jobs:
         env:
           AVRO_SKIP_LATENCY: 'true'
       - uses: julia-actions/julia-processcoverage@v1
-      - uses: codecov/codecov-action@v4
+      - uses: codecov/codecov-action@v7
         with:
           files: lcov.info
-          fail_ci_if_error: false   # coverage is informational (plan §9.14)
+          fail_ci_if_error: true
+          use_oidc: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
   prerelease:
     if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
     name: Julia ${{ matrix.version }} (informational)

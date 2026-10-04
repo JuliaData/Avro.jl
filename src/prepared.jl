@@ -144,9 +144,9 @@ function slowcall(r::DatumReader{T,P}, bytes::AbstractVector{UInt8}, pos::Int,
                    rawspaninputmax(budget, source.buffer,
                                    source.start, r.limits))
         span = decoderspan(d)
-        next = originalnext(source, span.next)
-        whole && next != source.sourceend + 1 &&
-            throw(DataError("trailing bytes after the datum", next))
+        nextpos = originalnext(source, span.next)
+        whole && nextpos != source.sourceend + 1 &&
+            throw(DataError("trailing bytes after the datum", nextpos))
         addinput!(budget, span.bytes)
         d.stop = span.next - 1
         planneddatumspan!(r.plan, d, span; resolved=r.resolved)
@@ -159,7 +159,7 @@ function slowcall(r::DatumReader{T,P}, bytes::AbstractVector{UInt8}, pos::Int,
             rethrow()
         end
         finishdatum!(d, work)
-        return (value, next)
+        return (value, nextpos)
     end
     return (finishtyped(r.plan, v, r.names), next)     # semantic conversion runs in caller space
 end
@@ -178,14 +178,14 @@ function (r::DatumReader{T,P})(io::IO) where {T,P}
         planneddatumspan!(r.plan, d, span; resolved=r.resolved)
         span = decoderspan(d)
         work = begindatum!(d, span)
-        v = try
+        value = try
             decodetyped(T, r.plan, d, r.names)
         catch
             abortdatum!(d, work)
             rethrow()
         end
         finishdatum!(d, work)
-        return v
+        return value
     end
     return finishtyped(r.plan, v, r.names)
 end
@@ -533,7 +533,7 @@ function decodedatum(writer::Schema, src, pos::Int, ::Type{T}, whole::Bool;
     plan, value, next = withbudget(limits) do budget
         generic = datumreaderplan(writer, reader_schema, union_resolution, limits, budget)
         effective = reader_schema === nothing ? writer : reader_schema
-        plan = T === GenericDatumTarget ? generic : typedplan(T, effective, generic, limits; budget=budget)
+        prepared = T === GenericDatumTarget ? generic : typedplan(T, effective, generic, limits; budget=budget)
         spans = spanplan(writer; budget=budget)
         source = if src isa IO
             buffer = sourcebytes(src, limits.max_datum_bytes, budget, DataError)
@@ -547,23 +547,23 @@ function decodedatum(writer::Schema, src, pos::Int, ::Type{T}, whole::Bool;
                    rawspaninputmax(budget, source.buffer,
                                    source.start, limits))
         span = decoderspan(decoder)
-        next = originalnext(source, span.next)
-        whole && next != source.sourceend + 1 &&
-            throw(DataError("trailing bytes after the datum", next))
+        nextpos = originalnext(source, span.next)
+        whole && nextpos != source.sourceend + 1 &&
+            throw(DataError("trailing bytes after the datum", nextpos))
         addinput!(budget, span.bytes)
         decoder.stop = span.next - 1
-        planneddatumspan!(plan, decoder, span;
+        planneddatumspan!(prepared, decoder, span;
                           resolved=reader_schema !== nothing)
         span = decoderspan(decoder)
         work = begindatum!(decoder, span)
-        value = try
-            decodetyped(T, plan, decoder, admitted)
+        decoded = try
+            decodetyped(T, prepared, decoder, admitted)
         catch
             abortdatum!(decoder, work)
             rethrow()
         end
         finishdatum!(decoder, work)
-        return (plan, value, next)
+        return (prepared, decoded, nextpos)
     end
     finished = finishtyped(plan, value, admitted)
     return whole ? finished : (finished, next)

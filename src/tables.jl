@@ -116,7 +116,8 @@ function projectschema(s::RecordSchema, sel::Vector{Int}, limits::Limits,
         name = copyfullname(s.name, budget)
         aliases = copystringvector(s.aliases, budget)
         rawaliases = copystringvector(s.rawaliases, budget)
-        doc = s.doc === nothing ? nothing : ownedstringcopy(s.doc, budget)
+        sourcedoc = s.doc
+        doc = sourcedoc === nothing ? nothing : ownedstringcopy(sourcedoc, budget)
         props = copyprops(s.props, budget, 2)
         meta = copiedmeta(s, sel, budget)
         out = publicnode(RecordSchema(name, aliases, rawaliases, doc, s.iserror,
@@ -627,7 +628,7 @@ function rowsymbols(rows::Rows)
     getfield(rows, :mode) === :generic || throw(ArgumentError("only the generic record mode has columns"))
     s = getfield(rows, :symbols)
     s === nothing || return s
-    s = admitnames(getfield(rows, :outschema), getfield(rows, :adm), getfield(rows, :reader).budget)   # names admit lazily, on first request
+    s = admitnames(getfield(rows, :outschema)::RecordSchema, getfield(rows, :adm), getfield(rows, :reader).budget)   # names admit lazily, on first request
     setfield!(rows, :symbols, s)
     return s
 end
@@ -647,7 +648,7 @@ end
 function Tables.schema(rows::Rows)
     cached = getfield(rows, :tablesschema)
     cached === nothing || return cached
-    value = storedschema(rowsymbols(rows), getfield(rows, :outschema),
+    value = storedschema(rowsymbols(rows), getfield(rows, :outschema)::RecordSchema,
                          getfield(rows, :reader).budget)
     setfield!(rows, :tablesschema, value)
     return value
@@ -753,7 +754,7 @@ function releaseblock!(rows::Rows, budget::Budget)
 end
 
 function decoderow(rows::Rows)
-    d = rows.decoder
+    d = rows.decoder::Decoder{Vector{UInt8}}
     mode = getfield(rows, :mode)
     if mode === :typed
         v = decodetyped(rows.plan isa TypedPlan ? rows.T : GenericDatumTarget, rows.plan, d, rows.adm)
@@ -761,10 +762,11 @@ function decoderow(rows::Rows)
     end
     if mode === :generic && rows.select !== nothing
         p = rows.plan
-        vals = projectrow(p, d, rows.select, rows.outschema)
+        out = rows.outschema::RecordSchema
+        vals = projectrow(p, d, rows.select, out)
         wrapper = rowwrapperbytes()
         reserve!(d.budget, wrapper)
-        row = Row(Record(rows.outschema, vals, Val(:unchecked)), rows.adm)
+        row = Row(Record(out, vals, Val(:unchecked)), rows.adm)
         allocated!(d.budget, recordbytes(length(vals)) - vectorbytes(Any, length(vals)) + wrapper)
         rows.lastwrapper = wrapper
         return row
@@ -892,7 +894,7 @@ function Base.iterate(it::RowsPartitions, ::Nothing=nothing)
         blockout <= r.limits.max_block_output_bytes ||
             throw(LimitError(:max_block_output_bytes, blockout, r.limits.max_block_output_bytes, :max_block_output_bytes, :decode))
         release!(b, bytesbytes(length(bytes)))
-        out = rows.outschema
+        out = rows.outschema::RecordSchema
         sel = rows.select === nothing ? eachindex(out.fields) : rows.select.indices
         finals = exactvector(AbstractVector, length(out.fields), b)
         for (position, i) in enumerate(sel)
@@ -919,7 +921,8 @@ a stored `Tables.Schema{nothing,nothing}`, so `Rows` materialises through its ow
 builders (also faster). The result is an `Avro.Table` over the not-yet-iterated remainder.
 """
 function Tables.columns(rows::Rows)
-    out = getfield(rows, :outschema)
+    getfield(rows, :mode) === :generic || throw(ArgumentError("only the generic record mode has columns"))
+    out = getfield(rows, :outschema)::RecordSchema
     rows.remaining == 0 || throw(ArgumentError("Tables.columns cannot start mid-block; iterate one interface only"))
     b = rows.reader.budget
     baseline = b.reserved

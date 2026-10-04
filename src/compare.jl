@@ -248,7 +248,7 @@ function admitcomparekind!(schema::UnionSchema, plan::UnionPlan,
 end
 
 function admitcomparekind!(schema::RecordSchema, plan::RecordPlan,
-                           da, db, ca, cb)
+                           da::Decoder, db::Decoder, ca, cb)
     enter!(da)
     enter!(db)
     result = 0
@@ -277,7 +277,7 @@ function restoreitemcursor!(cursor, decoder::Decoder)
 end
 
 function admitcomparekind!(schema::ArraySchema, plan::ArrayPlan,
-                           da, db, ca, cb)
+                           da::Decoder, db::Decoder, ca, cb)
     enter!(da)
     enter!(db)
     cursora = ItemCursor()

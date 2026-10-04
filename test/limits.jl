@@ -230,7 +230,7 @@
             ready = Channel{Nothing}(1)
             settle = Channel{Nothing}(1)
             done = Channel{Nothing}(1)
-            base0 = Avro.available_memory()
+            pending0 = @atomic Avro.GUARD.pending
             holder = Threads.@spawn begin
                 hb = Avro.Budget(Avro.Limits(max_total_bytes=1 << 30); available=1 << 40)
                 Avro.reserve!(hb, Avro.bytesbytes(N))
@@ -238,19 +238,28 @@
                 take!(settle)
                 block = fill(0x5a, N)                  # the real backing storage, then the settlement
                 Avro.allocated!(hb, Avro.bytesbytes(N))
-                put!(ready, nothing)
-                take!(done)
+                GC.@preserve block begin
+                    put!(ready, nothing)
+                    take!(done)
+                end
                 Avro.release!(hb, Avro.bytesbytes(N))
                 Avro.close!(hb)
                 block[1]
             end
             errormonitor(holder)
             take!(ready)                               # N bytes pending on the overlapping task
+            # Sample unreserved host memory after the worker is parked: its startup
+            # and any collection can change the host figure before the reservation.
+            base0 = min(Avro.host_free_memory(), Int(min(Sys.total_memory(), typemax(Int) % UInt64)),
+                        Avro.cgroup_remaining())
             pending_avail = Avro.available_memory()
+            @test (@atomic Avro.GUARD.pending) - pending0 == Avro.bytesbytes(N)
             @test base0 - pending_avail > N - Avro.GUARD_CHUNK - tol   # the guard subtracts pending reservations
+            @test base0 - pending_avail < Avro.bytesbytes(N) + tol
             put!(settle, nothing)
             take!(ready)                               # the holder allocated the block and settled it
             resident_avail = Avro.available_memory()
+            @test (@atomic Avro.GUARD.pending) == pending0
             # settled bytes leave the guard while their pages enter the OS figure: available_memory()
             # does not fall by another N (a leaked pending counter would subtract the storage twice)
             @test pending_avail - resident_avail < tol
