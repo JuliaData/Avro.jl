@@ -1,0 +1,1 @@
+{"name":"test.Weather","type":"record","fields":[{"name":"station","type":"string"},{"name":"pressure","type":"int"}]}

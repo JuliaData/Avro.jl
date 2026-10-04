@@ -1,0 +1,22 @@
+impl=Avro.jl version=1.1.2 julia=1.12.6 threads=1 cpu=Apple M3 Max rows=1000000
+metric=write codec=null best_s=1.1051045 all_s=[1.1051045, 1.338560166, 1.272886375] bytes=22050364
+metric=write codec=zstd best_s=1.0153025 all_s=[1.392034583, 1.0153025, 1.057156375] bytes=3833531
+metric=write codec=deflate best_s=1.434964833 all_s=[1.461554458, 1.536612333, 1.434964833] bytes=5833839
+metric=read_index codec=null best_s=1.48623825 all_s=[1.593502167, 1.84474725, 1.48623825]
+metric=materialize_columns codec=null best_s=3.712629209 all_s=[4.402292333, 3.712629209, 3.841621708]
+metric=read_to_columns codec=null best_s=5.296807 all_s=[5.565824708, 5.590989, 5.296807]
+metric=read_to_columns codec=zstd best_s=5.213614958 all_s=[5.495354833, 5.213614958, 5.330697042]
+metric=single_record_read bytes=1376 allocs=187
+metric=single_record_write bytes=944 allocs=200
+
+# 5 cold processes (§10.1 protocol, 2026-08-24, same host/julia; medians: write=0.945999958 read_to_columns=5.051266584)
+metric=write codec=null best_s=1.1051045 all_s=[1.1051045, 1.338560166, 1.272886375] bytes=22050364
+metric=read_to_columns codec=null best_s=5.296807 all_s=[5.565824708, 5.590989, 5.296807]
+metric=write codec=null best_s=0.945999958 all_s=[0.945999958, 1.118558709, 1.051731459] bytes=22050364
+metric=read_to_columns codec=null best_s=5.042072541 all_s=[5.04952475, 5.042072541, 5.044909792]
+metric=write codec=null best_s=1.203622292 all_s=[1.333107416, 1.296336292, 1.203622292] bytes=22050364
+metric=read_to_columns codec=null best_s=5.109198583 all_s=[5.743161334, 6.10493025, 5.109198583]
+metric=write codec=null best_s=0.926025875 all_s=[0.936610583, 1.023436292, 0.926025875] bytes=22050364
+metric=read_to_columns codec=null best_s=5.051266584 all_s=[5.066904708, 5.051266584, 5.104348041]
+metric=write codec=null best_s=0.937682916 all_s=[1.057313584, 0.937682916, 1.038905709] bytes=22050364
+metric=read_to_columns codec=null best_s=5.032883875 all_s=[5.032883875, 5.433302083, 5.562869666]

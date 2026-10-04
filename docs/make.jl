@@ -1,25 +1,30 @@
-using Avro
-using Documenter
-
-DocMeta.setdocmeta!(Avro, :DocTestSetup, :(using Avro); recursive=true)
+using Documenter, Avro
 
 makedocs(;
     modules=[Avro],
-    authors="Jacob Quinn <quinn.jacobd@gmail.com> and contributors",
-    repo="https://github.com/JuliaData/Avro.jl/blob/{commit}{path}#{line}",
     sitename="Avro.jl",
-    format=Documenter.HTML(;
-        edit_link="main",
-        prettyurls=get(ENV, "CI", "false") == "true",
-        canonical="https://JuliaData.github.io/Avro.jl",
-        assets=String[],
-    ),
+    format=Documenter.HTML(; size_threshold=2_000_000, size_threshold_warn=1_000_000),
+    authors="Jacob Quinn and contributors",
+    checkdocs=:public,
+    warnonly=false,
     pages=[
         "Home" => "index.md",
+        "Manual" => [
+            "manual/schemas.md",
+            "manual/encoding.md",
+            "manual/container.md",
+            "manual/tables.md",
+            "manual/evolution.md",
+            "manual/logicaltypes.md",
+            "manual/singleobject.md",
+            "manual/sortorder.md",
+            "manual/limits-and-security.md",
+            "manual/performance.md",
+        ],
+        "Migration from 1.x" => "migration.md",
+        "Benchmarks" => "benchmarks.md",
+        "Reference" => "reference.md",
     ],
 )
 
-deploydocs(;
-    repo="github.com/JuliaData/Avro.jl",
-    devbranch = "main",
-)
+deploydocs(; repo="github.com/JuliaData/Avro.jl", devbranch="main", push_preview=true)

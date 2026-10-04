@@ -1,0 +1,6 @@
+{
+ "type": "record",
+ "name": "Empty",
+ "namespace": "avro.jl.test",
+ "fields": []
+}
