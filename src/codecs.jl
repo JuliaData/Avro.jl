@@ -256,7 +256,7 @@ end
 
 The owned decompressed bytes of one block payload: every member decoded with its reported decoder
 requirement checked against `max_codec_memory` and reserved, members counted, the payload exactly
-exhausted, and the output bounded by `max_block_bytes`.
+exhausted (except bytes after a final deflate block), and the output bounded by `max_block_bytes`.
 """
 function decompressblock(name::Symbol, ::NullCodec, payload::AbstractVector{UInt8}, limits::Limits, budget::Budget)
     checkpoint = budgetcheckpoint(budget)
@@ -278,10 +278,10 @@ function decompressblock(name::Symbol, ::DeflateReader, payload::AbstractVector{
     try
         reserve!(budget, DEFLATE_DECODER_BYTES)        # settled inside transcodemember! once initialize runs
         out = initialoutput(budget, length(payload), limits.max_block_bytes)
-        consumed, out, outlen = transcodemember!(:deflate, DeflateDecompressor(), payload, 1, length(payload), out, 0, limits.max_block_bytes, budget, DEFLATE_DECODER_BYTES)
+        # Bytes after the final deflate block are ignored, as Java and Python readers do: the Apache
+        # Python writer and fastavro 1.13.1 and earlier leave 3 bytes of the zlib checksum there.
+        _, out, outlen = transcodemember!(:deflate, DeflateDecompressor(), payload, 1, length(payload), out, 0, limits.max_block_bytes, budget, DEFLATE_DECODER_BYTES)
         release!(budget, DEFLATE_DECODER_BYTES)
-        trailing = length(payload) - consumed
-        trailing == 0 || throw(CodecError(:deflate, :decompress, "$trailing bytes after the final deflate block"))
         addinput!(budget, outlen)
         addmembers!(budget)
         return shrinkexact(budget, out, outlen)

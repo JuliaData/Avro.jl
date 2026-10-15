@@ -292,26 +292,24 @@ import Logging
         end
 
         datafiles = avrofiles(datadir)
-        rejected = filter(f -> endswith(f, "-fastavro-deflate.avro"), datafiles)
         rootfiles = avrofiles(rootsdir)
         legacyfiles = avrofiles(legacydir)
         highwindowfiles = avrofiles(highwindowdir)
         overlimit = filter(f -> occursin("1g.avro", basename(f)), highwindowfiles)
         highwindowcontrols = setdiff(highwindowfiles, overlimit)
         apachefiles = avrofiles(apache)
-        recordfiles = sort!(vcat(setdiff(datafiles, rejected), apachefiles, legacyfiles, highwindowcontrols))
+        recordfiles = sort!(vcat(datafiles, apachefiles, legacyfiles, highwindowcontrols))
         allfiles = avrofiles(fixtureroot)
 
         # Plan §8.1/§8.2 defines this exact corpus. Projection applies only to generic record
         # roots; the two deliberate high-window bombs are excluded from default decoding by §4.4.
         @test length(datafiles) == 72
-        @test length(rejected) == 6
         @test length(rootfiles) == 156
         @test length(legacyfiles) == 5
         @test length(apachefiles) == 8
         @test length(highwindowcontrols) == 2 && length(overlimit) == 2
-        @test length(recordfiles) == 81
-        @test allfiles == sort!(vcat(recordfiles, rejected, rootfiles, overlimit))
+        @test length(recordfiles) == 87
+        @test allfiles == sort!(vcat(recordfiles, rootfiles, overlimit))
         @test sort([replace(relpath(f, apache), '\\' => '/') for f in apachefiles]) == [
             "schemas/simple/data.avro", "schemas/withUnion/data.avro", "syncInMeta.avro",
             "weather-deflate.avro", "weather-snappy.avro", "weather-sorted.avro",
@@ -404,40 +402,6 @@ import Logging
                 @test Avro.json(Avro.schema(roundtrip)) == Avro.json(Avro.schema(projected))
                 @test length(roundtrip) == length(projected)
                 @test isequal(Tables.columntable(roundtrip), Tables.columntable(projected))
-            end
-        end
-
-        # These files are record roots, but their documented codec verdict prevents a projection.
-        # Exercise every selection/mode/task combination so the exclusion cannot hide a success or
-        # change the accepted language.
-        for data in rejected
-            r = Avro.Reader(data; limits=raised)
-            s = Avro.writerschema(r)
-            close(r)
-            @test s isa Avro.RecordSchema
-            names = Symbol[Symbol(f.name) for f in s.fields]
-            for sel in corpusselections(names), val in (:strict, :fast)
-                for nt in (1, 2, 8)
-                    err = try
-                        Avro.Table(data; select=Tuple(sel), validate=val, ntasks=nt, limits=raised)
-                        nothing
-                    catch e
-                        e
-                    end
-                    @test err isa Avro.CodecError
-                    err isa Avro.CodecError && @test occursin("bytes after the final deflate block", err.msg)
-                end
-                rl = Avro.Rows(data; select=Tuple(sel), validate=val, limits=raised)
-                err = try
-                    collect(rl)
-                    nothing
-                catch e
-                    e
-                finally
-                    close(rl)
-                end
-                @test err isa Avro.CodecError
-                err isa Avro.CodecError && @test occursin("bytes after the final deflate block", err.msg)
             end
         end
 

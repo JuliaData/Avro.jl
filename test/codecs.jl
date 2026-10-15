@@ -143,12 +143,13 @@ end
         @test e isa Avro.CodecError && occursin("decoder memory", e.msg)          # ≈ 17 MB estimate > 16 MiB cap
         @test codecdec(:zstandard, big24) == zeros(UInt8, 1 << 20)                # the 32 MiB default admits it
     end
-    @testset "deflate and snappy strictness" begin
+    @testset "deflate trailing bytes and snappy strictness" begin
         w = Avro.writercodec(:deflate, nothing, L)
         block = Avro.compressblock(w, data)
-        @test_throws Avro.CodecError codecdec(:deflate, vcat(block, UInt8[0x01]))
-        @test_throws Avro.CodecError codecdec(:deflate, vcat(block, UInt8[0x01, 0x02, 0x03]))
-        @test_throws Avro.CodecError codecdec(:deflate, vcat(block, UInt8[0x01, 0x02, 0x03, 0x04]))
+        # Python writers leave part of the zlib checksum after the final block; readers ignore it.
+        @test codecdec(:deflate, vcat(block, UInt8[0x01])) == data
+        @test codecdec(:deflate, vcat(block, UInt8[0x01, 0x02, 0x03])) == data
+        @test codecdec(:deflate, vcat(block, UInt8[0x01, 0x02, 0x03, 0x04])) == data
         @test_throws Avro.CodecError codecdec(:deflate, block[1:end - 1])
         sn = Avro.writercodec(:snappy, nothing, L)
         sb = Avro.compressblock(sn, data)

@@ -237,17 +237,6 @@ end
         @test length(cases) > 150
         checked = 0
         for (file, base) in cases
-            if endswith(basename(file), "-fastavro-deflate.avro")
-                err = try
-                    Avro.Reader(r -> collect(Avro.eachdatum(r)), file)
-                    nothing
-                catch e
-                    e
-                end
-                @test err isa Avro.CodecError && occursin("bytes after the final deflate block", err.msg)
-                checked += 1
-                continue
-            end
             dir = dirname(file)
             jsonl = joinpath(dir, base * ".jsonl")
             isfile(jsonl) || (jsonl = joinpath(dirname(dir), "data", base * ".jsonl"))
@@ -1397,8 +1386,12 @@ end
                 return vcat(payload, suffix)
             end
             badreport = Avro.inspect(bad)
-            @test !isempty(badreport.issues)
-            @test any(issue -> occursin(String(inspectedcodec), issue), badreport.issues)
+            if inspectedcodec === :deflate                  # bytes after the final deflate block are ignored
+                @test isempty(badreport.issues)
+            else
+                @test !isempty(badreport.issues)
+                @test any(issue -> occursin(String(inspectedcodec), issue), badreport.issues)
+            end
         end
         legrep = Avro.inspect(joinpath(gen, "legacy1x", "avrojl112-zstd.avro"))
         @test any(occursin("zstd", i) for i in legrep.issues)
