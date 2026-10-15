@@ -575,26 +575,88 @@ function budgetedinsert!(d::FrozenDict{K,V}, k, v, budget::Union{Nothing,Budget}
         moved = checked_add(moved, checked_mul(n, checked_add(slotbytes(K), slotbytes(V))))
     end
     budget === nothing || addcompare!(budget, moved)   # all fallible work precedes allocation or mutation
-    if length(d.keys) == d.cap
-        newcap = max(2 * d.cap, 4)
-        growth = vectorbytes(K, newcap) + vectorbytes(V, newcap)
-        budget === nothing || reserve!(budget, growth)
-        nk = Vector{K}(undef, newcap)
-        nv = Vector{V}(undef, newcap)
-        budget === nothing || allocated!(budget, growth)
-        resize!(nk, length(d.keys))
-        resize!(nv, length(d.vals))
-        copyto!(nk, 1, d.keys, 1, length(d.keys))
-        copyto!(nv, 1, d.vals, 1, length(d.vals))
-        oldbytes = vectorbytes(K, d.cap) + vectorbytes(V, d.cap)
-        d.keys = nk                                    # the old storage is unreachable only after the rebind
-        d.vals = nv
-        d.cap = newcap
-        budget === nothing || release!(budget, oldbytes)
-    end
+    length(d.keys) == d.cap && growdict!(d, budget)
     insert!(d.keys, i, convert(K, k))
     insert!(d.vals, i, convert(V, v))
     return d
+end
+
+function growdict!(d::FrozenDict{K,V}, budget::Union{Nothing,Budget}) where {K,V}
+    newcap = max(2 * d.cap, 4)
+    growth = vectorbytes(K, newcap) + vectorbytes(V, newcap)
+    budget === nothing || reserve!(budget, growth)
+    nk = Vector{K}(undef, newcap)
+    nv = Vector{V}(undef, newcap)
+    budget === nothing || allocated!(budget, growth)
+    resize!(nk, length(d.keys))
+    resize!(nv, length(d.vals))
+    copyto!(nk, 1, d.keys, 1, length(d.keys))
+    copyto!(nv, 1, d.vals, 1, length(d.vals))
+    oldbytes = vectorbytes(K, d.cap) + vectorbytes(V, d.cap)
+    d.keys = nk                                        # the old storage is unreachable only after the rebind
+    d.vals = nv
+    d.cap = newcap
+    budget === nothing || release!(budget, oldbytes)
+    return d
+end
+
+"Append without ordering; `budgetedsort!` orders the complete dictionary once (sorted inserts move O(n²) entries)."
+function budgetedappend!(d::FrozenDict{K,V}, k, v, budget::Union{Nothing,Budget}) where {K,V}
+    d.frozen && throw(FrozenError("dict"))
+    if length(d.keys) == d.cap
+        budget === nothing || addcompare!(budget, checked_mul(length(d.keys), checked_add(slotbytes(K), slotbytes(V))))
+        growdict!(d, budget)
+    end
+    push!(d.keys, convert(K, k))
+    push!(d.vals, convert(V, v))
+    return d
+end
+
+"""
+    budgetedsort!(d::FrozenDict, budget) -> Int
+
+Sort the entries appended with `budgetedappend!` by key, with one charged stable merge sort. Returns 0,
+or the append position of the first key that repeats an earlier key (`d` then stays unsorted).
+"""
+function budgetedsort!(d::FrozenDict{K,V}, budget::Union{Nothing,Budget}) where {K,V}
+    d.frozen && throw(FrozenError("dict"))
+    n = length(d.keys)
+    n < 2 && return 0
+    scratch = vectorbytes(Int32, n) + vectorbytes(Int32, cld(n, 2))
+    budget === nothing || reserve!(budget, scratch)
+    perm = Vector{Int32}(undef, n)
+    tmp = Vector{Int32}(undef, cld(n, 2))
+    budget === nothing || allocated!(budget, scratch)
+    try
+        mergesort!(perm, tmp, d.keys, budget)
+        dup = 0
+        for i in 2:n
+            keyequal(d.keys[perm[i]], d.keys[perm[i - 1]], budget) || continue
+            dup = dup == 0 ? Int(perm[i]) : min(dup, Int(perm[i]))   # stable: perm[i] is the later one
+        end
+        dup == 0 || return dup
+        budget === nothing || addcompare!(budget, checked_mul(n, checked_add(slotbytes(K), slotbytes(V))))
+        for start in 1:n                               # apply the permutation in place, one cycle at a time
+            perm[start] > 0 || continue
+            key, val = d.keys[start], d.vals[start]
+            i = start
+            while true
+                j = Int(perm[i])
+                perm[i] = -perm[i]                     # negative marks a placed entry
+                if j == start
+                    d.keys[i] = key
+                    d.vals[i] = val
+                    break
+                end
+                d.keys[i] = d.keys[j]
+                d.vals[i] = d.vals[j]
+                i = j
+            end
+        end
+        return 0
+    finally
+        budget === nothing || release!(budget, scratch)
+    end
 end
 
 function budgetedsearchsortedfirst(keys::Vector, key, budget::Union{Nothing,Budget})

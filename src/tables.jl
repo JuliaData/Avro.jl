@@ -130,8 +130,9 @@ function projectschema(s::RecordSchema, sel::Vector{Int}, limits::Limits,
                 f = s.fields[i]
                 field = copyfield(f, deepcopyschema(f.schema, memo), budget, 3)
                 budgetedpush!(fields, field, budget)
-                budgetedinsert!(index, field.name, k, budget)
+                budgetedappend!(index, field.name, k, budget)
             end
+            budgetedsort!(index, budget)               # select= names are distinct
             freeze!(fields)
             freeze!(index)
             return finalizepublic!(out, limits, 0, 0)

@@ -259,18 +259,18 @@ function mapvaluebytes(::Type{V}, @nospecialize(value), ownvalues::Bool) where {
     return 0
 end
 
-function keyequal(a::String, b::String, budget::Union{Nothing,Budget})
-    budget === nothing || addcompare!(budget, min(sizeof(a), sizeof(b)) + 1)
-    return a == b
+function keyequal(a, b, budget::Union{Nothing,Budget})
+    budget === nothing || addcompare!(budget, keycomparisonwork(a, b))
+    return keymatches(a, b)
 end
 
 """
     mergesort!(perm, scratch, keys, budget=nothing)
 
-Stable merge sort of `perm` by `keys[perm[i]]` (byte order) using `scratch` of length `cld(n, 2)`;
+Stable merge sort of `perm` by `keys[perm[i]]` (`isless`; strings in byte order) using `scratch` of length `cld(n, 2)`;
 initialises `perm` and charges every key comparison and four-byte permutation move before doing it.
 """
-function mergesort!(perm::Vector{Int32}, scratch::Vector{Int32}, keys::Vector{String},
+function mergesort!(perm::Vector{Int32}, scratch::Vector{Int32}, keys::Vector,
                     budget::Union{Nothing,Budget}=nothing)
     for i in eachindex(perm)
         budget === nothing || addcompare!(budget, 4)
@@ -280,8 +280,8 @@ function mergesort!(perm::Vector{Int32}, scratch::Vector{Int32}, keys::Vector{St
     return nothing
 end
 
-function keyless(a::String, b::String, budget::Union{Nothing,Budget})
-    budget === nothing || addcompare!(budget, min(sizeof(a), sizeof(b)) + 1)
+function keyless(a, b, budget::Union{Nothing,Budget})
+    budget === nothing || addcompare!(budget, keycomparisonwork(a, b))
     return isless(a, b)
 end
 
@@ -290,7 +290,7 @@ function addpermutationmoves!(budget::Union{Nothing,Budget}, n::Int)
     return nothing
 end
 
-function msort!(v::Vector{Int32}, lo::Int, hi::Int, t::Vector{Int32}, keys::Vector{String}, budget)
+function msort!(v::Vector{Int32}, lo::Int, hi::Int, t::Vector{Int32}, keys::Vector, budget)
     if hi - lo < 16
         for i in lo + 1:hi
             x = v[i]

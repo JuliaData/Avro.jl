@@ -815,11 +815,17 @@ function parseunion(ctx::ParseContext, arr::JSONArray, enclosing::String, buf)
                 b isa JSONArray && schemaerror(ctx, "unions may not immediately contain other unions")
                 s = parsenode(ctx, b, enclosing, buf)
                 s isa UnionSchema && schemaerror(ctx, "unions may not immediately contain other unions")
-                ident = branchidentity(s)
-                budgetedhaskey(seen, ident, ctx.budget) &&
-                    schemaerror(ctx, "duplicate union branch $(branchidentitylabel(s))")
-                budgetedinsert!(seen, ident, i, ctx.budget)
+                budgetedappend!(seen, branchidentity(s), i, ctx.budget)
                 push!(branches, s)
+            finally
+                popparsepath!(ctx)
+            end
+        end
+        dup = budgetedsort!(seen, ctx.budget)
+        if dup != 0
+            pushparseindex!(ctx, dup - 1)
+            try
+                schemaerror(ctx, "duplicate union branch $(branchidentitylabel(branches[dup]))")
             finally
                 popparsepath!(ctx)
             end
@@ -964,11 +970,11 @@ function parseenum(ctx::ParseContext, obj::JSONObject, enclosing::String, buf)
     allocated!(ctx.budget, indexbytes)
     for (i, sym) in enumerate(syms)
         checkname(ctx, sym, "enum symbol", "symbols", i - 1)
-        budgetedhaskey(index, sym, ctx.budget) &&
-            schemaerror(ctx, "duplicate enum symbol \"$(escapename(sym))\"", "symbols", i - 1)
         retain!(ctx.budget, sizeof(sym) + 32)      # the symbol string the schema keeps alive
-        budgetedinsert!(index, sym, i, ctx.budget)
+        budgetedappend!(index, sym, i, ctx.budget)
     end
+    dup = budgetedsort!(index, ctx.budget)
+    dup == 0 || schemaerror(ctx, "duplicate enum symbol \"$(escapename(syms[dup]))\"", "symbols", dup - 1)
     doc = stringattr(ctx, obj, "doc")
     default = nodefault
     if haskey(obj, "default")
@@ -1070,24 +1076,22 @@ function parserecord(ctx::ParseContext, obj::JSONObject, enclosing::String, buf,
             try
                 f isa JSONObject || schemaerror(ctx, "each field must be a JSON object")
                 field = parsefield(ctx, f, ns, buf)
-                budgetedhaskey(fieldindex, field.name, ctx.budget) &&
-                    schemaerror(ctx, "duplicate field name \"$(escapename(field.name))\"", "name")
-                budgetedhaskey(aliasowners, field.name, ctx.budget) &&
-                    schemaerror(ctx, "field name \"$(escapename(field.name))\" collides with an earlier field alias", "name")
-                for alias in field.aliases
-                    budgetedhaskey(fieldindex, alias, ctx.budget) &&
-                        schemaerror(ctx, "field alias \"$(escapename(alias))\" collides with a field name", "aliases")
-                    budgetedhaskey(aliasowners, alias, ctx.budget) &&
-                        schemaerror(ctx, "field alias \"$(escapename(alias))\" is declared by two fields", "aliases")
-                    budgetedinsert!(aliasowners, alias, i, ctx.budget)
-                end
                 retain!(ctx.budget, sizeof(field.name) + 96)   # the field name, Field shell and index entry kept alive
                 push!(fields, field)
-                budgetedinsert!(fieldindex, field.name, i, ctx.budget)
+                budgetedappend!(fieldindex, field.name, i, ctx.budget)
             finally
                 popparsepath!(ctx)
                 popparsepath!(ctx)
             end
+        end
+        dup = budgetedsort!(fieldindex, ctx.budget)
+        dup == 0 || fielderror(ctx, dup, "duplicate field name \"$(escapename(fields[dup].name))\"", "name")
+        for (i, field) in enumerate(fields), alias in field.aliases
+            budgetedhaskey(fieldindex, alias, ctx.budget) &&
+                fielderror(ctx, i, "field alias \"$(escapename(alias))\" collides with a field name", "aliases")
+            budgetedhaskey(aliasowners, alias, ctx.budget) &&
+                fielderror(ctx, i, "field alias \"$(escapename(alias))\" is declared by two fields", "aliases")
+            budgetedinsert!(aliasowners, alias, i, ctx.budget)
         end
     finally
         release!(ctx.budget, frozendictbytes(aliasowners))
@@ -1096,6 +1100,17 @@ function parserecord(ctx::ParseContext, obj::JSONObject, enclosing::String, buf,
     freeze!(fieldindex)
     pop!(ctx.pending)
     return rec
+end
+
+function fielderror(ctx::ParseContext, i::Int, msg::AbstractString, key::String)
+    pushparsekey!(ctx, "fields")
+    pushparseindex!(ctx, i - 1)
+    try
+        schemaerror(ctx, msg, key)
+    finally
+        popparsepath!(ctx)
+        popparsepath!(ctx)
+    end
 end
 
 function parsefield(ctx::ParseContext, obj::JSONObject, ns::String, buf)
@@ -2994,6 +3009,7 @@ function EnumSchema(name::AbstractString, symbols; namespace::AbstractString="",
             symsbuf.len < limits.max_enum_symbols || throw(LimitError(:max_enum_symbols, symsbuf.len + 1, limits.max_enum_symbols, :max_enum_symbols, :encode))
             checkgraphnamebytes(x, limits, b.direction)
             sym = ownedstringcopy(x, b)
+            addinput!(b, sizeof(sym))                  # the caller's symbols are this construction's input text
             push!(symsbuf, b, sym)
         end
         syms = finishbuild!(symsbuf, b)
@@ -3003,9 +3019,10 @@ function EnumSchema(name::AbstractString, symbols; namespace::AbstractString="",
         allocated!(b, idxbytes)
         for (i, sym) in enumerate(syms)
             checkpublicname(sym, "enum symbol")
-            budgetedhaskey(index, sym, b) && throw(ArgumentError("duplicate enum symbol \"$sym\""))
-            budgetedinsert!(index, sym, i, b)
+            budgetedappend!(index, sym, i, b)
         end
+        dup = budgetedsort!(index, b)
+        dup == 0 || throw(ArgumentError("duplicate enum symbol \"$(syms[dup])\""))
         d = nodefault
         if !(default isa NoDefault)
             default isa AbstractString ||
@@ -3072,13 +3089,12 @@ function UnionSchema(branches; limits::Limits=Limits())
                                          :max_union_branches, :encode))
                     branch isa Schema || throw(ArgumentError("union branches must be schemas"))
                     branch isa UnionSchema && throw(ArgumentError("unions may not immediately contain other unions"))
-                    ident = branchidentity(branch)
-                    budgetedhaskey(seen, ident, b) &&
-                        throw(ArgumentError("duplicate union branch $(branchidentitylabel(branch))"))
-                    budgetedinsert!(seen, ident, bs.len + 1, b)
+                    budgetedappend!(seen, branchidentity(branch), bs.len + 1, b)
                     push!(bs, b, importchild(branch))
                 end
             end
+            dup = budgetedsort!(seen, b)
+            dup == 0 || throw(ArgumentError("duplicate union branch $(branchidentitylabel(bs.data[dup]))"))
         finally
             release!(b, frozendictbytes(seen))
         end
@@ -3180,12 +3196,12 @@ function recordschema_(f, name::AbstractString; namespace::AbstractString="", al
         length(fs) <= limits.max_fields || throw(LimitError(:max_fields, length(fs), limits.max_fields, :max_fields, :encode))
         for (i, fld) in enumerate(fs)
             fld isa Field || throw(ArgumentError("fields must be Avro.Field values"))
-            budgetedhaskey(index, fld.name, b) &&
-                throw(ArgumentError("duplicate field name \"$(fld.name)\""))
             field = copyfield(fld, importchild(fld.schema), b, 3)
             budgetedpush!(fields, field, b)
-            budgetedinsert!(index, field.name, i, b)
+            budgetedappend!(index, field.name, i, b)
         end
+        dup = budgetedsort!(index, b)
+        dup == 0 || throw(ArgumentError("duplicate field name \"$(fields[dup].name)\""))
     end
     reserve!(b, frozendictshell())
     aliasowners = FrozenDict{String,Int}()

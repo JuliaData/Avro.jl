@@ -419,6 +419,7 @@ function checkderivedname(ctx::DeriveContext, name, what::String, remedy::String
                          :max_name_bytes, ctx.budget.direction))
     copy = owned ? name::String : ownedstringcopy(name, ctx.budget)
     isvalidname(copy) || nameerror(what, remedy)
+    addinput!(ctx.budget, sizeof(copy))           # derived names are this operation's input text
     return copy
 end
 
@@ -621,13 +622,13 @@ function deriveenum(ctx::DeriveContext, ::Type{E}, name, namespace) where {E<:Ba
         raw = customsymbols ? avrosymbol(E, inst) : Symbol(inst)
         sym = checkderivedname(ctx, raw, "enum symbol",
                                "override `Avro.avrosymbol` for this enum")
-        budgetedhaskey(index, sym, ctx.budget) &&
-            throw(ArgumentError(typediagnostic(
-                ctx.budget, "enum ", E, " derives the symbol ",
-                boundedquoted(sym), " twice")))
         push!(syms, sym)
-        budgetedinsert!(index, sym, i, ctx.budget)
+        budgetedappend!(index, sym, i, ctx.budget)
     end
+    dup = budgetedsort!(index, ctx.budget)
+    dup == 0 || throw(ArgumentError(typediagnostic(
+        ctx.budget, "enum ", E, " derives the symbol ",
+        boundedquoted(syms[dup]), " twice")))
     reserve!(ctx.budget, 24)
     symbols = freeze!(FrozenVector{String}(syms, false))
     allocated!(ctx.budget, 24)
@@ -710,8 +711,9 @@ function derivenamedtuple(ctx::DeriveContext, ::Type{T}, name, namespace) where 
                       EMPTY_PROPS)
         allocated!(ctx.budget, 128)
         budgetedpush!(fields, field, ctx.budget)
-        budgetedinsert!(index, fn, i, ctx.budget)
+        budgetedappend!(index, fn, i, ctx.budget)
     end
+    budgetedsort!(index, ctx.budget)                   # NamedTuple names are distinct
     freeze!(fields)
     freeze!(index)
     return rec
@@ -750,10 +752,6 @@ function derivestruct(ctx::DeriveContext, ::Type{T}, name, namespace) where {T}
         rawname = tagged === nothing ? fname : tagged
         fn = checkderivedname(ctx, rawname, "field name",
                               "tag the field with `&(avro=(name=\"…\",),)`")
-        budgetedhaskey(index, fn, ctx.budget) &&
-            throw(ArgumentError(typediagnostic(
-                ctx.budget, "struct ", T, " derives the field name ",
-                boundedquoted(fn), " twice")))
         fs = derive(ctx, ftype, nothing, full.namespace)
         d = nodefault
         tagdefault = fieldtag(tags, fname, :default)
@@ -791,8 +789,12 @@ function derivestruct(ctx::DeriveContext, ::Type{T}, name, namespace) where {T}
                       EMPTY_PROPS)
         allocated!(ctx.budget, 128)
         budgetedpush!(fields, field, ctx.budget)
-        budgetedinsert!(index, fn, i, ctx.budget)
+        budgetedappend!(index, fn, i, ctx.budget)
     end
+    dup = budgetedsort!(index, ctx.budget)
+    dup == 0 || throw(ArgumentError(typediagnostic(
+        ctx.budget, "struct ", T, " derives the field name ",
+        boundedquoted(fields[dup].name), " twice")))
     freeze!(fields)
     freeze!(index)
     return rec
@@ -826,16 +828,16 @@ function schema(ts::Tables.Schema; name::AbstractString="Record", namespace::Abs
                     rawname = renamed === nothing ? col : renamed
                     fn = checkderivedname(ctx, rawname, "column name",
                                           "rename it with `names=Dict(:$col => \"…\")`")
-                    budgetedhaskey(index, fn, budget) &&
-                        throw(ArgumentError("column name \"$fn\" derived twice"))
                     fs = derive(ctx, ct, nothing, full.namespace)
                     reserve!(budget, 128)
                     field = Field(fn, fs, nothing, nodefault, :ascending,
                                   EMPTY_STRING_LIST, EMPTY_PROPS)
                     allocated!(budget, 128)
                     budgetedpush!(fields, field, budget)
-                    budgetedinsert!(index, fn, i, budget)
+                    budgetedappend!(index, fn, i, budget)
                 end
+                dup = budgetedsort!(index, budget)
+                dup == 0 || throw(ArgumentError("column name \"$(fields[dup].name)\" derived twice"))
                 freeze!(fields)
                 freeze!(index)
                 return rec

@@ -445,6 +445,31 @@
         @test P(SubString("\"float\" ", 1, 7)) isa Avro.FloatSchema
     end
 
+    @testset "wide schemas fit the default work rule" begin
+        # Name indexes are sorted once; inserting names one at a time in arrival order was quadratic and
+        # failed max_compare_bytes_per_byte for a few hundred unsorted names.
+        names = ["x$i" for i in 5000:-1:1]
+        rec = P("{\"type\":\"record\",\"name\":\"W\",\"fields\":[" *
+                join(("{\"name\":\"$n\",\"type\":\"long\"}" for n in names), ",") * "]}")
+        @test length(rec.fields) == 5000 && rec.fieldindex["x1"] == 5000 && rec.fieldindex["x5000"] == 1
+        @test P("{\"type\":\"enum\",\"name\":\"E\",\"symbols\":[" *
+                join(("\"S$i\"" for i in 1000:-1:1), ",") * "]}").symbolindex["S1"] == 1000
+        @test length(P("[" * join(("{\"type\":\"record\",\"name\":\"U$i\",\"fields\":[]}" for i in 100:-1:1), ",") * "]").branches) == 100
+        @test Avro.RecordSchema("C"; fields=[Avro.Field(n, Avro.LongSchema()) for n in names]).fieldindex["x1"] == 5000
+        @test Avro.EnumSchema("E", ["S$i" for i in 1000:-1:1]).symbolindex["S1"] == 1000
+        @test Avro.schema(Tables.Schema(Symbol.(names), fill(Int64, 5000))).fieldindex["x1"] == 5000
+        # duplicates are still reported at their second occurrence
+        dup(json) = try P(json); "" catch e; sprint(showerror, e) end
+        @test occursin("duplicate field name \"b\" (at \$.fields[2].name)",
+                       dup("""{"type":"record","name":"D","fields":[{"name":"b","type":"int"},{"name":"a","type":"int"},{"name":"b","type":"int"}]}"""))
+        @test occursin("duplicate enum symbol \"B\" (at \$.symbols[2])", dup("""{"type":"enum","name":"E","symbols":["B","A","B"]}"""))
+        @test occursin("duplicate union branch int (at \$[2])", dup("""["int",{"type":"record","name":"R","fields":[]},"int"]"""))
+        @test occursin("field alias \"g\" collides with a field name (at \$.fields[0].aliases)",
+                       dup("""{"type":"record","name":"R","fields":[{"name":"f","type":"int","aliases":["g"]},{"name":"g","type":"int"}]}"""))
+        @test_throws ArgumentError Avro.RecordSchema("C"; fields=[Avro.Field("a", Avro.IntSchema()), Avro.Field("a", Avro.IntSchema())])
+        @test_throws ArgumentError Avro.schema(Tables.Schema([:a, :b, :a], [Int, Int, Int]))
+    end
+
     @testset "immutability, identity, equality and hashing on cycles" begin
         s = P("""{"type":"record","name":"N","fields":[{"name":"next","type":["null","N"]},{"name":"p","type":"int","k":[1,{"a":2}]}]}""")
         @test_throws Avro.FrozenError push!(s.fields, s.fields[1])

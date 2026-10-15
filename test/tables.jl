@@ -282,6 +282,16 @@ import DataAPI
         close(rl)
         @test got == [Avro.Decimal(12345, 2), Avro.Decimal(-123, 2)]
     end
+    @testset "wide tables under default limits" begin
+        header = [Symbol("x", i) for i in 1:2000]                  # x1, x2, … is not byte order
+        src = Tables.table(reshape(collect(1:4000), 2, 2000); header=header)
+        t = Avro.Table(Avro.tobuffer(src))
+        @test Tables.columnnames(t) == header && Tables.getcolumn(t, :x1999) == [3997, 3998]
+        sel = Tuple(reverse(header[1001:2000]))
+        p = Avro.Table(Avro.tobuffer(src); select=sel)
+        @test collect(Tables.columnnames(p)) == collect(sel) && Tables.getcolumn(p, :x2000) == [3999, 4000]
+    end
+
     @testset "zero rows, zero columns, empty records" begin
         e0 = Avro.tobuffer(rows[1:0]; schema=s)
         t0 = Avro.Table(e0)
