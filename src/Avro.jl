@@ -4,8 +4,6 @@
 A production-grade implementation of the Apache Avro data format (schemas, binary and JSON encodings,
 schema resolution, single-object encoding, object container files) for Julia, with Tables.jl
 integration. The API is fully qualified: nothing is exported.
-
-See `AVRO_REWRITE_PLAN.md` for the design and `STATUS.md` for the implementation status.
 """
 module Avro
 

@@ -2,7 +2,7 @@
 
 Recorded on the authoring host (Apple silicon, macOS, Julia 1.12.6, 2026-08-23); reproduce with
 `AVRO_PERF=true` in the test suite (`test/perf.jl`: the §10.1 protocol, medians of 5 cold processes). Baselines are Avro.jl 1.1.2 on the same host under the same §10.1 protocol (medians of 5 cold
-processes, deterministic 1 M-row `{id, x, name, flag}` data; `benchmarks/logs/avro112.log`).
+processes, deterministic 1 M-row `{id, x, name, flag}` data).
 
 | Operation | Avro.jl 2.0 | Avro.jl 1.1.2 | ratio |
 |---|---|---|---|

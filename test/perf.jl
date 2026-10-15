@@ -7,8 +7,8 @@
 
 @testset "Performance gates (plan §10.1/§10.2)" begin
     BASE_WRITE_112 = 0.9460       # Avro 1.1.2 writetable, §10.1 protocol: median of 5 cold processes,
-    BASE_READMAT_112 = 5.0513     # each best-of-3, deterministic {id,x,name,flag} data — recorded with
-                                  # the full lines in benchmarks/logs/avro112.log (2026-08-24)
+    BASE_READMAT_112 = 5.0513     # each best-of-3, deterministic {id,x,name,flag} data — recorded on
+                                  # an Apple M3 Max with Julia 1.12.6 (2026-08-24)
     cold = joinpath(@__DIR__, "perf", "cold.jl")
     project = Base.active_project()
     # Pkg.test forces --check-bounds=yes on this process and Base.julia_cmd() reproduces it; the
