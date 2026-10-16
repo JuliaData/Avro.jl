@@ -773,10 +773,17 @@ end
         zero_with_payload = vcat(header, varint(0), varint(1), UInt8[0x00], sync)
         @test_throws Avro.DataError Avro.Reader(r -> collect(Avro.eachblock(r)), zero_with_payload)
         @test_throws Avro.DataError readall(zero_with_payload)
+        # every reader and validation mode rejects a block holding more datums than it declares
+        twoofthree = vcat(header, varint(2), varint(3), UInt8[0x02, 0x04, 0x06], sync)
+        for v in (:strict, :fast)
+            @test_throws Avro.DataError readall(zero_with_payload; validate=v)
+            @test_throws Avro.DataError readall(twoofthree; validate=v)
+            @test_throws Avro.DataError Avro.Rows(collect, twoofthree; validate=v)
+            @test_throws Avro.DataError Avro.Table(twoofthree; validate=v)
+        end
         zerorows = Avro.Rows(zero_with_payload)
         @test_throws Avro.DataError collect(zerorows)
         close(zerorows)
-        @test readall(zero_with_payload; validate=:fast) == []
         trailing = vcat(header, varint(1), varint(length(Avro.encode(P("{\"type\":\"record\",\"name\":\"Record\",\"fields\":[{\"name\":\"x\",\"type\":\"long\"}]}"), (x=Int64(7),))) + 1),
                         Avro.encode(P("{\"type\":\"record\",\"name\":\"Record\",\"fields\":[{\"name\":\"x\",\"type\":\"long\"}]}"), (x=Int64(7),)), UInt8[0x00], sync)
         lv = @test_logs (:warn, r"legacy") match_mode=:any Avro.Reader(r -> collect(Avro.eachdatum(r)), trailing; legacy=:avrojl1)

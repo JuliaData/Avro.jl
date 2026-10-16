@@ -545,8 +545,7 @@ function nextblock!(r::Reader; walk::Bool=true)
             out
         end
         n = Int(count)
-        r.validate === :strict && r.legacy === :avrojl1 &&
-            (bytes = exactlegacyblock(bytes, n, r))
+        r.legacy === :avrojl1 && (bytes = exactlegacyblock(bytes, n, r))
         checkblocklower!(r.budget, work, n, spanvalues(r.span))
         if walk
             d = setblockscope!(Decoder(bytes, r.budget; validate=r.validate), work)
@@ -656,7 +655,7 @@ function Base.iterate(it::EachDatum, ::Nothing=nothing)
         it.decoder = setblockscope!(Decoder(it.bytes, b; validate=it.reader.validate),
                                     it.blockwork::BlockWork)
         if it.remaining == 0
-            validateemptyblock(it.bytes, it.reader.validate)
+            validateemptyblock(it.bytes)
             finishblockwork!(b, it.blockwork::BlockWork)
             it.blockwork = nothing
             releaseblock!(it, b)
@@ -680,9 +679,8 @@ function Base.iterate(it::EachDatum, ::Nothing=nothing)
         throw(LimitError(:max_block_output_bytes, it.blockout, b.limits.max_block_output_bytes, :max_block_output_bytes, :decode))
     if it.remaining == 0
         d = it.decoder::Decoder{Vector{UInt8}}
-        if d.pos != length(it.bytes) + 1 && it.reader.validate === :strict
+        d.pos == length(it.bytes) + 1 ||
             throw(DataError("block datums did not consume the block exactly", d.pos))
-        end
         finishblockwork!(b, it.blockwork::BlockWork)
         it.blockwork = nothing
         releaseblock!(it, b)
@@ -690,9 +688,8 @@ function Base.iterate(it::EachDatum, ::Nothing=nothing)
     return (v, nothing)
 end
 
-function validateemptyblock(bytes::Vector{UInt8}, validate::Symbol)
-    validate === :strict && !isempty(bytes) &&
-        throw(DataError("a zero-count block has a non-empty payload", 1))
+function validateemptyblock(bytes::Vector{UInt8})
+    isempty(bytes) || throw(DataError("a zero-count block has a non-empty payload", 1))
     return nothing
 end
 

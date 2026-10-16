@@ -703,7 +703,7 @@ function Base.iterate(rows::Rows, ::Nothing=nothing)
         rows.decoder = setblockscope!(Decoder(rows.bytes, b; validate=r.validate),
                                       rows.blockwork::BlockWork)
         if rows.remaining == 0
-            validateemptyblock(rows.bytes, r.validate)
+            validateemptyblock(rows.bytes)
             finishblockwork!(b, rows.blockwork::BlockWork)
             rows.blockwork = nothing
             releaseblock!(rows, b)
@@ -736,7 +736,7 @@ function Base.iterate(rows::Rows, ::Nothing=nothing)
         throw(LimitError(:max_block_output_bytes, rows.blockout, b.limits.max_block_output_bytes, :max_block_output_bytes, :decode))
     if rows.remaining == 0
         d = rows.decoder::Decoder{Vector{UInt8}}
-        d.pos == length(rows.bytes) + 1 || r.validate !== :strict || throw(DataError("block datums did not consume the block exactly", d.pos))
+        d.pos == length(rows.bytes) + 1 || throw(DataError("block datums did not consume the block exactly", d.pos))
         finishblockwork!(b, rows.blockwork::BlockWork)
         rows.blockwork = nothing
         releaseblock!(rows, b)
