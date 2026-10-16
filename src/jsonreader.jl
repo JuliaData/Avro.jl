@@ -3,17 +3,6 @@
 # recursive-descent parser that builds frozen JSON trees with raw number tokens and WTF-8 strings.
 # JSON.jl is never used for parsing.
 
-struct JSONSyntaxError <: Exception
-    msg::String
-    pos::Int
-end
-
-function Base.showerror(io::IO, e::JSONSyntaxError)
-    return print(io, "JSON syntax error at byte ", e.pos, ": ", e.msg)
-end
-
-const WS = (UInt8(' '), UInt8('\t'), UInt8('\n'), UInt8('\r'))
-
 function isws(b::UInt8)
     return b == UInt8(' ') || b == UInt8('\t') || b == UInt8('\n') || b == UInt8('\r')
 end
@@ -137,7 +126,7 @@ appropriate error (`SchemaError`, `DataError`, …). Returns the maximum nesting
 function prescan(buf::AbstractVector{UInt8}, maxbytes::Int, maxdepth::Int, errfn;
                  limitfn=(limit, observed, value) -> errfn("$limit exceeded ($observed > $value)", 0),
                  bytelimit::Symbol=:max_bytes, depthlimit::Symbol=:max_depth, lenient::Bool=false,
-                 nbytes::Int=length(buf), stats::Bool=false)
+                 nbytes::Int=length(buf))
     n = nbytes
     0 <= n <= length(buf) || throw(ArgumentError("nbytes must be within the input buffer"))
     n <= maxbytes || limitfn(bytelimit, n, maxbytes)
@@ -202,7 +191,7 @@ function prescan(buf::AbstractVector{UInt8}, maxbytes::Int, maxdepth::Int, errfn
     end
     depth == 0 || errfn("unterminated container (missing closing bracket)", n + 1)
     nvalues >= 1 || errfn("empty JSON document", 1)
-    return stats ? (maxseen, nvalues) : maxseen
+    return maxseen
 end
 
 function scanliteral(buf, i, n, lit::String, errfn)
@@ -615,7 +604,7 @@ function releasecharge!(r::JSONReader, n::Int)
 end
 
 """
-    parsejson(buf; maxbytes, maxdepth, errfn, budget=nothing) -> FrozenJSON
+    parsejson(buf; maxbytes, maxdepth, errfn, budget=nothing) -> JSON value
 
 Pre-scan and parse one JSON document into a frozen tree (objects keep source key order in `order`,
 duplicate keys are errors detected over decoded keys, numbers are raw `JSONNumber` tokens).

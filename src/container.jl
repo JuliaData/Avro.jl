@@ -810,26 +810,6 @@ function estimatedelement(T::Type, estimate::OutputEstimate, p::WritePlan, x)
     return estimate.retained
 end
 
-function growbufextra(T::Type, count::Int, hint::Int; shell::Bool=true)
-    final = vectorbytes(T, count)
-    cap = growinitialcapacity(hint)
-    current = vectorbytes(T, cap)
-    peak = current
-    while cap < count
-        newcap = grownextcapacity(cap)
-        replacement = vectorbytes(T, newcap)
-        peak = max(peak, checked_add(current, replacement))
-        cap = newcap
-        current = replacement
-    end
-    if cap != count
-        peak = max(peak, checked_add(current, final))
-    end
-    extra = max(peak - final, 0)
-    shell && (extra = checked_add(extra, shellbytes(GrowBuf{T})))
-    return extra
-end
-
 "The final generic value storage and its maximum transient construction excess."
 function estimatewithpath(f::F, diagnostics::Union{Nothing,Encoder},
                           schema::Schema, kind::UInt8,
@@ -1265,26 +1245,9 @@ function readerblockpeak(compressedbytes::Int, decompressedbytes::Int, outputbyt
     return peak
 end
 
-"""
-The per-field slot allowance of the column consumer: the part of a field's output estimate that an
-`Avro.Table` chunk's reference slots already cover. The remainder of the estimate is the referenced
-payload the chunk holds beyond its slots (0 for inline cells).
-"""
-function cellslack(p::WritePlan)
-    p isa Union{WBool,WInt,WDate,WTimeMillis,WFloat} && return 4
-    p isa Union{WLong,WTimeMicros,WTimestamp,WLocalTimestamp,WDouble} && return 8
-    p isa WDuration && return 12
-    p isa WUUIDFixed && return 16
-    p isa WUUIDString && return STORAGE[].slot + 16
-    p isa WEnum && return enumvaluebytes()
-    p isa Union{WString,WBytes,WFixed} && return STORAGE[].slot
-    return 0
-end
-
 "The streamed `Avro.Table` consumer projection of a record-root writer."
 mutable struct TablePreflight
     const cols::Vector{Type}
-    const slack::Vector{Int}
     const builderstate::Int
     chunkbytes::Int      # chunk shells and capacities of the flushed blocks
     payload::Int         # referenced payload of the flushed blocks, counted once
@@ -1296,16 +1259,13 @@ end
 function TablePreflight(readerschema::RecordSchema, p::WRecord,
                         readerplan::RecordPlan, budget::Budget)
     n = length(readerschema.fields)
-    charge = checked_add(checked_add(vectorbytes(Type, n), vectorbytes(Int, n)),
-                         shellbytes(TablePreflight))
+    charge = checked_add(vectorbytes(Type, n), shellbytes(TablePreflight))
     reserve!(budget, charge)
     cols = Vector{Type}(undef, n)
-    slack = Vector{Int}(undef, n)
     for (index, field) in enumerate(readerschema.fields)
         cols[index] = juliatype(field.schema)
-        slack[index] = cellslack(p.fields[index])
     end
-    preflight = TablePreflight(cols, slack, columnbuildersstate(readerplan),
+    preflight = TablePreflight(cols, columnbuildersstate(readerplan),
                                0, 0, 0, 0, 0)
     allocated!(budget, charge)
     return preflight
@@ -1452,7 +1412,6 @@ mutable struct Writer
     const limits::Limits
     const budget::Budget
     const blockbytes::Int
-    const atomic::Bool
     const fsync::Bool
     const ownsink::Bool
     const encoder::Encoder
@@ -1662,7 +1621,7 @@ function Writer(dst::Union{AbstractString,IO}, schema::Schema; codec::Symbol=:nu
         datumencoder = Encoder(budget)
         stagevalues = schemaneedsstaging(schema, budget)
         writer = Writer(sink, path, atomic ? temppath : nothing, schema, plan, wcodec, syncmarker, limits, budget,
-                        Int(block_bytes), atomic, fsync, ownsink, encoder, datumencoder, preflightbase,
+                        Int(block_bytes), fsync, ownsink, encoder, datumencoder, preflightbase,
                         preflight, stagevalues, nothing, nothing, 0, 0, 0, 0, 0, 0, false, nothing)
         try
             writecontainerheader!(sink, entries, syncmarker)

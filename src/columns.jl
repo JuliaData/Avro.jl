@@ -462,10 +462,6 @@ function finishcolumn!(c::TypedColumn{E}, budget::Budget) where {E}
     return out
 end
 
-function rowcount(c::TypedColumn)
-    return c.len
-end
-
 """
     decodecolumns(plan::RecordPlan, d::Decoder, nrows; selected=nothing) -> Vector{ColumnBuilder}
 

@@ -115,11 +115,11 @@ function settlespanfinite!(memo::Vector{Union{Nothing,SpanPlan}}, budget)
         changed = false
         for candidate in memo
             candidate isa RecordSpan || continue
-            budget === nothing || addresolution!(budget)
+            addresolution!(budget)
             candidate.finite && continue
             finite = true
             for field in candidate.fields
-                budget === nothing || addresolution!(budget)
+                addresolution!(budget)
                 if !spanfinite(field)
                     finite = false
                     break
@@ -135,20 +135,20 @@ function settlespanfinite!(memo::Vector{Union{Nothing,SpanPlan}}, budget)
 end
 
 "Build the allocation-free span plan of a writer schema, memoised by its dense node ids."
-function spanplan(s::Schema; budget::Union{Nothing,Budget}=nothing)
+function spanplan(s::Schema; budget::Budget)
     nodes = graphinfo(s).nodes
     memocharge = vectorbytes(Union{Nothing,SpanPlan}, nodes)
-    checkpoint = budget === nothing ? nothing : budgetcheckpoint(budget)
+    checkpoint = budgetcheckpoint(budget)
     try
-        budget === nothing || reserve!(budget, memocharge)
+        reserve!(budget, memocharge)
         memo = Vector{Union{Nothing,SpanPlan}}(nothing, nodes)
-        budget === nothing || allocated!(budget, memocharge)
+        allocated!(budget, memocharge)
         plan = spanplan(s, memo, budget)
         settlespanfinite!(memo, budget)
-        budget === nothing || release!(budget, memocharge)
+        release!(budget, memocharge)
         return plan
     catch
-        budget === nothing || rollbackreservations!(budget, checkpoint::NTuple{2,Int})
+        rollbackreservations!(budget, checkpoint)
         rethrow()
     end
 end
@@ -157,7 +157,7 @@ function spanplan(s::Schema, memo::Vector{Union{Nothing,SpanPlan}}, budget)
     id = Int(nodeid(s)) + 1
     plan = memo[id]
     plan === nothing || return plan
-    budget === nothing || addresolution!(budget)
+    addresolution!(budget)
     plan = buildspanplan(s, memo, budget)
     memo[id] = plan
     return plan
@@ -202,14 +202,14 @@ end
 
 function buildspanplan(s::ArraySchema, memo, budget)
     items = spanplan(s.items, memo, budget)
-    ms = budget === nothing ? minsize(s.items) : minsize(s.items, budget)
+    ms = minsize(s.items, budget)
     return plannode(() -> ArraySpan(items, spanwidth(items), spanvalues(items), ms), budget,
                     spannodebytes(ArraySpan))
 end
 
 function buildspanplan(s::MapSchema, memo, budget)
     values = spanplan(s.values, memo, budget)
-    ms = budget === nothing ? minsize(s.values) : minsize(s.values, budget)
+    ms = minsize(s.values, budget)
     return plannode(() -> MapSpan(values, spanvalues(values), ms), budget,
                     spannodebytes(MapSpan))
 end
@@ -217,14 +217,14 @@ end
 function buildspanplan(s::UnionSchema, memo, budget)
     n = length(s.branches)
     charge = checked_add(vectorbytes(SpanPlan, n), spannodebytes(UnionSpan))
-    budget === nothing || reserve!(budget, charge)
+    reserve!(budget, charge)
     branches = Vector{SpanPlan}(undef, n)
-    budget === nothing || allocated!(budget, vectorbytes(SpanPlan, n))
+    allocated!(budget, vectorbytes(SpanPlan, n))
     for (i, branch) in enumerate(s.branches)
         branches[i] = spanplan(branch, memo, budget)
     end
     plan = UnionSpan(branches)
-    budget === nothing || allocated!(budget, spannodebytes(UnionSpan))
+    allocated!(budget, spannodebytes(UnionSpan))
     return plan
 end
 
@@ -233,11 +233,11 @@ function buildspanplan(s::RecordSchema, memo, budget)
     charge = checked_add(checked_add(vectorbytes(SpanPlan, n),
                                      vectorbytes(SpanStep, n)),
                          spannodebytes(RecordSpan))
-    budget === nothing || reserve!(budget, charge)
+    reserve!(budget, charge)
     fields = Vector{SpanPlan}(undef, n)
     steps = Vector{SpanStep}(undef, n)
     plan = RecordSpan(fields, steps, 0, 1, -1, -1, 0, false)
-    budget === nothing || allocated!(budget, charge)
+    allocated!(budget, charge)
     memo[Int(nodeid(s)) + 1] = plan
     width = 0
     values = 1
@@ -300,22 +300,7 @@ function buildspanplan(s::RecordSchema, memo, budget)
     return plan
 end
 
-mutable struct SpanCursor{B<:AbstractVector{UInt8}}
-    const buf::B
-    pos::Int
-    const stop::Int
-    const start::Int
-    const limits::Limits
-    const datummax::Int
-    const values0::Int
-    const inputmax::Int
-    const validate::Symbol
-    values::Int
-    depth::Int
-    blind::Bool
-end
-
-const SpanState = Union{SpanCursor,Decoder}
+const SpanState = Decoder
 
 function spanerror(cursor::SpanState, message::AbstractString, position::Int=cursor.pos)
     throw(DataError(message, position))
@@ -452,10 +437,6 @@ function checkspanvalues(cursor::SpanState, values::Int)
                          cursor.limits.max_total_values,
                          :max_total_values, :decode))
     return values
-end
-
-function checkblockspanvalues!(::SpanCursor, values::Int)
-    return nothing
 end
 
 "Check projected values against the active block's independent work scope."
@@ -1188,11 +1169,6 @@ function planneddatumspan!(plan, decoder::Decoder, span::DatumSpan;
                              active, basevalues)
 end
 
-function planneddatumspan(plan, decoder::Decoder, span::DatumSpan; kwargs...)
-    planneddatumspan!(plan, decoder, span; kwargs...)
-    return decoderspan(decoder)
-end
-
 "The largest possible datum suffix available to one span pass."
 function datumspanmax(buffer::AbstractVector{UInt8}, start::Int, limits::Limits)
     1 <= start <= length(buffer) + 1 || throw(ArgumentError("position $start out of range"))
@@ -1203,25 +1179,6 @@ end
 function rawspaninputmax(budget::Budget, buffer::AbstractVector{UInt8}, start::Int,
                          limits::Limits)
     return satadd(budget.input_bytes, datumspanmax(buffer, start, limits))
-end
-
-"Find one exact writer datum starting at `start` without materialising it."
-function datumspan(plan::SpanPlan, buffer::AbstractVector{UInt8}, start::Int, limits::Limits;
-                   values0::Int=0, inputmax::Union{Nothing,Int}=nothing,
-                   validate::Symbol=:strict)
-    datummax = datumspanmax(buffer, start, limits)
-    values0 >= 0 || throw(ArgumentError("prior span values must be non-negative"))
-    validate in (:strict, :fast) ||
-        throw(ArgumentError("validate must be :strict or :fast"))
-    maximum = inputmax === nothing ? datummax : inputmax
-    maximum >= 0 || throw(ArgumentError("maximum span input must be non-negative"))
-    cursor = SpanCursor(buffer, start, length(buffer), start, limits,
-                        datummax, values0, maximum, validate, 0, 0, false)
-    values = spanvalue!(plan, cursor)
-    checkspanvalues(cursor, values)
-    values == cursor.values ||
-        throw(DataError("internal error: span value count mismatch", cursor.pos))
-    return DatumSpan(cursor.pos, cursor.pos - start, values, cursor.blind)
 end
 
 "Find one exact writer datum with the caller's reusable decoder as span-cursor storage."
@@ -1262,12 +1219,6 @@ end
 @inline function decoderspan(decoder::Decoder)
     return DatumSpan(decoder.start, decoder.datummax, decoder.values,
                      decoder.blind)
-end
-
-function datumspan(plan::SpanPlan, decoder::Decoder, start::Int,
-                   values0::Int, inputmax::Int)
-    datumspan!(plan, decoder, start, values0, inputmax)
-    return decoderspan(decoder)
 end
 
 struct DatumWork
@@ -1333,17 +1284,6 @@ function abortdatum!(decoder::Decoder, work::StaticDatumWork)
 end
 
 "Pre-admit one exact datum and restrict its real decoder to the proven span."
-function begindatum!(decoder::Decoder, plan::SpanPlan, limits::Limits)
-    decoder.validate === :fast &&
-        throw(ArgumentError("fast datum admission requires the consumer plan"))
-    limits == decoder.limits ||
-        throw(ArgumentError("datum limits do not match the decoder"))
-    datumspan!(plan, decoder, decoder.pos, decoder.budget.values,
-               decoder.budget.input_bytes)
-    span = decoderspan(decoder)
-    return begindatum!(decoder, span)
-end
-
 function begindatum!(decoder::Decoder, spanplan::SpanPlan, consumer, limits::Limits;
                      resolved::Bool=false, projection=nothing, active::Bool=true)
     limits == decoder.limits ||

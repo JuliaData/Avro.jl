@@ -179,7 +179,7 @@
         parsedstring = parsedjson("\"x\"", stringbudget)
         parsedcharge = stringbudget.reserved
         convertedstring = Avro.jsontovalue(P("\"string\""), parsedstring,
-                                            Avro.JSONContext(stringbudget, true, false, false), 1)
+                                            Avro.JSONContext(stringbudget, false, false), 1)
         @test convertedstring === parsedstring
         @test stringbudget.reserved == parsedcharge
         Avro.close!(stringbudget)
@@ -197,7 +197,7 @@
             budget = Avro.Budget(Avro.Limits(); available=1 << 30)
             parsed = parsedjson(text, budget)
             before = budget.reserved
-            value = Avro.jsontovalue(schema, parsed, Avro.JSONContext(budget, true, false, false), 1)
+            value = Avro.jsontovalue(schema, parsed, Avro.JSONContext(budget, false, false), 1)
             @test length(value) == 8
             @test budget.reserved - before == Avro.vectorbytes(Avro.elementtype(schema.items), 8)
             Avro.close!(budget)
@@ -209,7 +209,7 @@
             filler = tight.ceiling - tight.reserved - needed
             Avro.reserve!(tight, filler)
             tightvalue = Avro.jsontovalue(schema, tightparsed,
-                                           Avro.JSONContext(tight, true, false, false), 1)
+                                           Avro.JSONContext(tight, false, false), 1)
             @test length(tightvalue) == 8
             @test tight.reserved == tight.ceiling - Avro.bytesbytes(payloadbytes)
             Avro.close!(tight)
@@ -220,7 +220,7 @@
         fixedparsed = parsedjson("\"x\"", fixedbudget)
         fixedbefore = fixedbudget.reserved
         fixedvalue = Avro.jsontovalue(fixedschema, fixedparsed,
-                                      Avro.JSONContext(fixedbudget, true, false, false), 1)
+                                      Avro.JSONContext(fixedbudget, false, false), 1)
         @test fixedvalue.bytes == UInt8['x']
         @test fixedbudget.reserved - fixedbefore == Avro.fixedbytes(1)
         Avro.close!(fixedbudget)

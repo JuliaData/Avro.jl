@@ -309,10 +309,6 @@ function Tables.columns(t::Table)
 end
 
 "A stored `Tables.Schema{nothing,nothing}`: file-derived names and eltypes never become type parameters."
-function storedschema(names::Vector{Symbol}, s::RecordSchema)
-    return Tables.Schema(names, Type[juliatype(f.schema) for f in s.fields]; stored=true)
-end
-
 function storedschema(names::Vector{Symbol}, s::RecordSchema, budget::Budget)
     n = length(s.fields)
     scratch = vectorbytes(Type, n)

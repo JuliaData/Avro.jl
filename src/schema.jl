@@ -201,14 +201,6 @@ function logical(::Schema)
     return nothing
 end
 
-function props(s::UnionSchema)
-    return EMPTY_PROPS
-end
-
-function props(s::Schema)
-    return s.props
-end
-
 """
     Avro.fullname(schema::NamedSchema) -> String
 """
@@ -1203,10 +1195,6 @@ function validatedefault(schema::UnionSchema, json, maxdepth::Int, depth::Int=1,
         defaultmatches(b, json, maxdepth, depth, budget) && return (true, i)
     end
     return (false, 0)
-end
-
-function defaultmatches(schema::Schema, json, maxdepth, depth)
-    return defaultmatches(schema, json, maxdepth, depth, nothing)
 end
 
 function defaultmatches(::NullSchema, json, maxdepth, depth, budget)

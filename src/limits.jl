@@ -314,11 +314,10 @@ function Budget(limits::Limits; direction::Symbol=:decode, available::Int=availa
 end
 
 "A persistent table ledger whose explicit byte ceiling is independent of operation-limit relations."
-function ledgerbudget(ceiling::Int; direction::Symbol=:decode)
+function ledgerbudget(ceiling::Int)
     ceiling >= 0 || throw(ArgumentError("ledger ceiling must be non-negative"))
-    direction in (:decode, :encode) || throw(ArgumentError("direction must be :decode or :encode"))
     limits = Limits()
-    return Budget(limits, ceiling, direction, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    return Budget(limits, ceiling, :decode, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
                   min(limits.max_total_values, limits.work_allowance), 0, 0)
 end
 
@@ -745,11 +744,6 @@ function resetbudget!(b::Budget)
     b.workcap = min(b.limits.max_total_values, b.limits.work_allowance)
     b.workdeferred = 0
     b.default_position = 0
-    return b
-end
-
-function reserve_replacement!(b::Budget, oldbytes::Int, newbytes::Int)
-    reserve!(b, newbytes)   # old and new storage are both charged during the copy
     return b
 end
 

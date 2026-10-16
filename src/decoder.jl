@@ -197,15 +197,6 @@ function validutf8(buf::AbstractVector{UInt8}, from::Int, to::Int)
     return true
 end
 
-function unsafe_substring(buf::AbstractVector{UInt8}, p::Int, n::Int)
-    n == 0 && return ""
-    return String(buf[p:p + n - 1])
-end
-
-function unsafe_substring(buf::Vector{UInt8}, p::Int, n::Int)
-    return n == 0 ? "" : unsafe_string(pointer(buf, p), n)
-end
-
 function ownedsubstring(buf::AbstractVector{UInt8}, p::Int, n::Int, budget::Budget)
     peak = bytesbytes(n) + stringbytes(0)
     reserve!(budget, peak)
@@ -295,11 +286,6 @@ end
 
 function leave!(d::Decoder)
     return (d.depth -= 1; nothing)
-end
-
-function skiplong(d::Decoder)
-    readlong(d)
-    return nothing
 end
 
 function skiplen(d::Decoder)

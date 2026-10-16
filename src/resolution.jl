@@ -651,22 +651,6 @@ function resolvenode(ctx::ResolveContext, w::Schema, r::Schema,
                       javasoft)
 end
 
-"Resolve the Java reader-union record candidate selected by structural soft matching."
-function resolvesoftrecord(ctx::ResolveContext, writer::RecordSchema,
-                           reader::RecordSchema,
-                           writerpath::ResolutionPath,
-                           readerpath::ResolutionPath)
-    return resolvenode(ctx, writer, reader, writerpath, readerpath, true)
-end
-
-function describe(s::NamedSchema)
-    return string(kind(s), " ", fullname(s))
-end
-
-function describe(s::Schema)
-    return string(kind(s))
-end
-
 "Named types match by normalised fullname, by a reader alias, or by the unqualified name (the spec's record rule)."
 function namesmatch(w::NamedSchema, r::NamedSchema, budget::Union{Nothing,Budget}=nothing)
     budget === nothing || addcompare!(budget, fullnamecomparisonwork(w.name, r.name))

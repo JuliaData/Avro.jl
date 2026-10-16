@@ -1666,10 +1666,6 @@ end
 
 # ---- leaf conversions (ConversionError on failure) -------------------------------------------------
 
-function convertleaf(::Type{T}, value) where {T}
-    return convertleaf(T, value, nothing)
-end
-
 function convertleaf(::Type{Nothing}, ::Missing, budget)
     return nothing
 end

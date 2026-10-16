@@ -150,7 +150,6 @@ function keymatches(a::AbstractString, b::FullName)
 end
 
 const PRIMITIVE_NAMES = ("null", "boolean", "int", "long", "float", "double", "bytes", "string")
-const COMPLEX_KEYWORDS = ("record", "error", "enum", "array", "map", "fixed")
 
 function isnamestart(b::UInt8)
     return (b == UInt8('_')) || (UInt8('A') <= b <= UInt8('Z')) || (UInt8('a') <= b <= UInt8('z'))
@@ -194,56 +193,6 @@ function isvalidnamespace(s::AbstractString)
         end
     end
     return !atstart
-end
-
-"""
-    splitfullname(s) -> (name, namespace)
-
-Split a (possibly dotted) name: the text after the last dot is the name, the text before it the
-namespace (`""` when there is no dot).
-"""
-function splitfullname(s::AbstractString)
-    i = findlast('.', s)
-    i === nothing && return (String(s), "")
-    return (String(s[nextind(s, i):end]), String(s[1:prevind(s, i)]))
-end
-
-"""
-    resolvefullname(name, namespace, enclosing) -> FullName
-
-The spec's fullname algorithm: a dotted `name` wins and `namespace` is ignored; a simple name takes the
-explicit `namespace` when given, else the enclosing namespace.
-"""
-function resolvefullname(name::AbstractString, namespace::Union{Nothing,AbstractString}, enclosing::AbstractString)
-    n, ns = splitfullname(name)
-    isempty(ns) || return FullName(n, ns)
-    namespace === nothing && return FullName(n, String(enclosing))
-    return FullName(n, String(namespace))
-end
-
-"""
-    resolvereference(ref, enclosing) -> String
-
-A named-type reference: a dotted reference is used as written; a simple one is qualified with the
-enclosing namespace.
-"""
-function resolvereference(ref::AbstractString, enclosing::AbstractString)
-    n, ns = splitfullname(ref)
-    isempty(ns) || return String(ref)
-    isempty(enclosing) && return n
-    return string(enclosing, ".", n)
-end
-
-"""
-    normalizealias(alias, namespace) -> String
-
-A type alias is normalised to a fullname: a relative alias takes the namespace of the type it aliases.
-"""
-function normalizealias(alias::AbstractString, namespace::AbstractString)
-    n, ns = splitfullname(alias)
-    isempty(ns) || return String(alias)
-    isempty(namespace) && return n
-    return string(namespace, ".", n)
 end
 
 """

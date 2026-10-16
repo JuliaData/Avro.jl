@@ -404,7 +404,6 @@ end
 
 struct JSONContext
     budget::Budget
-    strict::Bool
     unknownerror::Bool
     bareunion::Bool        # defaults: unions are bare values matched in branch order
     countdatum::Bool
@@ -412,9 +411,8 @@ struct JSONContext
     copystrings::Bool      # frozen defaults must materialise fresh caller-owned strings
 end
 
-function JSONContext(budget::Budget, strict::Bool, unknownerror::Bool,
-                     bareunion::Bool)
-    return JSONContext(budget, strict, unknownerror, bareunion, true, nothing, false)
+function JSONContext(budget::Budget, unknownerror::Bool, bareunion::Bool)
+    return JSONContext(budget, unknownerror, bareunion, true, nothing, false)
 end
 
 """
@@ -439,7 +437,7 @@ function fromjson(s::Schema, src::Union{AbstractString,AbstractVector{UInt8},IO}
         limitfn = (limit, observed, value) -> throw(LimitError(limit, observed, value, limit, :decode))
         j = parsejson(bytes; maxbytes=limits.max_datum_bytes, maxdepth=limits.max_json_depth, errfn=errfn, budget=budget,
                       limitfn=limitfn, bytelimit=:max_datum_bytes, depthlimit=:max_json_depth, lenient=!strict)
-        return jsontovalue(s, j, JSONContext(budget, strict, unknown === :error, false), 1)
+        return jsontovalue(s, j, JSONContext(budget, unknown === :error, false), 1)
     end
 end
 
@@ -490,7 +488,7 @@ function jsonvalue(s::Schema, j, budget::Budget, branch::Int,
     budget.default_position = 1
     countdatum || beginworkdefer!(budget)
     try
-        ctx = JSONContext(budget, true, false, true, countdatum, branches, true)
+        ctx = JSONContext(budget, false, true, countdatum, branches, true)
         value = jsontovalue(s, j, ctx, depth)
         budget.default_position == length(branches) + 1 ||
             jsonerror(ctx, "resolved default branch tape has trailing entries")
@@ -500,10 +498,6 @@ function jsonvalue(s::Schema, j, budget::Budget, branch::Int,
         countdatum || (budget.compare_bytes = compared)
         budget.default_position = position
     end
-end
-
-function jsonerror(msg::AbstractString)
-    throw(DataError(msg, 0))
 end
 
 function jsonerror(ctx::JSONContext, parts...)

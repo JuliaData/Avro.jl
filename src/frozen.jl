@@ -29,10 +29,6 @@ function FrozenVector{T}() where {T}
     return FrozenVector{T}(T[], false)
 end
 
-function FrozenVector(v::Vector{T}) where {T}
-    return FrozenVector{T}(v, false)
-end
-
 function Base.size(v::FrozenVector)
     return size(v.data)
 end
@@ -379,8 +375,6 @@ function JSONObject(members::FrozenDict{String,Any}, order::FrozenVector{String}
     isempty(members) && isempty(order) && return EMPTY_JSON_OBJECT
     return JSONObject(members, order, EMPTY_JSON_SPANS)
 end
-
-const FrozenJSON = Union{Nothing,Bool,Int64,Float64,String,JSONNumber,JSONArray,JSONObject}
 
 function Base.:(==)(a::JSONArray, b::JSONArray)
     return a.items.data == b.items.data
