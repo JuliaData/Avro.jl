@@ -1239,7 +1239,7 @@ function accepts(p::WRecord, x)
 end
 
 # Plain structs are record-like unless they are one of the scalar/container kinds the other branches own.
-const NOT_RECORDLIKE = Union{Missing,Nothing,Number,AbstractString,Symbol,Char,AbstractArray,Tuple,AbstractSet,Type,Function,
+const NOT_RECORDLIKE = Union{Missing,Nothing,Number,AbstractString,Symbol,Char,AbstractArray,AbstractDict,Tuple,AbstractSet,Type,Function,
                              Date,Time,DateTime,UUID,Decimal,WideDecimal,Timestamp,LocalTimestamp,Duration,Durations.Duration,Fixed,EnumValue,Map,UnionValue,Base.Enum}
 function isrecordlike(x)
     return isstructtype(typeof(x)) && !(x isa NOT_RECORDLIKE)

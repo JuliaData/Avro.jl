@@ -203,6 +203,30 @@ end
         return Avro.DatumReader(s, T).plan
     end
 
+    @testset "typed targets convert exactly or fail" begin
+        ms = P("""{"type":"long","logicalType":"timestamp-millis"}""")
+        second = Avro.encode(ms, Avro.Timestamp{Millisecond}(1_000))
+        @test Avro.decode(ms, second, Avro.Timestamp{Microsecond}) == Avro.Timestamp{Microsecond}(1_000_000)
+        @test Avro.decode(ms, second, Avro.Timestamp{Nanosecond}) == Avro.Timestamp{Nanosecond}(1_000_000_000)
+        @test_throws Avro.ConversionError Avro.decode(ms, second, Avro.LocalTimestamp{Millisecond})
+        us = P("""{"type":"long","logicalType":"timestamp-micros"}""")
+        @test Avro.decode(us, Avro.encode(us, Avro.Timestamp{Microsecond}(2_000)), Avro.Timestamp{Millisecond}) ==
+              Avro.Timestamp{Millisecond}(2)
+        @test_throws Avro.ConversionError Avro.decode(us, Avro.encode(us, Avro.Timestamp{Microsecond}(1_500)),
+                                                      Avro.Timestamp{Millisecond})
+        # decoded scalars are not collections
+        @test_throws Avro.ConversionError Avro.decode(P("\"string\""), Avro.encode(P("\"string\""), "abc"), Vector{UInt8})
+        @test_throws Avro.ConversionError Avro.decode(P("\"long\""), Avro.encode(P("\"long\""), 5), Vector{Int})
+        # a union branch's own Julia type wins; Float16 does not overflow silently
+        il = P("""["int","long"]""")
+        @test Avro.decode(il, Avro.encode(il, Avro.UnionValue(2, typemax(Int64))), Union{Int32,Int64}) === typemax(Int64)
+        fs = P("""["float","string"]""")
+        @test_throws Avro.ConversionError Avro.decode(fs, Avro.encode(fs, 1f10), Union{Float16,Float64,String})
+        # records decode into dictionary targets
+        r = P("""{"type":"record","name":"R","fields":[{"name":"a","type":"long"},{"name":"b","type":"string"}]}""")
+        @test Avro.decode(r, Avro.encode(r, (a=1, b="q")), Dict{String,Any}) == Dict{String,Any}("a" => 1, "b" => "q")
+    end
+
     @testset "NamedTuple targets and leaf conversions" begin
         NT = NamedTuple{(:a, :b, :c, :d, :e, :f, :g, :t, :ch, :fl),Tuple{Int,String,Union{Missing,Int},Vector{Float64},Dict{String,Int},Symbol,NTuple{2,UInt8},DateTime,Char,Float64}}
         @test plan(NT) isa Avro.SemanticTarget       # the Dict field converts after generic ownership transfer

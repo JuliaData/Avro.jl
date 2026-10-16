@@ -502,7 +502,10 @@ function builduniontarget(::Type{T}, s::UnionSchema, p::UnionPlan, memo::TypedMe
     branches = typedvector(TypedPlan, length(s.branches), memo)
     for (i, (b, bp)) in enumerate(zip(s.branches, p.branches))
         found = nothing
-        for m in members
+        natural = juliatype(b)                         # the branch's own type first, then declaration order
+        ordered = natural in members ?
+            Iterators.flatten(((natural,), Iterators.filter(!=(natural), members))) : members
+        for m in ordered
             mark = beginfresh!(memo)
             tp = buildtyped(m, b, bp, memo)
             if tp isa SemanticTarget
@@ -1676,7 +1679,9 @@ function convertleaf(::Type{Float64}, v::Float32, budget)
 end
 
 function convertleaf(::Type{Float16}, v::Float32, budget)
-    return Float16(v)
+    h = Float16(v)
+    isinf(h) && !isinf(v) && throw(ConversionError("target type Float16 cannot represent $v"))
+    return h
 end
 
 function convertleaf(::Type{DateTime}, v::Union{Timestamp,LocalTimestamp}, budget)
@@ -1929,6 +1934,18 @@ function applyeachmap(st::AvroStyle, f, values::Map)
     return StructUtils.defaultstate(st)
 end
 
+# StructUtils would treat a decoded scalar as a struct without fields and fill an array, dict or struct
+# target with nothing; refuse instead so the conversion fails.
+const SCALAR_VALUES = Union{Bool,Int32,Int64,Float32,Float64,String}
+
+function StructUtils.applyeach(::AvroStyle, f, x::SCALAR_VALUES)
+    throw(ArgumentError("a decoded $(typeof(x)) is not a collection"))
+end
+
+function StructUtils.applyeach(::AvroStyle, f::StructUtils.StructStyle, x::SCALAR_VALUES)
+    throw(ArgumentError("a decoded $(typeof(x)) is not a collection"))
+end
+
 # StructUtils lowers non-struct-like sources at the root only: the identity-bearing generic values are
 # representations, not structs to traverse.
 function StructUtils.structlike(::AvroStyle, ::Type{<:Union{Fixed,EnumValue,UnionValue}})
@@ -2066,8 +2083,24 @@ function StructUtils.lift(::Type{DateTime}, x::Union{Timestamp,LocalTimestamp})
     return DateTime(x)
 end
 
-function StructUtils.lift(::Type{T}, x::Union{Timestamp,LocalTimestamp}) where {T<:Union{Timestamp,LocalTimestamp}}
-    return T(x.ticks)
+# Timestamps convert through `lift` (exact rescaling), not field by field.
+function StructUtils.structlike(::AvroStyle, ::Type{<:Union{Timestamp,LocalTimestamp}})
+    return false
+end
+
+function StructUtils.lift(::Type{T}, x::Union{Timestamp{P},LocalTimestamp{P}}) where {T<:Union{Timestamp,LocalTimestamp},P}
+    x isa T && return x
+    (x isa Timestamp) == (T <: Timestamp) ||            # an instant and a wall-clock time do not convert
+        throw(ArgumentError("cannot convert $(typeof(x)) to $T"))
+    from, to = tickscale(P), tickscale(T.parameters[1])
+    if to >= from
+        ticks, overflow = Base.Checked.mul_with_overflow(x.ticks, Int64(to ÷ from))
+        overflow && throw(InexactError(:convert, T, x))
+        return T(ticks)
+    end
+    ticks, rest = divrem(x.ticks, Int64(from ÷ to))
+    rest == 0 || throw(InexactError(:convert, T, x))
+    return T(ticks)
 end
 
 function StructUtils.make(st::AvroStyle, ::Type{Durations.Duration}, x::Duration)
