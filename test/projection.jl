@@ -37,6 +37,8 @@ import Logging
         unique!(sels)
         return sels
     end
+    # a field whose type refers back to the root cannot be selected without every field
+    recursivefield = Dict("directly recursive root" => :next, "mutually recursive root" => :b)
     for (label, json, rows) in fixtures
         s = P(json)
         bytes = take!(Avro.tobuffer(rows; schema=s, block_bytes=512, limits=raised))
@@ -46,6 +48,13 @@ import Logging
                 fullct = Tables.columntable(full)
                 fullsch = Tables.schema(full)
                 for sel in selections(Tables.columnnames(full)), nt in (1, 2, 8)
+                    if get(recursivefield, label, nothing) in sel && length(sel) < length(fullsch.names)
+                        @test_throws ArgumentError Avro.Table(IOBuffer(bytes); select=Tuple(sel), validate=val,
+                                                              ntasks=nt, limits=raised)
+                        @test_throws ArgumentError Avro.Rows(IOBuffer(bytes); select=Tuple(sel), validate=val,
+                                                             limits=raised)
+                        continue
+                    end
                     pt = Avro.Table(IOBuffer(bytes); select=Tuple(sel), validate=val, ntasks=nt, limits=raised)
                     @test Tables.columnnames(pt) == sel
                     @test length(pt) == length(full)
@@ -60,11 +69,9 @@ import Logging
                     ps = Avro.schema(pt)
                     @test [f.name for f in ps.fields] == [String(nm) for nm in sel]
                 end
-                # writing a projection round-trips its derived schema (recursive roots included); for a
-                # recursive root the projection is graph-wide, so nested records re-encode projected and
-                # only the schema and row count round-trip value-independently
+                # writing a projection round-trips its derived schema and values
                 names = collect(Tables.columnnames(full))
-                sel = isempty(names) ? Symbol[] : [names[end]]
+                sel = isempty(names) ? Symbol[] : [names[1]]
                 pt = Avro.Table(IOBuffer(bytes); select=Tuple(sel), validate=val, limits=raised)
                 io = IOBuffer()
                 Avro.write(io, pt; limits=raised)
@@ -72,8 +79,7 @@ import Logging
                 t2 = Avro.Table(io; limits=raised)
                 @test Avro.json(Avro.schema(t2)) == Avro.json(Avro.schema(pt))
                 @test length(t2) == length(pt)
-                recursive = occursin("recursive", label)
-                recursive || @test isequal(Tables.columntable(t2), Tables.columntable(pt))
+                @test isequal(Tables.columntable(t2), Tables.columntable(pt))
             end
         end
     end

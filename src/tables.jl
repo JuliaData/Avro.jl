@@ -106,6 +106,14 @@ types, defaults, aliases, order, docs and props unchanged; a recursive root is s
 """
 function projectschema(s::RecordSchema, sel::Vector{Int}, limits::Limits,
                        budget::Budget)
+    # Nested values decode with every field, so a projected root substituted inside them would
+    # describe them wrongly and a write of the table would drop their unselected fields.
+    if length(sel) < length(s.fields)
+        for i in sel
+            refersto(s.fields[i].schema, s, budget) && throw(ArgumentError(
+                "select= cannot leave fields out of record $(fullname(s)): field \"$(s.fields[i].name)\" refers back to it"))
+        end
+    end
     return withconstructionbudget(budget) do _
         n = length(sel)
         charge = frozendictshell() + vectorbytes(Field, n) + vectorbytes(String, n) + vectorbytes(Int, n) + 128
@@ -140,6 +148,32 @@ function projectschema(s::RecordSchema, sel::Vector{Int}, limits::Limits,
             releaseownedmemo!(budget, memo)
         end
     end
+end
+
+"Whether `root` is reachable from `x` in their schema graph."
+function refersto(x::Schema, root::RecordSchema, budget::Budget)
+    n = graphinfo(root).nodes
+    charge = vectorbytes(UInt64, cld(n, 64)) + 32       # the visited set's chunks and shell
+    reserve!(budget, charge)
+    seen = falses(n)
+    allocated!(budget, charge)
+    try
+        return refersto(x, root, seen)
+    finally
+        release!(budget, charge)
+    end
+end
+
+function refersto(x::Schema, root::RecordSchema, seen::BitVector)
+    x === root && return true
+    id = Int(nodeid(x)) + 1
+    seen[id] && return false
+    seen[id] = true
+    x isa RecordSchema && return any(f -> refersto(f.schema, root, seen), x.fields)
+    x isa UnionSchema && return any(b -> refersto(b, root, seen), x.branches)
+    x isa ArraySchema && return refersto(x.items, root, seen)
+    x isa MapSchema && return refersto(x.values, root, seen)
+    return false
 end
 
 # ---- the effective schema and plan of a container operation ------------------------------------------
