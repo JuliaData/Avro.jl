@@ -271,9 +271,10 @@ end
     r = Avro.Record(pt, [1, "a"])
     @test r.x == 1 && r["y"] == "a" && r[:y] == "a" && r[2] == "a" && keys(r) == ["x", "y"] && length(r) == 2 && haskey(r, "x") && !haskey(r, :z) && get(r, :z, 0) == 0
     @test r.schema === pt && r.values == Any[1, "a"] && propertynames(r) == (:schema, :values)
-    clash = Avro.parseschema("""{"type":"record","name":"C","fields":[{"name":"schema","type":"string"},{"name":"values","type":"long"}]}""")
-    c = Avro.decode(clash, Avro.encode(clash, (schema="s", values=2)))
-    @test c.schema == "s" && c.values == 2 && Avro.schema(c) === clash
+    let clash = Avro.parseschema("""{"type":"record","name":"C","fields":[{"name":"schema","type":"string"},{"name":"values","type":"long"}]}""")
+        c = Avro.decode(clash, Avro.encode(clash, (schema="s", values=2)))
+        @test c.schema == "s" && c.values == 2 && Avro.schema(c) === clash
+    end
     @test_throws KeyError r.z
     @test_throws ArgumentError Avro.Record(pt, [1])
     @test r == Avro.Record(P(Avro.json(pt)), [1, "a"]) && hash(r) == hash(Avro.Record(pt, [1, "a"])) && r != Avro.Record(pt, [2, "a"])

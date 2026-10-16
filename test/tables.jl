@@ -288,10 +288,10 @@ import DataAPI
     end
 
     @testset "string columns whose later rows outgrow the first" begin
-        s = Union{Missing,String}[i % 7 == 0 ? missing : repeat("x", i == 1 ? 0 : i % 97) for i in 1:2000]
+        strs = Union{Missing,String}[i % 7 == 0 ? missing : repeat("x", i == 1 ? 0 : i % 97) for i in 1:2000]
         for codec in (:null, :zstandard)
-            t = Avro.Table(Avro.tobuffer((id=Int32.(1:2000), s=s); codec=codec))
-            @test isequal(Tables.getcolumn(t, :s), s)
+            t = Avro.Table(Avro.tobuffer((id=Int32.(1:2000), s=strs); codec=codec))
+            @test isequal(Tables.getcolumn(t, :s), strs)
         end
     end
 
