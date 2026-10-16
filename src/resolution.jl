@@ -211,6 +211,7 @@ mutable struct ResolveContext
     const memocaps::Vector{Int32}                  # prebuilt capacity per slot (§4.4 replacement growth)
     const readermemo::Vector{Union{Nothing,ReadPlan}}
     const writermemo::Vector{Union{Nothing,ReadPlan}}
+    const inserted::BuildBuf{NTuple{2,Int32}}      # pair-memo insertions (slot, key), undone when a branch fails
 end
 
 const PATH_FIELD = UInt8(1)
@@ -518,16 +519,18 @@ function resolve(writer::Schema, reader::Schema; union_resolution::Symbol=:spec,
             memokeys[i] = Int32[]
             memoplans[i] = ReadPlan[]
         end
-        ctx = ResolveContext(budget, union_resolution, decimal_little, memokeys, memoplans, zeros(Int32, wnodes),
-                             Vector{Union{Nothing,ReadPlan}}(nothing, rnodes),
-                             Vector{Union{Nothing,ReadPlan}}(nothing, wnodes))
+        readermemo = Vector{Union{Nothing,ReadPlan}}(nothing, rnodes)
+        writermemo = Vector{Union{Nothing,ReadPlan}}(nothing, wnodes)
+        memocaps = zeros(Int32, wnodes)
         allocated!(budget, tables)
+        ctx = ResolveContext(budget, union_resolution, decimal_little, memokeys, memoplans, memocaps,
+                             readermemo, writermemo, BuildBuf{NTuple{2,Int32}}(budget, 8))
         writerpath = ResolutionPath(budget, 8)
         readerpath = ResolutionPath(budget, 8)
         plan = resolvenode(ctx, writer, reader, writerpath, readerpath)
         release!(budget, pathstorage(writerpath) + pathstorage(readerpath))
         release!(budget, memotablebytes(ctx) + vectorbytes(Union{Nothing,ReadPlan}, rnodes) +
-                         vectorbytes(Union{Nothing,ReadPlan}, wnodes))     # construction memos die here
+                         vectorbytes(Union{Nothing,ReadPlan}, wnodes) + insertlogbytes(ctx))  # construction memos die here
         return ResolvedSchema(writer, reader, union_resolution, plan)
     catch
         rollbackreservations!(budget, checkpoint)
@@ -612,13 +615,27 @@ function memostore!(ctx::ResolveContext, w::Schema, r::Schema, p::ReadPlan,
     addresolution!(ctx.budget, checked_mul(2, length(keys) - i + 2)) # shifts plus new key and plan
     insert!(keys, i, ir)
     insert!(ctx.memoplans[iw], i, p)
+    push!(ctx.inserted, ctx.budget, (Int32(iw), ir))
     return p
 end
 
-# A failed subtree (a writer union branch that does not resolve) leaves no half-built entries behind.
-function memoclear!(ctx::ResolveContext)
-    foreach(empty!, ctx.memokeys)
-    foreach(empty!, ctx.memoplans)
+function insertlogbytes(ctx::ResolveContext)
+    return vectorbytes(NTuple{2,Int32}, length(ctx.inserted.data)) + shellbytes(BuildBuf{NTuple{2,Int32}})
+end
+
+"Forget the pair-memo entries inserted after `mark`; entries cached before a failed branch, including its
+ancestors' in-progress record plans, stay so recursive references still terminate."
+function memoforget!(ctx::ResolveContext, mark::Int)
+    log = ctx.inserted
+    while log.len > mark
+        iw, ir = log.data[log.len]
+        log.len -= 1
+        keys = ctx.memokeys[iw]
+        i = resolutionsearchsortedfirst(keys, ir, ctx.budget)
+        addresolution!(ctx.budget, checked_mul(2, length(keys) - i + 1))   # shifts
+        deleteat!(keys, i)
+        deleteat!(ctx.memoplans[iw], i)
+    end
     return nothing
 end
 
@@ -952,8 +969,9 @@ function resolvebranch(ctx::ResolveContext, w::Schema, r::Schema,
     readerpresent, readercharge = plansnapshot(ctx, ctx.readermemo)
     writerpresent, writercharge = plansnapshot(ctx, ctx.writermemo)
     checkpoint = budgetcheckpoint(ctx.budget)
-    tables0 = memotablebytes(ctx)
+    tables0 = memotablebytes(ctx) + insertlogbytes(ctx)
     paths0 = pathstorage(wp) + pathstorage(rp)
+    mark = ctx.inserted.len
     try
         out = resolvenode(ctx, w, r, wp, rp, javasoft)
         release!(ctx.budget, readercharge + writercharge)
@@ -965,11 +983,11 @@ function resolvebranch(ctx::ResolveContext, w::Schema, r::Schema,
         end
         restoreplans!(ctx.readermemo, readerpresent)
         restoreplans!(ctx.writermemo, writerpresent)
-        memoclear!(ctx)
+        memoforget!(ctx, mark)
         diagnostics = stringbytes(sizeof(e.msg)) + stringbytes(sizeof(e.writerpath)) +
                       stringbytes(sizeof(e.readerpath))
         pathgrowth = pathstorage(wp) + pathstorage(rp) - paths0
-        keep = memotablebytes(ctx) - tables0 + diagnostics + pathgrowth
+        keep = memotablebytes(ctx) + insertlogbytes(ctx) - tables0 + diagnostics + pathgrowth
         rollbackbranch!(ctx.budget, checkpoint, keep)
         release!(ctx.budget, readercharge + writercharge)
         skipper = writerplan(ctx, w)                  # built after rollback because the returned branch owns it

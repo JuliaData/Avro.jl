@@ -256,6 +256,16 @@
         @test immediatevalue.index == 2
         @test immediatevalue.value["x"] == UInt8[0x6f, 0x6b]
     end
+    @testset "a failed branch inside a recursive record keeps the record's cached plan" begin
+        w = P("""{"type":"record","name":"R","fields":[{"name":"a","type":["null",
+            {"type":"record","name":"X","fields":[{"name":"v","type":"string"}]},"R"]}]}""")
+        r = P("""{"type":"record","name":"R","fields":[{"name":"a","type":["null",
+            {"type":"record","name":"X","fields":[{"name":"v","type":"int"}]},"R"]}]}""")
+        @test Avro.resolve(w, r) isa Avro.ResolvedSchema
+        @test rt(w, r, (a=Avro.UnionValue(3, (a=Avro.UnionValue(1, missing),)),)).a.index == 3
+        @test_throws Avro.ResolutionError rt(w, r, (a=Avro.UnionValue(2, (v="s",)),))
+    end
+
     @testset "work limit, repair, equality shortcut" begin
         function wide(pfx, n)
             return P("[" * join(["{\"type\":\"record\",\"name\":\"$(pfx)$i\",\"fields\":[]}" for i in 1:n], ",") * "]")
