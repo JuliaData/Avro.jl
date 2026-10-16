@@ -15,8 +15,8 @@ types fall back to their underlying type and are preserved when re-encoding. The
 | `duration` | [`Avro.Duration`](@ref) | `months`/`days`/`millis` as `UInt32` |
 
 Timestamps never silently become `DateTime` — the exact wrappers preserve the full `Int64` range. A
-typed target of `DateTime` (or `ZonedDateTime` via the TimeZones extension, decoding as the UTC
-instant) performs the same explicit conversion.
+typed target of `DateTime` performs the same explicit conversion; a typed `Avro.Timestamp{P}` target
+of another unit converts exactly or raises `Avro.ConversionError`.
 
 Deviations from other implementations, in favour of the specification, are recorded in
 [Limits and security](limits-and-security.md): decimal precision is validated on decode as well as

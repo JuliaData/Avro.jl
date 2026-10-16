@@ -27,13 +27,11 @@ Zstd_jll = "3161d3a3-bdf6-5164-811a-617609db77b4"
 [weakdeps]
 CodecBzip2 = "523fee87-0ab8-5b00-afb7-3ecf72e48cfd"
 CodecXz = "ba30903b-d9e8-5048-a5ec-d1f5b0d4b47b"
-TimeZones = "f269a46b-ccf7-5d73-abea-4c690281aa53"
 XZ_jll = "ffd25f8a-64ca-5728-b0f7-c24cf3aae800"
 
 [extensions]
 AvroCodecBzip2Ext = "CodecBzip2"
 AvroCodecXzExt = ["CodecXz", "XZ_jll"]
-AvroTimeZonesExt = "TimeZones"
 
 [compat]
 DataDecimals = "1"
@@ -54,7 +52,6 @@ SHA = "0.7"
 Snappy = "0.4"
 StructUtils = "2.8"
 Tables = "1.13"
-TimeZones = "1"
 TranscodingStreams = "0.11"
 UUIDs = "1"
 XZ_jll = "5.8"
