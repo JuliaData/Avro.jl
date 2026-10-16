@@ -1616,9 +1616,9 @@ end
 function publishmode(path::String)
     isfile(path) && return filemode(path) & 0o777
     Sys.iswindows() && return 0o666
-    mask = ccall(:umask, Base.Cmode_t, (Base.Cmode_t,), 0o022)     # the umask is read by setting it
-    ccall(:umask, Base.Cmode_t, (Base.Cmode_t,), mask)
-    return 0o666 & ~UInt(mask)
+    mask = ccall(:umask, Cuint, (Cuint,), 0o022) & 0o777           # the umask is read by setting it
+    ccall(:umask, Cuint, (Cuint,), mask)
+    return 0o666 & ~mask
 end
 
 "The writer's destination: `(sink, temppath, ownsink)` — a temp file first when writing atomically."
