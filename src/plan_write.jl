@@ -923,7 +923,7 @@ function arrayitems(x::AbstractDict)
 end
 
 function arrayitems(x)
-    applicable(iterate, x) && return x
+    !(x isa NOT_ARRAYLIKE) && applicable(iterate, x) && return x
     return encodeerror("expected an array (an iterable collection)", x)
 end
 
@@ -1075,9 +1075,39 @@ function selectbranch(p::WUnion, x, budget::Union{Nothing,Budget}=nothing)
     end
     x isa Base.Enum && return first(selectenumbranch(p, x, budget))
     for (i, b) in enumerate(p.branches)
-        acceptsbranch(b, x, budget) && return i
+        acceptsbranch(b, x, budget) || continue
+        b isa WRecord && budget !== nothing && return recordbranch(p, i, x, budget)
+        return i
     end
     encodeerror("no union branch accepts the value", x)
+end
+
+"Of the record branches accepting `x`, the first that `x` fills completely with the most fields."
+function recordbranch(p::WUnion, first::Int, x, budget::Budget)
+    best, most = first, recordcover(p.branches[first]::WRecord, x, budget)
+    for i in first + 1:length(p.branches)
+        b = p.branches[i]
+        b isa WRecord && accepts(b, x) || continue
+        n = recordcover(b, x, budget)
+        n > most && ((best, most) = (i, n))
+    end
+    return best
+end
+
+"The number of `p`'s fields that `x` supplies, or -1 when `x` lacks one of them."
+function recordcover(p::WRecord, x, budget::Budget)
+    if x isa AbstractDict
+        values, boxes = recorddictvalues(p, x, budget)
+        lacks = any(v -> v === DICT_MISSING, values)
+        release!(budget, vectorbytes(Any, length(values)) + boxes)
+        return lacks ? -1 : length(values)
+    end
+    positions = x isa TableRow ? recordrowpositions(p, x.row, budget) :
+                x isa Tables.AbstractRow ? recordrowpositions(p, x, budget) :
+                recordfieldpositions(p, typeof(x), budget)
+    lacks = any(iszero, positions)
+    release!(budget, vectorbytes(Int, length(positions)))
+    return lacks ? -1 : length(positions)
 end
 
 function retainedidentityschema(x::Record)
@@ -1189,8 +1219,11 @@ function accepts(::WDuration, x)
     return x isa Union{Duration,Durations.Duration}
 end
 
+# Iterable in Julia, but not Avro arrays.
+const NOT_ARRAYLIKE = Union{AbstractString,AbstractDict,Number,AbstractChar,NamedTuple,Pair}
+
 function accepts(::WArray, x)
-    return !(x isa Union{AbstractString,AbstractDict}) && applicable(iterate, x)
+    return !(x isa NOT_ARRAYLIKE) && applicable(iterate, x)
 end
 
 function accepts(::WMap, x)

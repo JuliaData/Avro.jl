@@ -275,6 +275,25 @@ end
         @test hex(enc(enumunion, branchgreen)) == "0200"
     end
 
+    @testset "union branch choice: records by their fields, arrays only from collections" begin
+        u = P("""[{"type":"record","name":"A","fields":[{"name":"x","type":"long"}]},
+                   {"type":"record","name":"B","fields":[{"name":"x","type":"long"},{"name":"y","type":"string"}]}]""")
+        for v in ((x=1, y="kept"), Dict("x" => 1, "y" => "kept"))
+            d = Avro.decode(u, Avro.encode(u, v))
+            @test d.index == 2 && d.value.y == "kept"
+        end
+        @test Avro.decode(u, Avro.encode(u, (x=1,))).index == 1
+        lacks = P("""[{"type":"record","name":"A","fields":[{"name":"z","type":"long"}]},
+                       {"type":"record","name":"B","fields":[{"name":"x","type":"long"}]}]""")
+        @test Avro.decode(lacks, Avro.encode(lacks, (x=1,))).index == 2
+        @test_throws Avro.EncodeError Avro.encode(P("""{"type":"array","items":"int"}"""), 5)
+        @test_throws Avro.EncodeError Avro.encode(P("""["null",{"type":"array","items":"int"}]"""), 5)
+        @test_throws Avro.EncodeError Avro.encode(P("""{"type":"array","items":"string"}"""), 'x')
+        scalar = P("""[{"type":"array","items":"long"},"double"]""")
+        @test Avro.decode(scalar, Avro.encode(scalar, 5)) == Avro.UnionValue(2, 5.0)
+        @test Avro.decode(scalar, Avro.encode(scalar, [5])) == Avro.UnionValue(1, [5])
+    end
+
     @testset "arrays and maps: blocks, sized blocks, cross-form fixtures" begin
         arr = "{\"type\":\"array\",\"items\":\"long\"}"
         @test dec(arr, hex2bytes("00")) == Int64[] && hex(enc(arr, Int64[])) == "00"
