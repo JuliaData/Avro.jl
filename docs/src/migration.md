@@ -1,7 +1,7 @@
 # Migration from 1.x
 
-Avro.jl 2.0 is a rewrite; this page maps every 1.x usage to its 2.0 form. `Avro.readtable` and
-`Avro.writetable` keep working for one major cycle with deprecation warnings.
+Avro.jl 2.0 is a rewrite; this page maps 1.x usage to its 2.0 form. `Avro.readtable`,
+`Avro.writetable`, `Avro.read`, and `Avro.write(x)` keep working as deprecated shims until 3.0.
 
 ## Tables API
 
@@ -22,7 +22,7 @@ Avro.jl 2.0 is a rewrite; this page maps every 1.x usage to its 2.0 form. `Avro.
 | `Avro.read(buf, T)` | `Avro.DatumReader(Avro.schema(T), T)(buf)` or `Avro.decode(s, buf)` |
 | `Avro.schematype(T)` | `Avro.schema(T)` |
 
-`Avro.write(dst, x)` now always means the container writer for a Tables.jl source.
+`Avro.write(dst, x)` writes a container file from a Tables.jl source.
 
 ## Value model changes
 

@@ -325,8 +325,8 @@ A block-level container reader over a file path (memory-mapped by default; `mmap
 vector (caller-owned), an `IOBuffer` (its written bytes) or a streaming `IO`. `eachblock(r)` yields
 `(count, bytes)` with the owned decompressed block; `eachdatum(r)` yields the schema's generic values;
 `close(r)` is idempotent (the do-block form closes on exit; a finalizer closes a path-owned source as a
-fallback). `legacy=:avrojl1` tolerates the two unambiguous Avro.jl ≤ 1.1.2 defects; `decimal_byteorder=:little`
-explicitly reinterprets 1.x native-endian decimals.
+fallback). `legacy=:avrojl1` tolerates the Avro.jl ≤ 1.1.2 container defects (padded null-codec blocks, the
+`zstd` codec name, unnamed fixed schemas); `decimal_byteorder=:little` reinterprets 1.x native-endian decimals.
 """
 mutable struct Reader
     source::Union{Nothing,BlockSource}

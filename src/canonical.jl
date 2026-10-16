@@ -129,7 +129,7 @@ function hashfingerprint(pcf::AbstractVector{UInt8}, algorithm::Symbol, budget::
 end
 
 """
-    Avro.fingerprint(schema; algorithm=:crc64avro, limits=Limits()) -> UInt64 | Vector{UInt8}
+    Avro.fingerprint(schema; algorithm=:crc64avro, limits=Limits()) -> UInt64 | AbstractVector{UInt8}
 
 A fingerprint of the Parsing Canonical Form: `:crc64avro` (`UInt64`), `:md5` or `:sha256` (bytes).
 """

@@ -6,7 +6,7 @@ byte-lockstep — without materialising values — honouring record field `order
 them under a schema:
 
 ```julia
-Avro.comparebytes(a_bytes, b_bytes, s)   # -1, 0, or 1
+Avro.comparebytes(s, a_bytes, b_bytes)   # -1, 0, or 1
 Avro.compare(s, x, y)
 ```
 

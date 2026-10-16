@@ -202,12 +202,7 @@ function decodetyped(::Type{T}, plan::TypedPlan, d::Decoder, names) where {T}
     return decodetyped(plan, d, names)
 end
 
-"""
-    Avro.DatumWriter(schema; limits=Limits())
-
-A prepared encoder with a reusable buffer (single-owner): `writer(x) -> Vector{UInt8}` returns a fresh
-owned buffer; `writer(enc_or_io, x)` appends to the caller's encoder or stream.
-"""
+# The type parameter of a DatumWriter built without a fixed datum type.
 struct UnfixedDatumWriter end
 
 mutable struct DatumWriter{P<:WritePlan,T,FP}
@@ -227,8 +222,9 @@ end
     Avro.DatumWriter(schema; limits=Limits())
     Avro.DatumWriter(schema, T; limits=Limits())
 
-The typed form fixes the datum type `T` at construction; when `T` is a NamedTuple aligned with the
-record schema, prepared encodes run fully monomorphized (the §10.2 zero-allocation kernel).
+A prepared encoder with a reusable buffer (single-owner): `writer(x) -> Vector{UInt8}` returns a fresh
+owned buffer; `writer(io, x)` appends to `io`. The typed form fixes the datum type `T`; when `T` is a
+NamedTuple aligned with the record schema, encoding into a reused buffer does not allocate.
 """
 function DatumWriter(schema::Schema; limits::Limits=Limits())
     plan = withbudget(limits; direction=:encode) do b

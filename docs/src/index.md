@@ -1,6 +1,6 @@
 # Avro.jl
 
-A pure-Julia implementation of the [Apache Avro](https://avro.apache.org/docs/++current++/specification/)
+A pure-Julia implementation of the [Apache Avro](https://avro.apache.org/docs/current/specification/)
 data format: schemas, binary and JSON encodings, schema resolution, sort order, single-object encoding,
 and object container files — with a Tables.jl interface, parallel decoding, and fixed, portable
 resource limits so untrusted files fail predictably instead of exhausting memory.
@@ -15,7 +15,7 @@ using Pkg; Pkg.add("Avro")
 
 ## Quick start
 
-Object container files carry their schema, so Tables.jl sources round-trip with no ceremony:
+Object container files carry their schema, so Tables.jl sources round-trip:
 
 ```julia
 using Avro

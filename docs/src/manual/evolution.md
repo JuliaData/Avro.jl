@@ -26,8 +26,8 @@ The full "Schema Resolution" rules are implemented:
 * the decoded representation follows the **reader** schema (a resolved value looks as if it had been
   written under the reader schema).
 
-Branch selection failures inside data (a writer branch no reader branch accepts) surface as
-`Avro.DataError` at the offending datum, not at resolution time, matching Java.
+A writer union branch that no reader branch accepts raises `Avro.ResolutionError` when a datum uses
+it, not when the schemas are resolved, matching Java.
 
 Resolution work is bounded by `max_resolution_work` (see [Limits](limits-and-security.md)); results
 are memoised per `(writer, reader)` pair within an operation.

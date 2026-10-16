@@ -1,9 +1,10 @@
 # Limits and security
 
 Avro.jl is designed to read **untrusted files safely by default**. Every operation runs under an
-[`Avro.Limits`](@ref) value with fixed, portable defaults; exceeding any limit raises
-`Avro.LimitError` naming the limit, the observed value, and the keyword to raise. Limits can reject
-valid data by design — every one is raisable for trusted bulk workloads.
+[`Avro.Limits`](@ref) value with fixed, portable defaults; exceeding a limit raises
+`Avro.LimitError` naming the limit, the observed value, and the keyword to raise (a codec frame that
+needs more decoder memory than `max_codec_memory` raises `Avro.CodecError` naming that limit). Limits
+can reject valid data by design — every one is raisable for trusted bulk workloads.
 
 ## The ceiling
 
@@ -49,8 +50,9 @@ Generic iteration interns nothing; `names=:trusted` bypasses admission.
 
 Malformed data raises `Avro.DataError`, schema problems `Avro.SchemaError`, resource exhaustion
 `Avro.LimitError`, codec problems `Avro.CodecError`/`Avro.UnsupportedCodecError`, conversion problems
-`Avro.ConversionError`/`Avro.EncodeError` — never a crash, hang, or unbounded allocation. Errors carry
-positions. The fuzz harness (differential against the Java and Python implementations) enforces this.
+`Avro.ConversionError`/`Avro.EncodeError` — never a crash, hang, or unbounded allocation. A
+`DataError` carries the byte position; `SchemaError` and `EncodeError` carry a JSON path. A seeded
+mutation fuzzer in the test suite checks this.
 
 ## Recorded deviations and oracle readability
 

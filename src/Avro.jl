@@ -1,7 +1,7 @@
 """
     Avro
 
-A production-grade implementation of the Apache Avro data format (schemas, binary and JSON encodings,
+An implementation of the Apache Avro data format (schemas, binary and JSON encodings,
 schema resolution, single-object encoding, object container files) for Julia, with Tables.jl
 integration. The API is fully qualified: nothing is exported.
 """

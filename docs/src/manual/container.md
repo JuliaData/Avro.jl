@@ -9,8 +9,8 @@ Avro.write("data.avro", table; codec=:zstandard, level=7, metadata=Dict("origin"
 buf = Avro.tobuffer(table)                     # an IOBuffer instead of a file
 ```
 
-The schema comes from `schema=`, else from the retained schema of an Avro source (an `Avro.Table`,
-`Avro.Rows` or `Avro.Reader`), else from the source's `Tables.schema`. Sources without one need an
+The schema comes from `schema=`, else from the retained schema of an Avro source (an `Avro.Table` or
+`Avro.Rows`), else from the source's `Tables.schema`. Sources without one need an
 explicit `schema=`. `Tables.partitions` become block boundaries.
 
 Writing to a path is **atomic by default**: output goes to a temporary file that is renamed over the

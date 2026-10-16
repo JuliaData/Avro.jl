@@ -5,7 +5,7 @@
 [![CI](https://github.com/JuliaData/Avro.jl/workflows/CI/badge.svg)](https://github.com/JuliaData/Avro.jl/actions?query=workflow%3ACI)
 [![codecov](https://codecov.io/gh/JuliaData/Avro.jl/branch/main/graph/badge.svg)](https://codecov.io/gh/JuliaData/Avro.jl)
 
-A pure-Julia implementation of the [Apache Avro](https://avro.apache.org/docs/++current++/specification/)
+A pure-Julia implementation of the [Apache Avro](https://avro.apache.org/docs/current/specification/)
 data format: schemas, binary and JSON encodings, schema resolution, sort order, single-object encoding,
 and object container files — with a Tables.jl interface, parallel decoding, and fixed, portable
 resource limits so untrusted files fail predictably instead of exhausting memory.
@@ -58,13 +58,11 @@ value = Avro.decode(s, bytes)
 * **Tables.jl**: `Avro.Table` is a column table (with `Tables.partitions` per block and DataAPI
   metadata); `Avro.Rows` streams `Avro.Row`s; `select=` is projection pushdown that skips unselected
   fields; typed decoding into your own structs via StructUtils.
-* **Parallel decoding**: `Avro.Table(src; ntasks=…)` decodes blocks concurrently with strictly
-  bounded memory — parallelism only ever uses headroom under the memory ceiling, results and error
-  behaviour are identical to sequential decoding at every `ntasks`.
-* **Safety by default**: one fixed 256 MiB per-operation ceiling and validated limits govern every
-  allocation; a work rule bounds decompression bombs; strict validation is the default; `Symbol`
-  interning from untrusted data passes a bounded admission table. Every limit is raisable for trusted
-  bulk workloads (`Avro.Limits`).
+* **Parallel decoding**: `Avro.Table(src; ntasks=…)` decodes blocks in parallel when the memory
+  ceiling leaves room (raise `max_total_bytes`); results and errors match `ntasks=1`.
+* **Safety by default**: each operation's memory is capped (256 MiB by default), decompression work is
+  bounded, input is validated strictly, and `Symbol` creation from untrusted data is bounded. Raise any
+  limit with `Avro.Limits` for trusted bulk workloads.
 * **Interoperability**: files are round-tripped against the Java (avro-tools 1.12.2) and Python
   (fastavro 1.12.2) implementations in CI, over every codec and every root schema kind.
 
@@ -82,7 +80,7 @@ Avro.write("clean.avro",
 `Avro.inspect("old.avro")` reports header and framing issues, including the legacy `zstd` codec name.
 It walks datum structure without materialising values and diagnoses legacy null-codec padding. It does
 not infer decimal byte order. See the migration guide in the documentation for
-the 1.x → 2.0 API changes (`writetable`/`readtable` still work, with deprecation warnings).
+the 1.x → 2.0 API changes (`writetable`/`readtable` still work as deprecated shims).
 
 ## Documentation
 

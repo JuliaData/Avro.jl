@@ -63,8 +63,8 @@ deferred.
 
 ### Deprecated
 
-- `Avro.readtable(src)` (reads with `legacy=:avrojl1`) and `Avro.writetable(dst, tbl; compress=…)` —
-  removal in 3.0.
+- `Avro.readtable(src)` (reads with `legacy=:avrojl1`), `Avro.writetable(dst, tbl; compress=…)`,
+  `Avro.read(src, T_or_schema)`, and the one-argument datum form `Avro.write(x)` — removal in 3.0.
 
 ### Fixed
 

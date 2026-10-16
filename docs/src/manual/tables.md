@@ -30,7 +30,7 @@ df = DataFrame(t)                              # or any Tables.jl sink
 
 ## Projection pushdown
 
-`select=` on both readers skips unselected fields (strict mode walks them, fast mode jumps sized
+`select=` on `Avro.Table` and generic `Avro.Rows` skips unselected fields (strict mode walks them, fast mode jumps sized
 blocks) and derives an effective schema of exactly the selected fields, which `Avro.write`
 round-trips:
 

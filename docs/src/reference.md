@@ -5,4 +5,5 @@ change in any release.
 
 ```@autodocs
 Modules = [Avro]
+Private = false
 ```
