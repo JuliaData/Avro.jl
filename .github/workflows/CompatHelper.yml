@@ -1,0 +1,18 @@
+name: CompatHelper
+on:
+  schedule:
+    - cron: '0 4 * * 1'
+  workflow_dispatch:
+jobs:
+  CompatHelper:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run CompatHelper
+        run: |
+          import Pkg
+          Pkg.add("CompatHelper")
+          import CompatHelper
+          CompatHelper.main()
+        shell: julia --color=yes {0}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

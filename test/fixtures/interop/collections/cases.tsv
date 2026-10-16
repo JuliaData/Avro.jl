@@ -1,0 +1,3 @@
+# name	schema	expected	positive	sized
+array	array.avsc	array.json	array.positive.hex	array.sized.hex
+map	map.avsc	map.json	map.positive.hex	map.sized.hex

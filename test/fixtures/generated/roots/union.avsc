@@ -1,0 +1,1 @@
+["null", "int", "string", {"type": "record", "name": "P", "namespace": "avro.jl.test", "fields": [{"name": "x", "type": "double"}]}]

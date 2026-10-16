@@ -1,0 +1,66 @@
+# The performance gates (opt-in: AVRO_PERF=true on the
+# named authoring host). Every gated number is the median of 5 cold processes. Workload metrics use
+# the best of 3 in-process repetitions after one warm-up (test/perf/cold.jl); load and time-to-first-
+# table measure cold startup directly. Ratio gates compare against the Avro.jl 1.1.2 baselines
+# measured on the same host and Julia (recorded below); every numeric target is enforced on the
+# named host.
+
+@testset "Performance gates" begin
+    BASE_WRITE_112 = 0.9460       # Avro 1.1.2 writetable, median of 5 cold processes,
+    BASE_READMAT_112 = 5.0513     # each best-of-3, deterministic {id,x,name,flag} data — recorded on
+                                  # an Apple M3 Max with Julia 1.12.6 (2026-08-24)
+    cold = joinpath(@__DIR__, "perf", "cold.jl")
+    project = Base.active_project()
+    # Pkg.test forces --check-bounds=yes on this process and Base.julia_cmd() reproduces it; the
+    # measurement protocol measures default-flag cold processes (the 1.1.2 baselines were recorded that
+    # way), so the child drops the flag — globally-forced bounds checks compress the projection
+    # skip-path ratio from ≈2.4 to ≈1.85 while the suite's own assertions keep running checked.
+    juliacmd = Cmd(filter(a -> !startswith(a, "--check-bounds"), Base.julia_cmd().exec))
+    function coldmetric(metric; threads=1)
+        samples = Vector{Float64}[]
+        for _ in 1:5
+            out = read(`$juliacmd --startup-file=no --threads=$threads --project=$project $cold $metric`, String)
+            fields = split(strip(out))
+            @assert fields[1] == metric
+            push!(samples, parse.(Float64, fields[2:end]))
+        end
+        width = length(first(samples))
+        @assert width > 0 && all(length(sample) == width for sample in samples)
+        return ntuple(width) do i
+            values = sort!([sample[i] for sample in samples])
+            values[3]
+        end
+    end
+    twrite = only(coldmetric("write"))
+    @test twrite <= BASE_WRITE_112 / 4                              # ≥ 4× vs 1.1.2
+    @test twrite <= 0.25                                            # ≥ 80 MB/s on the named host
+    ttable = only(coldmetric("table1"))
+    @test ttable <= BASE_READMAT_112 / 10                           # ≥ 10× vs 1.1.2 read + materialise
+    @test ttable <= 0.30
+    ratio8 = nothing
+    if Sys.CPU_THREADS >= 8
+        ratio8 = only(coldmetric("table8"; threads=8))
+        @test ratio8 >= 3                                           # 8 tasks vs 1, 4 GiB limits on both
+    end
+    overheads = Dict{String,Float64}()
+    for codec in ("zstandard", "deflate", "snappy")
+        o = only(coldmetric("codec-$codec"))
+        overheads[codec] = o
+        @test o <= 1.3                                              # ≤ 1.3 × (null table + isolated transcode)
+    end
+    projratio = only(coldmetric("projection"))
+    @test projratio >= 2                                            # select=(:id,) under :fast
+    decallocs, dns, ea, ens, onedec, oneenc, parseus, parseallocs = coldmetric("kernels")
+    @test decallocs <= 1                                            # prepared typed decode: the string only
+    @test dns <= 150
+    @test ea == 0                                                   # prepared typed encode: zero allocations
+    @test parseus <= 100
+    # A regression bound on parser allocations (2,254 measured on the reference host); far fewer would
+    # need an arena-style parser.
+    @test parseallocs <= 2300
+    tload = only(coldmetric("load"))
+    @test tload <= 0.5
+    tttft = only(coldmetric("ttft"))
+    @test tttft <= 1.5
+    @info "performance medians (5 cold processes)" write_s = round(twrite; digits=3) write_ratio_vs_112 = round(BASE_WRITE_112 / twrite; digits=1) table1_s = round(ttable; digits=3) table_ratio_vs_112 = round(BASE_READMAT_112 / ttable; digits=1) ratio_8t = ratio8 === nothing ? "n/a" : round(ratio8; digits=2) codec_overheads = join(("$k=$(round(v; digits=2))" for (k, v) in overheads), " ") projection_ratio = round(projratio; digits=1) prepared_decode = "$(decallocs) allocs, $(round(dns; digits=0)) ns" prepared_encode = "$(ea) allocs, $(round(ens; digits=0)) ns" oneshot = "dec $(round(onedec; digits=0)) ns, enc $(round(oneenc; digits=0)) ns" parseschema = "$(round(parseus; digits=1)) μs, $(round(parseallocs; digits=0)) allocs" load_s = round(tload; digits=2) ttft_s = round(tttft; digits=2)
+end
