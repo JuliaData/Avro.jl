@@ -287,6 +287,14 @@ import DataAPI
         @test isequal(Tables.columntable(Tables.rows(t)), Tables.columntable(t))
     end
 
+    @testset "string columns whose later rows outgrow the first" begin
+        s = Union{Missing,String}[i % 7 == 0 ? missing : repeat("x", i == 1 ? 0 : i % 97) for i in 1:2000]
+        for codec in (:null, :zstandard)
+            t = Avro.Table(Avro.tobuffer((id=Int32.(1:2000), s=s); codec=codec))
+            @test isequal(Tables.getcolumn(t, :s), s)
+        end
+    end
+
     @testset "wide tables under default limits" begin
         header = [Symbol("x", i) for i in 1:2000]                  # x1, x2, … is not byte order
         src = Tables.table(reshape(collect(1:4000), 2, 2000); header=header)
