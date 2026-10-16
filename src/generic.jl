@@ -541,9 +541,11 @@ function Base.getindex(r::Record, i::Integer)
 end
 
 function Base.getproperty(r::Record, name::Symbol)
+    i = symbolfieldposition(r, name)                   # a field named `schema` or `values` wins
+    i != 0 && return getfield(r, :values)[i]
     name === :schema && return getfield(r, :schema)
     name === :values && return getfield(r, :values)
-    return r[name]
+    throw(KeyError(name))
 end
 
 function Base.propertynames(r::Record, private::Bool=false)
