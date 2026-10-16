@@ -3592,95 +3592,165 @@ end
     minsize(schema) -> Int
 
 The minimal encoded size in bytes of a datum of `schema` (`typemax(Int)` when no finite datum exists,
-e.g. an empty union, an empty enum, or a required recursive cycle without a nullable/array/map escape);
-a memoised, cycle-safe fixed point.
+e.g. an empty union, an empty enum, or a required recursive cycle without a nullable/array/map escape).
 """
 function minsize(s::Schema)
-    memo = Vector{Int}(undef, graphinfo(s).nodes)
-    fill!(memo, -1)
-    return minsize(s, memo, falses(length(memo)))
+    return minsize(s, nothing)
 end
 
-"The budgeted form plan construction uses: the transient memo and active set are charged and released."
-function minsize(s::Schema, budget::Budget)
+# Knuth's generalisation of Dijkstra's algorithm: a record's size is the sum of its fields' sizes, a
+# union's is its cheapest branch plus the branch index, and every other kind is a leaf. Finalising nodes
+# in increasing size gives mutually recursive records their least sizes; unreached nodes stay INFINITE.
+function minsize(s::Schema, budget::Union{Nothing,Budget})
     n = graphinfo(s).nodes
-    scratch = vectorbytes(Int, n) + vectorbytes(UInt64, cld(n, 64)) + 32   # the memo, BitVector chunks and shell
-    reserve!(budget, scratch)
-    memo = Vector{Int}(undef, n)
-    active = falses(n)
-    allocated!(budget, scratch)
-    fill!(memo, -1)
-    r = minsize(s, memo, active)
-    release!(budget, scratch)                          # construction-only scratch dies here (round-3 item 3)
-    return r
-end
-
-function minsize(s::Schema, memo::Vector{Int}, active::BitVector)
-    id = Int(nodeid(s)) + 1
-    memo[id] >= 0 && return memo[id]
-    if active[id]
-        return INFINITE   # an active recursion edge: this path has no finite datum
+    scratch = vectorbytes(Schema, n) + 2 * vectorbytes(Int32, n) + 2 * vectorbytes(Int, n) +
+              2 * (vectorbytes(UInt64, cld(n, 64)) + 32)
+    budget === nothing || reserve!(budget, scratch)
+    nodes = Vector{Schema}(undef, n)
+    head = zeros(Int32, n)                             # each node's first parent edge
+    pending = zeros(Int32, n)                          # a record's fields not yet finalised
+    total = zeros(Int, n)
+    best = fill(INFINITE, n)
+    seen = falses(n)
+    done = falses(n)
+    budget === nothing || allocated!(budget, scratch)
+    edges = BuildBuf{NTuple{3,Int32}}(budget, 8)       # (parent, branch position or 0 for a field, next edge)
+    stack = BuildBuf{Int32}(budget, 8)
+    heap = BuildBuf{Tuple{Int,Int32}}(budget, 8)
+    root = Int32(nodeid(s) + 1)
+    seen[root] = true
+    nodes[root] = s
+    push!(stack, budget, root)
+    while stack.len > 0                                # discover the graph and its parent edges
+        id = stack.data[stack.len]
+        stack.len -= 1
+        x = nodes[id]
+        if x isa RecordSchema
+            pending[id] = length(x.fields)
+            for f in x.fields
+                minsizeedge!(f.schema, id, Int32(0), nodes, head, seen, edges, stack, budget)
+            end
+            isempty(x.fields) && heappush!(heap, budget, (0, id))
+        elseif x isa UnionSchema
+            for (position, b) in enumerate(x.branches)
+                minsizeedge!(b, id, Int32(position), nodes, head, seen, edges, stack, budget)
+            end
+        else
+            size = minsizeof(x)
+            size == INFINITE || heappush!(heap, budget, (size, id))
+        end
     end
-    active[id] = true
-    r = minsizeof(s, memo, active)
-    active[id] = false
-    memo[id] = r
-    return r
+    while heap.len > 0                                 # finalise nodes in increasing size
+        size, id = heappop!(heap)
+        done[id] && continue
+        done[id] = true
+        best[id] = size
+        e = head[id]
+        while e != 0
+            parent, position, next = edges.data[e]
+            if !done[parent]
+                if position == 0
+                    pending[parent] -= 1
+                    total[parent] = satadd(total[parent], size)
+                    pending[parent] == 0 && total[parent] != INFINITE &&
+                        heappush!(heap, budget, (total[parent], parent))
+                else
+                    candidate = satadd(size, varintlength(position - 1))
+                    if candidate < best[parent]
+                        best[parent] = candidate
+                        heappush!(heap, budget, (candidate, parent))
+                    end
+                end
+            end
+            e = next
+        end
+    end
+    if budget !== nothing
+        release!(budget, scratch)
+        for b in (edges, stack, heap)
+            release!(budget, vectorbytes(eltype(b.data), length(b.data)) + shellbytes(typeof(b)))
+        end
+    end
+    return done[root] ? best[root] : INFINITE
 end
 
-function minsizeof(::NullSchema, memo, active)
+"Record the parent edge `parent -> child` (`position` 0 for a record field) and queue an unseen child."
+function minsizeedge!(child::Schema, parent::Int32, position::Int32, nodes::Vector{Schema},
+                      head::Vector{Int32}, seen::BitVector, edges::BuildBuf{NTuple{3,Int32}},
+                      stack::BuildBuf{Int32}, budget::Union{Nothing,Budget})
+    id = Int32(nodeid(child) + 1)
+    push!(edges, budget, (parent, position, head[id]))
+    head[id] = Int32(edges.len)
+    if !seen[id]
+        seen[id] = true
+        nodes[id] = child
+        push!(stack, budget, id)
+    end
+    return nothing
+end
+
+function heappush!(h::BuildBuf{Tuple{Int,Int32}}, budget::Union{Nothing,Budget}, x::Tuple{Int,Int32})
+    push!(h, budget, x)
+    i = h.len
+    while i > 1
+        parent = i >> 1
+        h.data[parent] <= h.data[i] && break
+        h.data[parent], h.data[i] = h.data[i], h.data[parent]
+        i = parent
+    end
+    return nothing
+end
+
+function heappop!(h::BuildBuf{Tuple{Int,Int32}})
+    top = h.data[1]
+    h.data[1] = h.data[h.len]
+    h.len -= 1
+    i = 1
+    while true
+        l, r, m = 2i, 2i + 1, i
+        l <= h.len && h.data[l] < h.data[m] && (m = l)
+        r <= h.len && h.data[r] < h.data[m] && (m = r)
+        m == i && break
+        h.data[i], h.data[m] = h.data[m], h.data[i]
+        i = m
+    end
+    return top
+end
+
+function minsizeof(::NullSchema)
     return 0
 end
 
-function minsizeof(::BooleanSchema, memo, active)
+function minsizeof(::BooleanSchema)
     return 1
 end
 
-function minsizeof(::Union{IntSchema,LongSchema}, memo, active)
+function minsizeof(::Union{IntSchema,LongSchema})
     return 1
 end
 
-function minsizeof(::FloatSchema, memo, active)
+function minsizeof(::FloatSchema)
     return 4
 end
 
-function minsizeof(::DoubleSchema, memo, active)
+function minsizeof(::DoubleSchema)
     return 8
 end
 
-function minsizeof(::Union{BytesSchema,StringSchema}, memo, active)
+function minsizeof(::Union{BytesSchema,StringSchema})
     return 1
 end
 
-function minsizeof(::Union{ArraySchema,MapSchema}, memo, active)
+function minsizeof(::Union{ArraySchema,MapSchema})
     return 1
 end
 
-function minsizeof(s::FixedSchema, memo, active)
+function minsizeof(s::FixedSchema)
     return s.size
 end
 
-function minsizeof(s::EnumSchema, memo, active)
+function minsizeof(s::EnumSchema)
     return isempty(s.symbols) ? INFINITE : 1
-end
-
-function minsizeof(s::UnionSchema, memo, active)
-    best = INFINITE
-    for (i, b) in enumerate(s.branches)
-        m = minsize(b, memo, active)
-        m == INFINITE && continue
-        best = min(best, satadd(m, varintlength(i - 1)))
-    end
-    return best
-end
-
-function minsizeof(s::RecordSchema, memo, active)
-    total = 0
-    for f in s.fields
-        total = satadd(total, minsize(f.schema, memo, active))
-        total == INFINITE && return INFINITE
-    end
-    return total
 end
 
 """

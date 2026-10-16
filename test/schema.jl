@@ -577,6 +577,15 @@ end
     @test Avro.minsize(P("""["int","string"]""")) == 2 && Avro.minsize(P("[" * join(["{\"type\":\"fixed\",\"name\":\"F$i\",\"size\":$(i == 64 ? 0 : 10)}" for i in 0:64], ",") * "]")) == 2   # the 65th branch (size 0) needs a 2-byte index
     huge = Avro.RecordSchema("Huge"; fields=[Avro.Field("a", Avro.FixedSchema("A", typemax(Int) - 1)), Avro.Field("b", Avro.FixedSchema("B", 2))])
     @test Avro.minsize(huge) == typemax(Int)
+    # mutually recursive records reached through another record: Company's least datum needs Person's
+    orgs = P("""{"type":"array","items":{"type":"record","name":"Org","fields":[
+        {"name":"founder","type":{"type":"record","name":"Person","fields":[{"name":"name","type":"string"},
+            {"name":"employer","type":["null",{"type":"record","name":"Company","fields":[
+                {"name":"title","type":"string"},{"name":"ceo","type":"Person"}]}]}]}},
+        {"name":"company","type":"Company"}]}}""")
+    @test Avro.minsize(orgs.items) == 5
+    org = [(founder=(name="ann", employer=missing), company=(title="acme", ceo=(name="bob", employer=missing)))]
+    @test Avro.decode(orgs, Avro.encode(orgs, org))[1].company.ceo.name == "bob"
     @test Avro.varintlength(0) == 1 && Avro.varintlength(63) == 1 && Avro.varintlength(64) == 2
 
     legacy_fixed_json = """{"type":"record","name":"LegacyFixedOrdinals","fields":[
