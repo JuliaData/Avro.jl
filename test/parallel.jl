@@ -1,4 +1,4 @@
-@testset "Parallel decode (plan §4.9)" begin
+@testset "Parallel decode" begin
     P = Avro.parseschema
     raised = Avro.Limits(max_total_bytes=2 << 30, max_block_bytes=16 << 20, max_block_output_bytes=256 << 20,
                          max_codec_memory=32 << 20, max_bytes=64 << 20, max_datum_bytes=64 << 20)

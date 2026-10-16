@@ -1,5 +1,5 @@
-# Schema resolution (plan §4.7): `resolve(writer, reader)` builds a writer-driven read plan whose values
-# are the reader schema's generic values (§4.6). Pairs are memoised on (writer, reader) node ids and
+# Schema resolution: `resolve(writer, reader)` builds a writer-driven read plan whose values
+# are the reader schema's generic values. Pairs are memoised on (writer, reader) node ids and
 # every match attempt, memo step and plan node is charged to `max_resolution_work`; unions follow the
 # spec policy (the first reader branch matching with promotion) or Apache Java's exact-match-first
 # policy; failures are `ResolutionError`s carrying both paths.
@@ -208,7 +208,7 @@ mutable struct ResolveContext
     const decimal_little::Bool
     const memokeys::Vector{Vector{Int32}}          # per writer node id: sorted reader node ids
     const memoplans::Vector{Vector{ReadPlan}}
-    const memocaps::Vector{Int32}                  # prebuilt capacity per slot (§4.4 replacement growth)
+    const memocaps::Vector{Int32}                  # prebuilt capacity per slot
     const readermemo::Vector{Union{Nothing,ReadPlan}}
     const writermemo::Vector{Union{Nothing,ReadPlan}}
     const inserted::BuildBuf{NTuple{2,Int32}}      # pair-memo insertions (slot, key), undone when a branch fails
@@ -493,7 +493,7 @@ end
 """
     Avro.resolve(writer::Schema, reader::Schema; union_resolution=:spec, limits=Limits()) -> ResolvedSchema
 
-Resolve data written with `writer` for a `reader` (plan §4.7): kinds, promotions
+Resolve data written with `writer` for a `reader`: kinds, promotions
 (`int→long/float/double`, `long→float/double`, `float→double`, `string↔bytes`), named types by fullname,
 reader aliases or unqualified name, record fields by name and reader field aliases (an alias consumes the
 writer field), reader-only fields from valid defaults, enum symbols by name with the reader default,
@@ -512,7 +512,7 @@ function resolve(writer::Schema, reader::Schema; union_resolution::Symbol=:spec,
         rnodes = graphinfo(reader).nodes
         tables = 2 * vectorbytes(Vector{Int32}, wnodes) + vectorbytes(Int32, wnodes) + 2 * wnodes * STORAGE[].vector +
                  vectorbytes(Union{Nothing,ReadPlan}, rnodes) + vectorbytes(Union{Nothing,ReadPlan}, wnodes)
-        reserve!(budget, tables)                           # the memo tables, released once the plan is built (§4.4)
+        reserve!(budget, tables)                           # the memo tables, released once the plan is built
         memokeys = Vector{Vector{Int32}}(undef, wnodes)
         memoplans = Vector{Vector{ReadPlan}}(undef, wnodes)
         for i in 1:wnodes
@@ -597,7 +597,7 @@ function memostore!(ctx::ResolveContext, w::Schema, r::Schema, p::ReadPlan,
         addresolution!(ctx.budget, checked_mul(2, length(keys))) # key and plan replacement copies
         newcap = max(2 * Int(ctx.memocaps[iw]), 4)
         growth = vectorbytes(Int32, newcap) + vectorbytes(ReadPlan, newcap)
-        reserve!(ctx.budget, growth)                   # the replacement partner vectors (§4.4)
+        reserve!(ctx.budget, growth)                   # the replacement partner vectors
         nk = Vector{Int32}(undef, newcap)
         np = Vector{ReadPlan}(undef, newcap)
         allocated!(ctx.budget, growth)
@@ -1092,7 +1092,7 @@ function resolverecord(ctx::ResolveContext, w::RecordSchema, r::RecordSchema,
                        javasoft::Bool=false)
     nw, nr = length(w.fields), length(r.fields)
     slots = vectorbytes(Pair{Int,ReadPlan}, nw) + vectorbytes(Pair{Int,DefaultPlan}, nr) + vectorbytes(Int, nr) + 64
-    reserve!(ctx.budget, slots)                        # exact step/default/box capacity and node shell (§4.4)
+    reserve!(ctx.budget, slots)                        # exact step/default/box capacity and node shell
     steps = Vector{Pair{Int,ReadPlan}}(undef, nw)
     resize!(steps, 0)
     defaults = Vector{Pair{Int,DefaultPlan}}(undef, nr)
@@ -1550,7 +1550,7 @@ function skipvalue(p::ResolvedRecordPlan, d::Decoder)
     return nothing
 end
 
-# ---- column builders over resolved records (plan §6; used by Avro.Table and Rows partitions) ---------
+# ---- column builders over resolved records (used by Avro.Table and Rows partitions) ---------
 
 "The retained builder state for one resolved reader record, excluding typed column data."
 function columnbuildersstate(p::ResolvedRecordPlan,

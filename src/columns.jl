@@ -1,4 +1,4 @@
-# Column builders (plan §4.5): the column plan family decodes record fields straight into typed column
+# Column builders: the column plan family decodes record fields straight into typed column
 # vectors. Builders live in a schema-independent `Vector{ColumnBuilder}` and are driven by one loop with
 # a function barrier per cell; every builder type is one member of the closed value set `E`
 # (`valuetypes()`), so untrusted schemas never create new method instances.
@@ -68,7 +68,7 @@ end
 
 "A field that is not selected: skipped under the active validation mode."
 struct SkipColumn{P<:ReadPlan} <: ColumnBuilder
-    plan::P                 # concrete: the skip devirtualizes (§10.2 projection work)
+    plan::P                 # concrete: the skip devirtualizes
 end
 
 """
@@ -400,7 +400,7 @@ function decodecell!(c::SkipRun, d::Decoder)
                 readint(d)
             elseif kind == SKIP_BOOL
                 countvalues!(b)
-                readbool(d)                            # bools stay domain-checked in both modes (§4.3)
+                readbool(d)                            # bools stay domain-checked in both modes
             elseif kind == SKIP_FLOAT
                 countvalues!(b)
                 readfloat(d)

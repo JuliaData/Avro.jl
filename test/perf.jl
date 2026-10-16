@@ -1,18 +1,18 @@
-# The §10.2 performance gates under the §10.1 measurement protocol (opt-in: AVRO_PERF=true on the
+# The performance gates (opt-in: AVRO_PERF=true on the
 # named authoring host). Every gated number is the median of 5 cold processes. Workload metrics use
 # the best of 3 in-process repetitions after one warm-up (test/perf/cold.jl); load and time-to-first-
 # table measure cold startup directly. Ratio gates compare against the Avro.jl 1.1.2 baselines
-# measured on the same host and Julia (recorded below); every numeric §10.2 target is enforced on the
+# measured on the same host and Julia (recorded below); every numeric target is enforced on the
 # named host.
 
-@testset "Performance gates (plan §10.1/§10.2)" begin
-    BASE_WRITE_112 = 0.9460       # Avro 1.1.2 writetable, §10.1 protocol: median of 5 cold processes,
+@testset "Performance gates" begin
+    BASE_WRITE_112 = 0.9460       # Avro 1.1.2 writetable, median of 5 cold processes,
     BASE_READMAT_112 = 5.0513     # each best-of-3, deterministic {id,x,name,flag} data — recorded on
                                   # an Apple M3 Max with Julia 1.12.6 (2026-08-24)
     cold = joinpath(@__DIR__, "perf", "cold.jl")
     project = Base.active_project()
     # Pkg.test forces --check-bounds=yes on this process and Base.julia_cmd() reproduces it; the
-    # §10.1 protocol measures default-flag cold processes (the 1.1.2 baselines were recorded that
+    # measurement protocol measures default-flag cold processes (the 1.1.2 baselines were recorded that
     # way), so the child drops the flag — globally-forced bounds checks compress the projection
     # skip-path ratio from ≈2.4 to ≈1.85 while the suite's own assertions keep running checked.
     juliacmd = Cmd(filter(a -> !startswith(a, "--check-bounds"), Base.julia_cmd().exec))
@@ -55,17 +55,12 @@
     @test dns <= 150
     @test ea == 0                                                   # prepared typed encode: zero allocations
     @test parseus <= 100
-    # Disputed (round-2 D07 sub-item): §10.2's gate column for `parseschema` is "—" — the ≤ 300
-    # allocations figure sits in the informational column. Reaching it needs an arena-style parser
-    # rewrite (the profile: ~287 boxed Ints, ~138 heap name tuples, per-token Strings), which is out of
-    # proportion for an informational number this late. The assertion below is a calibrated regression
-    # bound so parser-allocation regressions still fail loudly: measured 2,062 before the round-4
-    # exact-capacity contract, 2,254 after it (prebuilt containers and replacement growth cost a few
-    # vectors per node; shared frozen empties reclaim the alias-free and prop-free cases).
+    # A regression bound on parser allocations (2,254 measured on the reference host); far fewer would
+    # need an arena-style parser.
     @test parseallocs <= 2300
     tload = only(coldmetric("load"))
     @test tload <= 0.5
     tttft = only(coldmetric("ttft"))
     @test tttft <= 1.5
-    @info "§10.1 medians (5 cold processes)" write_s = round(twrite; digits=3) write_ratio_vs_112 = round(BASE_WRITE_112 / twrite; digits=1) table1_s = round(ttable; digits=3) table_ratio_vs_112 = round(BASE_READMAT_112 / ttable; digits=1) ratio_8t = ratio8 === nothing ? "n/a" : round(ratio8; digits=2) codec_overheads = join(("$k=$(round(v; digits=2))" for (k, v) in overheads), " ") projection_ratio = round(projratio; digits=1) prepared_decode = "$(decallocs) allocs, $(round(dns; digits=0)) ns" prepared_encode = "$(ea) allocs, $(round(ens; digits=0)) ns" oneshot = "dec $(round(onedec; digits=0)) ns, enc $(round(oneenc; digits=0)) ns" parseschema = "$(round(parseus; digits=1)) μs, $(round(parseallocs; digits=0)) allocs" load_s = round(tload; digits=2) ttft_s = round(tttft; digits=2)
+    @info "performance medians (5 cold processes)" write_s = round(twrite; digits=3) write_ratio_vs_112 = round(BASE_WRITE_112 / twrite; digits=1) table1_s = round(ttable; digits=3) table_ratio_vs_112 = round(BASE_READMAT_112 / ttable; digits=1) ratio_8t = ratio8 === nothing ? "n/a" : round(ratio8; digits=2) codec_overheads = join(("$k=$(round(v; digits=2))" for (k, v) in overheads), " ") projection_ratio = round(projratio; digits=1) prepared_decode = "$(decallocs) allocs, $(round(dns; digits=0)) ns" prepared_encode = "$(ea) allocs, $(round(ens; digits=0)) ns" oneshot = "dec $(round(onedec; digits=0)) ns, enc $(round(oneenc; digits=0)) ns" parseschema = "$(round(parseus; digits=1)) μs, $(round(parseallocs; digits=0)) allocs" load_s = round(tload; digits=2) ttft_s = round(tttft; digits=2)
 end

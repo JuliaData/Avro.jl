@@ -1,4 +1,4 @@
-# Error hierarchy (plan §4.13). Every defect the package detects in its input surfaces as an `AvroError`;
+# Error hierarchy. Every defect the package detects in its input surfaces as an `AvroError`;
 # exceptions that are not about the content (IOError, InterruptException, OutOfMemoryError, user-hook
 # errors) propagate unchanged.
 
@@ -21,7 +21,7 @@ abstract type DecodeError <: AvroError end
 """
     Avro.SchemaError(msg, path)
 
-A schema document violates the Avro schema rules (plan §3/§4.2). `path` is the JSON path of the offending
+A schema document violates the Avro schema rules. `path` is the JSON path of the offending
 element (e.g. `"\$.fields[2].type"`).
 """
 struct SchemaError <: AvroError
@@ -43,7 +43,7 @@ end
 """
     Avro.ResolutionError(msg, writerpath, readerpath)
 
-The writer and reader schemas do not resolve (plan §4.7).
+The writer and reader schemas do not resolve.
 """
 struct ResolutionError <: AvroError
     msg::String

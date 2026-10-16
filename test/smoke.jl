@@ -1,4 +1,4 @@
-# Cross-package smoke (plan §6, Phase 5): CSV → Avro → Arrow with the registered Arrow 2.x, and a
+# Cross-package smoke: CSV → Avro → Arrow with the registered Arrow 2.x, and a
 # DataFrames round trip through a stored schema. Opt-in: AVRO_SMOKE=true.
 
 import CSV, Arrow, DataFrames

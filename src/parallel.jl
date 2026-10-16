@@ -1,4 +1,4 @@
-# Parallel container decode (plan §4.9): `Avro.Table` over byte and mapped sources pre-scans block
+# Parallel container decode: `Avro.Table` over byte and mapped sources pre-scans block
 # headers into a block table, preallocates the final columns once at their exact storage, decodes the
 # lowest uncommitted block directly into them under the sequential rule, and admits higher blocks
 # strictly in block order into headroom with complete worst-case reservations (no eviction, no retry,
@@ -41,7 +41,7 @@ end
 "Fixed per-block decoder and coordinator state outside schema-derived builders and value storage."
 const BLOCK_STATE_MAX = 8 * MiB
 
-"The settled charged per-worker state allowance (plan §4.4; task stacks are runtime-owned, documented)."
+"The settled charged per-worker state allowance (task stacks are runtime-owned, documented)."
 const WORKER_STATE = 16 * 1024
 
 struct PrescanResult
@@ -54,7 +54,7 @@ end
 function prescanblocks(r::Reader)
     src = r.source::BytesSource
     tablecap = 64
-    reserve!(r.budget, blocktablecharge(tablecap))     # the block table grows by reserved exact-capacity replacement (§4.4)
+    reserve!(r.budget, blocktablecharge(tablecap))     # the block table grows by reserved exact-capacity replacement
     entries = Vector{BlockEntry}(undef, tablecap)
     allocated!(r.budget, blocktablecharge(tablecap))
     nentries = 0
@@ -109,7 +109,7 @@ function prescanblocks(r::Reader)
 end
 
 """
-The complete worst-case reservation `W` of one higher in-flight block (plan §4.9): compressed size, the
+The complete worst-case reservation `W` of one higher in-flight block: compressed size, the
 decompressed-buffer cap, the codec decoder requirement, its exact chunk shells and capacities, chunk
 payload up to the block-output cap, and the scratch/state allowance.
 """
@@ -159,7 +159,7 @@ mutable struct BlockJob
     @atomic state::Symbol            # :pending → :done | :failed | :abandoned
 end
 
-"Deterministic §4.9 counters of one parallel operation (also read by the peak-RSS gate)."
+"Deterministic counters of one parallel operation (also read by the peak-RSS gate)."
 mutable struct ParallelStats
     inflight_highwater::Int          # blocks concurrently in flight (the direct head plus workers)
     speculative_decoded::Int         # higher blocks decoded past an authoritative failure
@@ -515,7 +515,7 @@ function poolplan(r::Reader, cols::Vector{Type}, entries::BlockTable, ntasks::In
     return (slotrow, inflightcap, nworkers, poolstate)
 end
 
-"The live parallel pool: its reserved state charge, its objects, and liveness (round-4 item 6)."
+"The live parallel pool: its reserved state charge, its objects, and liveness."
 mutable struct BlockPool
     fail::Union{Nothing,FailBox}
     jobs::Union{Nothing,Vector{Union{Nothing,BlockJob}}}

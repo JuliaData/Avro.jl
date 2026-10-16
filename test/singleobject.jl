@@ -126,7 +126,7 @@
         @test_throws ArgumentError Avro.decodesingle(wbin, legacy)              # no nested operation budget fallback
     end
 
-    @testset "one operation budget; transactional exact-capacity cache (plan §4.4, amendment round 1)" begin
+    @testset "one operation budget; transactional exact-capacity cache" begin
         s1 = P("{\"type\":\"record\",\"name\":\"C1\",\"fields\":[{\"name\":\"a\",\"type\":\"long\"}]}")
         s2 = P("{\"type\":\"record\",\"name\":\"C2\",\"fields\":[{\"name\":\"a\",\"type\":\"long\"}]}")
         c = Avro.SchemaCache(max_entries=1)

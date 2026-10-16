@@ -1,4 +1,4 @@
-# Sort order (plan §4.12): `comparebytes` orders two encoded datums under a schema without materialising
+# Sort order: `comparebytes` orders two encoded datums under a schema without materialising
 # them — numerics with Java's `Double.compare` policy (NaN greatest and equal to itself, `-0.0 < 0.0`),
 # bytes/fixed/strings unsigned lexicographic, arrays item-wise regardless of block form, enums by
 # position, unions by branch then value, records by field order honouring `ascending`/`descending`/
@@ -9,7 +9,7 @@
 """
     Avro.comparebytes(schema, abytes, bbytes; limits=Limits(), validate=:strict) -> Int
 
-`-1`, `0` or `1` ordering two encoded datums under `schema` (plan §4.12) without decoding them; each
+`-1`, `0` or `1` ordering two encoded datums under `schema` without decoding them; each
 buffer must hold exactly one datum (`DataError` otherwise). Maps are unorderable unless inside an
 `order: "ignore"` field (`ArgumentError`).
 """
@@ -135,7 +135,7 @@ function checkorderable(s::Schema, visited::Vector{Bool}, budget::Budget)
     visited[id] && return nothing
     visited[id] = true
     addresolution!(budget)
-    s isa MapSchema && throw(ArgumentError("maps have no sort order (plan §4.12); a map field must be marked order=\"ignore\""))
+    s isa MapSchema && throw(ArgumentError("maps have no sort order; a map field must be marked order=\"ignore\""))
     s isa ArraySchema && return checkorderable(s.items, visited, budget)
     if s isa UnionSchema
         foreach(b -> checkorderable(b, visited, budget), s.branches)
@@ -312,7 +312,7 @@ function admitcomparekind!(schema::ArraySchema, plan::ArrayPlan,
 end
 
 function admitcomparekind!(::MapSchema, plan, da, db, ca, cb)
-    throw(ArgumentError("maps have no sort order (plan §4.12)"))
+    throw(ArgumentError("maps have no sort order"))
 end
 
 "Run the data-aware fast consumer pass for both comparison inputs."
@@ -509,5 +509,5 @@ function comparekind(s::ArraySchema, p::ArrayPlan, da::Decoder, db::Decoder)
 end
 
 function comparekind(s::MapSchema, p, da::Decoder, db::Decoder)
-    throw(ArgumentError("maps have no sort order (plan §4.12)"))
+    throw(ArgumentError("maps have no sort order"))
 end

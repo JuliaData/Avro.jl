@@ -75,7 +75,7 @@ function __init__()
     return nothing
 end
 
-"`JSON.json` prints an `Avro.Schema` as its schema JSON (parsing is Avro-owned; plan §11)."
+"`JSON.json` prints an `Avro.Schema` as its schema JSON (parsing is Avro-owned)."
 function JSON.json(s::Schema)
     return json(s)
 end

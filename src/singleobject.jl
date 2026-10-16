@@ -1,4 +1,4 @@
-# Single-object encoding and schema stores (plan §4.10): marker `C3 01`, the little-endian CRC-64-AVRO
+# Single-object encoding and schema stores: marker `C3 01`, the little-endian CRC-64-AVRO
 # fingerprint of the writer schema's Parsing Canonical Form, then the binary datum.
 
 const SINGLE_OBJECT_MARKER = (0xC3, 0x01)
@@ -30,7 +30,7 @@ mutable struct SchemaCache <: SchemaStore
     const max_entries::Int
     const max_bytes::Int
     const ledger::Budget             # owns every persistent index allocation across register! calls
-    fingerprints::Vector{UInt64}    # exact-capacity replacement on insert (§4.4 growth rule)
+    fingerprints::Vector{UInt64}    # exact-capacity replacement on insert
     schemas::Vector{Schema}
     bytes::Int
 end
@@ -218,11 +218,11 @@ Register `schema` and return its CRC-64-AVRO fingerprint.
 """
 function register!(c::SchemaCache, s::Schema; limits::Limits=Limits())
     graphinfo(s).repaired_names && throw(ArgumentError("a schema with repaired invalid names has no Parsing Canonical Form"))
-    return withbudget(limits) do budget                # one operation: print, hash, compare, insert (D03)
+    return withbudget(limits) do budget                # one operation: print, hash, compare, insert
         w = BoundedWriter(budget, limits.max_schema_bytes)
         seen = schemaseen(s, budget)
         canonicalprint(w, s, seen)
-        releaseseen!(budget, seen)                     # dead before hashing and comparison (round-3 item 1)
+        releaseseen!(budget, seen)                     # dead before hashing and comparison
         fp = crc64avro(boundedview(w))
         lock(c.lock) do
         i = cacheindex(c.fingerprints, fp, budget)
@@ -241,7 +241,7 @@ function register!(c::SchemaCache, s::Schema; limits::Limits=Limits())
             retain!(c.ledger, schemacharge)
             fingerprintcharge = vectorbytes(UInt64, n)
             reserve!(c.ledger, fingerprintcharge)
-            newfingerprints = Vector{UInt64}(undef, n)     # exact-capacity replacement (§4.4 growth rule)
+            newfingerprints = Vector{UInt64}(undef, n)     # exact-capacity replacement
             allocated!(c.ledger, fingerprintcharge)
             schemacharge = vectorbytes(Schema, n)
             reserve!(c.ledger, schemacharge)
@@ -277,7 +277,7 @@ end
 The schema registered under `fingerprint` (`Avro.UnknownSchemaError` otherwise).
 """
 function lookup(c::SchemaCache, fp::UInt64; limits::Limits=Limits())
-    return withbudget(limits) do budget                # the binary search is charged work (D03)
+    return withbudget(limits) do budget                # the binary search is charged work
         return lookup(c, fp, budget)
     end
 end
@@ -286,7 +286,7 @@ end
     Avro.lookup(store, fingerprint, budget::Avro.Budget) -> Schema
 
 The shared-budget route `decodesingle` uses. Custom stores must implement it so lookup work is charged
-to the caller's operation budget instead of opening a second budget (D03).
+to the caller's operation budget instead of opening a second budget.
 """
 function lookup(::SchemaStore, ::UInt64, ::Budget)
     throw(ArgumentError("a custom Avro.SchemaStore used by decodesingle must implement Avro.lookup(store, fingerprint, budget)"))
@@ -325,14 +325,14 @@ Parsing Canonical Form, and the binary datum.
 """
 function encodesingle(s::Schema, x; limits::Limits=Limits())
     graphinfo(s).repaired_names && throw(ArgumentError("a schema with repaired invalid names has no Parsing Canonical Form"))
-    return withbudget(limits; direction=:encode) do budget    # one operation budget (plan §4.4, amendment round 1)
+    return withbudget(limits; direction=:encode) do budget    # one operation budget
         local fp, e, npayload
         beginworkdefer!(budget)
         try
             w = BoundedWriter(budget, limits.max_schema_bytes; credit=false)
             seen = schemaseen(s, budget)
             canonicalprint(w, s, seen)
-            releaseseen!(budget, seen)                 # dead before hashing and the write plan (round-3 item 1)
+            releaseseen!(budget, seen)                 # dead before hashing and the write plan
             fp = crc64avro(boundedview(w))
             plan = writeplan(s; budget=budget)
             e = Encoder(budget)
@@ -379,12 +379,12 @@ function decodesingleoperation(src::AbstractVector{UInt8}, store::SchemaStore, b
     local tplan, adm, d, span
     beginworkdefer!(budget)
     try
-        writer = lookup(store, fp, budget)             # the shared-budget route (D03); SchemaCache charges this budget
+        writer = lookup(store, fp, budget)             # the shared-budget route; SchemaCache charges this budget
         writer isa Schema || throw(ArgumentError("the schema store returned $(typeof(writer)), not an Avro.Schema"))
         w = BoundedWriter(budget, limits.max_schema_bytes; credit=false)
         seen = schemaseen(writer, budget)
         canonicalprint(w, writer, seen)
-        releaseseen!(budget, seen)                     # dead before hashing (round-3 item 1)
+        releaseseen!(budget, seen)                     # dead before hashing
         actual = crc64avro(boundedview(w))
         actual == fp || throw(DataError("the schema store returned a schema with fingerprint $(string(actual; base=16)) for $(string(fp; base=16))", 3))
         effective = reader_schema === nothing ? writer : reader_schema

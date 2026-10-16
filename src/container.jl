@@ -1,4 +1,4 @@
-# Object container files (plan §4.9): a strict block reader over memory-mapped, byte and streamed
+# Object container files: a strict block reader over memory-mapped, byte and streamed
 # sources; a writer with the atomic path contract and the full failure contract. Every limit a reader
 # enforces the writer enforces; `max_codec_memory` is checked per member read and per frame written.
 
@@ -207,7 +207,7 @@ function readmetadataentry(s::BlockSource, limits::Limits, budget::Budget, total
     return (key, value, total)
 end
 
-"Replace the metadata index vectors at exact `newcap` (old storage released after the copy, §4.4)."
+"Replace the metadata index vectors at exact `newcap` (old storage released after the copy)."
 function resizemetadata(keys::Vector{String}, vals::Vector{Vector{UInt8}}, oldcap::Int, newcap::Int,
                         n::Int, budget::Budget)
     newkeys, newvals = metadataindexes(newcap, budget)
@@ -698,7 +698,7 @@ function validateemptyblock(bytes::Vector{UInt8})
     return nothing
 end
 
-# ---- the reader-side output estimate of encoded values (plan §4.9, one consumer-independent formula) --
+# ---- the reader-side output estimate of encoded values (one consumer-independent formula) --
 
 struct OutputEstimate
     retained::Int
@@ -1247,17 +1247,17 @@ function estimaterecordvalue(p::WRecord, x::T,
     end
 end
 
-# ---- the writer's reader preflight (plan §4.4) -------------------------------------------------------
+# ---- the writer's reader preflight -------------------------------------------------------
 
 "The reader-retained charge of the block table: one entry per block (offset, size, count, cumulative rows)."
 function blocktablecharge(nblocks::Int)
-    return checked_add(STORAGE[].vector, checked_mul(40, nblocks))   # a 5-Int BlockEntry (R06)
+    return checked_add(STORAGE[].vector, checked_mul(40, nblocks))   # a 5-Int BlockEntry
 end
 
 """
-One block's transient reader-side peak (plan §4.4): the compressed and decompressed buffers, the codec's
+One block's transient reader-side peak: the compressed and decompressed buffers, the codec's
 decoder requirement, and the block's decoded output. One function for the writer preflight, sequential
-reading, and the Phase 4c parallel admission arithmetic.
+reading, and the parallel admission arithmetic.
 """
 function readerblockpeak(compressedbytes::Int, decompressedbytes::Int, outputbytes::Int, codecmemory::Int, samebuffer::Bool)
     peak = checked_add(checked_add(bytesbytes(decompressedbytes), outputbytes), codecmemory)
@@ -1266,7 +1266,7 @@ function readerblockpeak(compressedbytes::Int, decompressedbytes::Int, outputbyt
 end
 
 """
-The per-field slot allowance of the column consumer: the part of a field's §4.9 output estimate that an
+The per-field slot allowance of the column consumer: the part of a field's output estimate that an
 `Avro.Table` chunk's reference slots already cover. The remainder of the estimate is the referenced
 payload the chunk holds beyond its slots (0 for inline cells).
 """
@@ -1281,7 +1281,7 @@ function cellslack(p::WritePlan)
     return 0
 end
 
-"The streamed `Avro.Table` consumer projection of a record-root writer (plan §4.4)."
+"The streamed `Avro.Table` consumer projection of a record-root writer."
 mutable struct TablePreflight
     const cols::Vector{Type}
     const slack::Vector{Int}
@@ -1372,7 +1372,7 @@ function tablebuildfinishpeak(n::Int)
     return max(chunkfinish, countfinish)
 end
 
-"The §4.9 estimate of one record-root datum plus its column-consumer payload beyond the chunk slots."
+"The output estimate of one record-root datum plus its column-consumer payload beyond the chunk slots."
 function estimaterootrecord(p::WRecord, pf::TablePreflight, x, budget::Budget,
                             diagnostics::Union{Nothing,Encoder}=nothing)
     estimate, payload = estimaterecordvalue(p, x, pf.cols, budget,
@@ -1460,7 +1460,7 @@ mutable struct Writer
     const preflightbase::Int
     const preflight::Union{Nothing,TablePreflight}
     const stagevalues::Bool
-    fasttype::Any                    # single-entry aligned-NamedTuple cache (Phase 4d)
+    fasttype::Any                    # single-entry aligned-NamedTuple cache
     fastplans::Any
     pendingcount::Int
     pendingbytes::Int
@@ -1513,7 +1513,7 @@ function writerheaderentries(schema::Schema, codec::Symbol, metadata, limits::Li
     budget.workcap = workcap0
     nentries = 2 + length(metadata)
     nentries <= limits.max_metadata_entries || throw(LimitError(:max_metadata_entries, nentries, limits.max_metadata_entries, :max_metadata_entries, :encode))
-    reserve!(budget, STORAGE[].vector + 16 * nentries)        # the entries vector at exact capacity (§4.4 growth rule)
+    reserve!(budget, STORAGE[].vector + 16 * nentries)        # the entries vector at exact capacity
     entries = Vector{Tuple{String,Vector{UInt8}}}(undef, nentries)
     allocated!(budget, STORAGE[].vector + 16 * nentries)
     reserve!(budget, stringbytes(11) + bytesbytes(sizeof(schemajson)))
@@ -1564,7 +1564,7 @@ function writerheaderentries(schema::Schema, codec::Symbol, metadata, limits::Li
 end
 
 """
-The reader's construction retention, preflighted under the writer's budget (plan §4.4): the parsed
+The reader's construction retention, preflighted under the writer's budget: the parsed
 schema graph a reader builds from the same JSON, the materialised metadata of a stream reader (key
 and value buffers plus the retained entries and map), and the generic read and datum-span plans. Returns
 `(preflightbase, preflight)`.
@@ -1642,7 +1642,7 @@ function Writer(dst::Union{AbstractString,IO}, schema::Schema; codec::Symbol=:nu
     gi.repaired_defaults && !allow_invalid_defaults && throw(ArgumentError("the schema contains invalid defaults; pass allow_invalid_defaults=true to write it"))
     syncmarker = writersyncmarker(sync)
     metadata isa AbstractDict{<:AbstractString,<:AbstractVector{UInt8}} || throw(ArgumentError("metadata must map strings to byte vectors"))
-    budget = Budget(limits; direction=:encode)                    # the budget exists before any header allocation (R04)
+    budget = Budget(limits; direction=:encode)                    # the budget exists before any header allocation
     wcodec = writercodec(codec, level, limits)
     sink = nothing
     temppath = nothing
@@ -2701,7 +2701,7 @@ function flushblock!(w::Writer)
                 throw(LimitError(:max_total_bytes, tableprojected, w.budget.ceiling,
                                  :max_total_bytes, :encode))
         end
-        reserve!(w.budget, bytesbytes(w.encoder.pos))              # the pending-block copy, before take! (R04)
+        reserve!(w.budget, bytesbytes(w.encoder.pos))              # the pending-block copy, before take!
         blockbytes = take!(w.encoder)
         allocated!(w.budget, bytesbytes(length(blockbytes)))
         cbound = compressbound(w.wcodec, length(blockbytes))

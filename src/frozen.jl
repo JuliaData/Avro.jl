@@ -1,8 +1,8 @@
-# Frozen containers (plan §4.2): the parser fills them and calls `freeze!` once; afterwards every
+# Frozen containers: the parser fills them and calls `freeze!` once; afterwards every
 # mutating method throws, so nothing reachable from a frozen schema can be mutated through the public
 # API. No hashing: `FrozenDict` is a
 # sorted key vector with binary search (the package never performs hash-table lookups of untrusted
-# keys, plan decision 35). Schema nodes hold these containers in `const` fields.
+# keys). Schema nodes hold these containers in `const` fields.
 
 struct FrozenError <: Exception
     what::String
@@ -13,7 +13,7 @@ function Base.showerror(io::IO, e::FrozenError)
 end
 
 mutable struct FrozenVector{T} <: AbstractVector{T}
-    data::Vector{T}          # replaceable: §4.4 exact-replacement growth rebinds it
+    data::Vector{T}          # replaceable: exact-replacement growth rebinds it
     cap::Int                 # the prebuilt backing capacity (length(data) may be shorter)
     frozen::Bool
     function FrozenVector{T}(data::Vector{T}, cap::Int, frozen::Bool) where {T}
@@ -91,7 +91,7 @@ function isfrozen(v::FrozenVector)
     return v.frozen
 end
 
-"An empty frozen vector whose backing storage is prebuilt at exact `capacity` (§4.4 growth rule)."
+"An empty frozen vector whose backing storage is prebuilt at exact `capacity`."
 function emptywithcapacity(::Type{FrozenVector{T}}, capacity::Int) where {T}
     data = Vector{T}(undef, max(capacity, 0))
     resize!(data, 0)
@@ -105,7 +105,7 @@ An insertion-free, sorted-key dictionary (binary search on `keys`); no hashing. 
 `isless`/`==` on their `K` values (`String` keys compare by bytes).
 """
 mutable struct FrozenDict{K,V} <: AbstractDict{K,V}
-    keys::Vector{K}          # replaceable: §4.4 exact-replacement growth rebinds them
+    keys::Vector{K}          # replaceable: exact-replacement growth rebinds them
     vals::Vector{V}
     cap::Int                 # the prebuilt backing capacity (lengths may be shorter)
     frozen::Bool
@@ -122,7 +122,7 @@ function FrozenDict{K,V}() where {K,V}
     return FrozenDict{K,V}(K[], V[], false)
 end
 
-"An empty frozen dictionary whose key and value storage is prebuilt at exact `capacity` (§4.4)."
+"An empty frozen dictionary whose key and value storage is prebuilt at exact `capacity`."
 function emptywithcapacity(::Type{FrozenDict{K,V}}, capacity::Int) where {K,V}
     ks = Vector{K}(undef, max(capacity, 0))
     resize!(ks, 0)
@@ -325,7 +325,7 @@ end
 """
     JSONNumber(text)
 
-A raw JSON number token kept lexically (plan §4.2): metadata numbers are never materialised as `BigInt`
+A raw JSON number token kept lexically: metadata numbers are never materialised as `BigInt`
 or `BigFloat`; equality and hashing are by the token bytes (`1`, `1.0` and `1e0` differ).
 """
 struct JSONNumber

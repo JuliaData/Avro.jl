@@ -1,4 +1,4 @@
-# Representation storage formulas (plan §4.4 (b)): every charge for package-produced Julia storage is
+# Representation storage formulas: every charge for package-produced Julia storage is
 # `header + per_element × n` with constants measured at package initialisation from canonical probe
 # objects with `Base.summarysize`, so a Julia layout change is picked up rather than trusted. The same
 # formulas are the oracle `heldbytes(x) ≥ Base.summarysize(x; exclude=Avro.Schema)` asserted by the

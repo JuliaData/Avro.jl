@@ -1,4 +1,4 @@
-# The Phase 4d projection equivalence matrix (plan §6/§12): names, order, eltypes, Tables.schema, row
+# The projection equivalence matrix: names, order, eltypes, Tables.schema, row
 # count and values of `Table(src; select=cols)` equal `columntable(Table(src))[cols]` over the fixture
 # battery — multi-block files, empty records, select=(), nested and nullable fields, directly and
 # mutually recursive roots — in both validation modes and for ntasks ∈ {1, 2, 8}; malformed data inside
@@ -6,7 +6,7 @@
 
 import Logging
 
-@testset "Projection equivalence matrix (plan §6)" begin
+@testset "Projection equivalence matrix" begin
     P = Avro.parseschema
     fixtures = Tuple{String,String,Vector{<:Any}}[]
     push!(fixtures, ("plain multi-block",
@@ -247,7 +247,7 @@ import Logging
         end
     end
 
-    @testset "corpus sweep: exact fixture scope and projection matrix (R14, D09)" begin
+    @testset "corpus sweep: exact fixture scope and projection matrix" begin
         fixtureroot = joinpath(@__DIR__, "fixtures")
         gen = joinpath(fixtureroot, "generated")
         apache = joinpath(fixtureroot, "apache")
@@ -307,8 +307,8 @@ import Logging
         recordfiles = sort!(vcat(datafiles, apachefiles, legacyfiles, highwindowcontrols))
         allfiles = avrofiles(fixtureroot)
 
-        # Plan §8.1/§8.2 defines this exact corpus. Projection applies only to generic record
-        # roots; the two deliberate high-window bombs are excluded from default decoding by §4.4.
+        # This is the exact fixture corpus. Projection applies only to generic record
+        # roots; the two deliberate high-window bombs are excluded from decoding under default limits.
         @test length(datafiles) == 72
         @test length(rootfiles) == 156
         @test length(legacyfiles) == 5

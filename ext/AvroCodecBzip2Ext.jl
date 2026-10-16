@@ -1,4 +1,4 @@
-# bzip2 codec adapter (plan §4.9): multi-stream payloads decoded to exact exhaustion; the decoder's
+# bzip2 codec adapter: multi-stream payloads decoded to exact exhaustion; the decoder's
 # fixed requirement (≤ 3.7 MiB for the 900 KiB block format) is reserved per stream.
 module AvroCodecBzip2Ext
 

@@ -1,7 +1,7 @@
-# Schema model (plan §4.2): immutable, transitively frozen schema graphs with dense node ids, the
+# Schema model: immutable, transitively frozen schema graphs with dense node ids, the
 # fullname algorithm, the contextual attribute grammar, the recursive default rule, printing and
 # structural equality. Nodes are heap objects with `const` fields (never inlined into the values that
-# reference them: `Record`, `EnumValue` and `Fixed` carry one 8-byte reference — plan §4.4 (b)).
+# reference them: `Record`, `EnumValue` and `Fixed` carry one 8-byte reference).
 
 const Props = FrozenDict{String,Any}   # custom attributes as frozen JSON trees (raw number tokens)
 
@@ -235,7 +235,7 @@ end
 """
     Avro.Schema constructors: Avro.NullSchema(; props), …, Avro.RecordSchema(name; …), Avro.Field(name, schema; …)
 
-Public constructors validate every §4.2 rule, reject `props` keys that collide with the structural keys
+Public constructors validate every schema rule, reject `props` keys that collide with the structural keys
 the same constructor emits, deep-copy already-frozen children into the new graph, and freeze.
 """
 function NullSchema(; props=(;), limits::Limits=Limits())
@@ -289,10 +289,10 @@ mutable struct ParseContext
     const budget::Budget
     const allow_invalid_names::Bool
     const allow_invalid_defaults::Bool
-    const named::FrozenDict{String,Schema}    # fullname → schema (sorted vector; §4.4 replacement growth)
+    const named::FrozenDict{String,Schema}    # fullname → schema (sorted vector; replacement growth)
     const identities::FrozenDict{String,Schema} # every fullname and alias, for global uniqueness
     const pending::Vector{RecordSchema}       # records registered but not yet filled (≤ max_depth, prebuilt)
-    metas::Vector{NodeMeta}                   # in creation order → dense ids (§4.4 replacement growth)
+    metas::Vector{NodeMeta}                   # in creation order → dense ids
     metascap::Int
     const namedcount::Base.RefValue{Int}
     const legacyfixednames::Bool              # legacy=:avrojl1: Avro.jl ≤ 1.1.2 wrote fixed schemas without names
@@ -308,7 +308,7 @@ function ParseContext(limits::Limits, budget::Budget, allow_invalid_names::Bool,
     state = vectorbytes(RecordSchema, limits.max_schema_depth) + vectorbytes(NodeMeta, metascap) +
             frozendictshell() + 128   # pending, metas, context and both table shells
     reserve!(budget, state)
-    pending = Vector{RecordSchema}(undef, limits.max_schema_depth)   # the fill stack never exceeds max_schema_depth (§4.4)
+    pending = Vector{RecordSchema}(undef, limits.max_schema_depth)   # the fill stack never exceeds max_schema_depth
     resize!(pending, 0)
     metas = Vector{NodeMeta}(undef, metascap)
     resize!(metas, 0)
@@ -395,7 +395,7 @@ function schemaerror(ctx::ParseContext, msg::AbstractString, key::String, index:
 end
 
 # Shared frozen empties: frozen containers are immutable by contract, so every node may reference the
-# same empty instance instead of allocating one (uncharged: process-global constants, plan §4.6).
+# same empty instance instead of allocating one (uncharged: process-global constants).
 const EMPTY_PROPS = freeze!(Props())
 const EMPTY_STRING_LIST = freeze!(FrozenVector{String}())
 
@@ -429,7 +429,7 @@ function newmeta!(ctx::ParseContext)
     return m
 end
 
-"Settle the node-shell reservation `newmeta!` made, right after the schema node exists (§4.4 order)."
+"Settle the node-shell reservation `newmeta!` made, right after the schema node exists."
 function settlednode(ctx::ParseContext, s::Schema)
     allocated!(ctx.budget, NODE_SHELL_BYTES)
     return s
@@ -455,7 +455,7 @@ function collectprops(ctx::ParseContext, obj::JSONObject, grammar)
     end
     n == 0 && return EMPTY_PROPS
     slots = vectorbytes(String, n) + vectorbytes(Any, n) + 32
-    reserve!(ctx.budget, slots)                    # the exact key/value capacity and dict shell (§4.4)
+    reserve!(ctx.budget, slots)                    # the exact key/value capacity and dict shell
     p = emptywithcapacity(Props, n)
     allocated!(ctx.budget, slots)
     for k in obj.order
@@ -563,7 +563,7 @@ end
     Avro.parseschema(src; allow_invalid_names=false, allow_invalid_defaults=false, limits=Limits()) -> Schema
 
 Parse an Avro schema from JSON text (a `String`, a byte vector, or an `IO` read incrementally under
-`max_schema_bytes`). Every rule of plan §3/§4.2 is validated; violations raise `SchemaError` (with a
+`max_schema_bytes`). Every schema rule is validated; violations raise `SchemaError` (with a
 JSON path) or `LimitError`. With `allow_invalid_names=true` invalid names are admitted (the graph is
 marked `repaired_names`); with `allow_invalid_defaults=true` invalid defaults are kept with
 `valid=false`.
@@ -802,7 +802,7 @@ function parseunion(ctx::ParseContext, arr::JSONArray, enclosing::String, buf)
     length(arr) <= ctx.limits.max_union_branches ||
         throw(LimitError(:max_union_branches, length(arr), ctx.limits.max_union_branches, :max_union_branches, :decode))
     branchbytes = vectorbytes(Schema, length(arr)) + 24
-    reserve!(ctx.budget, branchbytes)              # the exact branch capacity and frozen shell (§4.4)
+    reserve!(ctx.budget, branchbytes)              # the exact branch capacity and frozen shell
     branches = emptywithcapacity(FrozenVector{Schema}, length(arr))
     allocated!(ctx.budget, branchbytes)
     reserve!(ctx.budget, frozendictshell())
@@ -965,7 +965,7 @@ function parseenum(ctx::ParseContext, obj::JSONObject, enclosing::String, buf)
     length(syms) <= ctx.limits.max_enum_symbols ||
         throw(LimitError(:max_enum_symbols, length(syms), ctx.limits.max_enum_symbols, :max_enum_symbols, :decode))
     indexbytes = vectorbytes(String, length(syms)) + vectorbytes(Int, length(syms)) + 32
-    reserve!(ctx.budget, indexbytes)               # the exact symbol-index capacity and shell (§4.4)
+    reserve!(ctx.budget, indexbytes)               # the exact symbol-index capacity and shell
     index = emptywithcapacity(FrozenDict{String,Int}, length(syms))
     allocated!(ctx.budget, indexbytes)
     for (i, sym) in enumerate(syms)
@@ -1058,7 +1058,7 @@ function parserecord(ctx::ParseContext, obj::JSONObject, enclosing::String, buf,
     p = collectprops(ctx, obj, SCHEMA_GRAMMAR[:record])
     nfields = length(farr)
     fieldstate = vectorbytes(Field, nfields) + vectorbytes(String, nfields) + vectorbytes(Int, nfields) + 56
-    reserve!(ctx.budget, fieldstate)               # exact field-vector and index capacity plus shells (§4.4)
+    reserve!(ctx.budget, fieldstate)               # exact field-vector and index capacity plus shells
     fields = emptywithcapacity(FrozenVector{Field}, nfields)
     fieldindex = emptywithcapacity(FrozenDict{String,Int}, nfields)
     allocated!(ctx.budget, fieldstate)
@@ -1176,7 +1176,7 @@ function makedefault(ctx::ParseContext, schema::Schema, json, span::String)
     return d
 end
 
-# ---- the recursive default rule (plan §4.2) ---------------------------------------------------------
+# ---- the recursive default rule ---------------------------------------------------------
 
 """
     validatedefault(schema, json, maxdepth) -> (ok::Bool, branch::Int)
@@ -1184,7 +1184,7 @@ end
 Validate a JSON default against a schema: union defaults are the bare JSON of the value matched
 against the branches in declaration order (returning the 1-based branch); record defaults may omit
 fields that have their own defaults and ignore unknown members; every other kind follows the strict
-datum-JSON row of plan §4.11.
+JSON encoding of a datum.
 """
 function validatedefault(schema::Schema, json, maxdepth::Int, depth::Int=1,
                          budget::Union{Nothing,Budget}=nothing)
@@ -1692,7 +1692,7 @@ end
 """
     ==(a::Schema, b::Schema)
 
-Structural equality (plan §4.2): kind, fullname, fields (name, schema, default value and selected
+Structural equality: kind, fullname, fields (name, schema, default value and selected
 branch, order, normalised aliases, doc), symbols, enum default, size, logical type, `iserror`, and
 `props` as unordered maps of JSON values; cyclic graphs terminate through a visited-pair set keyed by
 dense node ids, charged to `max_resolution_work` of the larger recorded limits.
@@ -1865,13 +1865,13 @@ end
 # ---- printing ---------------------------------------------------------------------------------------
 
 """
-A charging output sink for the schema printers (plan §4.4, amendment round 1): produced text is the
+A charging output sink for the schema printers: produced text is the
 work-rule input, growth is reserved in chunks before it is written, and the text is bounded by
 `max_schema_bytes`. Public operations use `Limits()` unless the caller supplies a different limit set;
 `show` explicitly uses the schema's recorded limits so an admitted schema remains displayable.
 """
 mutable struct BoundedWriter <: IO
-    buf::Vector{UInt8}      # a package-owned charged buffer grown by reserved exact replacement (D02)
+    buf::Vector{UInt8}      # a package-owned charged buffer grown by reserved exact replacement
     len::Int
     const budget::Budget
     const maxbytes::Int
@@ -1903,7 +1903,7 @@ function boundedgrow!(w::BoundedWriter, n::Int)
         grown = cap > w.maxbytes - cap ? w.maxbytes : 2 * cap
         newcap = max(grown, written)
         newcharge = bytesbytes(newcap)
-        reserve!(w.budget, newcharge)                  # reserved exact-capacity replacement (§4.4)
+        reserve!(w.budget, newcharge)                  # reserved exact-capacity replacement
         nb = try
             out = Vector{UInt8}(undef, newcap)
             allocated!(w.budget, newcharge)
@@ -2000,7 +2000,7 @@ function schemaseen(s::Schema, budget::Budget)
     return seen
 end
 
-"Release a printer's dead seen table in exact order: its print has finished (round-3 item 1)."
+"Release a printer's dead seen table in exact order: its print has finished."
 function releaseseen!(budget::Budget, seen::Vector{Bool})
     release!(budget, vectorbytes(Bool, length(seen)))
     return nothing
@@ -2327,7 +2327,7 @@ end
 # ---- public constructors ---------------------------------------------------------------------------
 
 function build(::Type{T}, propsin; logical=nothing, limits::Limits=Limits()) where {T<:PrimitiveSchema}
-    return withconstruction(limits) do _                # the budget opens before any copy (D01)
+    return withconstruction(limits) do _                # the budget opens before any copy
         build_(T, propsin; logical=logical, limits=limits)
     end
 end
@@ -2377,7 +2377,7 @@ function makeprops(propsin, structural, logical, budget::Budget)
     cap = (sized ? length(propsin) : 0) + extra
     sized && cap == 0 && return EMPTY_PROPS
     slots = frozendictshell() + 16 * cap
-    reserve!(budget, slots)                            # the shell and exact slot capacity (§4.4)
+    reserve!(budget, slots)                            # the shell and exact slot capacity
     p = emptywithcapacity(Props, cap)
     allocated!(budget, slots)
     kvs = propsin isa NamedTuple ? pairs(propsin) : propsin
@@ -2549,7 +2549,7 @@ function copyjsonarray(x::AbstractVector, b::Budget, depth::Int)
     n = length(x)
     n == 0 && return EMPTY_JSON_ARRAY
     slots = 64 + 24 + vectorbytes(Any, n)
-    reserve!(b, slots)                                 # shell, exact capacity and wrapper (§4.4)
+    reserve!(b, slots)                                 # shell, exact capacity and wrapper
     v = emptywithcapacity(FrozenVector{Any}, n)
     allocated!(b, slots)
     for e in x
@@ -2566,7 +2566,7 @@ function tojsonvalueimpl(x::Union{AbstractDict,NamedTuple}, b::Budget, depth::In
     n = length(x)
     n == 0 && return EMPTY_JSON_OBJECT
     slots = frozendictshell() + frozenvectorshell() + 24 * n + 64
-    reserve!(b, slots)                                 # shells, exact slot capacity and wrapper (§4.4)
+    reserve!(b, slots)                                 # shells, exact slot capacity and wrapper
     m = emptywithcapacity(FrozenDict{String,Any}, n)
     order = emptywithcapacity(FrozenVector{String}, n)
     allocated!(b, slots)
@@ -2593,7 +2593,7 @@ function importmemo()
 end
 
 """
-One construction budget per outermost public constructor call (plan §4.4, round-2 D01): the first
+One construction budget per outermost public constructor call: the first
 public entry opens it and stores it task-locally; nested constructor calls — the builder form
 included — charge the same scope, so every copy a construction makes is reserved against one budget.
 """
@@ -2666,7 +2666,7 @@ end
 
 """
 The one construction scope every public constructor, deriver and projection funnels through
-(plan §4.4, amendment round 1): the finished graph is walked once under a construction budget that
+: the finished graph is walked once under a construction budget that
 charges each node and enforces every schema limit the parser enforces — nodes, named types, depth,
 per-record fields, union branches, enum symbols, and name/alias bytes — so a caller-supplied
 `Limits` bounds construction exactly as it bounds parsing.
@@ -2675,7 +2675,7 @@ function finalizepublic!(s::Schema, limits::Limits, nodes::Int, named::Int)
     builderdepth() > 0 && return s
     return withconstruction(limits) do budget
         walkstate = vectorbytes(NodeMeta, 16) + 2 * frozendictshell() + 64
-        reserve!(budget, walkstate)                    # the walk's memo storage and table shells (§4.4)
+        reserve!(budget, walkstate)                    # the walk's memo storage and table shells
         walkmetas = Vector{NodeMeta}(undef, 16)
         resize!(walkmetas, 0)
         walk = MetaWalk(walkmetas, 16)
@@ -2804,7 +2804,7 @@ function checkgraphnames(s::NamedSchema, limits::Limits, direction::Symbol)
     return nothing
 end
 
-"The finalisation walk's growable node memo (§4.4 exact replacement across recursive frames)."
+"The finalisation walk's growable node memo."
 mutable struct MetaWalk
     metas::Vector{NodeMeta}
     cap::Int
@@ -2887,11 +2887,11 @@ end
 """
     Avro.juliatype(schema) -> Type
 
-The generic Julia representation of values of `schema` (plan §4.6).
+The generic Julia representation of values of `schema`.
 """
 function juliatype end
 
-# ---- complex public constructors (plan §5.1) --------------------------------------------------------
+# ---- complex public constructors --------------------------------------------------------
 
 function checkpublicname(name::AbstractString, what::String)
     isvalidname(name) || throw(ArgumentError("invalid $what \"$name\" (must match [A-Za-z_][A-Za-z0-9_]*)"))
@@ -3014,7 +3014,7 @@ function EnumSchema(name::AbstractString, symbols; namespace::AbstractString="",
         end
         syms = finishbuild!(symsbuf, b)
         idxbytes = 48 + vectorbytes(String, length(syms)) + vectorbytes(Int, length(syms))
-        reserve!(b, idxbytes)                          # the index shell and exact capacity (§4.4)
+        reserve!(b, idxbytes)                          # the index shell and exact capacity
         index = emptywithcapacity(FrozenDict{String,Int}, length(syms))
         allocated!(b, idxbytes)
         for (i, sym) in enumerate(syms)

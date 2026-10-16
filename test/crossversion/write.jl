@@ -1,4 +1,4 @@
-# Cross-version producer (plan §12 Phase 4c/5 gate): writes a corpus of container files plus their
+# Cross-version producer : writes a corpus of container files plus their
 # expected JSON datum lines into ARGS[1]; a consumer on a different Julia version verifies them.
 using Avro
 outdir = abspath(ARGS[1])

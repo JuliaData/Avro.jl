@@ -1,6 +1,6 @@
-# Fuzz gate (plan §9.7): the recorded sample (200 corpus entries × 1,000 seeded mutations) runs in
+# Fuzz gate: the recorded sample (200 corpus entries × 1,000 seeded mutations) runs in
 # sandboxed subprocess batches under CPU, RSS and wall-clock limits; every case must end in an AvroError
-# or a valid result, and the acceptance-equivalence rules of §9.8 must hold. AVRO_FUZZ_ITERATIONS=N runs
+# or a valid result, and the acceptance-equivalence rules must hold. AVRO_FUZZ_ITERATIONS=N runs
 # the whole corpus with N mutations per entry. Failures are shrunk and persisted under test/fuzz/failures.
 include(joinpath(@__DIR__, "fuzz", "worker.jl"))
 

@@ -19,7 +19,7 @@ end
     base = Avro.admissionbasebytes()
     @test_throws ArgumentError Avro.SymbolAdmission(max_bytes=base - 1)   # the fixed structure must fit
     emptytable = Avro.SymbolAdmission(max_bytes=base)
-    @test emptytable.bytes == base                                        # counted from construction (round-4 item 4)
+    @test emptytable.bytes == base                                        # counted from construction
     @test emptytable.bytes >= Base.summarysize(emptytable)
     a = Avro.SymbolAdmission(max_names=3, max_bytes=base + 100)
     @test Avro.admit!(a, "x") === :x
@@ -91,7 +91,7 @@ end
     foreach(wait, tasks)
     @test length(c) == 300
 
-    # deamortised merges: mid-merge lookups stay exact across every power-of-two boundary (plan §4.4)
+    # deamortised merges: mid-merge lookups stay exact across every power-of-two boundary
     dm = Avro.SymbolAdmission(max_names=1 << 20, max_bytes=1 << 24)
     limit = (Avro.RUN_BASE << 6) + 3
     for i in 1:limit
@@ -110,7 +110,7 @@ end
     end
     @test length(dm) == limit && sum(length, dm.runs; init=0) + length(dm.recent) == limit
 
-    # one million incremental admissions, latency recorded (plan §4.4 gate)
+    # one million incremental admissions, latency recorded 
     mm = Avro.SymbolAdmission(max_names=1 << 21, max_bytes=64 << 20)
     t0 = time()
     for i in 1:1_000_000
@@ -170,7 +170,7 @@ end
     @test admissionstate(transactional) == before
     @test !Avro.contains_unlocked(transactional, admissionname(4_097))
 
-    # round-3 item 5: the recent buffer is prebuilt at exact RUN_BASE capacity, and a live merge's
+    # the recent buffer is prebuilt at exact RUN_BASE capacity, and a live merge's
     # complete output state is held in `bytes` (replacement overlap) until its sources are dropped
     ov = Avro.SymbolAdmission(max_names=1 << 16, max_bytes=1 << 24)
     VERSION >= v"1.11" && @test Avro.capacity(ov.recent) == Avro.RUN_BASE
@@ -186,7 +186,7 @@ end
     @test ov.bytes >= Base.summarysize(ov)
     VERSION >= v"1.11" && @test Avro.capacity(ov.recent) == Avro.RUN_BASE      # reused, never regrown
 
-    # the admitting operation's lookup and merge-step work charges its own budget (§4.4, R07)
+    # the admitting operation's lookup and merge-step work charges its own budget
     ab = Avro.SymbolAdmission(max_names=1 << 16, max_bytes=1 << 24)
     bud = Avro.Budget(Avro.Limits())
     Avro.addinput!(bud, 1 << 20)
@@ -225,7 +225,7 @@ end
     @test length(raced) == 1000
     Avro.close!(racebudget)
 
-    # a rejected admission advances no maintenance state (round-2 D10)
+    # a rejected admission advances no maintenance state
     tr = Avro.SymbolAdmission(max_names=Avro.RUN_BASE * 4, max_bytes=1 << 24)
     for i in 1:(2 * Avro.RUN_BASE + 100)              # leave a merge in progress
         Avro.admit!(tr, "t$(lpad(i, 6, '0'))")

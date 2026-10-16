@@ -1,4 +1,4 @@
-@testset "1.x deprecation shims (plan §7)" begin
+@testset "1.x deprecation shims" begin
     @test Avro.read !== Base.read
 
     leg = joinpath(@__DIR__, "fixtures", "generated", "legacy1x", "avrojl112-null.avro")

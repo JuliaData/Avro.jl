@@ -1,4 +1,4 @@
-# 1.x deprecation shims (plan §7): kept for one major cycle, removal in 3.0. Tested against real
+# 1.x deprecation shims: kept for one major cycle, removal in 3.0. Tested against real
 # files written by the pinned Avro.jl 1.1.2 (test/fixtures/generated/legacy1x).
 
 """

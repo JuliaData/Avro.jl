@@ -1,4 +1,4 @@
-# Generic value types that carry schema identity (plan §4.6): Record, EnumValue, Fixed, UnionValue and
+# Generic value types that carry schema identity: Record, EnumValue, Fixed, UnionValue and
 # the package-owned Avro.Map (sorted permutation; no hashing).
 
 """
@@ -748,7 +748,7 @@ function ordinal(x::UnionValue)
     return x.index - 1
 end
 
-# ---- the generic Julia type of a schema (plan §4.6) --------------------------------------------------
+# ---- the generic Julia type of a schema --------------------------------------------------
 
 function juliatype(::NullSchema)
     return Missing
@@ -809,7 +809,7 @@ function decimaltype(l::DecimalLogical)
     return l.precision <= 38 ? Decimal : WideDecimal
 end
 
-# ---- the closed value set E (plan §4.6) --------------------------------------------------------------
+# ---- the closed value set E --------------------------------------------------------------
 
 """
     Avro.LEAF_TYPES
@@ -847,7 +847,7 @@ end
 """
     narrowelement(t::Type) -> Type
 
-The element type the generic model stores for values of type `t` inside an array or map (plan §4.6, one
+The element type the generic model stores for values of type `t` inside an array or map (one
 level of typed nesting): a leaf, `Record`, `UnionValue` or `Union{Missing,y}` for a non-missing leaf or
 `Record` is kept; every other type (nested arrays and maps, abstract joins) is stored as `Any`.
 """

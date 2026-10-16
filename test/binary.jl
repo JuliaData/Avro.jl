@@ -941,7 +941,7 @@ end
         @test saturatederror isa Avro.LimitError
         @test saturatederror.limit == :max_datum_bytes
 
-        # skipping via resolution is Phase 3; skip() directly:
+        # skip() directly:
         plan = Avro.readplan(s)
         for mode in (:strict, :fast)
             b = Avro.Budget(Avro.Limits(); available=1 << 40)

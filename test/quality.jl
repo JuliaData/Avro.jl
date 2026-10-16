@@ -1,4 +1,4 @@
-# Quality gates (plan §9.14): run with AVRO_QUALITY_GATES=true.
+# Quality gates: run with AVRO_QUALITY_GATES=true.
 using Aqua
 using JET
 

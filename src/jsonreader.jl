@@ -1,4 +1,4 @@
-# Avro-owned JSON reader (plan §4.2, decision 51): an allocation-free lexical pre-scan (size, depth,
+# Avro-owned JSON reader: an allocation-free lexical pre-scan (size, depth,
 # strict UTF-8, escape syntax, number grammar, literals, bracket balance, trailing content) followed by a
 # recursive-descent parser that builds frozen JSON trees with raw number tokens and WTF-8 strings.
 # JSON.jl is never used for parsing.
@@ -471,7 +471,7 @@ end
 
 Decode the pre-scanned JSON string whose opening quote is at `buf[i]`, returning its WTF-8 form: a high
 surrogate immediately followed by a low surrogate becomes one scalar; any other surrogate code unit is
-kept as its own 3-byte sequence (plan decision 47). `j` is the position of the closing quote. Raw
+kept as its own 3-byte sequence. `j` is the position of the closing quote. Raw
 bytes (already strict UTF-8) are copied as they are.
 """
 function decodestring(buf::AbstractVector{UInt8}, i::Int, j::Int,

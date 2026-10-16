@@ -1,4 +1,4 @@
-# Precompile workload (plan §11): schema parse/print/canonical/fingerprint, prepared and one-shot
+# Precompile workload: schema parse/print/canonical/fingerprint, prepared and one-shot
 # encode/decode, container round trips over the built-in codecs, Table (with a projection), Rows,
 # single-object, and the JSON encoding. Budget: ≤ 15 s precompile, ≤ 0.5 s load.
 

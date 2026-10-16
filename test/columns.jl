@@ -101,7 +101,7 @@
     cols = Avro.columnbuilders(bp, nothing, 100, budget)
     kernel(cols, d, 100)
     @test @allocated(kernel(cols, d, 100)) == 0
-    # a string column allocates exactly one String per cell (plan §9.12)
+    # a string column allocates exactly one String per cell
     ss = P("{\"type\":\"record\",\"name\":\"S\",\"fields\":[{\"name\":\"s\",\"type\":\"string\"}]}")
     sb = reduce(vcat, [Avro.encode(ss, (s="row$i",)) for i in 1:200])
     scols = Avro.columnbuilders(Avro.readplan(ss), nothing, 200, budget)

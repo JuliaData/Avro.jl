@@ -1,5 +1,5 @@
-# Fuzz worker (plan §9.7): mutates corpus inputs and checks the error guarantee (§4.13) and the
-# acceptance-equivalence rules (§9.8) in a subprocess bounded by CPU time (setrlimit), RSS (self-check)
+# Fuzz worker: mutates corpus inputs and checks the error guarantee and the
+# acceptance-equivalence rules in a subprocess bounded by CPU time (setrlimit), RSS (self-check)
 # and the parent's wall-clock watchdog. Invoked by test/fuzz.jl as
 #   julia worker.jl <fixtures> <sample.tsv> <from> <to> <iterations> <results.tsv> <failures dir> <rss MiB> <cpu s>
 # and included by it for the in-process helpers.
@@ -215,7 +215,7 @@ function isutf8(msg)
     return occursin("UTF-8", msg)
 end
 
-"A raw datum under its valid schema: DataError/LimitError or a valid decode, and the §9.8 acceptance rules."
+"A raw datum under its valid schema: DataError/LimitError or a valid decode, and the acceptance rules."
 function datumcase(ctx, m::Vector{UInt8}, limits)
     s, plan = ctx.schema, ctx.plan
     strict = attempt(() -> Avro.decode(s, m; limits=limits))
@@ -268,7 +268,7 @@ function singlecase(ctx, m::Vector{UInt8}, limits)
     return nothing
 end
 
-"A mutated container file: any AvroError or a valid read (the §4.13 whole-file guarantee)."
+"A mutated container file: any AvroError or a valid read (the whole-file error guarantee)."
 function containercase(m::Vector{UInt8}, limits)
     r = attempt(() -> Avro.Reader(rr -> (foreach(identity, Avro.eachdatum(rr)); nothing), m; limits=limits))
     r[1] === :other && return "guarantee: container read raised $(r[1]) — $(r[2])"

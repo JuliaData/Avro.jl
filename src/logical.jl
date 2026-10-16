@@ -1,4 +1,4 @@
-# Logical types (plan §4.2, §4.8): a closed set of annotations on an underlying schema, evaluated in
+# Logical types: a closed set of annotations on an underlying schema, evaluated in
 # context — a malformed or misplaced annotation drops to the underlying type with the raw attributes
 # preserved in `props` (as Java does), never rejecting the schema.
 
@@ -159,7 +159,7 @@ end
     evaluatelogical(kind, size, props) -> Union{Nothing,LogicalType}
 
 Evaluate a `logicalType` attribute in the context of its underlying schema kind (`:int`, `:long`,
-`:bytes`, `:string`, `:fixed` with `size`) per plan §4.2; `nothing` when the annotation is absent or
+`:bytes`, `:string`, `:fixed` with `size`); `nothing` when the annotation is absent or
 invalid for the context (the raw attributes stay in `props`).
 """
 function evaluatelogical(kind::Symbol, size::Int, props)

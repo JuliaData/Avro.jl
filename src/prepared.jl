@@ -1,18 +1,18 @@
-# Prepared codecs and one-shot conveniences (plan §4.5, §5.2).
+# Prepared codecs and one-shot conveniences.
 
 """
     Avro.DatumReader(writer_schema; reader_schema=nothing, union_resolution=:spec, limits=Limits(), validate=:strict, names=Avro.DEFAULT_ADMISSION)
     Avro.DatumReader(writer_schema, T; kw...)
 
 A prepared decoder for datums written with `writer_schema`, optionally resolved against
-`reader_schema` (plan §4.7) and optionally producing the typed target `T`. Immutable after construction
+`reader_schema` and optionally producing the typed target `T`. Immutable after construction
 and safe to share across tasks (every call allocates its own decoder state and budget):
 `reader(bytes)`, `reader(bytes, pos) -> (value, nextpos)`, `reader(io)`.
 """
 mutable struct DatumReader{T,P}
     const writer::Schema
     const reader::Schema
-    const plan::P               # the concrete plan type: prepared calls devirtualize end to end (§10.2)
+    const plan::P               # the concrete plan type: prepared calls devirtualize end to end
     const span::SpanPlan         # exact writer-datum boundary/value plan (allocation-free per call)
     const limits::Limits
     const validate::Symbol
@@ -84,7 +84,7 @@ end
     return slowcall(r, bytes, Int(pos), false)
 end
 
-"The pooled per-call path: ≤ 1 payload allocation per decode (§10.2; its own scope, so nothing boxes)."
+"The pooled per-call path: ≤ 1 payload allocation per decode (its own scope, so nothing boxes)."
 @inline function pooledcall(r::DatumReader{T,P}, bytes::Vector{UInt8}, pos::Int,
                             whole::Bool) where {T,P}
     sc = @atomicswap(r.scratch = nothing)
@@ -207,7 +207,7 @@ struct UnfixedDatumWriter end
 
 mutable struct DatumWriter{P<:WritePlan,T,FP}
     const schema::Schema
-    const plan::P               # concrete plan type (§10.2)
+    const plan::P               # concrete plan type
     const limits::Limits
     const callbudget::Budget      # reset for each call; writer is single-owner
     encoder::Union{Nothing,Encoder}

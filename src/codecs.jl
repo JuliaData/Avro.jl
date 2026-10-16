@@ -1,4 +1,4 @@
-# Codecs (plan §4.9): block compression and strictly bounded decompression. `max_codec_memory` has
+# Codecs: block compression and strictly bounded decompression. `max_codec_memory` has
 # exactly one meaning — the cap on the complete decoder memory requirement of one codec member as the
 # codec library reports it — enforced on every member read and on every frame written. Multi-member
 # payloads (zstandard frames incl. skippable ones; xz/bzip2 streams via the extensions) are decoded to
@@ -86,7 +86,7 @@ end
 const DEFLATE_DECODER_BYTES = 1 << 16       # zlib inflate state incl. the 32 KiB window
 const DEFLATE_ENCODER_BYTES = 320 * 1024    # zlib deflate state at any level
 
-# ---- zstandard library calls (Zstd_jll; the sizing functions are required symbols, plan §11) ---------
+# ---- zstandard library calls (Zstd_jll; the sizing functions are required symbols) ---------
 
 function zstd_iserror(code::Csize_t)
     return ccall((:ZSTD_isError, Zstd_jll.libzstd), Cuint, (Csize_t,), code) != 0
@@ -189,7 +189,7 @@ function transcodemember!(name::Symbol, codec::TranscodingStreams.Codec, input::
                           out::Vector{UInt8}, outlen::Int, maxout::Int, budget::Budget, workspace::Int=0)
     err = TranscodingStreams.Error()
     TranscodingStreams.initialize(codec)
-    workspace > 0 && allocated!(budget, workspace)     # the native state initialize just malloc'd (§4.4 order)
+    workspace > 0 && allocated!(budget, workspace)     # the native state initialize just malloc'd
     inpos = from
     try
         TranscodingStreams.startproc(codec, :read, err) === :ok || throw(CodecError(name, :decompress, codecmessage(err)))
@@ -373,7 +373,7 @@ struct WriterCodec
     windowlog::Int
 end
 
-"Validate `codec`/`level` for writing under `limits` (plan §4.9: a writer never emits a frame a reader with identical limits cannot decode)."
+"Validate `codec`/`level` for writing under `limits` (a writer never emits a frame a reader with identical limits cannot decode)."
 function writercodec(name::Symbol, level, limits::Limits)
     if name === :null
         level === nothing || throw(ArgumentError("the null codec takes no level"))
@@ -425,7 +425,7 @@ function compresscapacity(::Val{:zstandard}, n::Int)
     return boundint(:zstandard, bound)
 end
 
-"The exact-capacity compressor output allocation, reserved before the codec runs (R04)."
+"The exact-capacity compressor output allocation, reserved before the codec runs."
 function compressbound(w::WriterCodec, n::Int)
     n >= 0 || throw(ArgumentError("input length must be non-negative"))
     w.name === :null && return 0

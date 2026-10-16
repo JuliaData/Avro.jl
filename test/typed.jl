@@ -474,7 +474,7 @@ end
         @test Avro.DatumReader(bs, Bits)(vcat(bb, bb), length(bb) + 1) == (Bits(3, 1.5f0, true), 2 * length(bb) + 1)
     end
 
-    @testset "measured typed shells: layouts, marginals, true-up (plan §4.4, round-2 D06)" begin
+    @testset "measured typed shells: layouts, marginals, true-up" begin
         for T in (@NamedTuple{a::Int64, s::String}, @NamedTuple{a::Int64, b::Float64},
                   @NamedTuple{s::String, v::Vector{Int64}}, @NamedTuple{}, ShellMut, ShellPadded)
             probeshell = Avro.measuredshell(T)
@@ -609,7 +609,7 @@ end
                     @test nullable_charge >= summarysize(nullable)
 
                     # A typed map's values vector receives the same immutable inline-shell transfer as
-                    # arrays: each decoded value's shell moves into its exact Vector{T} slot (round-3 item 4).
+                    # arrays: each decoded value's shell moves into its exact Vector{T} slot.
                     map_schema = Avro.MapSchema(scalar_schema)
                     map_input = Avro.Map{T}([("k1", case.value), ("k2", case.value)])
                     avromap, map_charge = chargedtyped(map_schema, Avro.Map{T}, map_input)
@@ -635,7 +635,7 @@ end
         @test occursin("no finite datum", sprint(showerror, err))
     end
 
-    @testset "the direct typed route over resolving plans (plan §4.8, R18)" begin
+    @testset "the direct typed route over resolving plans" begin
         w = P("{\"type\":\"record\",\"name\":\"E1\",\"fields\":[{\"name\":\"a\",\"type\":\"int\"},{\"name\":\"drop\",\"type\":\"string\"},{\"name\":\"b\",\"type\":[\"null\",\"long\"]}]}")
         r = P("{\"type\":\"record\",\"name\":\"E1\",\"fields\":[{\"name\":\"a\",\"type\":\"double\"},{\"name\":\"b\",\"type\":[\"null\",\"long\"]},{\"name\":\"z\",\"type\":\"int\",\"default\":9}]}")
         T = @NamedTuple{a::Float64, b::Union{Missing,Int64}, z::Int32}

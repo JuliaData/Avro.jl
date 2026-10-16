@@ -146,7 +146,7 @@
         Avro.close!(b)
     end
 
-    @testset "guard residency: settlement contract (review round 3, item 2)" begin
+    @testset "guard residency: settlement contract" begin
         b = Avro.Budget(l; available=1 << 40)
         Avro.reserve!(b, 1000)
         @test b.pending == 1000 && b.reserved == 1000
@@ -202,7 +202,7 @@
         @test observed[1] == observed[2] == 2 * need - 1
     end
 
-    @testset "guard residency: a live Writer publishes only its preflight model (round 3, item 2)" begin
+    @testset "guard residency: a live Writer publishes only its preflight model" begin
         meta = Dict("user.blob" => rand(UInt8, 2 << 20))
         s = Avro.parseschema("{\"type\":\"record\",\"name\":\"RP\",\"fields\":[{\"name\":\"a\",\"type\":\"long\"}]}")
         io = IOBuffer()
@@ -227,7 +227,7 @@
         Avro.close!(db)
     end
 
-    @testset "overlapping guard residency under real memory (round-4 item 2)" begin
+    @testset "overlapping guard residency under real memory" begin
         if Threads.nthreads() > 1
             N = 64 << 20
             tol = 24 << 20                             # host free-memory noise allowance

@@ -1,4 +1,4 @@
-# Value types that do not reference schemas (plan §4.6). `Record`, `EnumValue`, `Fixed`, `UnionValue` and
+# Value types that do not reference schemas. `Record`, `EnumValue`, `Fixed`, `UnionValue` and
 # `Avro.Map` live in `schema.jl`/`map.jl` because they carry schema identity or frozen storage.
 
 using Dates: Dates, Millisecond, Microsecond, Nanosecond, DateTime, Date, Time

@@ -1,4 +1,4 @@
-# Names (plan §4.2): the fullname algorithm, name grammar validation and namespace resolution.
+# Names: the fullname algorithm, name grammar validation and namespace resolution.
 
 """
     FullName(name, namespace)
@@ -163,7 +163,7 @@ end
 """
     isvalidname(s) -> Bool
 
-`true` when `s` matches the Avro name grammar `[A-Za-z_][A-Za-z0-9_]*` (plan §3).
+`true` when `s` matches the Avro name grammar `[A-Za-z_][A-Za-z0-9_]*`.
 """
 function isvalidname(s::AbstractString)
     cu = codeunits(s)
@@ -237,8 +237,7 @@ end
 """
     normalizealias(alias, namespace) -> String
 
-A type alias is normalised to a fullname: a relative alias takes the namespace of the type it aliases
-(plan §4.2).
+A type alias is normalised to a fullname: a relative alias takes the namespace of the type it aliases.
 """
 function normalizealias(alias::AbstractString, namespace::AbstractString)
     n, ns = splitfullname(alias)

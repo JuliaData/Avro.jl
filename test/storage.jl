@@ -1,4 +1,4 @@
-@testset "Storage formulas (plan §4.4 (b))" begin
+@testset "Storage formulas" begin
     @testset "layout probes equal the recorded constants" begin
         @test Avro.STORAGE[] == Avro.RECORDED_STORAGE
         @test Avro.measurestorage() == Avro.RECORDED_STORAGE

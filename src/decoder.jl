@@ -1,4 +1,4 @@
-# Byte-level decoder (plan §4.3): every read is bounds-checked against an explicit end position with
+# Byte-level decoder: every read is bounds-checked against an explicit end position with
 # checked arithmetic; every length/count is validated before allocation; failures are `DataError`s with
 # the byte position.
 
@@ -9,7 +9,7 @@ A cursor over a contiguous byte buffer: `pos` is the next byte to read and `stop
 (inclusive). `budget` is the operation's `Budget`; `validate` is `:strict` or `:fast`.
 """
 mutable struct Decoder{B<:AbstractVector{UInt8}}
-    buf::B                  # non-const: prepared readers reuse the decoder across calls (§10.2)
+    buf::B                  # non-const: prepared readers reuse the decoder across calls
     pos::Int
     stop::Int
     depth::Int

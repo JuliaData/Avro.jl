@@ -596,7 +596,7 @@ end
     @test_throws Avro.SchemaError Avro.parseschema(legacy_fixed_json)
     @test_throws MethodError Avro.parseschema(legacy_fixed_json; legacy_fixed_names=true)
 
-    @testset "construction scope enforces graph limits (plan §4.4, amendment round 1)" begin
+    @testset "construction scope enforces graph limits" begin
         parse_limits = Avro.Limits(max_depth=1, max_schema_depth=7)
         parse_budget = Avro.Budget(parse_limits; available=1 << 40)
         parse_ctx = Avro.ParseContext(parse_limits, parse_budget, false, false)
@@ -671,7 +671,7 @@ end
         @test Avro.json(Avro.ArraySchema(Avro.LongSchema())) == "{\"type\":\"array\",\"items\":\"long\"}"
     end
 
-    @testset "bounded charging printers (plan §4.4, amendment round 1)" begin
+    @testset "bounded charging printers" begin
         s = P("{\"type\":\"record\",\"name\":\"BP\",\"fields\":[{\"name\":\"a\",\"type\":\"long\"},{\"name\":\"b\",\"type\":\"string\"}]}")
         tiny = Avro.Limits(max_schema_bytes=16)
         for f in (Avro.json, Avro.canonical, Avro.fingerprint)

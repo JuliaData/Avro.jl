@@ -1,4 +1,4 @@
-# One cold-process §10.1 measurement: `julia --startup-file=no cold.jl <metric>` prints `metric value`.
+# One cold-process measurement: `julia --startup-file=no cold.jl <metric>` prints `metric value`.
 # Workload metrics report the best of 3 in-process repetitions after one warm-up; load and time-to-
 # first-table measure cold startup directly. The driver takes the median of 5 cold processes. Kernels
 # use prepared objects built outside the timed region.

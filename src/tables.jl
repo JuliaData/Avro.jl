@@ -1,4 +1,4 @@
-# Tables.jl integration (plan §6): `Avro.Table` (a column table with a stored `Tables.Schema`),
+# Tables.jl integration: `Avro.Table` (a column table with a stored `Tables.Schema`),
 # `Avro.Rows` in its three modes, `Avro.Row` (a record plus the operation's admission object),
 # projection pushdown through `select=`, and the read-only DataAPI metadata interface. Symbol admission
 # is the trust boundary: column names intern only through the operation's admission object, lazily for
@@ -245,7 +245,7 @@ function Table(src; reader_schema::Union{Nothing,Schema}=nothing, union_resoluti
             colstypes[index] = juliatype(field.schema)
         end
         if r.source isa BytesSource
-            # byte and mapped sources: pre-scan, exact final preallocation, direct/parallel decode (§4.9)
+            # byte and mapped sources: pre-scan, exact final preallocation, direct/parallel decode
             pre = prescanblocks(r)
             nrows = pre.totalrows
             finals = exactvector(AbstractVector, nkept, r.budget)
@@ -479,7 +479,7 @@ function DataAPI.metadata(t::Table, key::AbstractString, default; style::Bool=fa
     return DataAPI.metadata(t, key; style=style)
 end
 
-"The streamed consumer: per-block exact chunk columns assembled once at the end (plan §4.4/§4.9)."
+"The streamed consumer: per-block exact chunk columns assembled once at the end."
 function decodestreamed!(r::Reader, plan, projection::Union{Nothing,Projection},
                          colstypes::Vector{Type}, resolved::Bool=false)
     countbuilder = BuildBuf{Int}(r.budget, 0)
@@ -517,7 +517,7 @@ function decodestreamed!(r::Reader, plan, projection::Union{Nothing,Projection},
     counts = finishbuild!(countbuilder, r.budget)
     nrows = sum(counts; init=0)
     finals = exactvector(AbstractVector, length(colstypes), r.budget)
-    for (index, E) in enumerate(colstypes)             # both sets of reference slots coexist during assembly (plan §4.4)
+    for (index, E) in enumerate(colstypes)             # both sets of reference slots coexist during assembly
         reserve!(r.budget, vectorbytes(E, nrows))
         finals[index] = Vector{E}(undef, nrows)
         allocated!(r.budget, vectorbytes(E, nrows))
@@ -551,11 +551,11 @@ end
 
 Stream a container file's datums. **Generic record mode** (record root, no `T`): a Tables.jl row source
 yielding `Avro.Row`, with lazy column-name admission and per-block `Tables.partitions`. **Typed mode**
-(`T`): a plain iterator of `T` (no Tables interface). **Non-record mode**: a plain iterator of the §4.6
+(`T`): a plain iterator of `T` (no Tables interface). **Non-record mode**: a plain iterator of the generic
 values. `select=` applies to the generic record mode only. `close(rows)` is idempotent; the do-block
 form closes on exit.
 """
-mutable struct Rows{L}                     # L::Bool — a byte-source pre-scan supplied an exact length (R09)
+mutable struct Rows{L}                     # L::Bool — a byte-source pre-scan supplied an exact length
     const reader::Reader
     const mode::Symbol                     # :generic, :typed or :nonrecord
     const effective::Schema

@@ -1,4 +1,4 @@
-# Write plans (plan §4.5, §4.6 branch recovery, §4.3 validation): one dynamic node per schema node;
+# Write plans (union branch recovery and validation): one dynamic node per schema node;
 # values are extracted from generic values, NamedTuples, StructUtils structs, Tables rows,
 # dictionaries and iterables.
 
@@ -1030,7 +1030,7 @@ function collectmapentries(pairs, budget::Budget)
     end
 end
 
-# unions: branch recovery (plan §4.6)
+# unions: branch recovery
 function encodevalue(p::WUnion, e::Encoder, x)
     i = selectbranch(p, x, e.budget)
     writelong!(e, Int64(i) - 1)
@@ -1531,7 +1531,7 @@ function fieldnamematches(name::String, candidate)
     throw(ArgumentError("StructUtils field tag `name` must be a Symbol or string, got $(typeof(candidate))"))
 end
 
-# ---- the aligned-NamedTuple fast path (Phase 4d performance work) ------------------------------------
+# ---- the aligned-NamedTuple fast path ------------------------------------
 #
 # `Avro.write` streams Tables rows, most commonly NamedTuples whose fields align 1:1 with the record
 # plan. A per-writer cache holds the plan fields as a concrete tuple; the estimate and encode walks then
@@ -1600,7 +1600,7 @@ end
             checked_add(payload, restpayload))
 end
 
-"The §4.9 estimate of one aligned row (the `estimaterootrecord` arithmetic, monomorphized)."
+"The output estimate of one aligned row (the `estimaterootrecord` arithmetic, monomorphized)."
 function estimatealigned(plans::Tuple, x::NamedTuple,
                          cols::Union{Nothing,Vector{Type}}, budget::Budget,
                          fields=nothing,

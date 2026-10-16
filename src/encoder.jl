@@ -1,4 +1,4 @@
-# Byte-level encoder (plan §4.3): a growable buffer grown only by reserved exact-capacity replacement.
+# Byte-level encoder: a growable buffer grown only by reserved exact-capacity replacement.
 
 const ENCODE_PATH_FIELD = UInt8(1)
 const ENCODE_PATH_INDEX = UInt8(2)
@@ -26,7 +26,7 @@ mutable struct Encoder
     budget::Budget    # active operation limits and work accounting
     owner::Budget     # owns the retained buffer allocation (differs during prepared append calls)
     depth::Int
-    credited::Int     # bytes already credited to the work rule (plan §4.3: the output is the denominator)
+    credited::Int     # bytes already credited to the work rule (the output is the denominator)
     expected::Union{Nothing,Schema}
     path::EncodePath
 end

@@ -1,7 +1,7 @@
-# JSON encoding (plan §4.11). `tojson` validates through the binary write plan (identical validation and
+# JSON encoding. `tojson` validates through the binary write plan (identical validation and
 # union branch recovery to `encode`), decodes the bytes back into the closed generic value set and prints
 # that with Java-compatible labels; `fromjson` parses with Avro's own bounded JSON reader (never JSON.jl)
-# and converts by the §4.11 rule table. Both are bounded by `max_datum_bytes`, `max_total_values`,
+# and converts by the JSON encoding rules. Both are bounded by `max_datum_bytes`, `max_total_values`,
 # `max_json_depth` and the operation budget.
 
 struct JSONOut
@@ -406,7 +406,7 @@ struct JSONContext
     budget::Budget
     strict::Bool
     unknownerror::Bool
-    bareunion::Bool        # defaults: unions are bare values matched in branch order (plan §4.2)
+    bareunion::Bool        # defaults: unions are bare values matched in branch order
     countdatum::Bool
     branches::Union{Nothing,Vector{Int}}
     copystrings::Bool      # frozen defaults must materialise fresh caller-owned strings

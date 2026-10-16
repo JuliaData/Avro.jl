@@ -252,7 +252,7 @@ end
                    any(f -> f.schema isa Avro.UnionSchema && Avro.nullablebranch(f.schema) == 0, ws.fields)
                 # the committed -xz.avro data (like -fastavro-*) went through fastavro, which reselects union branches
                 # fastavro rewrote Java's data and reselects union branches (enum → string, float/long → double);
-                # it is an oracle only where branch identity is preserved (plan §8.5)
+                # it is an oracle only where branch identity is preserved
                 @test length(values) == length(expected)
                 keep = [!(f.schema isa Avro.UnionSchema && Avro.nullablebranch(f.schema) == 0) for f in ws.fields]
                 @test all(all(!keep[j] || isequal(values[i][j], expected[i][j]) for j in eachindex(ws.fields)) for i in eachindex(values))

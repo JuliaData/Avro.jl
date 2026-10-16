@@ -137,11 +137,11 @@ function fingerprint(s::Schema; algorithm::Symbol=:crc64avro, limits::Limits=Lim
     graphinfo(s).repaired_names && throw(ArgumentError("a schema with repaired invalid names has no Parsing Canonical Form"))
     algorithm in (:crc64avro, :md5, :sha256) ||
         throw(ArgumentError("unknown fingerprint algorithm :$algorithm (use :crc64avro, :md5 or :sha256)"))
-    return withbudget(limits) do budget                # one operation: print and hash in the same scope (D02)
+    return withbudget(limits) do budget                # one operation: print and hash in the same scope
         w = BoundedWriter(budget, limits.max_schema_bytes)
         seen = schemaseen(s, budget)
         canonicalprint(w, s, seen)
-        releaseseen!(budget, seen)                     # the seen table dies before hashing (round-3 item 1)
+        releaseseen!(budget, seen)                     # the seen table dies before hashing
         pcf = boundedview(w)
         algorithm === :crc64avro && return crc64avro(pcf)
         return hashfingerprint(pcf, algorithm, budget)
@@ -157,11 +157,11 @@ function parsingequivalent(a::Schema, b::Schema; limits::Limits=Limits())
     for s in (a, b)
         graphinfo(s).repaired_names && throw(ArgumentError("a schema with repaired invalid names has no Parsing Canonical Form"))
     end
-    return withbudget(limits) do budget                # one operation for both canonical forms (D02)
+    return withbudget(limits) do budget                # one operation for both canonical forms
         wa = BoundedWriter(budget, limits.max_schema_bytes)
         seena = schemaseen(a, budget)
         canonicalprint(wa, a, seena)
-        releaseseen!(budget, seena)                    # dead before the second print (round-3 item 1)
+        releaseseen!(budget, seena)                    # dead before the second print
         wb = BoundedWriter(budget, limits.max_schema_bytes)
         seenb = schemaseen(b, budget)
         canonicalprint(wb, b, seenb)

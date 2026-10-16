@@ -1,9 +1,9 @@
-# Symbol admission (plan §4.4/§6): Julia interns `Symbol`s permanently, so untrusted strings are
+# Symbol admission: Julia interns `Symbol`s permanently, so untrusted strings are
 # admitted through a bounded, lock-protected table before interning. The table is a log-structured set
 # of sorted runs (no hashing): a recent buffer scanned linearly, sorted into a run when full. Merges
 # are deamortised: an in-progress merge advances by at most MERGE_STEP moved entries per admission,
 # the source runs stay searchable until the completed output replaces them (a partially built run is
-# never consulted). `max_bytes` accounts the table's complete memory (round-4 item 4): the fixed
+# never consulted). `max_bytes` accounts the table's complete memory: the fixed
 # deterministic structure (`admissionbasebytes()` — the recent buffer, the runs table, and the carry
 # workspace, all prebuilt once at exact capacity), each admitted string and its run slot, every carried
 # run shell, and the staged merge's complete output state while the merge is live. Every
@@ -76,7 +76,7 @@ function SymbolAdmission(; max_names::Integer=1_000_000, max_bytes::Integer=64 <
     max_names >= 0 || throw(ArgumentError("max_names must be ≥ 0"))
     max_bytes >= admissionbasebytes() ||
         throw(ArgumentError("max_bytes must cover the table's fixed structure ($(admissionbasebytes()) bytes)"))
-    recent = Vector{String}(undef, RUN_BASE)           # exact capacity once, never grown (§4.4 growth rule)
+    recent = Vector{String}(undef, RUN_BASE)           # exact capacity once, never grown
     resize!(recent, 0)
     runs = Vector{Vector{String}}(undef, MAX_RUNS)
     resize!(runs, 0)
@@ -104,7 +104,7 @@ end
 
 """
 Stage the next equal-size pair. The output vector and merge node are held in `a.bytes` while the merge
-is live (replacement overlap, round-3 item 5); `prebuilt` is the output vector built before the
+is live (replacement overlap); `prebuilt` is the output vector built before the
 admission mutated anything (an exact fresh allocation covers a prediction mismatch, which never
 happens under the lock).
 """
@@ -260,9 +260,9 @@ end
 Admit `s` (if new, counting it against the table's budgets) and return `Symbol(s)`.
 """
 function admit!(a::SymbolAdmission, s::AbstractString; budget::Union{Nothing,Budget}=nothing)
-    nbytes0 = sizeof(s)                                # charged before any copy is made (round-2 D10)
+    nbytes0 = sizeof(s)                                # charged before any copy is made
     lock(a.lock) do
-        if budget !== nothing                          # charge the state that this locked lookup will search (§4.4, R07)
+        if budget !== nothing                          # charge the state that this locked lookup will search
             addcompare!(budget, checked_mul(max(nbytes0, 1), length(a.recent) + 34 * (length(a.runs) + 1)))
         end
         if contains_unlocked(a, s)
@@ -288,7 +288,7 @@ function admit!(a::SymbolAdmission, s::AbstractString; budget::Union{Nothing,Bud
         mergebytes = nextlen == 0 ? 0 : mergeoverlapbytes(nextlen)
         need = checked_add(nbytes, carrybytes + mergebytes - released)
         need <= a.max_bytes || throw(LimitError(:max_bytes, need, a.max_bytes, :max_bytes, :decode))
-        # Every fallible allocation, copy and sort precedes any mutation (round-4 item 4): the retained
+        # Every fallible allocation, copy and sort precedes any mutation: the retained
         # copy, the fully sorted carried run and the next merge's output exist before the table changes,
         # so a failure here leaves the table unchanged.
         retained = admissionstringcopy(s)

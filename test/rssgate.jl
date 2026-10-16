@@ -1,9 +1,9 @@
-# The Phase 4c peak-RSS gate (plan §4.9, fixed method): a fresh warmed child process faults the input
+# The peak-RSS gate: a fresh warmed child process faults the input
 # buffer before the baseline, the parent samples `ps -o rss=` every 10 ms between an acknowledged READY
 # and DONE, and `peak − baseline ≤ effective_ceiling + 128 MiB` with an in-flight high-water ≥ 2.
 # Opt-in: AVRO_RSS_GATE=true (Unix; needs a multi-thread-capable host).
 
-@testset "Parallel peak RSS (plan §4.9)" begin
+@testset "Parallel peak RSS" begin
     lim = Avro.Limits(max_total_bytes=4 << 30, max_block_bytes=64 << 20, max_block_output_bytes=128 << 20,
                       max_codec_memory=64 << 20, max_bytes=256 << 20, max_datum_bytes=256 << 20)
     wlim = Avro.Limits(max_total_bytes=16 << 30, max_block_bytes=64 << 20, max_block_output_bytes=8 << 30,

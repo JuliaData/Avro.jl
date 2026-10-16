@@ -1,4 +1,4 @@
-# xz codec adapter (plan §4.9): multi-stream payloads with the format's four-byte zero stream padding;
+# xz codec adapter: multi-stream payloads with the format's four-byte zero stream padding;
 # liblzma enforces `max_codec_memory` as its decoder `memlimit` (the complete per-block requirement) but
 # cannot report a block's requirement before allocating, so the workspace reservation is the cap itself.
 # The writer's workspace and the emitted streams' decoder requirement come from the liblzma estimators.

@@ -1,4 +1,4 @@
-# Compile-cost gate (plan §4.5): after a warm-up covering every member of the closed value set E, decoding
+# Compile-cost gate: after a warm-up covering every member of the closed value set E, decoding
 # random heterogeneous schemas through the generic and column paths creates no new method instances for
 # Avro's functions and bounded RSS growth. Value generators: test/valuegen.jl.
 
@@ -78,7 +78,7 @@ end
     end
     # One barrier shared by the warm-up and the measured batch: every harness call context (abstract
     # `Avro.Schema` arguments, the column closure) compiles here exactly once during the warm-up, so
-    # the measured batch reports only schema-content-driven method instances (review round 2).
+    # the measured batch reports only schema-content-driven method instances.
     @noinline function runone(s::Avro.Schema, @nospecialize(v))
         bytes = Avro.encode(s, v)
         Avro.decode(s, bytes)
@@ -170,7 +170,7 @@ end
     end
     exercise(2)     # the agreed warm-up: one pass over the closed schema/value kinds
     before = avrospecializations()
-    # The agreed §10.2 protocol (review round 1, R14): the RSS baseline is taken after the `E` warm-up,
+    # The measurement protocol: the RSS baseline is taken after the `E` warm-up,
     # and the single post-warm-up batch of 1,000 random schemas must grow the high-water mark by less
     # than 50 MB. Full collections on both sides keep the collector's heap-sizing policy out of the
     # delta; the measured number is compiled code plus retained caches.

@@ -315,7 +315,7 @@ import DataAPI
         @test length(t00) == 250 && isempty(Tables.columnnames(t00))
     end
 
-    @testset "Rows length via the byte-source pre-scan (plan §6, R09)" begin
+    @testset "Rows length via the byte-source pre-scan" begin
         bytes = take!(Avro.tobuffer([(a=Int64(i),) for i in 1:250]; block_bytes=128))
         rl = Avro.Rows(IOBuffer(bytes))
         @test Base.IteratorSize(typeof(rl)) === Base.HasLength()

@@ -1,4 +1,4 @@
-# Typed decoding (plan §4.5, §4.8). A typed plan specialises on a caller-supplied target type `T`.
+# Typed decoding. A typed plan specialises on a caller-supplied target type `T`.
 # The fast route constructs plain data types directly — NamedTuples by construction, structs with
 # `Expr(:new)` in a function generated for the compile-time `T` — so no user constructor ever runs
 # under the ceiling and the only allocations are the approved representations. Everything the fast route
@@ -80,10 +80,10 @@ A record into a `NamedTuple` or plain struct: `plans` are the per-schema-field p
 `MAP[k]` is the schema field feeding target field `k` (0 → `defaults[k]`).
 """
 mutable struct RecordTarget{T,PS<:Tuple,MAP} <: TypedPlan   # heap identity: an inline immutable would
-    const schema::RecordSchema                                # re-box on every `plan` field load (§10.2)
+    const schema::RecordSchema                                # re-box on every `plan` field load
     const plans::PS
     const defaults::Vector{Any}
-    const shell::Int    # measured per `T` from an empty probe (plan §4.4, R10)
+    const shell::Int    # measured per `T` from an empty probe
 end
 
 "Recursion through the user's own recursive types (filled after construction; a function barrier)."
@@ -108,11 +108,11 @@ struct TypedMark
 end
 
 """
-Per-node (target type => plan) entries, no hashing, plus the construction budget (round-2 D06).
+Per-node (target type => plan) entries, no hashing, plus the construction budget.
 `fresh` tracks all settled storage not yet committed to a returned graph or an outer fallback frame.
 The paired change buffers make nested record, union and resolution attempts transactional. Rollback
 clears every discarded plan reference before its graph storage is released, so a later attempt cannot
-reuse released storage and abandoned candidates do not consume later headroom (round-5 item 1).
+reuse released storage and abandoned candidates do not consume later headroom.
 """
 struct TypedMemo
     entries::Vector{Vector{TypedMemoEntry}}
@@ -240,7 +240,7 @@ function buildtypedroot(::Type{T}, reader::Schema, plan::ReadPlan, budget::Budge
     root = buildtyped(T, reader, plan, memo)
     # The memo table, its entry shells and rollback buffers are construction-only. Discarded entries have
     # already cleared their plan references, so only these container allocations die at this boundary.
-    # Memoised nodes stay charged — the plan graph (or a recursive reference) may hold them (item 4).
+    # Memoised nodes stay charged — the plan graph (or a recursive reference) may hold them.
     dead = vectorbytes(Vector{TypedMemoEntry}, nodes)
     for v in entries
         dead = checked_add(dead, vectorbytes(TypedMemoEntry, length(v)) + memoentrybytes() * length(v))
@@ -332,7 +332,7 @@ function typedmemopush!(buffer::BuildBuf, value, budget::Budget)
     return nothing
 end
 
-# ---- construction accounting (plan §4.4 (e), round-3 item 4) -----------------------------------------
+# ---- construction accounting -----------------------------------------
 #
 # Every typed-plan node is charged to the construction scope before it is built. A node's box charge is
 # the `shellbytes` convention over its concrete type (an isbits node charges its box, since it lives
@@ -346,7 +346,7 @@ function nodebytes(::Type{P}) where {P}
     return isbitstype(P) ? boxbytes(P) : shellbytes(P)
 end
 
-"Reserve one node's box before it is built; `settlenode!` settles it right after construction (§4.4)."
+"Reserve one node's box before it is built; `settlenode!` settles it right after construction."
 function reservenode!(memo::TypedMemo, ::Type{P}) where {P}
     addresolution!(memo.budget)
     reserve!(memo.budget, nodebytes(P))
@@ -409,7 +409,7 @@ function buildtyped(::Type{T}, s::Schema, p::ReadPlan, memo::TypedMemo) where {T
     customhooks(T) && return chargedsemantic(T, s, p, memo)
     if isresolving(p)                                        # the settled eligibility analysis applies to
         mark = beginfresh!(memo)
-        t = buildresolvedtyped(T, s, p, memo)                # resolved plans too (plan §4.8, R18); anything
+        t = buildresolvedtyped(T, s, p, memo)                # resolved plans too; anything
         if t !== nothing
             keepfresh!(memo, mark)
             return t
@@ -772,7 +772,7 @@ function buildrecordplan(::Type{T}, s::RecordSchema, p::RecordPlan, memo::TypedM
 end
 
 """
-The direct typed route over resolving plans (plan §4.8, R18): promotions and enum remaps are leaves
+The direct typed route over resolving plans: promotions and enum remaps are leaves
 (their decode already yields the reader value); a two-branch-nullable reader union resolves through a
 wrapped or per-writer-branch target; resolved records decode writer-ordered steps straight into `T`'s
 fields with reader-only defaults materialised once at plan time. Returns `nothing` when ineligible.
@@ -881,7 +881,7 @@ function typedvalue(p::ResolvedNullableTarget{N}, d::Decoder, names) where {N}
     return decodetyped(p.branches[i], d, names)
 end
 
-"A resolved record decoded stepwise (writer order) directly into `T` (plan §4.8, R18)."
+"A resolved record decoded stepwise (writer order) directly into `T`."
 mutable struct ResolvedRecordTarget{T,PS<:Tuple,SLOTMAP} <: TypedPlan
     const schema::RecordSchema
     const plans::PS      # one target per writer step, writer order (SkipTarget when unmapped)
@@ -1142,7 +1142,7 @@ function buildmaptarget(::Type{T}, s::MapSchema, p::MapPlan, memo::TypedMemo) wh
         return chargedsemantic(T, s, p, memo)
     end
     # The same immutable inline-shell transfer as arrays: the decoded value's shell moves into its
-    # exact `Vector{V}` slot on Julia 1.11+ (round-3 item 4).
+    # exact `Vector{V}` slot on Julia 1.11+.
     inlineshell = VERSION >= v"1.11" && inlinestruct(V) ? measuredinlineshell(V, memo.budget) : 0
     reservenode!(memo, MapTarget{K,V,typeof(vp)})
     out = MapTarget{K,V,typeof(vp)}(vp, p.minsize, false, inlineshell)
@@ -1549,7 +1549,7 @@ function typedvalue(p::MapTarget{K,V}, d::Decoder, names) where {K,V}
     return todict(K, V, keys, vals, names)
 end
 
-# `Dict` targets are built outside exact accounting (plan §4.6); `Symbol` keys pass admission.
+# `Dict` targets are built outside exact accounting; `Symbol` keys pass admission.
 function todict(::Type{K}, ::Type{V}, keys::Vector{String}, vals::Vector{V}, names) where {K,V}
     out = Dict{K,V}()
     sizehint!(out, length(keys))
@@ -1572,7 +1572,7 @@ end
 """
 The heap shell of one decoded `T`, measured once per plan from an empty probe (`Expr(:new, T)` with no
 fields: reference fields stay undefined, so `Base.summarysize` reports exactly the header plus the
-inline layout — including nested inline structs — and no referenced payload; plan §4.4, R10). The
+inline layout — including nested inline structs — and no referenced payload). The
 checked fallback bound covers types `:new` cannot probe.
 """
 @generated function emptyprobe(::Type{T}) where {T}

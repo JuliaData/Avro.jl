@@ -1,6 +1,6 @@
-# 1.x regression port (plan §9.16): the datum-level cases of the Avro.jl 1.1.2 test suite re-expressed
+# 1.x regression port: the datum-level cases of the Avro.jl 1.1.2 test suite re-expressed
 # through the 2.0 API (`Avro.encode(x)` under the conventional schema, `Avro.decode(schema, bytes, T)`).
-# The container cases (`tobuffer`/`readtable`) follow the container reader and writer in Phase 4b.
+# The container cases (`tobuffer`/`readtable`) exercise the container reader and writer.
 
 @enum LegacyEnum hey there stranger
 

@@ -1,5 +1,5 @@
-# Latency gate (plan §4.4): the worst-density legal inputs the default limits admit —
-# max_values_per_byte values per byte under the work rule (finalised at 12 in the round-1 calibration),
+# Latency gate: the worst-density legal inputs the default limits admit —
+# max_values_per_byte values per byte under the work rule,
 # up to max_total_values — decode or skip in ≤ 10 s single-threaded on every supported Julia version.
 # The fixtures derive their density from the limit, so recalibration keeps them worst-case.
 

@@ -1,4 +1,4 @@
-# Julia type → schema derivation with the complete name policy (plan §4.8), and the value-level
+# Julia type → schema derivation with the complete name policy, and the value-level
 # `Avro.schema(x)`.
 
 using StructUtils: StructUtils
@@ -435,7 +435,7 @@ end
 """
     Avro.schema(T::Type; name=nothing, namespace=nothing, limits=Limits()) -> Schema
 
-The conventional schema of a Julia type (plan §4.8): `Missing`/`Nothing → null`, `Bool`, `Int8/16/32`,
+The conventional schema of a Julia type: `Missing`/`Nothing → null`, `Bool`, `Int8/16/32`,
 `UInt8/16 → int`, `Int64`, `UInt32/64 → long`, `Float16/32 → float`, `Float64 → double`,
 `Vector{UInt8} → bytes`, strings/`Symbol`/`Char → string`, `NTuple{N,UInt8} → fixed_N`,
 `Union{Missing,T} → ["null", T]`, other unions in member order, `Base.Enum` subtypes → enum,
@@ -445,7 +445,7 @@ The conventional schema of a Julia type (plan §4.8): `Missing`/`Nothing → nul
 be a valid Avro name (no transliteration); `name=`/`namespace=` override the root.
 """
 function schema(::Type{T}; name=nothing, namespace=nothing, limits::Limits=Limits()) where {T}
-    return withconstruction(limits; direction=:encode) do budget   # finalize and defaults share this scope (D01)
+    return withconstruction(limits; direction=:encode) do budget   # finalize and defaults share this scope
         ctx = derivecontext(limits, budget, 0)
         try
             s = withbuilder(() -> derive(ctx, T, name, namespace))
@@ -643,14 +643,14 @@ function deriveunion(ctx::DeriveContext, ::Type{U}, namespace) where {U}
     if length(members) == 2 && Missing in members && !(Nothing in members)
         other = members[1] === Missing ? members[2] : members[1]
         twobranch = frozenvectorshell() + 16
-        reserve!(ctx.budget, twobranch)                # the two-branch vector, built next (§4.4)
+        reserve!(ctx.budget, twobranch)                # the two-branch vector, built next
         bs = FrozenVector{Schema}(Schema[derive(ctx, Missing, nothing, namespace),
                                          derive(ctx, other, nothing, namespace)], false)
         allocated!(ctx.budget, twobranch)
         return UnionSchema(freeze!(bs), NodeMeta())
     end
     branchbytes = 24 + vectorbytes(Schema, length(members))
-    reserve!(ctx.budget, branchbytes)                  # shell and exact branch capacity (§4.4)
+    reserve!(ctx.budget, branchbytes)                  # shell and exact branch capacity
     bs = emptywithcapacity(FrozenVector{Schema}, length(members))
     allocated!(ctx.budget, branchbytes)
     reserve!(ctx.budget, frozendictshell())
@@ -696,7 +696,7 @@ function derivenamedtuple(ctx::DeriveContext, ::Type{T}, name, namespace) where 
     nf = length(names)
     slots = 24 + vectorbytes(Field, nf) + 48 + vectorbytes(String, nf) +
             vectorbytes(Int, nf)
-    reserve!(ctx.budget, slots)                        # record shells and exact field capacity (§4.4)
+    reserve!(ctx.budget, slots)                        # record shells and exact field capacity
     fields = emptywithcapacity(FrozenVector{Field}, nf)
     index = emptywithcapacity(FrozenDict{String,Int}, nf)
     allocated!(ctx.budget, slots)
@@ -739,7 +739,7 @@ function derivestruct(ctx::DeriveContext, ::Type{T}, name, namespace) where {T}
     nf = fieldcount(T)
     slots = 24 + vectorbytes(Field, nf) + 48 + vectorbytes(String, nf) +
             vectorbytes(Int, nf)
-    reserve!(ctx.budget, slots)                        # record shells and exact field capacity (§4.4)
+    reserve!(ctx.budget, slots)                        # record shells and exact field capacity
     fields = emptywithcapacity(FrozenVector{Field}, nf)
     index = emptywithcapacity(FrozenDict{String,Int}, nf)
     allocated!(ctx.budget, slots)
@@ -806,7 +806,7 @@ end
 A record schema from a `Tables.Schema` (column names and types); `names` renames columns.
 """
 function schema(ts::Tables.Schema; name::AbstractString="Record", namespace::AbstractString="", names=Dict{Symbol,String}(), limits::Limits=Limits())
-    return withconstruction(limits; direction=:encode) do budget   # finalize and defaults share this scope (D01)
+    return withconstruction(limits; direction=:encode) do budget   # finalize and defaults share this scope
         ctx = derivecontext(limits, budget, 1)
         try
             s = withbuilder() do

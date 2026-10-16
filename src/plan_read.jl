@@ -1,6 +1,6 @@
-# Generic read plans (plan §4.5): one dynamic plan node per schema node, producing the finite value
-# set of §4.6. Untrusted schemas never drive compilation — every plan node is one of a closed set of
-# types and children are dispatched behind a function barrier.
+# Generic read plans: one dynamic plan node per schema node, producing the finite set of generic
+# values. Untrusted schemas never drive compilation — every plan node is one of a closed set of types
+# and children are dispatched behind a function barrier.
 
 abstract type ReadPlan end
 
@@ -58,7 +58,7 @@ mutable struct RecordPlan <: ReadPlan
     const boxes::Vector{Int}         # boxed-value charge per field (0 for reference types)
 end
 
-"Build one plan node under §4.4 order: reserve its box, construct, settle."
+"Build one plan node in order: reserve its box, construct, settle."
 function plannode(f, budget::Union{Nothing,Budget}, bytes::Int=64)
     budget === nothing || reserve!(budget, bytes)
     try
@@ -190,7 +190,7 @@ end
 function buildreadplan(s::RecordSchema, memo, budget, little)
     nf = length(s.fields)
     slots = vectorbytes(ReadPlan, nf) + vectorbytes(Int, nf) + 64
-    budget === nothing || reserve!(budget, slots)      # the exact field vectors and node shell (§4.4)
+    budget === nothing || reserve!(budget, slots)      # the exact field vectors and node shell
     fields = Vector{ReadPlan}(undef, nf)
     resize!(fields, 0)
     boxes = Vector{Int}(undef, nf)
@@ -669,7 +669,7 @@ end
 function skipvalue(::BoolPlan, d::Decoder)
     return (readbool(d); nothing)
 end
-# Logical values are domain-checked when skipped exactly as when decoded (plan §4.3: only skipped
+# Logical values are domain-checked when skipped exactly as when decoded (only skipped
 # strings are not UTF-8-validated).
 function skipvalue(::Union{IntPlan,DatePlan}, d::Decoder)
     return (readint(d); nothing)

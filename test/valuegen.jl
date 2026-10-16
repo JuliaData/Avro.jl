@@ -1,4 +1,4 @@
-# Deterministic generators over the closed value set E (plan §4.6) shared by the compile-cost gate, the
+# Deterministic generators over the closed value set E shared by the compile-cost gate, the
 # storage oracle and other property tests.
 
 "A schema whose generic representation is the value type `T`, or `nothing` when Avro cannot express it."

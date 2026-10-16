@@ -1,4 +1,4 @@
-# Limits, budgets and the memory ceiling (plan §4.4).
+# Limits, budgets and the memory ceiling.
 #
 # One fixed-default, portable per-operation ceiling bounds package-owned memory through reservations made
 # before the corresponding allocation; work is bounded as a function of input bytes (the value rule), and
@@ -12,7 +12,7 @@ const MiB = 1 << 20
     Avro.Limits(; kwargs...)
 
 Fixed-default, portable resource limits. Every field is an `Int ≥ 0`; the constructor validates the
-cross-field relations of plan §4.4 and raises `ArgumentError` otherwise. The same limits must be raised
+cross-field relations and raises `ArgumentError` otherwise. The same limits must be raised
 on every side that processes the data (writers enforce every limit readers enforce).
 
 Fields (defaults): `max_depth` (1024), `max_bytes` (64 MiB), `max_datum_bytes` (64 MiB),
@@ -182,7 +182,7 @@ end
     first_unit_bytes(limits)
 
 The memory the first unit of progress of any operation may need: one compressed block, its decompressed
-buffer, the codec workspace plus 4 MiB of fixed overhead, and one datum (plan §4.4).
+buffer, the codec workspace plus 4 MiB of fixed overhead, and one datum.
 """
 function first_unit_bytes(l::Limits)
     return satadd(satadd(satadd(l.max_block_bytes, l.max_block_bytes),
@@ -190,7 +190,7 @@ function first_unit_bytes(l::Limits)
                   l.max_datum_bytes)
 end
 
-# ---- available-memory guard (best-effort; plan §4.4) ------------------------------------------------
+# ---- available-memory guard (best-effort) ------------------------------------------------
 
 mutable struct GuardState
     @atomic pending::Int   # bytes reserved by live operations but not yet allocated
@@ -267,7 +267,7 @@ end
 """
     effective_ceiling(limits; available=available_memory())
 
-`min(limits.max_total_bytes, available ÷ 2)` — the ceiling an operation actually runs under (plan §4.4).
+`min(limits.max_total_bytes, available ÷ 2)` — the ceiling an operation actually runs under.
 """
 function effective_ceiling(l::Limits; available::Int=available_memory())
     return min(l.max_total_bytes, max(available, 0) ÷ 2)
@@ -279,8 +279,8 @@ end
     Budget(limits; direction=:decode, available=available_memory())
 
 The accumulator of one operation: live reservations against the effective ceiling, the value and
-comparison work counters, rows, blocks, codec members, resolution work and the shared allowance
-(plan §4.4). Constructing a budget fails with `LimitError(:available_memory)` when the effective
+comparison work counters, rows, blocks, codec members, resolution work and the shared allowance.
+Constructing a budget fails with `LimitError(:available_memory)` when the effective
 ceiling cannot admit the operation's first unit of progress.
 """
 mutable struct Budget
@@ -385,7 +385,7 @@ end
     allocated!(budget, n)
 
 Record that `n` previously reserved bytes are now resident: they leave the guard's pending counter,
-which must only carry reservations not yet backed by storage (plan §4.4 — the OS counters already see
+which must only carry reservations not yet backed by storage (the OS counters already see
 resident pages, so leaving them pending would subtract them twice from `available_memory()`). Settling
 more bytes than are pending is a settlement mismatch and throws instead of clamping.
 """
@@ -403,7 +403,7 @@ Charge `n` bytes of storage that already exists and is being retained beyond the
 allocated it — tree references a schema node keeps alive, or slot shifts inside prebuilt capacity.
 Nothing is allocated at the call site, so the reservation settles immediately: the storage is
 already resident. Storage allocated at the call site must use `reserve!` before the allocation and
-`allocated!` after it instead (round-4 item 2).
+`allocated!` after it instead.
 """
 function retain!(b::Budget, n::Int)
     reserve!(b, n)
@@ -476,7 +476,7 @@ function rollbackreservations!(budget::Budget, checkpoint::NTuple{2,Int})
 end
 
 """
-Construction-side exact-replacement growth (plan §4.4): the backing vector starts at a reserved exact
+Construction-side exact-replacement growth: the backing vector starts at a reserved exact
 capacity, grows only by reserving the doubled replacement before allocating it, and shrinks to its
 exact final length in `finishbuild!`. `budget === nothing` builds without accounting (unbudgeted
 public constructors account elsewhere).
@@ -538,7 +538,7 @@ function finishbuild!(bb::BuildBuf{T}, budget::Union{Nothing,Budget}) where {T}
     return out
 end
 
-"Push with §4.4 exact-replacement growth when the prebuilt capacity is exhausted."
+"Push with exact-replacement growth when the prebuilt capacity is exhausted."
 function budgetedpush!(v::FrozenVector{T}, x, budget::Union{Nothing,Budget}) where {T}
     v.frozen && throw(FrozenError("vector"))
     if length(v.data) == v.cap
@@ -557,7 +557,7 @@ function budgetedpush!(v::FrozenVector{T}, x, budget::Union{Nothing,Budget}) whe
     return v
 end
 
-"Sorted insert (or overwrite) with §4.4 exact-replacement growth when the capacity is exhausted."
+"Sorted insert (or overwrite) with exact-replacement growth when the capacity is exhausted."
 function budgetedinsert!(d::FrozenDict{K,V}, k, v, budget::Union{Nothing,Budget}) where {K,V}
     d.frozen && throw(FrozenError("dict"))
     i = budgetedsearchsortedfirst(d.keys, k, budget)

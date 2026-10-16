@@ -1,4 +1,4 @@
-@testset "Writer/Reader invariant: consumers and source modes (plan §4.4)" begin
+@testset "Writer/Reader invariant: consumers and source modes" begin
     P = Avro.parseschema
     dir = mktempdir()
     @testset "write plan nodes are bounded and field lookup is reentrant" begin

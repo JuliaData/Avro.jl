@@ -1,4 +1,4 @@
-# Live differential tests against Apache avro-tools (plan §8.5, Phase 2 datum level): run with
+# Live differential tests against Apache avro-tools: run with
 # AVRO_INTEROP=true and AVRO_TOOLS_JAR pointing at the pinned avro-tools-1.12.2.jar (sha256
 # 6220e8bc089aaf917cdad4cd358bd651fc0394c0e5ddb8b36da402012c294a68) with a JDK ≥ 17 on PATH. Java's
 # `tojson` corpus lines are decoded by Julia (`fromjson`) and re-encoded: byte-exact against `jsontofrag`
@@ -67,7 +67,7 @@ end
         julia = [Avro.encode(s, v) for v in vs]
         @test all(isequal(Avro.fromjson(s, Avro.tojson(s, v)), v) for v in vs)
         if Avro.minsize(s) == 0
-            @test all(isempty, julia)             # zero-byte datums: avro-tools' fragtojson prints nothing for them and jsontofrag hangs on `{}` (oracle limitation, plan §8.4)
+            @test all(isempty, julia)             # zero-byte datums: avro-tools' fragtojson prints nothing for them and jsontofrag hangs on `{}` (oracle limitation)
             continue
         end
         javabytes = javatool("jsontofrag", "--schema-file", avsc, jsonl)
@@ -86,7 +86,7 @@ end
     end
 end
 
-# ---- the complete §8.5 matrix (Phase 5 / review round 1, R12) ---------------------------------------
+# ---- the complete interop matrix ---------------------------------------
 
 const AVRO_PYTHON = get(ENV, "AVRO_PYTHON", "")
 const INTEROP_FIXTURES = joinpath(FIXTURES, "interop")
@@ -145,11 +145,11 @@ function javaharnesstext(dir::String, class::String, args...)
     return String(javaharness(dir, class, args...))
 end
 
-@testset "§8.5 matrix: containers, canonical, resolution, single-object, sort order, negatives" begin
+@testset "interop matrix: containers, canonical, resolution, single-object, sort order, negatives" begin
     gen = joinpath(FIXTURES, "generated")
     hd0 = harnessdir()
     @test hd0 !== nothing
-    hd0 === nothing && error("javac is required for the complete §8.5 matrix")
+    hd0 === nothing && error("javac is required for the complete interop matrix")
     hd = hd0::String
     py0 = Sys.which(AVRO_PYTHON)
     @test py0 !== nothing
@@ -305,7 +305,7 @@ if metadata.get("interop.suite") != suite or metadata.get("interop.case") != cas
             vs = [Avro.fromjson(s, line) for line in filter(!isempty, readlines(jsonl))]
             isempty(vs) && continue
             caseid = splitext(basename(avsc))[1]
-            suiteid = "D08-category-1"
+            suiteid = "interop-category-1"
             metadata = Dict("interop.suite" => Vector{UInt8}(suiteid),
                             "interop.case" => Vector{UInt8}(caseid))
             for codec in containercodecs
