@@ -626,6 +626,27 @@ end
         Avro.decode(mapreadplan, Avro.Decoder(mapbytes, mapreadbudget))
         @test mapestimate[1] + mapestimate[2] >= mapreadbudget.peak - mapbaseline
     end
+    @testset "IOBuffer offsets, partition columns, published file modes" begin
+        rows = [(x=Int64(i),) for i in 1:10]
+        pb = PipeBuffer()                                 # take! after a read leaves a memory offset on Julia 1.11+
+        write(pb, UInt8[0xff])
+        write(pb, take!(Avro.tobuffer(rows)))
+        read(pb, UInt8)
+        @test [v.x for v in readall(IOBuffer(take!(pb)))] == collect(1:10)
+        @test_throws ArgumentError Avro.tobuffer(Tables.partitioner([(a=[1],), (a=[2], b=[3])]))
+        @test length(Avro.Table(Avro.tobuffer(Tables.partitioner([(a=[1],), (a=[2],)])))) == 2
+        if !Sys.iswindows()
+            dir = mktempdir()
+            plain = joinpath(dir, "plain.avro")
+            open(io -> nothing, plain, "w")               # the mode the umask gives a new file
+            fresh = joinpath(dir, "fresh.avro")
+            Avro.write(fresh, rows)
+            @test filemode(fresh) & 0o777 == filemode(plain) & 0o777
+            chmod(fresh, 0o640)
+            Avro.write(fresh, rows)                       # replacing keeps the existing mode
+            @test filemode(fresh) & 0o777 == 0o640
+        end
+    end
     @testset "sources: path, mmap=false stream, IO, bytes" begin
         rows = [(x=Int64(i),) for i in 1:100]
         buffered = Avro.tobuffer(rows)

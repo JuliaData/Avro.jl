@@ -114,7 +114,12 @@ function opensource(src::Vector{UInt8}; mmap::Bool=true)
 end
 
 function opensource(src::IOBuffer; mmap::Bool=true)
-    return BytesSource(src.data, 1, src.size)
+    return BytesSource(src.data, iobufferstart(src), src.size)
+end
+
+# On Julia 1.11+ an IOBuffer over a Vector with a memory offset starts after index 1 of `data`.
+function iobufferstart(src::IOBuffer)
+    return max(1, src.ptr - position(src))
 end
 
 function opensource(src::IO; mmap::Bool=true)
@@ -127,7 +132,7 @@ function opensource(src::AbstractString; mmap::Bool=true)
 end
 
 function opensource(src::IOBuffer, ::Val{:trim})
-    return BytesSource(src.data, 1, src.size)
+    return BytesSource(src.data, iobufferstart(src), src.size)
 end
 
 # ---- header -----------------------------------------------------------------------------------------
@@ -1607,6 +1612,15 @@ function writecontainerheader!(sink, entries, syncmarker)
     return nothing
 end
 
+"The mode of a published file: the replaced file's mode, else the mode `open` gives a new file."
+function publishmode(path::String)
+    isfile(path) && return filemode(path) & 0o777
+    Sys.iswindows() && return 0o666
+    mask = ccall(:umask, Base.Cmode_t, (Base.Cmode_t,), 0o022)     # the umask is read by setting it
+    ccall(:umask, Base.Cmode_t, (Base.Cmode_t,), mask)
+    return 0o666 & ~UInt(mask)
+end
+
 "The writer's destination: `(sink, temppath, ownsink)` — a temp file first when writing atomically."
 function openwritersink(dst::Union{AbstractString,IO}, atomic::Bool)
     path = dst isa AbstractString ? String(dst) : nothing
@@ -2790,7 +2804,10 @@ function Base.close(w::Writer; abort::Bool=false)
         w.fsync ? syncfile(w.sink) : flush(w.sink)
         if w.path !== nothing
             w.ownsink && close(w.sink)
-            w.temppath !== nothing && Base.Filesystem.rename(w.temppath, w.path)
+            if w.temppath !== nothing
+                chmod(w.temppath, publishmode(w.path))          # mktemp creates owner-only files
+                Base.Filesystem.rename(w.temppath, w.path)
+            end
         end
         w.closed = true
     catch e
@@ -2840,6 +2857,7 @@ function write(dst::Union{AbstractString,IO}, table; schema::Union{Nothing,Schem
     end
     w = nothing
     ok = false
+    derivedfrom = nothing                                # the columns a derived schema came from
     try
         for part in Tables.partitions(table)
             rows = Tables.rows(part)
@@ -2847,6 +2865,12 @@ function write(dst::Union{AbstractString,IO}, table; schema::Union{Nothing,Schem
                 ts = Tables.schema(rows)
                 ts === nothing && throw(ArgumentError("the source reports no Tables.schema and no `schema=` was given; materialise it (`Tables.dictrowtable`) and derive one with `Avro.schema(Tables.schema(...))`"))
                 s = Avro.schema(ts; name=name, namespace=namespace, limits=limits)
+                derivedfrom = ts.names
+            elseif derivedfrom !== nothing
+                ts = Tables.schema(rows)
+                # encoding matches columns by name, so a later partition's extra column would be dropped
+                ts === nothing || issetequal(ts.names, derivedfrom) ||
+                    throw(ArgumentError("a partition has columns $(collect(ts.names)) but the schema was derived from $(collect(derivedfrom)); pass `schema=`"))
             end
             w === nothing && (w = Writer(dst, s; limits=limits, kw...))
             for row in rows
