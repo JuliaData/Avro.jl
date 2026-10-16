@@ -2566,13 +2566,6 @@ function pushprepareddatum!(w::Writer, datum, stagedcompare::Int=0)
     end
 end
 
-function Base.write(w::Writer, datums)
-    for d in datums
-        push!(w, d)
-    end
-    return w
-end
-
 "Validate the exact work carried by one compressed block before any sink bytes change."
 function writerflushprojection(w::Writer, payloadbytes::Int, compressedbytes::Int)
     framing = checked_add(checked_add(varintlength(w.pendingcount),
