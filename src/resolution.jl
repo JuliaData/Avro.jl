@@ -1102,6 +1102,7 @@ function resolverecord(ctx::ResolveContext, w::RecordSchema, r::RecordSchema,
         for (j, rf) in enumerate(r.fields)
             for name in Iterators.flatten(((rf.name,), rf.aliases))
                 addresolution!(ctx.budget, 1)
+                addinput!(ctx.budget, sizeof(name))   # matched names are this operation's input text
                 i = budgetedget(w.fieldindex, name, 0, ctx.budget)
                 (i == 0 || i == cand[j]) && continue
                 if cand[j] != 0

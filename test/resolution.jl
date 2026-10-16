@@ -266,6 +266,14 @@
         @test_throws Avro.ResolutionError rt(w, r, (a=Avro.UnionValue(2, (v="s",)),))
     end
 
+    @testset "wide records resolve under default limits" begin
+        widerecord(t) = P("{\"type\":\"record\",\"name\":\"W\",\"fields\":[" *
+                          join(("{\"name\":\"f$i\",\"type\":\"$t\"}" for i in 1:3000), ",") * "]}")
+        w, r = widerecord("int"), widerecord("long")
+        @test Avro.resolve(w, r) isa Avro.ResolvedSchema
+        @test rt(w, r, Dict("f$i" => Int32(i) for i in 1:3000)).f3000 === Int64(3000)
+    end
+
     @testset "work limit, repair, equality shortcut" begin
         function wide(pfx, n)
             return P("[" * join(["{\"type\":\"record\",\"name\":\"$(pfx)$i\",\"fields\":[]}" for i in 1:n], ",") * "]")
