@@ -282,6 +282,11 @@ import DataAPI
         close(rl)
         @test got == [Avro.Decimal(12345, 2), Avro.Decimal(-123, 2)]
     end
+    @testset "Tables.rows of a Table has a column path" begin
+        t = Avro.Table(Avro.tobuffer([(a=1, b="x"), (a=2, b="y")]))
+        @test isequal(Tables.columntable(Tables.rows(t)), Tables.columntable(t))
+    end
+
     @testset "wide tables under default limits" begin
         header = [Symbol("x", i) for i in 1:2000]                  # x1, x2, … is not byte order
         src = Tables.table(reshape(collect(1:4000), 2, 2000); header=header)

@@ -348,6 +348,15 @@ function Tables.isrowtable(::Type{_TableRows})
     return true
 end
 
+# The stored schema has no type parameters, so Tables.jl's generic row-to-column fallback cannot use it.
+function Tables.columnaccess(::Type{_TableRows})
+    return true
+end
+
+function Tables.columns(rows::_TableRows)
+    return getfield(rows, :table)
+end
+
 function Tables.schema(rows::_TableRows)
     return Tables.schema(getfield(rows, :table))
 end
