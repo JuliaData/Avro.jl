@@ -5,7 +5,7 @@ using Avro, StructUtils
 # Field tags rename Avro fields and supply defaults for reader-side evolution.
 @defaults struct Event
     id::Int64 = 0
-    kind::Symbol = :unknown                      # Symbols pass the admission table
+    kind::Symbol = :unknown                      # interned (pass `names=` to cap interning)
     payload::Union{Missing,String} = missing &(avro=(name="body",),)
 end
 

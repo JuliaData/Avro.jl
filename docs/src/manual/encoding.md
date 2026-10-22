@@ -58,7 +58,7 @@ dr = Avro.DatumReader(s, Person)
 p = dr(bytes)
 ```
 
-`NamedTuple`s, plain structs, `Dict` targets, `Base.Enum`s, `Symbol`s (through the admission table),
+`NamedTuple`s, plain structs, `Dict` targets, `Base.Enum`s, `Symbol`s (through `names=` when given),
 `DateTime` (an explicit range-checked conversion from the exact timestamp wrappers) and StructUtils
 customisations are supported. Conversion failures raise `Avro.ConversionError`.
 

@@ -290,7 +290,7 @@
         rr = P("{\"type\":\"record\",\"name\":\"T\",\"fields\":[{\"name\":\"a\",\"type\":\"long\"},{\"name\":\"s\",\"type\":\"string\"}]}")
         @test Avro.fromjson(rr, "{\"a\":1,\"s\":\"q\"}", NamedTuple{(:a, :s),Tuple{Int,Symbol}}) == (a=1, s=:q)
         @test_throws Avro.LimitError Avro.fromjson(rr, "{\"a\":1,\"s\":\"q\"}", NamedTuple{(:a, :s),Tuple{Int,Symbol}}; names=Avro.SymbolAdmission(max_names=0))
-        @test Avro.fromjson(rr, "{\"a\":1,\"s\":\"q\"}", NamedTuple{(:a, :s),Tuple{Int,Symbol}}; names=:trusted) == (a=1, s=:q)
+        @test Avro.fromjson(rr, "{\"a\":1,\"s\":\"q\"}", NamedTuple{(:a, :s),Tuple{Int,Symbol}}; names=nothing) == (a=1, s=:q)
         @test Avro.fromjson(rr, "{\"a\":1,\"s\":\"q\"}", Avro.Record).a == 1 && Avro.fromjson(rr, "{\"a\":1,\"s\":\"q\"}", Any).s == "q"
         @test_throws Avro.ConversionError Avro.fromjson(rr, "{\"a\":1,\"s\":\"q\"}", Int)
         # Apache fixtures: weather records printed like Java's tojson

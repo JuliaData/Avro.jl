@@ -42,10 +42,11 @@ preflights the reader's complete memory peak — including the streamed consumer
 
 ## Symbol admission
 
-`Symbol`s intern permanently, so untrusted strings pass a bounded admission table before interning
-([`Avro.SymbolAdmission`](@ref); the process default `Avro.DEFAULT_ADMISSION` admits 1,000,000 names /
-64 MiB counting its fixed buffers, retained strings and run slots, run shells, and live merge state).
-Generic iteration interns nothing; `names=:trusted` bypasses admission.
+Column names and typed `Symbol` values are interned directly by default, so acceptance never depends
+on what the process read before; a file's names are bounded by `max_schema_bytes` and friends.
+`Symbol`s are never freed, so a long-running service reading untrusted files can pass a caller-owned
+[`Avro.SymbolAdmission`](@ref) as `names=` to cap the strings interned through it (that table is
+shared state, so a read fails once it is full). Generic iteration interns nothing.
 
 ## The error guarantee
 

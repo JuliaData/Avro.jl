@@ -412,7 +412,7 @@ end
         @test Avro.decode(ss, sb, SymField) == SymField(:hello, :q) && plan(SymField, ss) isa Avro.RecordTarget
         tiny = Avro.SymbolAdmission(max_names=1)
         @test_throws Avro.LimitError Avro.decode(ss, sb, SymField; names=tiny)
-        @test Avro.decode(ss, sb, SymField; names=:trusted) == SymField(:hello, :q)
+        @test Avro.decode(ss, sb, SymField; names=nothing) == SymField(:hello, :q)
         @test Avro.decode(ss, sb, SymField; names=Avro.SymbolAdmission(max_names=2)) == SymField(:hello, :q)
         # repeated values do not count twice
         adm = Avro.SymbolAdmission(max_names=2)
@@ -432,7 +432,7 @@ end
         arr = P("{\"type\":\"array\",\"items\":\"string\"}")
         @test Avro.decode(arr, Avro.encode(arr, ["a", "b"]), semantic) == [:a, :b]
         @test_throws Avro.LimitError Avro.decode(arr, Avro.encode(arr, ["a", "b"]), Set{Symbol}; names=Avro.SymbolAdmission(max_names=1))   # semantic route honours the admission object
-        @test Avro.decode(arr, Avro.encode(arr, ["a", "b"]), Set{Symbol}; names=:trusted) == Set([:a, :b])
+        @test Avro.decode(arr, Avro.encode(arr, ["a", "b"]), Set{Symbol}; names=nothing) == Set([:a, :b])
     end
 
     @testset "allocation budgets (kernel) and prepared readers" begin
@@ -531,7 +531,7 @@ end
                  value=NullableLayout((missing, NullableChild((Int64(7), "nullable"))))),
             )
 
-            function chargedtyped(s::Avro.Schema, ::Type{T}, x, names=:trusted) where {T}
+            function chargedtyped(s::Avro.Schema, ::Type{T}, x, names=nothing) where {T}
                 bytes = Avro.encode(s, x)
                 target = Avro.typedplan(T, s, Avro.readplan(s), Avro.Limits())
                 budget = Avro.Budget(Avro.Limits())
@@ -557,7 +557,7 @@ end
             char_value, char_charge = chargedtyped(Avro.StringSchema(), Char, "é")
             @test char_value === 'é'
             @test char_charge == 0
-            for names in (:trusted, Avro.SymbolAdmission(max_names=1))
+            for names in (nothing, Avro.SymbolAdmission(max_names=1))
                 symbol_value, symbol_charge = chargedtyped(Avro.StringSchema(), Symbol, "hello", names)
                 @test symbol_value === :hello
                 @test symbol_charge == 0

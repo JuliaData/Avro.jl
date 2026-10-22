@@ -1,7 +1,7 @@
 # Tables.jl integration: `Avro.Table` (a column table with a stored `Tables.Schema`),
-# `Avro.Rows` in its three modes, `Avro.Row` (a record plus the operation's admission object),
-# projection pushdown through `select=`, and the read-only DataAPI metadata interface. Symbol admission
-# is the trust boundary: column names intern only through the operation's admission object, lazily for
+# `Avro.Rows` in its three modes, `Avro.Row` (a record plus the operation's `names=` choice),
+# projection pushdown through `select=`, and the read-only DataAPI metadata interface. Column names
+# intern through `names=` (directly by default, or through a caller's `SymbolAdmission`), lazily for
 # `Rows`.
 
 import DataAPI
@@ -12,19 +12,19 @@ import DataAPI
     Avro.Row
 
 The row type `Avro.Rows` yields in generic record mode: the decoded `Avro.Record` together with the
-operation's symbol-admission object, so every `Symbol`-producing path honours the caller's boundary.
-`Avro.Row(record; names=Avro.DEFAULT_ADMISSION)` wraps a detached record.
+operation's `names=` choice, so every `Symbol`-producing path honours a caller's `SymbolAdmission`.
+`Avro.Row(record; names=nothing)` wraps a detached record.
 """
 struct Row <: Tables.AbstractRow
     record::Record
-    admission::Union{SymbolAdmission,Symbol}
+    admission::Union{Nothing,SymbolAdmission}
 end
 
 function rowwrapperbytes()
     return sizeof(Row) - STORAGE[].record
 end
 
-function Row(record::Record; names=DEFAULT_ADMISSION)
+function Row(record::Record; names=nothing)
     return Row(record, admission(names))
 end
 
@@ -36,7 +36,7 @@ function admitnames(s::RecordSchema, adm, budget::Union{Nothing,Budget}=nothing)
     names = Vector{Symbol}(undef, length(s.fields))
     allocated!(budget, charge)
     for (index, field) in enumerate(s.fields)
-        names[index] = admit!(adm, field.name; budget=budget)
+        names[index] = admit!(adm, field.name)
     end
     return names
 end
@@ -190,7 +190,7 @@ end
 """
     Avro.Table(src; reader_schema=nothing, union_resolution=:spec, ntasks=Threads.nthreads(),
                limits=Limits(), legacy=nothing, decimal_byteorder=:big, allow_invalid_names=false,
-               allow_invalid_defaults=false, validate=:strict, mmap=true, names=Avro.DEFAULT_ADMISSION,
+               allow_invalid_defaults=false, validate=:strict, mmap=true, names=nothing,
                select=nothing)
 
 Materialise a container file with a record root as a Tables.jl column table (plain `Vector` columns,
@@ -222,7 +222,7 @@ end
 function Table(src; reader_schema::Union{Nothing,Schema}=nothing, union_resolution::Symbol=:spec,
                ntasks::Integer=Threads.nthreads(), limits::Limits=Limits(), legacy::Union{Nothing,Symbol}=nothing,
                decimal_byteorder::Symbol=:big, allow_invalid_names::Bool=false, allow_invalid_defaults::Bool=false,
-               validate::Symbol=:strict, mmap::Bool=true, names=DEFAULT_ADMISSION, select=nothing)
+               validate::Symbol=:strict, mmap::Bool=true, names=nothing, select=nothing)
     1 <= ntasks <= typemax(Int) || throw(ArgumentError("ntasks must be in 1:$(typemax(Int)), got $ntasks"))
     taskcount = Int(ntasks)
     adm = admission(names)
@@ -542,11 +542,11 @@ end
 """
     Avro.Rows(src; T=nothing, reader_schema=nothing, union_resolution=:spec, limits=Limits(),
               legacy=nothing, decimal_byteorder=:big, allow_invalid_names=false,
-              allow_invalid_defaults=false, validate=:strict, mmap=true, names=Avro.DEFAULT_ADMISSION,
+              allow_invalid_defaults=false, validate=:strict, mmap=true, names=nothing,
               select=nothing)
 
 Stream a container file's datums. **Generic record mode** (record root, no `T`): a Tables.jl row source
-yielding `Avro.Row`, with lazy column-name admission and per-block `Tables.partitions`. **Typed mode**
+yielding `Avro.Row`, with lazily interned column names and per-block `Tables.partitions`. **Typed mode**
 (`T`): a plain iterator of `T` (no Tables interface). **Non-record mode**: a plain iterator of the generic
 values. `select=` applies to the generic record mode only. `close(rows)` is idempotent; the do-block
 form closes on exit.
@@ -558,7 +558,7 @@ mutable struct Rows{L}                     # L::Bool — a byte-source pre-scan 
     const outschema::Union{Nothing,RecordSchema}
     const plan::Any                        # ReadPlan or TypedPlan
     const T::Any
-    const adm::Union{SymbolAdmission,Symbol}
+    const adm::Union{Nothing,SymbolAdmission}
     const select::Union{Nothing,Projection}
     const resolved::Bool                     # the plan can add zero-input reader defaults
     const nrows::Int                       # exact datum count when L (0 otherwise)
@@ -576,7 +576,7 @@ end
 function Rows(src; T=nothing, reader_schema::Union{Nothing,Schema}=nothing, union_resolution::Symbol=:spec,
               limits::Limits=Limits(), legacy::Union{Nothing,Symbol}=nothing, decimal_byteorder::Symbol=:big,
               allow_invalid_names::Bool=false, allow_invalid_defaults::Bool=false, validate::Symbol=:strict,
-              mmap::Bool=true, names=DEFAULT_ADMISSION, select=nothing)
+              mmap::Bool=true, names=nothing, select=nothing)
     adm = admission(names)
     r = Reader(src; limits=limits, legacy=legacy, decimal_byteorder=decimal_byteorder, allow_invalid_names=allow_invalid_names,
                allow_invalid_defaults=allow_invalid_defaults, validate=validate, mmap=mmap)

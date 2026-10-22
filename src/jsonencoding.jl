@@ -399,7 +399,7 @@ function JSONContext(budget::Budget, unknownerror::Bool, bareunion::Bool)
 end
 
 """
-    Avro.fromjson(schema, json; strict=true, unknown=:ignore, limits=Limits(), names=Avro.DEFAULT_ADMISSION)
+    Avro.fromjson(schema, json; strict=true, unknown=:ignore, limits=Limits(), names=nothing)
     Avro.fromjson(schema, json, T; kw...)
 
 Decode the Avro JSON encoding of one datum (`json` is a string, bytes or an `IO`) into the generic value
@@ -408,7 +408,7 @@ tokens `NaN`/`Infinity`/`-Infinity`; `unknown=:error` rejects unknown record mem
 default, like Java).
 """
 function fromjson(s::Schema, src::Union{AbstractString,AbstractVector{UInt8},IO}; strict::Bool=true, unknown::Symbol=:ignore,
-                  limits::Limits=Limits(), names=DEFAULT_ADMISSION)
+                  limits::Limits=Limits(), names=nothing)
     graphinfo(s).repaired_names &&
         throw(ArgumentError("fromjson rejects a schema parsed with allow_invalid_names=true"))
     unknown in (:ignore, :error) || throw(ArgumentError("unknown must be :ignore or :error"))
@@ -424,7 +424,7 @@ function fromjson(s::Schema, src::Union{AbstractString,AbstractVector{UInt8},IO}
     end
 end
 
-function fromjson(s::Schema, src, ::Type{T}; names=DEFAULT_ADMISSION, kw...) where {T}
+function fromjson(s::Schema, src, ::Type{T}; names=nothing, kw...) where {T}
     v = fromjson(s, src; names=names, kw...)
     (T === Any || v isa T) && return v
     return semanticvalue(T, v, admission(names), s)

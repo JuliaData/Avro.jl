@@ -30,7 +30,7 @@ deferred.
 - Parallel container decoding: `Avro.Table(src; ntasks=…)` — identical results, acceptance and errors
   at every `ntasks`; parallelism only uses headroom under the memory ceiling.
 - Fixed, validated resource limits (`Avro.Limits`) with one 256 MiB per-operation default ceiling, a
-  decompression work rule, per-block caps, and a bounded `Symbol`-admission table
+  decompression work rule, per-block caps, and an opt-in `Symbol`-admission table
   (`Avro.SymbolAdmission`, `names=` everywhere `Symbol`s are produced).
 - Validation modes: `validate=:strict` (default) and `:fast`.
 - Writer safety: atomic file replacement, failure poisoning, and a preflight that guarantees every

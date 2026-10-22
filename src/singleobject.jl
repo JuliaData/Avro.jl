@@ -342,7 +342,7 @@ function encodesingle(s::Schema, x; limits::Limits=Limits())
 end
 
 """
-    Avro.decodesingle(src, store; reader_schema=nothing, union_resolution=:spec, validate=:strict, limits=Limits(), names=Avro.DEFAULT_ADMISSION, T=nothing)
+    Avro.decodesingle(src, store; reader_schema=nothing, union_resolution=:spec, validate=:strict, limits=Limits(), names=nothing, T=nothing)
 
 Decode a single-object message: validates the marker, looks the writer schema up by fingerprint,
 recomputes the fingerprint of the returned schema (rejecting a mismatch), resolves against
@@ -352,7 +352,7 @@ selects a typed target.
 function decodesingleoperation(src::AbstractVector{UInt8}, store::SchemaStore, budget::Budget;
                                reader_schema::Union{Nothing,Schema}=nothing,
                                union_resolution::Symbol=:spec, validate::Symbol=:strict,
-                               limits::Limits=Limits(), names=DEFAULT_ADMISSION, T=nothing)
+                               limits::Limits=Limits(), names=nothing, T=nothing)
     T === nothing || T isa Type || throw(ArgumentError("T must be a type or nothing"))
     n = length(src)
     n >= 10 || throw(DataError("single-object message shorter than the 10-byte header", n + 1))
@@ -405,7 +405,7 @@ end
 
 function decodesingle(src::AbstractVector{UInt8}, store::SchemaStore; reader_schema::Union{Nothing,Schema}=nothing,
                       union_resolution::Symbol=:spec, validate::Symbol=:strict, limits::Limits=Limits(),
-                      names=DEFAULT_ADMISSION, T=nothing)
+                      names=nothing, T=nothing)
     value, plan, adm = withbudget(limits) do budget
         return decodesingleoperation(src, store, budget; reader_schema=reader_schema,
                                      union_resolution=union_resolution, validate=validate,

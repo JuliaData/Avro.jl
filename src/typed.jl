@@ -23,7 +23,7 @@ struct LeafTarget{T,P<:ReadPlan} <: TypedPlan
     plan::P
 end
 
-"A `string` or `enum` decoded to `Symbol` through the operation's admission object."
+"A `string` or `enum` decoded to `Symbol` through the operation's `names=` choice."
 struct SymbolTarget{P<:Union{StringPlan,EnumPlan}} <: TypedPlan
     plan::P
 end
@@ -1387,7 +1387,7 @@ end
 """
     decodetyped(plan::TypedPlan, d::Decoder, names) -> value
 
-Decode one value of `plan` (counted like the generic `decode`); `names` is the admission object.
+Decode one value of `plan` (counted like the generic `decode`); `names` is the `names=` choice.
 """
 @inline function decodetyped(p::TypedPlan, d::Decoder, names)
     countvalues!(d.budget)
@@ -1412,7 +1412,7 @@ end
 
 function typedvalue(p::SymbolTarget{StringPlan}, d::Decoder, names)
     value = readstring(d)
-    symbol = admit!(names, value; budget=d.budget)
+    symbol = admit!(names, value)
     bytes = sizeof(value)
     value = nothing
     release!(d.budget, stringbytes(bytes))
@@ -1425,7 +1425,7 @@ end
 
 function typedvalue(p::SymbolTarget{EnumPlan}, d::Decoder, names)
     syms = p.plan.schema.symbols
-    return admit!(names, syms[readindex(d, length(syms))]; budget=d.budget)
+    return admit!(names, syms[readindex(d, length(syms))])
 end
 
 function typedvalue(p::EnumTarget{T}, d::Decoder, names) where {T}
@@ -1443,7 +1443,7 @@ end
 
 function typedvalue(p::EnumRemapTarget{Symbol}, d::Decoder, names)
     sym = p.plan.reader.symbols[enumremapindex(p.plan, d)]
-    return admit!(names, sym; budget=d.budget)
+    return admit!(names, sym)
 end
 
 function typedvalue(p::EnumRemapNativeTarget{T}, d::Decoder, names) where {T}
@@ -1547,7 +1547,7 @@ function typedvalue(p::MapTarget{K,V}, d::Decoder, names) where {K,V}
     return todict(K, V, keys, vals, names)
 end
 
-# `Dict` targets are built outside exact accounting; `Symbol` keys pass admission.
+# `Dict` targets are built outside exact accounting; `Symbol` keys go through `names`.
 function todict(::Type{K}, ::Type{V}, keys::Vector{String}, vals::Vector{V}, names) where {K,V}
     out = Dict{K,V}()
     sizehint!(out, length(keys))
@@ -1725,7 +1725,7 @@ function withadmission(f, names)
 end
 
 function currentadmission()
-    return get(task_local_storage(), ADMISSION_KEY, DEFAULT_ADMISSION)
+    return get(task_local_storage(), ADMISSION_KEY, nothing)
 end
 
 """

@@ -355,7 +355,7 @@
         function buf()
             return Avro.tobuffer([(p=Int64(1), q=Int64(2))]; schema=s)
         end
-        adm = Avro.SymbolAdmission(max_names=2, max_bytes=Avro.admissionbasebytes() + 64)
+        adm = Avro.SymbolAdmission(max_names=2)
         @test Tables.columnnames(Avro.Table(buf(); names=adm)) == [:p, :q]
         @test Tables.columnnames(Avro.Table(buf(); names=adm)) == [:p, :q]     # already-admitted names do not count twice
         s2 = P("{\"type\":\"record\",\"name\":\"A2\",\"fields\":[{\"name\":\"r\",\"type\":\"long\"}]}")

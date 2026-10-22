@@ -54,7 +54,7 @@ if VERSION >= v"1.11.0-DEV.469"
         :AvroError, :DecodeError, :SchemaError, :EncodeError, :ResolutionError, :LimitError, :CodecError,
         :UnsupportedCodecError, :ConversionError, :UnknownSchemaError, :AmbiguousSchemaError,
         :WriterClosedError, :DataError,
-        :Limits, :SymbolAdmission, :DEFAULT_ADMISSION,
+        :Limits, :SymbolAdmission,
         :Decimal, :WideDecimal, :Timestamp, :LocalTimestamp, :Duration, :truncate, :round,
         :Schema, :parseschema, :json, :canonical, :fingerprint, :parsingequivalent, :fullname, :nodefault,
         :NullSchema, :BooleanSchema, :IntSchema, :LongSchema, :FloatSchema, :DoubleSchema, :BytesSchema, :StringSchema,

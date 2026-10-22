@@ -61,8 +61,8 @@ value = Avro.decode(s, bytes)
 * **Parallel decoding**: `Avro.Table(src; ntasks=…)` decodes blocks in parallel when the memory
   ceiling leaves room (raise `max_total_bytes`); results and errors match `ntasks=1`.
 * **Safety by default**: each operation's memory is capped (256 MiB by default), decompression work is
-  bounded, input is validated strictly, and `Symbol` creation from untrusted data is bounded. Raise any
-  limit with `Avro.Limits` for trusted bulk workloads.
+  bounded, and input is validated strictly; a service can cap `Symbol` creation with
+  `names=Avro.SymbolAdmission(...)`. Raise any limit with `Avro.Limits` for trusted bulk workloads.
 * **Interoperability**: files are round-tripped against the Java (avro-tools 1.12.2) and Python
   (fastavro 1.12.2) implementations in CI, over every codec and every root schema kind.
 

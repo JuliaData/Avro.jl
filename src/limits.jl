@@ -533,10 +533,11 @@ const NAME_INDEX_RUNS = 64   # a binary counter of an Int count has at most 63 s
 """
     NameIndex{V}(budget)
 
-An index of `String` keys (fullnames, aliases) that is built one insertion at a time with lookups in
-between: sorted runs whose lengths are distinct powers of two, merged like a binary counter, so `n`
-insertions move `O(n log n)` entries and a lookup binary-searches at most 64 runs. No hashing of
-untrusted keys; `FullName` keys find equal `String` keys (`isless` and `keymatches` compare them).
+An index of `String` keys (fullnames, aliases, admitted names) that is built one insertion at a time
+with lookups in between: sorted runs whose lengths are distinct powers of two, merged like a binary
+counter, so `n` insertions move `O(n log n)` entries and a lookup binary-searches at most 64 runs. No
+hashing of untrusted keys; `FullName` keys find equal `String` keys (`isless` and `keymatches` compare
+them). Storage is reserved against `budget` (`nothing` builds without accounting).
 """
 mutable struct NameIndex{V}
     const keys::Vector{Vector{String}}   # runs, longest first
@@ -553,15 +554,15 @@ function runbytes(::Type{V}, n::Int) where {V}
     return vectorbytes(String, n) + vectorbytes(V, n)
 end
 
-function NameIndex{V}(budget::Budget) where {V}
+function NameIndex{V}(budget::Union{Nothing,Budget}) where {V}
     charge = nameindexshellbytes(V)
-    reserve!(budget, charge)
+    budget === nothing || reserve!(budget, charge)
     keys = Vector{Vector{String}}(undef, NAME_INDEX_RUNS)
     vals = Vector{Vector{V}}(undef, NAME_INDEX_RUNS)
     resize!(keys, 0)
     resize!(vals, 0)
     index = NameIndex{V}(keys, vals, 0)
-    allocated!(budget, charge)
+    budget === nothing || allocated!(budget, charge)
     return index
 end
 
@@ -589,11 +590,11 @@ function Base.get(index::NameIndex, key, default)
 end
 
 "Insert a key that is not present (callers check `haskey` first)."
-function Base.insert!(index::NameIndex{V}, key::String, value, budget::Budget) where {V}
-    reserve!(budget, runbytes(V, 1))
+function Base.insert!(index::NameIndex{V}, key::String, value, budget::Union{Nothing,Budget}) where {V}
+    budget === nothing || reserve!(budget, runbytes(V, 1))
     ks = String[key]
     vs = V[value]
-    allocated!(budget, runbytes(V, 1))
+    budget === nothing || allocated!(budget, runbytes(V, 1))
     while !isempty(index.keys) && length(index.keys[end]) == length(ks)
         ks, vs = mergeruns(pop!(index.keys), pop!(index.vals), ks, vs, budget)
     end
@@ -604,12 +605,12 @@ function Base.insert!(index::NameIndex{V}, key::String, value, budget::Budget) w
 end
 
 function mergeruns(ak::Vector{String}, av::Vector{V}, bk::Vector{String}, bv::Vector{V},
-                   budget::Budget) where {V}
+                   budget::Union{Nothing,Budget}) where {V}
     n = length(ak) + length(bk)
-    reserve!(budget, runbytes(V, n))
+    budget === nothing || reserve!(budget, runbytes(V, n))
     ks = Vector{String}(undef, n)
     vs = Vector{V}(undef, n)
-    allocated!(budget, runbytes(V, n))
+    budget === nothing || allocated!(budget, runbytes(V, n))
     i = j = 1
     for k in 1:n
         if j > length(bk) || (i <= length(ak) && isless(ak[i], bk[j]))
@@ -622,7 +623,8 @@ function mergeruns(ak::Vector{String}, av::Vector{V}, bk::Vector{String}, bv::Ve
             j += 1
         end
     end
-    release!(budget, runbytes(V, length(ak)) + runbytes(V, length(bk)))   # both inputs die with this frame
+    budget === nothing ||
+        release!(budget, runbytes(V, length(ak)) + runbytes(V, length(bk)))   # both inputs die with this frame
     return (ks, vs)
 end
 

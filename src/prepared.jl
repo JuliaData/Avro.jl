@@ -1,7 +1,7 @@
 # Prepared codecs and one-shot conveniences.
 
 """
-    Avro.DatumReader(writer_schema; reader_schema=nothing, union_resolution=:spec, limits=Limits(), validate=:strict, names=Avro.DEFAULT_ADMISSION)
+    Avro.DatumReader(writer_schema; reader_schema=nothing, union_resolution=:spec, limits=Limits(), validate=:strict, names=nothing)
     Avro.DatumReader(writer_schema, T; kw...)
 
 A prepared decoder for datums written with `writer_schema`, optionally resolved against
@@ -16,7 +16,7 @@ mutable struct DatumReader{T,P}
     const span::SpanPlan         # exact writer-datum boundary/value plan (allocation-free per call)
     const limits::Limits
     const validate::Symbol
-    const names::Union{SymbolAdmission,Symbol}
+    const names::Union{Nothing,SymbolAdmission}
     const resolved::Bool       # reader defaults need a plan-aware zero-input-value pre-scan
     const staticvalues::Int    # exact writer value count, or -1 when a structural scan is required
     @atomic scratch::Any        # one pooled per-call Decoder (its budget inside), shared lock-free
@@ -33,7 +33,7 @@ function datumreaderplan(writer::Schema, reader_schema::Union{Nothing,Schema}, u
 end
 
 function DatumReader(writer::Schema; reader_schema::Union{Nothing,Schema}=nothing, union_resolution::Symbol=:spec,
-                     limits::Limits=Limits(), validate::Symbol=:strict, names=DEFAULT_ADMISSION)
+                     limits::Limits=Limits(), validate::Symbol=:strict, names=nothing)
     validate in (:strict, :fast) || throw(ArgumentError("validate must be :strict or :fast"))
     effective = reader_schema === nothing ? writer : reader_schema
     plan, span = withbudget(limits) do budget
@@ -49,7 +49,7 @@ end
 
 function DatumReader(writer::Schema, ::Type{T}; reader_schema::Union{Nothing,Schema}=nothing,
                      union_resolution::Symbol=:spec, limits::Limits=Limits(), validate::Symbol=:strict,
-                     names=DEFAULT_ADMISSION) where {T}
+                     names=nothing) where {T}
     validate in (:strict, :fast) || throw(ArgumentError("validate must be :strict or :fast"))
     effective = reader_schema === nothing ? writer : reader_schema
     plan, span = withbudget(limits) do budget
@@ -520,7 +520,7 @@ end
 
 function decodedatum(writer::Schema, src, pos::Int, ::Type{T}, whole::Bool;
                       reader_schema::Union{Nothing,Schema}=nothing, union_resolution::Symbol=:spec,
-                      limits::Limits=Limits(), validate::Symbol=:strict, names=DEFAULT_ADMISSION) where {T}
+                      limits::Limits=Limits(), validate::Symbol=:strict, names=nothing) where {T}
     validate in (:strict, :fast) || throw(ArgumentError("validate must be :strict or :fast"))
     admitted = admission(names)
     plan, value, next = withbudget(limits) do budget

@@ -58,7 +58,8 @@ t = Avro.Table("big.avro"; ntasks=8, limits=lim)
 
 ## Symbol admission
 
-`Symbol`s intern permanently in Julia, so every `Symbol`-producing path (column names, typed `Symbol`
-values) passes an admission table with name and byte budgets. The process-wide default admits 1 M
-names / 64 MiB; pass `names=Avro.SymbolAdmission(...)` for per-tenant budgets or `names=:trusted` to
-bypass admission for trusted data. See [`Avro.SymbolAdmission`](@ref).
+Column names and typed `Symbol` values are interned directly by default; a file's names are bounded by
+its schema limits. Julia never frees interned `Symbol`s, so a long-running service that reads many
+untrusted files can pass `names=Avro.SymbolAdmission(...)` (one per tenant) to cap the names interned
+through it. That table is shared state by design: a read can fail once it is full. See
+[`Avro.SymbolAdmission`](@ref).
