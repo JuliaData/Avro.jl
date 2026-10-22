@@ -147,7 +147,6 @@ end
         Avro.release!(namebudget, Avro.stringbytes(sizeof(internal)))
     end
     Avro.releasederivecontext!(namectx)
-    Avro.close!(namebudget)
     hugeparameter = Symbol(repeat("a", 1_000_000))
     hugetype = T.HookedName{hugeparameter}
     T.AVRONAME_CALLS[] = 0
@@ -198,7 +197,6 @@ end
     @test Avro.derive(derive_ctx, T.SelfRef, nothing, nothing) === first_derived
     @test derive_budget.reserved == first_charge
     Avro.releasederivecontext!(derive_ctx)
-    Avro.close!(derive_budget)
     # value-level schema(x)
     rec = Avro.Record(pt, Any[1.0, missing, String[], DateTime(2020)])
     @test Avro.schema(rec) === pt

@@ -34,7 +34,6 @@ end
 function Encoder(budget::Budget; capacity::Int=256)
     reserve!(budget, bytesbytes(capacity))
     buf = Vector{UInt8}(undef, capacity)
-    allocated!(budget, bytesbytes(capacity))
     path = EncodePath(budget, min(budget.limits.max_depth, 16))
     e = Encoder(buf, 0, budget, budget, 0, 0, nothing, path)
     return e
@@ -92,8 +91,6 @@ function ensureroom!(e::Encoder, n::Int)
     end
     nb = try
         value = Vector{UInt8}(undef, newcap)
-        allocated!(owner, newbytes)
-        active === owner || allocated!(active, newbytes)
         value
     catch
         rollbackreservations!(active, activecheckpoint)

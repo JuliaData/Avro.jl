@@ -59,12 +59,11 @@ function writeplan(s::Schema; budget::Union{Nothing,Budget}=nothing)
     try
         budget === nothing || reserve!(budget, mbytes)     # the construction memo, released once the root is built
         memo = Vector{Union{Nothing,WritePlan}}(nothing, nodes)
-        budget === nothing || allocated!(budget, mbytes)
         p = writeplan(s, memo, budget)
         budget === nothing || release!(budget, mbytes)     # the memo dies here; the plan graph stays charged
         return p
     catch
-        budget === nothing || rollbackreservations!(budget, checkpoint::NTuple{2,Int})
+        budget === nothing || rollbackreservations!(budget, checkpoint::Int)
         rethrow()
     end
 end
@@ -153,13 +152,11 @@ function buildwriteplan(s::UnionSchema, memo, budget)
     budget === nothing || reserve!(budget, vectors + node)
     branches = Vector{WritePlan}(undef, n)
     jtypes = Vector{Any}(undef, n)
-    budget === nothing || allocated!(budget, vectors)
     for (i, b) in enumerate(s.branches)
         branches[i] = writeplan(b, memo, budget)
         jtypes[i] = juliatype(b)
     end
     p = WUnion(s, branches, nullablebranch(s), jtypes)
-    budget === nothing || allocated!(budget, node)
     return p
 end
 
@@ -170,7 +167,6 @@ function buildwriteplan(s::RecordSchema, memo, budget)
     fields = Vector{WritePlan}(undef, nf)
     resize!(fields, 0)
     p = WRecord(s, fields)
-    budget === nothing || allocated!(budget, slots)
     memo[Int(nodeid(s)) + 1] = p
     for f in s.fields
         push!(p.fields, writeplan(f.schema, memo, budget))
@@ -196,8 +192,6 @@ function pushencodepath!(e::Encoder, kind::UInt8,
             active === owner || reserve!(active, newbytes)
             reserve!(owner, newbytes)
             replacement = Vector{EncodePathSegment}(undef, newcap)
-            allocated!(owner, newbytes)
-            active === owner || allocated!(active, newbytes)
         catch
             replacement = nothing
             rollbackreservations!(active, activecheckpoint)
@@ -768,7 +762,6 @@ function twoscomplement(v::Union{Int128,BigInt}, budget::Budget; maxbytes::Int=b
     try
         reserve!(budget, charge)
         out = Vector{UInt8}(undef, n)
-        allocated!(budget, charge)
         return filltwoscomplement!(out, v)
     catch
         rollbackreservations!(budget, checkpoint)
@@ -1005,7 +998,6 @@ function collectmapentries(pairs, budget::Budget)
         values = Vector{Any}(undef, n)
         perm = Vector{Int32}(undef, n)
         scratch = Vector{Int32}(undef, cld(n, 2))
-        allocated!(budget, vectors)
         i = 0
         for (k, v) in pairs
             i < n || encodeerror("map size changed during iteration", pairs)
@@ -1016,7 +1008,6 @@ function collectmapentries(pairs, budget::Budget)
             box = isbits(v) ? boxbytes(typeof(v)) : 0
             box > 0 && reserve!(budget, box)
             values[i] = v
-            box > 0 && allocated!(budget, box)
             boxes = checked_add(boxes, box)
         end
         i == n || encodeerror("map size changed during iteration", pairs)
@@ -1377,7 +1368,6 @@ function recordpositions(n::Int, budget::Budget)
     try
         reserve!(budget, charge)
         positions = Vector{Int}(undef, n)
-        allocated!(budget, charge)
         fill!(positions, 0)
         return positions
     catch
@@ -1413,14 +1403,7 @@ end
 function recordfieldindex(p::WRecord, candidate::AbstractString, budget::Budget)
     charge = stringbytes(sizeof(candidate))
     reserve!(budget, charge)
-    name = try
-        value = String(candidate)
-        allocated!(budget, charge)
-        value
-    catch
-        unreserve!(budget, charge)
-        rethrow()
-    end
+    name = String(candidate)
     try
         return recordfieldindex(p, name, budget)
     finally
@@ -1494,7 +1477,6 @@ function recorddictvalues(p::WRecord, x::AbstractDict, budget::Budget)
     values = try
         reserve!(budget, charge)
         result = Vector{Any}(undef, length(p.fields))
-        allocated!(budget, charge)
         fill!(result, DICT_MISSING)
         result
     catch
@@ -1512,7 +1494,6 @@ function recorddictvalues(p::WRecord, x::AbstractDict, budget::Budget)
             box = isbits(value) ? boxbytes(typeof(value)) : 0
             box > 0 && reserve!(budget, box)
             values[i] = value
-            box > 0 && allocated!(budget, box)
             boxes = checked_add(boxes, box)
         end
         return values, boxes
@@ -1590,11 +1571,10 @@ function alignedplans(p::WritePlan, ::Type{T}, budget::Union{Nothing,Budget}=not
     plans = try
         Tuple(p.fields)
     catch
-        budget === nothing || unreserve!(budget, charge)
+        budget === nothing || release!(budget, charge)
         rethrow()
     end
     sizeof(plans) == charge || throw(ArgumentError("internal error: aligned-plan tuple layout changed"))
-    budget === nothing || allocated!(budget, charge)
     return plans
 end
 

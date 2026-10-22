@@ -46,30 +46,26 @@
         @test !isdefined(Avro, :available_memory) && !isdefined(Avro, :GUARD)
     end
 
-    @testset "Budget: reservations, pending counter, release" begin
+    @testset "Budget: reservations and release" begin
         b = Avro.Budget(l)
         Avro.reserve!(b, 1000 + (1 << 20))
-        @test b.reserved == 1000 + (1 << 20) && b.peak == b.reserved && b.pending == b.reserved
-        Avro.allocated!(b, 400)
-        @test b.pending == 600 + (1 << 20)
-        @test_throws ArgumentError Avro.release!(b, 401)                            # only the resident 400 can release
-        @test_throws ArgumentError Avro.allocated!(b, 601 + (1 << 20))              # settlement mismatch fails, no clamp
-        @test_throws ArgumentError Avro.unreserve!(b, 601 + (1 << 20))              # only pending returns via unreserve!
-        Avro.release!(b, 400)                                                       # the resident portion
-        Avro.unreserve!(b, 600 + (1 << 20))                                         # the never-resident headroom
-        @test b.reserved == 0 && b.pending == 0
+        @test b.reserved == 1000 + (1 << 20) && b.peak == b.reserved
+        Avro.release!(b, 400)
+        @test b.reserved == 600 + (1 << 20) && b.peak == 1000 + (1 << 20)
+        @test_throws ArgumentError Avro.release!(b, 601 + (1 << 20))               # an over-release is a mismatch, no clamp
+        @test b.reserved == 600 + (1 << 20)
+        @test_throws ArgumentError Avro.reserve!(b, -1)
+        @test_throws ArgumentError Avro.release!(b, -1)
+        Avro.release!(b, 600 + (1 << 20))
+        @test b.reserved == 0
+        checkpoint = Avro.budgetcheckpoint(b)
         Avro.reserve!(b, 10)
-        underflow_state = (b.reserved, b.pending)
-        @test_throws ArgumentError Avro.release!(b, 11)
-        @test_throws ArgumentError Avro.release!(b, 10)                             # reserved but pending: nothing resident yet
-        @test (b.reserved, b.pending) == underflow_state
-        Avro.unreserve!(b, 10)
+        Avro.reserve!(b, 20)
+        Avro.rollbackreservations!(b, checkpoint)
+        @test b.reserved == 0
         @test_throws Avro.LimitError Avro.reserve!(b, b.ceiling + 1)
         Avro.reserve!(b, b.ceiling)   # exactly the ceiling is admitted
         @test_throws Avro.LimitError Avro.reserve!(b, 1)
-        Avro.close!(b)
-        @test b.pending == 0
-        @test_throws ArgumentError Avro.reserve!(b, -1)
         r = Avro.withbudget(l) do bb
             Avro.reserve!(bb, 10)
             42
@@ -84,7 +80,6 @@
     @testset "BuildBuf accounts for its mutable shell" begin
         b = Avro.Budget(l)
         bb = Avro.BuildBuf{Int}(b, 4)
-        @test b.pending == 0
         @test b.reserved == Avro.vectorbytes(Int, 4) + Avro.shellbytes(typeof(bb))
         push!(bb, b, 1)
         data = Avro.finishbuild!(bb, b)
@@ -93,49 +88,26 @@
         data = nothing
         Avro.release!(b, Avro.vectorbytes(Int, 1))
         @test b.reserved == 0
-        Avro.close!(b)
     end
 
-    @testset "settlement contract" begin
-        b = Avro.Budget(l)
-        Avro.reserve!(b, 1000)
-        @test b.pending == 1000 && b.reserved == 1000
-        @test_throws ArgumentError Avro.allocated!(b, -1)               # negative settlements are mismatches too
-        @test_throws ArgumentError Avro.release!(b, -1)
-        @test_throws ArgumentError Avro.unreserve!(b, -1)
-        @test b.pending == 1000 && b.reserved == 1000
-        @test_throws ArgumentError Avro.allocated!(b, 1001)              # settlement mismatch fails, no clamp
-        @test_throws ArgumentError Avro.release!(b, 1)                   # nothing resident yet
-        Avro.allocated!(b, 600)
-        @test b.pending == 400
-        @test_throws ArgumentError Avro.unreserve!(b, 401)               # only pending returns via unreserve!
-        Avro.unreserve!(b, 400)
-        @test b.pending == 0 && b.reserved == 600
-        Avro.release!(b, 600)
-        @test b.reserved == 0
-        Avro.close!(b)
-    end
-
-    @testset "a live Writer's header copies are resident" begin
+    @testset "live Writer header copies stay reserved" begin
         meta = Dict("user.blob" => rand(UInt8, 2 << 20))
         s = Avro.parseschema("{\"type\":\"record\",\"name\":\"RP\",\"fields\":[{\"name\":\"a\",\"type\":\"long\"}]}")
         io = IOBuffer()
         w = Avro.Writer(io, s; metadata=meta)
         try
-            b = w.budget
-            # the retained header copies (schema json, codec, metadata) are resident and settled
-            @test b.reserved - b.pending >= Avro.bytesbytes(2 << 20)     # the resident metadata copy
+            # the retained header copies (schema json, codec, metadata) stay reserved while the writer lives
+            @test w.budget.reserved >= Avro.bytesbytes(2 << 20)
         finally
             close(w)
         end
-        # decode-side: a completed datum decode leaves nothing pending
+        # decode-side: a completed datum decode keeps its live output reserved
         db = Avro.Budget(Avro.Limits())
         bytes = Avro.encode(s, (a=Int64(1),))
         d = Avro.Decoder(bytes, db)
         v = Avro.decode(Avro.readplan(s), d)
         @test v.a == 1
-        @test db.pending == 0 && db.reserved > 0                         # all live output is settled resident
-        Avro.close!(db)
+        @test db.reserved > 0
     end
 
     @testset "a prepared reader recovers after a failed call" begin
@@ -154,7 +126,6 @@
         bytes = Avro.sourcebytes(IOBuffer(input), length(input), budget, Avro.SchemaError)
         @test bytes == input
         @test budget.peak >= 2 * Avro.bytesbytes(length(input))
-        Avro.close!(budget)
 
         datum_budget = Avro.Budget(l)
         err = try
@@ -164,7 +135,6 @@
             e
         end
         @test err isa Avro.LimitError && err.limit == :max_datum_bytes && err.keyword == :max_datum_bytes
-        Avro.close!(datum_budget)
     end
 
     @testset "Budget: work and count rules" begin
@@ -223,7 +193,6 @@
         Avro.countvalues!(saturatedbudget, 4)
         @test saturatedbudget.workcap == saturated.max_total_values
         @test Avro.checkoperationwork!(saturatedbudget) == 0
-        Avro.close!(saturatedbudget)
 
         ints = Avro.IntSchema()
         encoded = Avro.encode(ints, Int32(7); limits=saturated)

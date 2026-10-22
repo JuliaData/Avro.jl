@@ -162,7 +162,6 @@ function readbytes(d::Decoder)
     n = readlen(d, d.budget.limits.max_bytes, :max_bytes)
     reserve!(d.budget, bytesbytes(n))
     out = Vector{UInt8}(undef, n)
-    allocated!(d.budget, bytesbytes(n))
     copyto!(out, 1, d.buf, d.pos, n)
     d.pos += n
     return out
@@ -178,7 +177,7 @@ function readstring(d::Decoder)
     p = d.pos
     validutf8(d.buf, p, p + n - 1) || dataerror(d, "invalid UTF-8 in string")
     if n == 0
-        retain!(d.budget, stringbytes(0))
+        reserve!(d.budget, stringbytes(0))
         s = ""
     else
         s = ownedsubstring(d.buf, p, n, d.budget)
@@ -201,10 +200,8 @@ function ownedsubstring(buf::AbstractVector{UInt8}, p::Int, n::Int, budget::Budg
     peak = bytesbytes(n) + stringbytes(0)
     reserve!(budget, peak)
     bytes = Vector{UInt8}(undef, n)
-    allocated!(budget, bytesbytes(n))
     copyto!(bytes, 1, buf, p, n)
     text = String(bytes)
-    allocated!(budget, stringbytes(0))
     release!(budget, bytesbytes(0))
     return text
 end
@@ -213,7 +210,6 @@ function ownedsubstring(buf::Vector{UInt8}, p::Int, n::Int, budget::Budget)
     charge = stringbytes(n)
     reserve!(budget, charge)
     text = unsafe_string(pointer(buf, p), n)
-    allocated!(budget, charge)
     return text
 end
 
@@ -226,7 +222,6 @@ function ownedsubstring(buf::SubArray{UInt8,1}, p::Int, n::Int, budget::Budget)
     charge = stringbytes(n)
     reserve!(budget, charge)
     text = GC.@preserve buf unsafe_string(pointer(buf, p), n)
-    allocated!(budget, charge)
     return text
 end
 
@@ -236,7 +231,6 @@ function readfixed(d::Decoder, n::Int)
         dataerror(d, "fixed of $n bytes exceeds the remaining $(remaining(d)) bytes")
     reserve!(d.budget, bytesbytes(n))
     out = Vector{UInt8}(undef, n)
-    allocated!(d.budget, bytesbytes(n))
     copyto!(out, 1, d.buf, d.pos, n)
     d.pos += n
     return out

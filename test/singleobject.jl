@@ -147,7 +147,6 @@
         Avro.register!(probe, nullschema)
         chargebudget = Avro.Budget(Avro.Limits())
         longcharge = Avro.schemaretainedbytes(longschema, chargebudget)
-        Avro.close!(chargebudget)
         exactlimit = probe.bytes + longcharge + Avro.cacheindexbytes(2)
         peakbounded = Avro.SchemaCache(max_bytes=exactlimit - 1)
         nullfp = Avro.register!(peakbounded, nullschema)
@@ -181,9 +180,6 @@
         @test Avro.storagebytes(viewvalue) == Avro.heldbytes(viewvalue)
         @test viewbudget.reserved == vectorbudget.reserved
         @test viewbudget.peak == vectorbudget.peak
-        @test viewbudget.pending == vectorbudget.pending == 0
-        Avro.close!(vectorbudget)
-        Avro.close!(viewbudget)
 
         compareschema = P("\"string\"")
         comparecache = Avro.SchemaCache()

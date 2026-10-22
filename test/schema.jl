@@ -95,7 +95,6 @@
                 digest = Avro.hashfingerprint(UInt8[0x01], algorithm, ample)
                 @test ample.reserved == Base.summarysize(digest)
                 peak = ample.peak
-                Avro.close!(ample)
 
                 tight = Avro.Budget(Avro.Limits())
                 err = try
@@ -104,8 +103,6 @@
                     nothing
                 catch e
                     e
-                finally
-                    Avro.close!(tight)
                 end
                 @test err isa Avro.LimitError
                 @test err.limit === :max_total_bytes
@@ -152,8 +149,7 @@
         @test rec == P(Avro.json(rec))
         equalbudget = Avro.Budget(Avro.Limits())
         @test Avro.budgetedschemaequal(rec, P(Avro.json(rec)), equalbudget)
-        @test equalbudget.pending == equalbudget.reserved == 0              # equality memo is operation scratch
-        Avro.close!(equalbudget)
+        @test equalbudget.reserved == 0              # equality memo is operation scratch
         @test Avro.canonical(rec) == "{\"name\":\"LongList\",\"type\":\"record\",\"fields\":[{\"name\":\"value\",\"type\":\"long\"},{\"name\":\"next\",\"type\":[\"null\",\"LongList\"]}]}"
         # a bare reference may name a null-namespace type from inside a namespace
         s2 = P("""{"type":"record","name":"R","fields":[{"name":"e","type":{"type":"fixed","name":"F","size":1}},{"name":"n","type":{"type":"record","name":"ns.Inner","fields":[{"name":"f","type":"F"}]}}]}""")
@@ -632,7 +628,6 @@ end
                                                 min(parse_limits.max_schema_depth, 16)) +
                                Avro.shellbytes(Avro.ParsePath)
         @test parse_budget.reserved == expected_parse_state
-        Avro.close!(parse_budget)
 
         generated_union = Avro.UnionSchema((Avro.FixedSchema("Generated_$i", 1) for i in 1:5))
         @test generated_union.branches.cap == length(generated_union.branches) == 5

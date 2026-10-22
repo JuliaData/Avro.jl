@@ -119,11 +119,10 @@ function hashfingerprint(pcf::AbstractVector{UInt8}, algorithm::Symbol, budget::
     reserve!(budget, peak)
     try
         digest = algorithm === :md5 ? MD5.md5(pcf) : SHA.sha256(pcf)
-        allocated!(budget, peak)
         release!(budget, transient)
         return digest
     catch
-        unreserve!(budget, peak)
+        release!(budget, peak)
         rethrow()
     end
 end

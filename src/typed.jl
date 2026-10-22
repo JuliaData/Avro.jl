@@ -101,7 +101,7 @@ mutable struct TypedMemoEntry
     active::Bool
 end
 
-"A checkpoint for both unsettled graph storage and speculative memo changes."
+"A checkpoint for both fresh graph storage and speculative memo changes."
 struct TypedMark
     fresh::Int
     changes::Int
@@ -109,7 +109,7 @@ end
 
 """
 Per-node (target type => plan) entries, no hashing, plus the construction budget.
-`fresh` tracks all settled storage not yet committed to a returned graph or an outer fallback frame.
+`fresh` tracks all charged storage not yet committed to a returned graph or an outer fallback frame.
 The paired change buffers make nested record, union and resolution attempts transactional. Rollback
 clears every discarded plan reference before its graph storage is released, so a later attempt cannot
 reuse released storage and abandoned candidates do not consume later headroom.
@@ -175,7 +175,7 @@ function discardfresh!(memo::TypedMemo, mark::TypedMark)
     return nothing
 end
 
-"Record already settled storage retained directly by a fresh typed-plan node."
+"Record already charged storage retained directly by a fresh typed-plan node."
 function ownfresh!(memo::TypedMemo, bytes::Int)
     memo.fresh[] += bytes
     return nothing
@@ -191,10 +191,9 @@ function typedvector(::Type{E}, n::Int, memo::TypedMemo) where {E}
     reserve!(memo.budget, charge)
     try
         values = Vector{E}(undef, n)
-        allocated!(memo.budget, charge)
         return values
     catch
-        unreserve!(memo.budget, charge)
+        release!(memo.budget, charge)
         rethrow()
     end
 end
@@ -233,7 +232,6 @@ function buildtypedroot(::Type{T}, reader::Schema, plan::ReadPlan, budget::Budge
     for i in eachindex(entries)
         entries[i] = TypedMemoEntry[]
     end
-    allocated!(budget, memocharge)
     changes = BuildBuf{TypedMemoEntry}(budget, 0)
     replaced = BuildBuf{Union{Nothing,TypedMemoEntry}}(budget, 0)
     memo = TypedMemo(entries, budget, Ref(0), Ref(0), changes, replaced)
@@ -277,7 +275,6 @@ function appendmemo!(memo::TypedMemo, slot::Int, entry::TypedMemoEntry)
     newcharge = vectorbytes(TypedMemoEntry, n)
     reserve!(memo.budget, newcharge)
     replacement = Vector{TypedMemoEntry}(undef, n)
-    allocated!(memo.budget, newcharge)
     copyto!(replacement, 1, entries, 1, n - 1)
     replacement[n] = entry
     oldcharge = vectorbytes(TypedMemoEntry, n - 1)
@@ -312,7 +309,6 @@ function memostore!(memo::TypedMemo, s::Schema, ::Type{T}, p::TypedPlan) where {
     end
     reserve!(memo.budget, memoentrybytes())
     entry = TypedMemoEntry(T, p, true)
-    allocated!(memo.budget, memoentrybytes())
     if memo.specdepth[] > 0
         typedmemopush!(memo.changes, entry, memo.budget)
         typedmemopush!(memo.replaced, prior, memo.budget)
@@ -346,7 +342,7 @@ function nodebytes(::Type{P}) where {P}
     return isbitstype(P) ? boxbytes(P) : shellbytes(P)
 end
 
-"Reserve one node's box before it is built; `settlenode!` settles it right after construction."
+"Reserve one node's box before it is built; `settlenode!` records it as fresh storage right after construction."
 function reservenode!(memo::TypedMemo, ::Type{P}) where {P}
     addresolution!(memo.budget)
     reserve!(memo.budget, nodebytes(P))
@@ -354,7 +350,6 @@ function reservenode!(memo::TypedMemo, ::Type{P}) where {P}
 end
 
 function settlenode!(memo::TypedMemo, ::Type{P}) where {P}
-    allocated!(memo.budget, nodebytes(P))
     memo.fresh[] += nodebytes(P)
     return nothing
 end
@@ -369,7 +364,7 @@ end
 
 """
 Build the tuple `(parts...,)` under the construction scope: a bound over the inline element sizes is
-reserved first, the actual box charge is settled and the slack returned. Returns `(tuple, boxbytes)`;
+reserved first, then the slack over the actual box charge is returned. Returns `(tuple, boxbytes)`;
 the caller releases `boxbytes` once the tuple's owner is built (tuples used as type parameters are
 interned by the type system, which is process-global and outside operation accounting).
 """
@@ -383,8 +378,7 @@ function chargedtuple(memo::TypedMemo, parts::Vector)
     ps = (parts...,)
     actual = 16 + sizeof(typeof(ps))
     actual <= bound || throw(ArgumentError("tuple storage $actual exceeds its construction bound $bound"))
-    allocated!(memo.budget, actual)
-    unreserve!(memo.budget, bound - actual)
+    release!(memo.budget, bound - actual)
     return (ps, actual)
 end
 
@@ -743,7 +737,6 @@ function buildrecordplan(::Type{T}, s::RecordSchema, p::RecordPlan, memo::TypedM
             bb = isbits(v) ? boxbytes(typeof(v)) : 0
             bb > 0 && reserve!(memo.budget, bb)        # the retained Any-slot box, made at the assignment
             defaults[k] = v
-            bb > 0 && allocated!(memo.budget, bb)
             defaultcharge += bb
         elseif Missing <: ft
             defaults[k] = missing
@@ -985,7 +978,6 @@ function checkedreaderdefault(::Type{T}, dp::DefaultPlan, budget::Budget) where 
     addresolution!(budget)
     reserve!(budget, nodebytes(ResolvedReaderDefault{T}))
     out = ResolvedReaderDefault{T}(dp)
-    allocated!(budget, nodebytes(ResolvedReaderDefault{T}))   # the retained default node
     return out
 end
 
@@ -1021,7 +1013,6 @@ function resolvedstaticdefaults!(::Type{T}, defaults::Vector{Any}, covered::Vect
             bb = isbits(v) ? boxbytes(typeof(v)) : 0
             bb > 0 && reserve!(budget, bb)             # the retained Any-slot box, made at the assignment
             defaults[k] = v
-            bb > 0 && allocated!(budget, bb)
             retained[] += bb
         elseif Missing <: ft
             defaults[k] = missing
@@ -1085,7 +1076,6 @@ function typedvalue(p::ResolvedRecordTarget{T}, d::Decoder, names) where {T}
     enter!(d)
     reserve!(d.budget, p.shell)
     v = resolvedrecordvalue(p, d, names)
-    allocated!(d.budget, p.shell)                      # the value's shell (inline shells release at their vector slot)
     leave!(d)
     return v
 end
@@ -1492,7 +1482,6 @@ function typedvalue(p::ArrayTarget{E}, d::Decoder, names) where {E}
     if g === nothing
         reserve!(d.budget, STORAGE[].vector)
         out = Vector{E}(undef, 0)
-        allocated!(d.budget, STORAGE[].vector)
         return out
     end
     return finish!(g, d)
@@ -1538,7 +1527,6 @@ function typedvalue(p::MapTarget{K,V}, d::Decoder, names) where {K,V}
     vals = if vs === nothing
         reserve!(d.budget, STORAGE[].vector)
         empty = Vector{V}(undef, 0)
-        allocated!(d.budget, STORAGE[].vector)
         empty
     else
         finish!(vs, d)
@@ -1562,7 +1550,6 @@ function typedvalue(p::RecordTarget{T}, d::Decoder, names) where {T}
     enter!(d)
     reserve!(d.budget, p.shell)
     v = recordvalue(p, d, names)
-    allocated!(d.budget, p.shell)                      # the value's shell (inline shells release at their vector slot)
     leave!(d)
     return v
 end
@@ -1587,20 +1574,15 @@ end
 function measuredinlineshell(::Type{T}, budget::Budget) where {T}
     bound = checked_add(checked_add(sizeof(T), checked_mul(8, fieldcount(T))), 64)
     reserve!(budget, bound)                            # the transient probe object, built next
-    settled = false
     try
         probe = try
             emptyprobe(T)
         catch
-            allocated!(budget, bound)
-            settled = true
             return bound
         end
-        allocated!(budget, bound)
-        settled = true
         return max(Int(Base.summarysize(probe)), 8)
     finally
-        settled ? release!(budget, bound) : unreserve!(budget, bound)
+        release!(budget, bound)
     end
 end
 
@@ -1608,16 +1590,13 @@ function measuredshell(::Type{T}, budget::Union{Nothing,Budget}=nothing) where {
     isbitstype(T) && return 0
     bound = checked_add(checked_add(sizeof(T), checked_mul(8, fieldcount(T))), 64)
     budget === nothing || reserve!(budget, bound)      # the transient probe object, built next
-    settled = false
     try
         shell = if ismutabletype(T) || isstructtype(T)
             probe = try
                 emptyprobe(T)
             catch
-                budget === nothing || settled || (allocated!(budget, bound); settled = true)
                 return bound
             end
-            budget === nothing || settled || (allocated!(budget, bound); settled = true)
             marginal = Int(Base.summarysize(probe))
             for i in 1:fieldcount(T)                   # inline nested structs charge their own shells
                 F = fieldtype(T, i)
@@ -1631,9 +1610,7 @@ function measuredshell(::Type{T}, budget::Union{Nothing,Budget}=nothing) where {
         end
         return shell
     finally
-        if budget !== nothing
-            settled ? release!(budget, bound) : unreserve!(budget, bound)
-        end
+        budget === nothing || release!(budget, bound)
     end
 end
 

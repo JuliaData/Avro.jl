@@ -480,7 +480,6 @@ end
         @test estimateerror isa Avro.EncodeError
         @test estimateerror.path == "\$.xs[0]"
         @test estimateerror.schema === stagepathrecord.fields[1].schema.items
-        Avro.close!(estimatebudget)
 
         missingpathrecord = P("""{"type":"record","name":"WriterMissingPath","fields":[
             {"name":"xs","type":{"type":"array","items":"int"}}]}""")
@@ -691,7 +690,6 @@ end
         @test closeerror isa ErrorException
         @test closeerror === nothing || closeerror.msg == "reader source close sentinel"
         @test closereader.source === nothing
-        @test closereader.budget.pending == 0
         @test ownedcloses[] == 1
         @test close(closereader) === nothing
 
@@ -1209,7 +1207,6 @@ end
             end
             @test cleanuperror isa Exception
             @test isdir(cleanuptemp)
-            @test cleanupwriter.budget.pending == 0
             cleanupfollowup = try
                 push!(cleanupwriter, (x=Int64(2),))
                 nothing
@@ -1288,7 +1285,6 @@ end
         GC.gc(true)
         @test metadatakeyref.value === nothing
         @test metadatavalueref.value === nothing
-        Avro.close!(headerbudget)
         rep = P("{\"type\":\"record\",\"name\":\"B\",\"fields\":[{\"name\":\"bad-name\",\"type\":\"int\"}]}"; allow_invalid_names=true)
         @test_throws ArgumentError Avro.Writer(IOBuffer(), rep)
         @test Avro.Writer(IOBuffer(), rep; allow_invalid_names=true) isa Avro.Writer

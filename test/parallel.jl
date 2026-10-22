@@ -41,15 +41,10 @@
                     function planned(ceiling)
                         budget = Avro.blockbudget(limits, ceiling)
                         Avro.reserve!(budget, resident)
-                        Avro.allocated!(budget, resident)
                         controlled = Avro.Reader(nothing, reader.schema, reader.plan, reader.span,
                             reader.codecname, reader.codec, reader.metadata, reader.sync, limits, budget,
                             reader.validate, reader.legacy, reader.blockindex, true, reader.warned)
-                        try
-                            return Avro.poolplan(controlled, cols, pre.entries, 8, builderpeak)
-                        finally
-                            Avro.close!(budget)
-                        end
+                        return Avro.poolplan(controlled, cols, pre.entries, 8, builderpeak)
                     end
                     full = planned(2 << 30)
                     required = resident + full[4] +
@@ -197,7 +192,6 @@
         job = Avro.BlockJob(entry, W, jobbudget, Threads.Event(), nothing, 0, nothing, :done)
         @test_throws Avro.LimitError Avro.commitjob!(reader, job, AbstractVector[], Int[], Avro.ParallelStats())
         @test reader.budget.reserved == base
-        @test jobbudget.pending == 0
         close(reader)
     end
     @testset "forced schedules: both interleavings produce the reference" begin

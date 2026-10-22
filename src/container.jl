@@ -86,7 +86,6 @@ end
 function sourcepayload(s::StreamSource, n::Int, budget::Budget)
     reserve!(budget, bytesbytes(n))
     out = Vector{UInt8}(undef, n)
-    allocated!(budget, bytesbytes(n))
     consumed = readbytes!(s.io, out, n)
     s.pos += consumed
     consumed == n || throw(DataError("truncated file", s.pos))
@@ -146,24 +145,16 @@ end
 function metadataindexes(capacity::Int, budget::Budget)
     keycharge = vectorbytes(String, capacity)
     reserve!(budget, keycharge)
-    newkeys = try
-        keys = Vector{String}(undef, capacity)
-        allocated!(budget, keycharge)
-        keys
-    catch
-        unreserve!(budget, keycharge)
-        rethrow()
-    end
+    newkeys = Vector{String}(undef, capacity)
     valcharge = vectorbytes(Vector{UInt8}, capacity)
     reserve!(budget, valcharge)
     newvals = try
         vals = Vector{Vector{UInt8}}(undef, capacity)
-        allocated!(budget, valcharge)
         vals
     catch
         newkeys = nothing
         release!(budget, keycharge)                    # the key vector allocated above dies with this frame
-        unreserve!(budget, valcharge)
+        release!(budget, valcharge)
         rethrow()
     end
     return (newkeys, newvals)
@@ -176,10 +167,9 @@ function ownedmetadatabytes(payload, len::Int, budget::Budget)
     reserve!(budget, charge)                           # reserve the byte-source copy before allocation
     try
         buffer = Vector{UInt8}(payload)
-        allocated!(budget, charge)
         return buffer
     catch
-        unreserve!(budget, charge)
+        release!(budget, charge)
         rethrow()
     end
 end
@@ -282,18 +272,10 @@ function headercodecname(metadata, budget::Budget, s::BlockSource)
     validutf8(codecbytes, 1, length(codecbytes)) || throw(DataError("avro.codec is not valid UTF-8", position(s)))
     codecvectorsize = bytesbytes(length(codecbytes))
     reserve!(budget, codecvectorsize)
-    codeccopy = try
-        bytes = copy(codecbytes)
-        allocated!(budget, codecvectorsize)
-        bytes
-    catch
-        unreserve!(budget, codecvectorsize)
-        rethrow()
-    end
+    codeccopy = copy(codecbytes)
     codecshell = stringbytes(0)
     reserve!(budget, codecshell)
     codecname = String(codeccopy)
-    allocated!(budget, codecshell)
     codeccopy = nothing
     release!(budget, bytesbytes(0))
     return codecname
@@ -346,20 +328,13 @@ mutable struct Reader
     warned::Bool
 end
 
-"Close a reader source and its budget. Explicit close reports the source failure after the budget is settled."
-function closereaderresources(source, budget::Budget; suppress::Bool=false)
-    failure = nothing
+"Close a reader's source. Explicit close reports the source failure; `suppress=true` swallows it."
+function closereaderresources(source; suppress::Bool=false)
     try
         source === nothing || closesource(source)
     catch err
-        failure = err
+        suppress || rethrow()
     end
-    try
-        close!(budget)
-    catch err
-        failure === nothing && (failure = err)
-    end
-    suppress || failure === nothing || throw(failure)
     return nothing
 end
 
@@ -387,18 +362,15 @@ function Reader(src; limits::Limits=Limits(), legacy::Union{Nothing,Symbol}=noth
         Reader(source, parsed, plan, spans, cname, codec, metadata, syncmarker, limits, budget,
                validate, legacy, 0, false, false)
     catch
-        try
-            closereaderresources(source, budget; suppress=true)
-        finally
-            rethrow()
-        end
+        closereaderresources(source; suppress=true)
+        rethrow()
     end
     finalizer(r) do x
         if !x.closed
             source = x.source
             x.source = nothing
             x.closed = true
-            closereaderresources(source, x.budget; suppress=true)
+            closereaderresources(source; suppress=true)
         end
         return nothing
     end
@@ -419,7 +391,7 @@ function Base.close(r::Reader)
     source = r.source
     r.source = nothing
     r.closed = true
-    return closereaderresources(source, r.budget)
+    return closereaderresources(source)
 end
 
 function checkopen(r::Reader)
@@ -509,7 +481,6 @@ function exactlegacyblock(bytes::Vector{UInt8}, count::Int, reader::Reader)
     charge = bytesbytes(newlength)
     reserve!(reader.budget, charge)
     exact = Vector{UInt8}(undef, newlength)
-    allocated!(reader.budget, charge)
     copyto!(exact, 1, bytes, 1, newlength)
     release!(reader.budget, bytesbytes(length(bytes)))
     removeinput!(reader.budget, length(bytes) - newlength)
@@ -656,7 +627,6 @@ function Base.iterate(it::EachDatum, ::Nothing=nothing)
         it.blockwork = blk[3]
         it.blockout = 0
         reserve!(b, bytesbytes(length(it.bytes)))     # the block is resident while its datums decode
-        allocated!(b, bytesbytes(length(it.bytes)))   # decompressed by nextblock!; already resident
         it.decoder = setblockscope!(Decoder(it.bytes, b; validate=it.reader.validate),
                                     it.blockwork::BlockWork)
         if it.remaining == 0
@@ -1241,7 +1211,6 @@ function schemaneedsstaging(schema::Schema, budget::Budget)
     charge = vectorbytes(Bool, graphinfo(schema).nodes)
     reserve!(budget, charge)
     seen = fill(false, graphinfo(schema).nodes)
-    allocated!(budget, charge)
     try
         return schemaneedsstaging(schema, seen, budget, 0)
     finally
@@ -1326,7 +1295,6 @@ function symbolbytescopy(symbol::Symbol, budget::Budget)
     charge = bytesbytes(n)
     reserve!(budget, charge)
     bytes = Vector{UInt8}(undef, n)
-    allocated!(budget, charge)
     source = Base.unsafe_convert(Ptr{UInt8}, symbol)
     n > 0 && GC.@preserve symbol bytes unsafe_copyto!(pointer(bytes), source, n)
     return bytes
@@ -1352,14 +1320,11 @@ function writerheaderentries(schema::Schema, codec::Symbol, metadata, limits::Li
     nentries <= limits.max_metadata_entries || throw(LimitError(:max_metadata_entries, nentries, limits.max_metadata_entries, :max_metadata_entries, :encode))
     reserve!(budget, STORAGE[].vector + 16 * nentries)        # the entries vector at exact capacity
     entries = Vector{Tuple{String,Vector{UInt8}}}(undef, nentries)
-    allocated!(budget, STORAGE[].vector + 16 * nentries)
     reserve!(budget, stringbytes(11) + bytesbytes(sizeof(schemajson)))
     entries[1] = ("avro.schema", Vector{UInt8}(codeunits(schemajson)))
-    allocated!(budget, stringbytes(11) + bytesbytes(sizeof(schemajson)))
     codecbytes = symbolbytescopy(codec, budget)
     reserve!(budget, stringbytes(10))
     entries[2] = ("avro.codec", codecbytes)
-    allocated!(budget, stringbytes(10))
     i = 2
     total = checked_add(checked_add(11, sizeof(schemajson)),
                         checked_add(10, sizeof(codec)))
@@ -1378,7 +1343,6 @@ function writerheaderentries(schema::Schema, codec::Symbol, metadata, limits::Li
         valuecharge = bytesbytes(length(v))
         reserve!(budget, valuecharge)
         valuecopy = Vector{UInt8}(v)
-        allocated!(budget, valuecharge)
         i += 1
         entries[i] = (keycopy, valuecopy)
     end
@@ -1412,7 +1376,6 @@ function readerconstruction!(schemajson::String, entries, limits::Limits, budget
     reserve!(budget, 2 * STORAGE[].vector + 16 * length(entries))   # the mirror key/value vectors, exact capacity
     keys = Vector{String}(undef, length(entries))
     vals = Vector{Vector{UInt8}}(undef, length(entries))
-    allocated!(budget, 2 * STORAGE[].vector + 16 * length(entries))
     for (j, (k, v)) in enumerate(entries)
         reserve!(budget, checked_add(stringbytes(sizeof(k)), bytesbytes(length(v))))  # the reader's own entry copy
         keys[j] = k
@@ -1503,22 +1466,14 @@ function Writer(dst::Union{AbstractString,IO}, schema::Schema; codec::Symbol=:nu
         end
         writer
     catch
-        try
-            writer === nothing && sink !== nothing &&
-                cleanupwritersink(sink, temppath, ownsink; suppress=true)
-        finally
-            close!(budget)
-        end
+        writer === nothing && sink !== nothing &&
+            cleanupwritersink(sink, temppath, ownsink; suppress=true)
         rethrow()
     end
     finalizer(w) do x
         if !x.closed
             x.closed = true
-            try
-                abortcleanup(x; suppress=true)
-            finally
-                close!(x.budget)
-            end
+            abortcleanup(x; suppress=true)
         end
         return nothing
     end
@@ -1728,7 +1683,6 @@ function pushstaged!(values::BuildBuf{Any}, value, state::WriterStageState)
     box = isbits(value) ? boxbytes(typeof(value)) : 0
     box > 0 && reserve!(state.budget, box)
     push!(values, state.budget, value)
-    box > 0 && allocated!(state.budget, box)
     return nothing
 end
 
@@ -1812,7 +1766,6 @@ function stagewritermap(plan::WMap, value, state::WriterStageState, depth::Int)
     charge = shellbytes(StagedWriterMap)
     reserve!(state.budget, charge)
     result = StagedWriterMap(outkeys, outvals)
-    allocated!(state.budget, charge)
     return (result, true)
 end
 
@@ -1834,7 +1787,6 @@ function assignstagedrecord!(values::Vector{Any}, index::Int, value, budget::Bud
     box = isbits(value) ? boxbytes(typeof(value)) : 0
     box > 0 && reserve!(budget, box)
     values[index] = value
-    box > 0 && allocated!(budget, box)
     return nothing
 end
 
@@ -1861,7 +1813,6 @@ function stagewriterrecord(plan::WRecord, value, state::WriterStageState, depth:
         if changed && output === nothing
             reserve!(state.budget, recordbytes(count))
             output = Vector{Any}(undef, count)
-            allocated!(state.budget, vectorbytes(Any, count))
             for previous in 1:index - 1
                 assignstagedrecord!(output, previous,
                     stagedrecordfield(plan, value, previous, state.budget), state.budget)
@@ -1871,7 +1822,6 @@ function stagewriterrecord(plan::WRecord, value, state::WriterStageState, depth:
     end
     output === nothing && return (value, normalized)
     result = Record(plan.schema, output, Val(:unchecked))
-    allocated!(state.budget, recordbytes(count) - vectorbytes(Any, count))
     preparedcharge > 0 && release!(state.budget, preparedcharge)
     return (result, true)
 end
@@ -1887,7 +1837,6 @@ function stagewriterunion(plan::WUnion, value, state::WriterStageState, depth::I
         charge = unionvaluebytes()
         reserve!(state.budget, charge)
         result = UnionValue(index, staged)
-        allocated!(state.budget, charge)
         return (result, true)
     end
     index = selectbranch(plan, value, state.budget)
@@ -1901,7 +1850,6 @@ function stagewriterunion(plan::WUnion, value, state::WriterStageState, depth::I
     charge = checked_add(unionvaluebytes(), box)
     reserve!(state.budget, charge)
     result = UnionValue(index, staged)
-    allocated!(state.budget, charge)
     return (result, true)
 end
 
@@ -1925,7 +1873,6 @@ function preparedrecord(p::WRecord, values::Vector{Any}, boxes::Int,
     end
     reserve!(budget, STORAGE[].record)
     record = Record(p.schema, values, Val(:unchecked))
-    allocated!(budget, STORAGE[].record)
     return (record, checked_add(recordbytes(length(values)), boxes))
 end
 
@@ -1933,7 +1880,6 @@ function preparedrecordstorage(p::WRecord, budget::Budget)
     n = length(p.fields)
     reserve!(budget, vectorbytes(Any, n))
     values = Vector{Any}(undef, n)
-    allocated!(budget, vectorbytes(Any, n))
     fill!(values, DICT_MISSING)
     return values
 end
@@ -1942,7 +1888,6 @@ function assignpreparedrecord!(values::Vector{Any}, index::Int, value, budget::B
     box = isbits(value) ? boxbytes(typeof(value)) : 0
     box > 0 && reserve!(budget, box)
     values[index] = value
-    box > 0 && allocated!(budget, box)
     return box
 end
 
@@ -2407,10 +2352,9 @@ function flushblock!(w::Writer)
             throw(limiterror(w.budget, :max_blocks, nextblocks, w.limits.max_blocks))
         reserve!(w.budget, bytesbytes(w.encoder.pos))              # the pending-block copy, before take!
         blockbytes = take!(w.encoder)
-        allocated!(w.budget, bytesbytes(length(blockbytes)))
         cbound = compressbound(w.wcodec, length(blockbytes))
         reserve!(w.budget, cbound)                                  # the compressor's output bound, before it allocates
-        compressed = compressblock(w.wcodec, blockbytes, w.budget)
+        compressed = compressblock(w.wcodec, blockbytes)
         length(compressed) <= w.limits.max_block_bytes ||
             throw(LimitError(:max_block_bytes, length(compressed), w.limits.max_block_bytes, :max_block_bytes, :encode))
         verifyframe(w.wcodec, compressed, w.limits)
@@ -2419,7 +2363,7 @@ function flushblock!(w::Writer)
         peak = readerblockpeak(length(compressed), length(blockbytes), outputpeak,
                                w.wcodec.name === :null ? 0 : w.limits.max_codec_memory, w.wcodec.name === :null)
         reserve!(w.budget, peak)                       # one block's transient reader peak fits the ceiling
-        unreserve!(w.budget, peak)                     # a pure admission probe; nothing was allocated
+        release!(w.budget, peak)                     # a pure admission probe; nothing was allocated
         writevarint(w.sink, w.pendingcount)
         writevarint(w.sink, length(compressed))
         Base.write(w.sink, compressed)
@@ -2470,11 +2414,7 @@ function Base.close(w::Writer; abort::Bool=false)
     w.closed && return nothing
     if abort || w.poison !== nothing
         w.closed = true
-        try
-            abortcleanup(w)
-        finally
-            close!(w.budget)
-        end
+        abortcleanup(w)
         return nothing
     end
     try
@@ -2497,8 +2437,6 @@ function Base.close(w::Writer; abort::Bool=false)
             throw(CompositeException(Any[e, cleanup]))
         end
         rethrow()
-    finally
-        close!(w.budget)
     end
     return nothing
 end
@@ -2688,9 +2626,7 @@ function InspectIssues(budget::Budget)
     try
         reserve!(budget, charge)
         data = Vector{String}(undef, INSPECT_ISSUE_CAPACITY)
-        allocated!(budget, vectorbytes(String, INSPECT_ISSUE_CAPACITY))
         issues = InspectIssues(data, 0, "", "", false, false)
-        allocated!(budget, shellbytes(InspectIssues))
         issues.fallback = ownedstringcopy(INSPECT_LIMIT_FALLBACK, budget)
         issues.omitted = ownedstringcopy(INSPECT_OMITTED, budget)
         return issues
@@ -2948,7 +2884,6 @@ function inspect(src; limits::Limits=Limits())
         end
         issuevector = finishinspectissues!(issues, budget)
         report = InspectReport(codecname, schemaout, blocks, datums, cbytes, issuevector)
-        allocated!(budget, reportcharge)
         return report
     end
 end
@@ -2987,7 +2922,6 @@ function inspectdecimalwarnings!(issues::InspectIssues, s::Schema, budget::Budge
     charge = vectorbytes(Bool, graphinfo(s).nodes)
     reserve!(budget, charge)
     seen = fill(false, graphinfo(s).nodes)
-    allocated!(budget, charge)
     try
         inspectdecimalwarnings!(issues, s, seen, budget, limits)
     finally

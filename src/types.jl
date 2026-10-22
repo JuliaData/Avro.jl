@@ -180,14 +180,11 @@ function derivedtypehash(budget::Budget, ::Type{T}) where {T}
     try
         reserve!(budget, checked_add(bufferbytes, sinkbytes))
         buffer = Vector{UInt8}(undef, 4096)
-        allocated!(budget, bufferbytes)
         sink = DerivedHashSink(SHA.SHA2_256_CTX(), buffer, 0)
-        allocated!(budget, sinkbytes)
         print(sink, T)
         flushhash!(sink)
         reserve!(budget, digestbytes)
         digest = SHA.digest!(sink.context)
-        allocated!(budget, digestbytes)
         buffer = nothing
         release!(budget, checked_add(bufferbytes, sinkbytes))
         return digest
@@ -211,15 +208,12 @@ function boundedtypedescription(budget::Budget, ::Type{T}) where {T}
     try
         reserve!(budget, checked_add(prefixbytes, sinkbytes))
         prefix = Vector{UInt8}(undef, 129)
-        allocated!(budget, prefixbytes)
         sink = DerivedNameSink(prefix, 0)
-        allocated!(budget, sinkbytes)
         print(sink, T)
         if sink.total <= 128
             outlen = sink.total
             reserve!(budget, bytesbytes(outlen))
             output = Vector{UInt8}(undef, outlen)
-            allocated!(budget, bytesbytes(outlen))
             copyto!(output, 1, prefix, 1, outlen)
         else
             stop = 100
@@ -230,7 +224,6 @@ function boundedtypedescription(budget::Budget, ::Type{T}) where {T}
             outlen = checked_add(stop, 17)
             reserve!(budget, bytesbytes(outlen))
             output = Vector{UInt8}(undef, outlen)
-            allocated!(budget, bytesbytes(outlen))
             copyto!(output, 1, prefix, 1, stop)
             output[stop + 1] = UInt8('#')
             hex = codeunits("0123456789abcdef")
@@ -297,11 +290,8 @@ function defaultderivedname(ctx, ::Type{T}) where {T}
     try
         reserve!(ctx.budget, checked_add(prefixbytes, sinkbytes))
         prefix = Vector{UInt8}(undef, 129)
-        allocated!(ctx.budget, prefixbytes)
         sink = DerivedNameSink(prefix, 0)
-        allocated!(ctx.budget, shellbytes(DerivedNameSink))
         parameter = DerivedParameterSink(sink, false, false)
-        allocated!(ctx.budget, shellbytes(DerivedParameterSink))
         print(sink, nameof(T))
         params = T isa DataType ? T.parameters : ()
         if !isempty(params)
@@ -317,7 +307,6 @@ function defaultderivedname(ctx, ::Type{T}) where {T}
         outlen = long ? 117 : sink.total
         reserve!(ctx.budget, bytesbytes(outlen))
         output = Vector{UInt8}(undef, outlen)
-        allocated!(ctx.budget, bytesbytes(outlen))
         if long
             copyto!(output, 1, prefix, 1, 100)
             output[101] = UInt8('_')
@@ -394,7 +383,6 @@ function derivecontext(limits::Limits, budget::Budget, anonymous::Int)
     charge = 2 * frozendictshell()
     reserve!(budget, charge)
     ctx = DeriveContext(limits, budget, FrozenDict{String,Schema}(), FrozenDict{String,Type}(), Ref(anonymous))
-    allocated!(budget, charge)
     return ctx
 end
 
@@ -475,10 +463,9 @@ function derive(ctx::DeriveContext, ::Type{T}, name, namespace) where {T}
     s = try
         deriveimpl(ctx, T, name, namespace)
     catch
-        unreserve!(ctx.budget, nodebytes)
+        release!(ctx.budget, nodebytes)
         rethrow()
     end
-    allocated!(ctx.budget, nodebytes)
     return s
 end
 
@@ -616,7 +603,6 @@ function deriveenum(ctx::DeriveContext, ::Type{E}, name, namespace) where {E<:Ba
     syms = Vector{String}(undef, n)
     resize!(syms, 0)
     index = emptywithcapacity(FrozenDict{String,Int}, n)
-    allocated!(ctx.budget, containers)
     customsymbols = which(avrosymbol, Tuple{Type{E},E}) !== DEFAULT_AVROSYMBOL_METHOD
     for (i, inst) in enumerate(instances(E))
         raw = customsymbols ? avrosymbol(E, inst) : Symbol(inst)
@@ -631,7 +617,6 @@ function deriveenum(ctx::DeriveContext, ::Type{E}, name, namespace) where {E<:Ba
         boundedquoted(syms[dup]), " twice")))
     reserve!(ctx.budget, 24)
     symbols = freeze!(FrozenVector{String}(syms, false))
-    allocated!(ctx.budget, 24)
     s = EnumSchema(full, EMPTY_STRING_LIST, EMPTY_STRING_LIST, nothing,
                    symbols, nodefault,
                    freeze!(index), EMPTY_PROPS, NodeMeta())
@@ -646,16 +631,13 @@ function deriveunion(ctx::DeriveContext, ::Type{U}, namespace) where {U}
         reserve!(ctx.budget, twobranch)                # the two-branch vector, built next
         bs = FrozenVector{Schema}(Schema[derive(ctx, Missing, nothing, namespace),
                                          derive(ctx, other, nothing, namespace)], false)
-        allocated!(ctx.budget, twobranch)
         return UnionSchema(freeze!(bs), NodeMeta())
     end
     branchbytes = 24 + vectorbytes(Schema, length(members))
     reserve!(ctx.budget, branchbytes)                  # shell and exact branch capacity
     bs = emptywithcapacity(FrozenVector{Schema}, length(members))
-    allocated!(ctx.budget, branchbytes)
     reserve!(ctx.budget, frozendictshell())
     seen = FrozenDict{BranchIdentity,Int}()
-    allocated!(ctx.budget, frozendictshell())
     try
         for (i, m) in enumerate(members)
             s = derive(ctx, m, nothing, namespace)
@@ -699,7 +681,6 @@ function derivenamedtuple(ctx::DeriveContext, ::Type{T}, name, namespace) where 
     reserve!(ctx.budget, slots)                        # record shells and exact field capacity
     fields = emptywithcapacity(FrozenVector{Field}, nf)
     index = emptywithcapacity(FrozenDict{String,Int}, nf)
-    allocated!(ctx.budget, slots)
     rec = RecordSchema(full, EMPTY_STRING_LIST, EMPTY_STRING_LIST, nothing, false,
                        EMPTY_PROPS, fields, index, NodeMeta())
     registerderived!(ctx, rec, T)
@@ -709,7 +690,6 @@ function derivenamedtuple(ctx::DeriveContext, ::Type{T}, name, namespace) where 
         reserve!(ctx.budget, 128)
         field = Field(fn, fs, nothing, nodefault, :ascending, EMPTY_STRING_LIST,
                       EMPTY_PROPS)
-        allocated!(ctx.budget, 128)
         budgetedpush!(fields, field, ctx.budget)
         budgetedappend!(index, fn, i, ctx.budget)
     end
@@ -742,7 +722,6 @@ function derivestruct(ctx::DeriveContext, ::Type{T}, name, namespace) where {T}
     reserve!(ctx.budget, slots)                        # record shells and exact field capacity
     fields = emptywithcapacity(FrozenVector{Field}, nf)
     index = emptywithcapacity(FrozenDict{String,Int}, nf)
-    allocated!(ctx.budget, slots)
     rec = RecordSchema(full, EMPTY_STRING_LIST, EMPTY_STRING_LIST, nothing, false,
                        EMPTY_PROPS, fields, index, NodeMeta())
     registerderived!(ctx, rec, T)
@@ -787,7 +766,6 @@ function derivestruct(ctx::DeriveContext, ::Type{T}, name, namespace) where {T}
         reserve!(ctx.budget, 128)
         field = Field(fn, fs, nothing, d, :ascending, EMPTY_STRING_LIST,
                       EMPTY_PROPS)
-        allocated!(ctx.budget, 128)
         budgetedpush!(fields, field, ctx.budget)
         budgetedappend!(index, fn, i, ctx.budget)
     end
@@ -818,7 +796,6 @@ function schema(ts::Tables.Schema; name::AbstractString="Record", namespace::Abs
                 reserve!(budget, slots)
                 fields = emptywithcapacity(FrozenVector{Field}, nf)
                 index = emptywithcapacity(FrozenDict{String,Int}, nf)
-                allocated!(budget, slots)
                 rec = publicnode(RecordSchema(full, EMPTY_STRING_LIST, EMPTY_STRING_LIST,
                                               nothing, false, EMPTY_PROPS, fields, index,
                                               publicmeta()))
@@ -832,7 +809,6 @@ function schema(ts::Tables.Schema; name::AbstractString="Record", namespace::Abs
                     reserve!(budget, 128)
                     field = Field(fn, fs, nothing, nodefault, :ascending,
                                   EMPTY_STRING_LIST, EMPTY_PROPS)
-                    allocated!(budget, 128)
                     budgetedpush!(fields, field, budget)
                     budgetedappend!(index, fn, i, budget)
                 end

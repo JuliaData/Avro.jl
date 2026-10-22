@@ -68,7 +68,6 @@ end
             e
         end
         result = (err, budget.members, budget.values)
-        Avro.close!(budget)
         return result
     end
     @testset "round trips (every codec, incl. empty)" begin
@@ -214,7 +213,6 @@ end
             @test out == Vector{UInt8}("reservation")
             Avro.release!(budget, Avro.bytesbytes(length(out)))
             @test budget.reserved == baseline
-            Avro.close!(budget)
         end
     end
     @testset "crc32 against zlib" begin

@@ -142,7 +142,6 @@ function spanplan(s::Schema; budget::Budget)
     try
         reserve!(budget, memocharge)
         memo = Vector{Union{Nothing,SpanPlan}}(nothing, nodes)
-        allocated!(budget, memocharge)
         plan = spanplan(s, memo, budget)
         settlespanfinite!(memo, budget)
         release!(budget, memocharge)
@@ -219,12 +218,10 @@ function buildspanplan(s::UnionSchema, memo, budget)
     charge = checked_add(vectorbytes(SpanPlan, n), spannodebytes(UnionSpan))
     reserve!(budget, charge)
     branches = Vector{SpanPlan}(undef, n)
-    allocated!(budget, vectorbytes(SpanPlan, n))
     for (i, branch) in enumerate(s.branches)
         branches[i] = spanplan(branch, memo, budget)
     end
     plan = UnionSpan(branches)
-    allocated!(budget, spannodebytes(UnionSpan))
     return plan
 end
 
@@ -237,7 +234,6 @@ function buildspanplan(s::RecordSchema, memo, budget)
     fields = Vector{SpanPlan}(undef, n)
     steps = Vector{SpanStep}(undef, n)
     plan = RecordSpan(fields, steps, 0, 1, -1, -1, 0, false)
-    allocated!(budget, charge)
     memo[Int(nodeid(s)) + 1] = plan
     width = 0
     values = 1
@@ -1351,7 +1347,6 @@ function positionalsource(source::AbstractVector{UInt8}, position::Int,
     charge = bytesbytes(count)
     reserve!(budget, charge)
     buffer = Vector{UInt8}(undef, count)
-    allocated!(budget, charge)
     copyto!(buffer, 1, source, position, count)
     return PositionalDatumSource(buffer, 1, position - 1, length(source))
 end

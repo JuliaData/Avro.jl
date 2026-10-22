@@ -160,7 +160,6 @@
         Avro.printdurationbytestring(sink, x)
         sink.len = 0
         @test @allocated(Avro.printdurationbytestring(sink, x)) == 0
-        Avro.close!(budget)
     end
 
     @testset "JSON conversion ownership" begin
@@ -182,7 +181,6 @@
                                             Avro.JSONContext(stringbudget, false, false), 1)
         @test convertedstring === parsedstring
         @test stringbudget.reserved == parsedcharge
-        Avro.close!(stringbudget)
 
         cases = (
             ("{\"type\":\"bytes\",\"logicalType\":\"decimal\",\"precision\":5}", "\"\\u0001\"", 1),
@@ -200,7 +198,6 @@
             value = Avro.jsontovalue(schema, parsed, Avro.JSONContext(budget, false, false), 1)
             @test length(value) == 8
             @test budget.reserved - before == Avro.vectorbytes(Avro.elementtype(schema.items), 8)
-            Avro.close!(budget)
 
             tight = Avro.Budget(Avro.Limits())
             tightparsed = parsedjson(text, tight)
@@ -212,7 +209,6 @@
                                            Avro.JSONContext(tight, false, false), 1)
             @test length(tightvalue) == 8
             @test tight.reserved == tight.ceiling - Avro.bytesbytes(payloadbytes)
-            Avro.close!(tight)
         end
 
         fixedschema = P("{\"type\":\"fixed\",\"name\":\"OwnedFixed\",\"size\":1}")
@@ -223,7 +219,6 @@
                                       Avro.JSONContext(fixedbudget, false, false), 1)
         @test fixedvalue.bytes == UInt8['x']
         @test fixedbudget.reserved - fixedbefore == Avro.fixedbytes(1)
-        Avro.close!(fixedbudget)
     end
 
     @testset "pretty printing, limits, typed targets, fixtures" begin

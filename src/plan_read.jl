@@ -58,15 +58,14 @@ mutable struct RecordPlan <: ReadPlan
     const boxes::Vector{Int}         # boxed-value charge per field (0 for reference types)
 end
 
-"Build one plan node in order: reserve its box, construct, settle."
+"Build one plan node in order: reserve its box, then construct it."
 function plannode(f, budget::Union{Nothing,Budget}, bytes::Int=64)
     budget === nothing || reserve!(budget, bytes)
     try
         p = f()
-        budget === nothing || allocated!(budget, bytes)
         return p
     catch
-        budget === nothing || unreserve!(budget, bytes)
+        budget === nothing || release!(budget, bytes)
         rethrow()
     end
 end
@@ -83,12 +82,11 @@ function readplan(s::Schema; budget::Union{Nothing,Budget}=nothing, little::Bool
     try
         budget === nothing || reserve!(budget, mbytes)     # the construction memo, released once the root is built
         memo = Vector{Union{Nothing,ReadPlan}}(nothing, nodes)
-        budget === nothing || allocated!(budget, mbytes)
         p = readplan(s, memo, budget, little)
         budget === nothing || release!(budget, mbytes)     # the memo dies here; the plan graph stays charged
         return p
     catch
-        budget === nothing || rollbackreservations!(budget, checkpoint::NTuple{2,Int})
+        budget === nothing || rollbackreservations!(budget, checkpoint::Int)
         rethrow()
     end
 end
@@ -178,12 +176,10 @@ function buildreadplan(s::UnionSchema, memo, budget, little)
     node = 48
     budget === nothing || reserve!(budget, vectors + node)
     branches = Vector{ReadPlan}(undef, n)
-    budget === nothing || allocated!(budget, vectors)
     for (i, b) in enumerate(s.branches)
         branches[i] = readplan(b, memo, budget, little)
     end
     p = UnionPlan(branches, nullablebranch(s))
-    budget === nothing || allocated!(budget, node)
     return p
 end
 
@@ -196,7 +192,6 @@ function buildreadplan(s::RecordSchema, memo, budget, little)
     boxes = Vector{Int}(undef, nf)
     resize!(boxes, 0)
     p = RecordPlan(s, fields, boxes)
-    budget === nothing || allocated!(budget, slots)
     memo[Int(nodeid(s)) + 1] = p
     for f in s.fields
         push!(p.fields, readplan(f.schema, memo, budget, little))
@@ -253,7 +248,6 @@ end
 function decodevalue(p::FixedPlan, d::Decoder)
     reserve!(d.budget, STORAGE[].fixed)
     v = Fixed(p.schema, readfixed(d, p.schema.size), Val(:unchecked))
-    allocated!(d.budget, STORAGE[].fixed)
     return v
 end
 
@@ -261,7 +255,6 @@ function decodevalue(p::EnumPlan, d::Decoder)
     i = readindex(d, length(p.schema.symbols))
     reserve!(d.budget, enumvaluebytes())
     v = EnumValue(p.schema, Int32(i), Val(:unchecked))
-    allocated!(d.budget, enumvaluebytes())
     return v
 end
 
@@ -333,13 +326,11 @@ function decimalunscaled(d::Decoder, p::DecimalPlan, start::Int, n::Int)
     try
         reserve!(d.budget, charge)
         big = BigInt(; nbits=checked_mul(8, n))
-        allocated!(d.budget, charge)
         negative = buf[p.little ? start + n - 1 : start] >= 0x80
         if negative
             tempcharge = bytesbytes(n)
             reserve!(d.budget, tempcharge)
             temp = Vector{UInt8}(undef, n)
-            allocated!(d.budget, tempcharge)
             copyto!(temp, 1, buf, start, n)
             for i in eachindex(temp)
                 @inbounds temp[i] = ~temp[i]
@@ -485,7 +476,6 @@ function GrowBuf{T}(d::Decoder, hint::Int) where {T}
         reserve!(d.budget, charge)
         data = Vector{T}(undef, cap)
         g = GrowBuf{T}(data, 0)
-        allocated!(d.budget, charge)
         return g
     catch
         data = nothing
@@ -499,7 +489,6 @@ end
         newcap = grownextcapacity(length(g.data))
         reserve!(d.budget, vectorbytes(T, newcap))
         nd = Vector{T}(undef, newcap)
-        allocated!(d.budget, vectorbytes(T, newcap))
         copyto!(nd, 1, g.data, 1, g.len)
         oldbytes = vectorbytes(T, length(g.data))
         g.data = nd                                       # the old storage is unreachable only after the rebind
@@ -515,7 +504,6 @@ function finish!(g::GrowBuf{T}, d::Decoder) where {T}
     if g.len != length(out)
         reserve!(d.budget, vectorbytes(T, g.len))
         out = Vector{T}(undef, g.len)
-        allocated!(d.budget, vectorbytes(T, g.len))
         copyto!(out, 1, g.data, 1, g.len)
         oldbytes = vectorbytes(T, length(g.data))
         g.data = out                                      # the old storage is unreachable only after the rebind
@@ -554,7 +542,6 @@ function decodevalue(p::ArrayPlan, d::Decoder)
     if g === nothing
         reserve!(d.budget, STORAGE[].vector)
         out = p.eltype === Any ? [] : Vector{p.eltype}(undef, 0)
-        allocated!(d.budget, STORAGE[].vector)
         return out
     end
     return finish!(g, d)
@@ -604,7 +591,6 @@ function decodevalue(p::MapPlan, d::Decoder)
     if vs === nothing
         reserve!(d.budget, vectorbytes(p.eltype, 0))
         vals = Vector{p.eltype}(undef, 0)
-        allocated!(d.budget, vectorbytes(p.eltype, 0))
     else
         vals = finish!(vs, d)
     end
@@ -625,7 +611,6 @@ function decodevalue(p::UnionPlan, d::Decoder)
     box = isbits(v) ? boxbytes(typeof(v)) : 0
     box > 0 && reserve!(d.budget, box)
     u = UnionValue(i, v)                                  # the shell and the box become resident here
-    allocated!(d.budget, unionvaluebytes() + box)
     return u
 end
 
@@ -634,17 +619,14 @@ function decodevalue(p::RecordPlan, d::Decoder)
     n = length(p.fields)
     reserve!(d.budget, recordbytes(n))
     vals = Vector{Any}(undef, n)
-    allocated!(d.budget, vectorbytes(Any, n))
     @inbounds for i in 1:n
         v = decode(p.fields[i], d)
         b = p.boxes[i]
         b > 0 && reserve!(d.budget, b)
         vals[i] = v                                       # an isbits value boxes on assignment
-        b > 0 && allocated!(d.budget, b)
     end
     leave!(d)
     r = Record(p.schema, vals, Val(:unchecked))
-    allocated!(d.budget, recordbytes(n) - vectorbytes(Any, n))
     return r
 end
 

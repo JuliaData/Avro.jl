@@ -54,7 +54,7 @@ function SchemaCache(; max_entries::Integer=10_000, max_bytes::Integer=64 << 20)
     ledger = ledgerbudget(bytes)
     fingerprints = UInt64[]
     schemas = Schema[]
-    retain!(ledger, base)
+    reserve!(ledger, base)
     return SchemaCache(ReentrantLock(), entries, bytes, ledger, fingerprints, schemas, base)
 end
 
@@ -198,7 +198,6 @@ function schemaretainedbytes(s::Schema, budget::Budget)
     charge = vectorbytes(Bool, graphinfo(s).nodes)
     reserve!(budget, charge)
     seen = Vector{Bool}(undef, graphinfo(s).nodes)
-    allocated!(budget, charge)
     fill!(seen, false)
     try
         return checked_add(checked_add(144, GRAPH_INFO_BYTES), schemaretainedbytes(s, seen))
@@ -237,15 +236,13 @@ function register!(c::SchemaCache, s::Schema; limits::Limits=Limits())
         schemacharge = schemaretainedbytes(s, budget)
         checkpoint = budgetcheckpoint(c.ledger)
         nf, ns = try
-            retain!(c.ledger, schemacharge)
+            reserve!(c.ledger, schemacharge)
             fingerprintcharge = vectorbytes(UInt64, n)
             reserve!(c.ledger, fingerprintcharge)
             newfingerprints = Vector{UInt64}(undef, n)     # exact-capacity replacement
-            allocated!(c.ledger, fingerprintcharge)
             schemacharge = vectorbytes(Schema, n)
             reserve!(c.ledger, schemacharge)
             newschemas = Vector{Schema}(undef, n)
-            allocated!(c.ledger, schemacharge)
             copyto!(newfingerprints, 1, c.fingerprints, 1, i - 1)
             copyto!(newschemas, 1, c.schemas, 1, i - 1)
             newfingerprints[i] = fp
@@ -331,7 +328,6 @@ function encodesingle(s::Schema, x; limits::Limits=Limits())
         checkoperationwork!(budget)
         reserve!(budget, bytesbytes(10 + npayload))
         out = Vector{UInt8}(undef, 10 + npayload)
-        allocated!(budget, bytesbytes(10 + npayload))
         out[1], out[2] = SINGLE_OBJECT_MARKER
         for i in 0:7
             out[3 + i] = UInt8((fp >> (8 * i)) & 0xff)

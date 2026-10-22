@@ -15,74 +15,57 @@
         generatedbudget = Avro.Budget(Avro.Limits())
         generated = Avro.tojsonvalue((a=Int64(1),), generatedbudget)
         @test generatedbudget.reserved == Avro.cachejsonbytes(generated)
-        Avro.close!(generatedbudget)
         parsedbudget = Avro.Budget(Avro.Limits())
         parsed = Avro.parsejson(Vector{UInt8}("{\"a\":1}"); maxbytes=16, maxdepth=8,
                                 errfn=(message, position) -> error("$message at $position"),
                                 budget=parsedbudget)
         @test parsedbudget.reserved == Avro.cachejsonbytes(parsed)
-        Avro.close!(parsedbudget)
         generatedemptybudget = Avro.Budget(Avro.Limits())
         generatedempty = Avro.tojsonvalue((;), generatedemptybudget)
         @test generatedempty === Avro.EMPTY_JSON_OBJECT
         @test generatedemptybudget.reserved == Avro.cachejsonbytes(generatedempty) == 0
-        Avro.close!(generatedemptybudget)
         parsedemptybudget = Avro.Budget(Avro.Limits())
         parsedempty = Avro.parsejson(Vector{UInt8}("{}"); maxbytes=16, maxdepth=8,
                                      errfn=(message, position) -> error("$message at $position"),
                                      budget=parsedemptybudget)
         @test parsedempty === Avro.EMPTY_JSON_OBJECT
         @test parsedemptybudget.reserved == Avro.cachejsonbytes(parsedempty) == 0
-        Avro.close!(parsedemptybudget)
         for source in (generated, parsed, generatedempty, parsedempty)
             budget = Avro.Budget(Avro.Limits())
-            try
-                copy = Avro.copyjsonobject(source, budget, 1)
-                @test copy == source
-                @test budget.reserved == Avro.cachejsonbytes(copy)
-                @test isempty(source.spans) == (copy.spans === Avro.EMPTY_JSON_SPANS)
-            finally
-                Avro.close!(budget)
-            end
+            copy = Avro.copyjsonobject(source, budget, 1)
+            @test copy == source
+            @test budget.reserved == Avro.cachejsonbytes(copy)
+            @test isempty(source.spans) == (copy.spans === Avro.EMPTY_JSON_SPANS)
         end
         generatedarraybudget = Avro.Budget(Avro.Limits())
         generatedarray = Avro.tojsonvalue([], generatedarraybudget)
         @test generatedarray === Avro.EMPTY_JSON_ARRAY
         @test generatedarraybudget.reserved == Avro.cachejsonbytes(generatedarray) == 0
-        Avro.close!(generatedarraybudget)
         parsedarraybudget = Avro.Budget(Avro.Limits())
         parsedarray = Avro.parsejson(Vector{UInt8}("[]"); maxbytes=16, maxdepth=8,
                                      errfn=(message, position) -> error("$message at $position"),
                                      budget=parsedarraybudget)
         @test parsedarray === Avro.EMPTY_JSON_ARRAY
         @test parsedarraybudget.reserved == Avro.cachejsonbytes(parsedarray) == 0
-        Avro.close!(parsedarraybudget)
         generatednonemptybudget = Avro.Budget(Avro.Limits())
         generatednonempty = Avro.tojsonvalue(Any[Int64(1)], generatednonemptybudget)
         @test generatednonemptybudget.reserved == Avro.cachejsonbytes(generatednonempty)
-        Avro.close!(generatednonemptybudget)
         parsednonemptybudget = Avro.Budget(Avro.Limits())
         parsednonempty = Avro.parsejson(Vector{UInt8}("[1]"); maxbytes=16, maxdepth=8,
                                         errfn=(message, position) -> error("$message at $position"),
                                         budget=parsednonemptybudget)
         @test parsednonemptybudget.reserved == Avro.cachejsonbytes(parsednonempty)
-        Avro.close!(parsednonemptybudget)
         for source in (generatedarray, parsedarray, generatednonempty, parsednonempty)
             budget = Avro.Budget(Avro.Limits())
-            try
-                copy = Avro.copyjsonarray(source, budget, 1)
-                @test copy == source
-                @test budget.reserved == Avro.cachejsonbytes(copy)
-                @test isempty(source) == (copy === Avro.EMPTY_JSON_ARRAY)
-            finally
-                Avro.close!(budget)
-            end
+            copy = Avro.copyjsonarray(source, budget, 1)
+            @test copy == source
+            @test budget.reserved == Avro.cachejsonbytes(copy)
+            @test isempty(source) == (copy === Avro.EMPTY_JSON_ARRAY)
         end
         for value in (1.5, NaN, Inf, -Inf, Avro.JSONNumber("2.5"))
             budget = Avro.Budget(Avro.Limits())
             converted = Avro.tojsonvalue(value, budget)
             @test budget.reserved == Avro.cachejsonbytes(converted)
-            Avro.close!(budget)
         end
         for text in ("1.5", "[1.5]", "{\"a\":1.5}")
             budget = Avro.Budget(Avro.Limits())
@@ -92,7 +75,6 @@
                                            error("$message at $position"),
                                        budget=budget)
             @test budget.reserved == Avro.cachejsonbytes(converted)
-            Avro.close!(budget)
         end
     end
     @testset "storagebytes ≥ summarysize for every member of E; decoders reserve at least the formula" begin
@@ -112,14 +94,10 @@
 
         function decodedaccounting(s, bytes)
             budget = Avro.Budget(Avro.Limits())
-            try
-                Avro.addinput!(budget, length(bytes))
-                d = Avro.Decoder(bytes, budget)
-                value = Avro.decode(Avro.readplan(s), d)
-                return value, budget.reserved
-            finally
-                Avro.close!(budget)
-            end
+            Avro.addinput!(budget, length(bytes))
+            d = Avro.Decoder(bytes, budget)
+            value = Avro.decode(Avro.readplan(s), d)
+            return value, budget.reserved
         end
         checked = 0
         for T in Avro.valuetypes()

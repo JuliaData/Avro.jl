@@ -34,7 +34,6 @@ function admitnames(s::RecordSchema, adm, budget::Union{Nothing,Budget}=nothing)
     charge = vectorbytes(Symbol, length(s.fields))
     reserve!(budget, charge)
     names = Vector{Symbol}(undef, length(s.fields))
-    allocated!(budget, charge)
     for (index, field) in enumerate(s.fields)
         names[index] = admit!(adm, field.name)
     end
@@ -74,7 +73,6 @@ function selectindices(s::RecordSchema, select, budget::Budget)
     slotcharge = vectorbytes(Int, nf)
     reserve!(budget, slotcharge)
     slots = zeros(Int, nf)
-    allocated!(budget, slotcharge)
     for nm in select
         (nm isa Symbol || nm isa AbstractString) || throw(ArgumentError("select= takes column names (Symbols or strings), got $(typeof(nm))"))
         sizeof(nm) <= budget.limits.max_name_bytes ||
@@ -96,7 +94,6 @@ function selectindices(s::RecordSchema, select, budget::Budget)
     charge = sizeof(Projection)
     reserve!(budget, charge)
     projection = Projection(indices, slots)
-    allocated!(budget, charge)
     return projection
 end
 
@@ -130,7 +127,6 @@ function projectschema(s::RecordSchema, sel::Vector{Int}, limits::Limits,
         meta = copiedmeta(s, sel, budget)
         out = publicnode(RecordSchema(name, aliases, rawaliases, doc, s.iserror,
                                       props, fields, index, meta))
-        allocated!(budget, charge)
         try
             rootkey = ownedfullname(s.name, budget)
             insert!(memo, rootkey, out, budget)
@@ -156,7 +152,6 @@ function refersto(x::Schema, root::RecordSchema, budget::Budget)
     charge = vectorbytes(UInt64, cld(n, 64)) + 32       # the visited set's chunks and shell
     reserve!(budget, charge)
     seen = falses(n)
-    allocated!(budget, charge)
     try
         return refersto(x, root, seen)
     finally
@@ -231,7 +226,6 @@ function exactvector(::Type{T}, n::Int, budget::Budget) where {T}
     charge = vectorbytes(T, n)
     reserve!(budget, charge)
     values = Vector{T}(undef, n)
-    allocated!(budget, charge)
     return values
 end
 
@@ -272,7 +266,6 @@ function Table(src; reader_schema::Union{Nothing,Schema}=nothing, union_resoluti
             for (index, E) in enumerate(colstypes)
                 reserve!(r.budget, vectorbytes(E, nrows))
                 finals[index] = Vector{E}(undef, nrows)
-                allocated!(r.budget, vectorbytes(E, nrows))
             end
             decodeblocks!(r, plan, projection, finals, keptidx, colstypes, pre, taskcount,
                           reader_schema !== nothing)
@@ -297,7 +290,6 @@ function Table(src; reader_schema::Union{Nothing,Schema}=nothing, union_resoluti
         reserve!(r.budget, shellbytes(Table))
         table = Table(outschema, r.schema, outnames, tablesschema, finals, nrows,
                       ranges, r.metadata, r.codecname, r.sync)
-        allocated!(r.budget, shellbytes(Table))
         release!(r.budget, vectorbytes(Type, length(colstypes)))
         release!(r.budget, vectorbytes(Int, length(counts)))
         keptowned && release!(r.budget, vectorbytes(Int, length(keptidx)))
@@ -337,7 +329,6 @@ function storedschema(names::Vector{Symbol}, s::RecordSchema, budget::Budget)
     try
         reserve!(budget, scratch)
         types = Vector{Type}(undef, n)
-        allocated!(budget, scratch)
         for (index, field) in enumerate(s.fields)
             types[index] = juliatype(field.schema)
         end
@@ -345,7 +336,6 @@ function storedschema(names::Vector{Symbol}, s::RecordSchema, budget::Budget)
                                shellbytes(Tables.Schema{nothing,nothing}))
         reserve!(budget, retained)
         value = Tables.Schema(names, types; stored=true)
-        allocated!(budget, retained)
         types = nothing
         release!(budget, scratch)
         return value
@@ -504,7 +494,6 @@ function decodestreamed!(r::Reader, plan, projection::Union{Nothing,Projection},
     while (blk = nextblock!(r; walk=false)) !== nothing
         count, bytes, blockwork = blk
         reserve!(r.budget, bytesbytes(length(bytes)))
-        allocated!(r.budget, bytesbytes(length(bytes)))                     # decompressed by nextblock!; already resident
         d = setblockscope!(Decoder(bytes, r.budget; validate=r.validate),
                            blockwork)
         cols = columnbuilders(plan, projection, count, r.budget)
@@ -536,7 +525,6 @@ function decodestreamed!(r::Reader, plan, projection::Union{Nothing,Projection},
     for (index, E) in enumerate(colstypes)             # both sets of reference slots coexist during assembly
         reserve!(r.budget, vectorbytes(E, nrows))
         finals[index] = Vector{E}(undef, nrows)
-        allocated!(r.budget, vectorbytes(E, nrows))
     end
     for k in eachindex(finals)
         col = finals[k]
@@ -624,7 +612,6 @@ function Rows(src; T=nothing, reader_schema::Union{Nothing,Schema}=nothing, unio
                               projection, reader_schema !== nothing, nrows,
                               nothing, nothing, UInt8[], nothing,
                               0, 0, 0, 0, nothing)
-            allocated!(r.budget, charge)
             return rows
         end
         charge = shellbytes(Rows{false})
@@ -633,7 +620,6 @@ function Rows(src; T=nothing, reader_schema::Union{Nothing,Schema}=nothing, unio
                            projection, reader_schema !== nothing, 0,
                            nothing, nothing, UInt8[], nothing,
                            0, 0, 0, 0, nothing)
-        allocated!(r.budget, charge)
         return rows
     catch
         close(r)
@@ -758,7 +744,6 @@ function Base.iterate(rows::Rows, ::Nothing=nothing)
         rows.blockwork = blk[3]
         rows.blockout = 0
         reserve!(b, bytesbytes(length(rows.bytes)))
-        allocated!(b, bytesbytes(length(rows.bytes)))          # decompressed by nextblock!; already resident
         rows.decoder = setblockscope!(Decoder(rows.bytes, b; validate=r.validate),
                                       rows.blockwork::BlockWork)
         if rows.remaining == 0
@@ -827,7 +812,6 @@ function decoderow(rows::Rows)
         wrapper = rowwrapperbytes()
         reserve!(d.budget, wrapper)
         row = Row(Record(out, vals, Val(:unchecked)), rows.adm)
-        allocated!(d.budget, recordbytes(length(vals)) - vectorbytes(Any, length(vals)) + wrapper)
         rows.lastwrapper = wrapper
         return row
     end
@@ -836,7 +820,6 @@ function decoderow(rows::Rows)
         wrapper = rowwrapperbytes()
         reserve!(d.budget, wrapper)
         row = Row(v::Record, rows.adm)
-        allocated!(d.budget, wrapper)
         rows.lastwrapper = wrapper
         return row
     end
@@ -849,7 +832,6 @@ function projectrow(p::RecordPlan, d::Decoder, projection::Projection, out::Reco
     n = length(projection.indices)
     reserve!(d.budget, recordbytes(n))
     kept = Vector{Any}(undef, n)
-    allocated!(d.budget, vectorbytes(Any, n))
     for (i, f) in enumerate(p.fields)
         slot = projection.slots[i]
         if slot != 0
@@ -857,7 +839,6 @@ function projectrow(p::RecordPlan, d::Decoder, projection::Projection, out::Reco
             b = p.boxes[i]
             b > 0 && reserve!(d.budget, b)
             kept[slot] = v                                     # an isbits value boxes on assignment
-            b > 0 && allocated!(d.budget, b)
         else
             skip(f, d)
         end
@@ -871,7 +852,6 @@ function projectrow(p::ResolvedRecordPlan, d::Decoder, projection::Projection, o
     n = length(projection.indices)
     reserve!(d.budget, recordbytes(n))
     kept = Vector{Any}(undef, n)
-    allocated!(d.budget, vectorbytes(Any, n))
     for (slot, plan) in p.steps
         projected = slot == 0 ? 0 : projection.slots[slot]
         if projected != 0
@@ -879,7 +859,6 @@ function projectrow(p::ResolvedRecordPlan, d::Decoder, projection::Projection, o
             b = p.boxes[slot]
             b > 0 && reserve!(d.budget, b)
             kept[projected] = v                                # an isbits value boxes on assignment
-            b > 0 && allocated!(d.budget, b)
         else
             skip(plan, d)
         end
@@ -891,7 +870,6 @@ function projectrow(p::ResolvedRecordPlan, d::Decoder, projection::Projection, o
         b > 0 && reserve!(d.budget, b)
         kept[projected] = jsonvalue(dp, d.budget;
                                     depth=satadd(d.depth, 1))
-        b > 0 && allocated!(d.budget, b)
     end
     leave!(d)
     return kept
@@ -926,7 +904,6 @@ function Base.iterate(it::RowsPartitions, ::Nothing=nothing)
     baseline = b.reserved
     try
         reserve!(b, bytesbytes(length(bytes)))
-        allocated!(b, bytesbytes(length(bytes)))               # decompressed by nextblock!; already resident
         before = b.reserved
         d = setblockscope!(Decoder(bytes, b; validate=r.validate), blockwork)
         plan = rows.plan
@@ -968,7 +945,6 @@ function Base.iterate(it::RowsPartitions, ::Nothing=nothing)
         reserve!(b, shellbytes(Table))
         t = Table(out, r.schema, outnames, tableschema, finals, count, ranges,
                   r.metadata, r.codecname, r.sync)
-        allocated!(b, shellbytes(Table))
         return (t, nothing)
     finally
         release!(b, max(b.reserved - baseline, 0))       # completed output transfers at return; partial output dies here
@@ -1005,7 +981,6 @@ function Tables.columns(rows::Rows)
         reserve!(b, shellbytes(Table))
         t = Table(out, writerschema(rows), outnames, tableschema, finals, nrows,
                   ranges, metadata(rows), codec(rows), sync(rows))
-        allocated!(b, shellbytes(Table))
         release!(b, vectorbytes(Int, length(counts)))
         return t
     finally

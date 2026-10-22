@@ -10,17 +10,14 @@
                 "{\"type\":\"bytes\",\"logicalType\":\"decimal\",\"precision\":4,\"scale\":2}")
             budget = Avro.Budget(Avro.Limits())
             plan = Avro.writeplan(P(json); budget=budget)
-            @test budget.pending == 0
             @test budget.reserved >= 64
-            Avro.close!(budget)
         end
         limited = Avro.Limits(max_resolution_work=1)
         union = P("[\"null\",\"long\"]")
         for build in (Avro.readplan, Avro.writeplan)
             budget = Avro.Budget(limited)
             @test_throws Avro.LimitError build(union; budget=budget)
-            @test budget.pending == budget.reserved == 0
-            Avro.close!(budget)
+            @test budget.reserved == 0
         end
         recursive = P("{\"type\":\"record\",\"name\":\"FieldCache\",\"fields\":[{\"name\":\"child\",\"type\":[\"null\",\"FieldCache\"]},{\"name\":\"tail\",\"type\":\"int\"}]}")
         value = (child=(tail=Int32(2), child=missing), tail=Int32(1))

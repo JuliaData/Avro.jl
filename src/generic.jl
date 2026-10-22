@@ -71,7 +71,6 @@ function collectpairs(::Type{V}, @nospecialize(pairs), budget::Budget) where {V}
         push!(keys, budget, key)
         box > 0 && reserve!(budget, box)
         push!(vals, budget, value)
-        box > 0 && allocated!(budget, box)
         boxes = checked_add(boxes, box)
     end
     return finishbuild!(keys, budget), finishbuild!(vals, budget), boxes
@@ -83,7 +82,6 @@ function convertmap(::Type{V}, ks::Vector{String}, vs::Vector{Any}, boxes::Int,
     charge = vectorbytes(V, length(vs))
     reserve!(budget, charge)
     converted = Vector{V}(undef, length(vs))
-    allocated!(budget, charge)
     for i in eachindex(vs)
         converted[i], owned = preparedmapvalue(V, vs[i], budget)
         addinput!(budget, owned)
@@ -149,7 +147,6 @@ function copymapkey(k::Union{AbstractString,Symbol}, budget::Budget)
     try
         reserve!(budget, charge)
         value = k isa String ? GC.@preserve(k, unsafe_string(pointer(k), n)) : String(k)
-        allocated!(budget, charge)
         key = value
         isstrictutf8(key) || encodeerror("map key is not valid UTF-8", k)
         return key
@@ -178,7 +175,6 @@ function buildmap(::Type{V}, keys::Vector{String}, vals::Vector{V}, budget::Unio
     budget === nothing || reserve!(budget, mapshellbytes(n) + vectorbytes(Int32, cld(n, 2)))   # struct, permutation and the sort scratch
     perm = Vector{Int32}(undef, n)
     scratch = Vector{Int32}(undef, cld(n, 2))
-    budget === nothing || allocated!(budget, vectorbytes(Int32, n) + vectorbytes(Int32, cld(n, 2)))   # the Map shell settles at construction
     mergesort!(perm, scratch, keys)
     # duplicates: the sorted run groups equal keys; the earliest index keeps the position, the last value wins
     ndup = 0
@@ -186,7 +182,6 @@ function buildmap(::Type{V}, keys::Vector{String}, vals::Vector{V}, budget::Unio
     if n > 1
         budget === nothing || reserve!(budget, vectorbytes(Bool, n))
         keep = fill(true, n)
-        budget === nothing || allocated!(budget, vectorbytes(Bool, n))
         i = 1
         while i <= n
             j = i
@@ -217,7 +212,6 @@ function buildmap(::Type{V}, keys::Vector{String}, vals::Vector{V}, budget::Unio
         if ndup > 0
             budget === nothing || reserve!(budget, vectorbytes(Int32, n))
             newindex = Vector{Int32}(undef, n)
-            budget === nothing || allocated!(budget, vectorbytes(Int32, n))
             w = 0
             for i in 1:n
                 if keep[i]
@@ -244,7 +238,6 @@ function buildmap(::Type{V}, keys::Vector{String}, vals::Vector{V}, budget::Unio
     end
     budget === nothing || release!(budget, vectorbytes(Int32, cld(n, 2)))
     m = Map{V}(keys, vals, perm)
-    budget === nothing || allocated!(budget, STORAGE[].map)
     return m
 end
 
@@ -457,7 +450,6 @@ struct Record
             countvalues!(budget)                                         # the record itself
             reserve!(budget, recordbytes(nf))                                # before the values copy
             vs = Vector{Any}(undef, nf)
-            allocated!(budget, vectorbytes(Any, nf))
             i = 0
             for v in values
                 countvalues!(budget)
@@ -466,11 +458,9 @@ struct Record
                 box = isbits(v) ? boxbytes(typeof(v)) : 0
                 box > 0 && reserve!(budget, box)
                 vs[i] = v
-                box > 0 && allocated!(budget, box)
             end
             i == nf || throw(ArgumentError("record \"$(fullname(schema))\" has $nf fields, got $i values"))
             r = new(schema, vs)
-            allocated!(budget, recordbytes(nf) - vectorbytes(Any, nf))
             return r
         end
     end
@@ -609,7 +599,6 @@ function publicenumvalue(schema::EnumSchema, index::Integer, budget::Budget; cou
     1 <= index <= length(schema.symbols) ||
         throw(ArgumentError("enum \"$(fullname(schema))\" has $(length(schema.symbols)) symbols; index $index is out of range"))
     value = EnumValue(schema, Int32(index), Val(:unchecked))
-    allocated!(budget, enumvaluebytes())
     return value
 end
 
@@ -654,7 +643,6 @@ struct Fixed
             countvalues!(budget)
             reserve!(budget, fixedbytes(length(bytes)))
             f = new(schema, Vector{UInt8}(bytes))
-            allocated!(budget, fixedbytes(length(bytes)))
             return f
         end
     end

@@ -38,9 +38,7 @@ function positionalprojection(selected::AbstractVector{Int}, nfields::Int, budge
              vectorbytes(Int, nfields)
     reserve!(budget, charge)
     indices = Vector{Int}(undef, length(selected))
-    allocated!(budget, vectorbytes(Int, length(selected)))
     slots = zeros(Int, nfields)
-    allocated!(budget, vectorbytes(Int, nfields))
     for (slot, position) in enumerate(selected)
         1 <= position <= nfields || throw(ArgumentError("selected field position $position is out of range"))
         slots[position] == 0 || throw(ArgumentError("selected field position $position is duplicated"))
@@ -48,7 +46,6 @@ function positionalprojection(selected::AbstractVector{Int}, nfields::Int, budge
         slots[position] = slot
     end
     projection = Projection(indices, slots)
-    allocated!(budget, sizeof(Projection))
     return projection
 end
 
@@ -180,7 +177,6 @@ function setskipcolumn!(cols::Vector{ColumnBuilder}, index::Int, plan::P,
     charge = columnnodebytes(SkipColumn{P})
     reserve!(budget, charge)
     cols[index] = SkipColumn{P}(plan)
-    allocated!(budget, charge)
     return nothing
 end
 
@@ -255,7 +251,6 @@ function fuseskips(cols::Vector{ColumnBuilder}, budget::Union{Nothing,Budget}=no
     try
         budget === nothing || reserve!(budget, charge)
         out = Vector{ColumnBuilder}(undef, outlen)
-        budget === nothing || allocated!(budget, vectorbytes(ColumnBuilder, outlen))
         i = 1
         dest = 0
         while i <= length(cols)
@@ -267,8 +262,6 @@ function fuseskips(cols::Vector{ColumnBuilder}, budget::Union{Nothing,Budget}=no
                 end
                 plans = Vector{ReadPlan}(undef, i - first)
                 fastkinds = Vector{UInt8}(undef, i - first)
-                budget === nothing || allocated!(budget, vectorbytes(ReadPlan, length(plans)))
-                budget === nothing || allocated!(budget, vectorbytes(UInt8, length(fastkinds)))
                 width = 0
                 maxbytes = 0
                 for (offset, source) in enumerate(first:i - 1)
@@ -280,7 +273,6 @@ function fuseskips(cols::Vector{ColumnBuilder}, budget::Union{Nothing,Budget}=no
                     maxbytes = max(maxbytes, skipmaxbytes(plan))
                 end
                 out[dest] = SkipRun(plans, fastkinds, width, maxbytes)
-                budget === nothing || allocated!(budget, columnnodebytes(SkipRun))
             else
                 out[dest] = cols[i]
                 i += 1
@@ -289,7 +281,7 @@ function fuseskips(cols::Vector{ColumnBuilder}, budget::Union{Nothing,Budget}=no
         return out
     catch
         out = nothing
-        budget === nothing || rollbackreservations!(budget, checkpoint::NTuple{2,Int})
+        budget === nothing || rollbackreservations!(budget, checkpoint::Int)
         rethrow()
     end
 end
@@ -310,7 +302,6 @@ function columnbuilders(p::RecordPlan, projection::Union{Nothing,Projection}, ca
         outer = vectorbytes(ColumnBuilder, length(p.fields))
         reserve!(budget, outer)
         cols = Vector{ColumnBuilder}(undef, length(p.fields))
-        allocated!(budget, outer)
         for (i, f) in enumerate(p.schema.fields)
             if projection === nothing || projection.slots[i] != 0
                 cols[i] = makecolumn(juliatype(f.schema), p.fields[i], capacity, budget)
@@ -344,9 +335,7 @@ function makecolumn(::Type{E}, plan::P, capacity::Int, budget::Budget) where {E,
         node = columnnodebytes(TypedColumn{E,P})
         reserve!(budget, checked_add(databytes, node))
         data = Vector{E}(undef, capacity)
-        allocated!(budget, databytes)
         column = TypedColumn{E,P}(plan, data, 0)
-        allocated!(budget, node)
         return column
     catch
         data = nothing
@@ -435,7 +424,6 @@ end
 function grow!(c::TypedColumn{E}, budget::Budget, newcap::Int) where {E}
     reserve!(budget, vectorbytes(E, newcap))
     nd = Vector{E}(undef, newcap)
-    allocated!(budget, vectorbytes(E, newcap))
     copyto!(nd, 1, c.data, 1, c.len)
     oldbytes = vectorbytes(E, length(c.data))
     c.data = nd                                        # the old storage is unreachable only after the rebind
@@ -453,7 +441,6 @@ function finishcolumn!(c::TypedColumn{E}, budget::Budget) where {E}
     if c.len != length(out)
         reserve!(budget, vectorbytes(E, c.len))
         out = Vector{E}(undef, c.len)
-        allocated!(budget, vectorbytes(E, c.len))
         copyto!(out, 1, c.data, 1, c.len)
         oldbytes = vectorbytes(E, length(c.data))
         c.data = out                                   # the old storage is unreachable only after the rebind

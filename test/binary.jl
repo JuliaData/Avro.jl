@@ -11,13 +11,13 @@ struct ArrayLengthMismatch
     actual::Int
 end
 
-struct PendingReadProbe <: Avro.ReadPlan
+struct ReservedReadProbe <: Avro.ReadPlan
     seen::Base.RefValue{Int}
 end
 
 struct ChangingWriteProbe <: Avro.WritePlan end
 
-struct PendingWriteProbe <: Avro.WritePlan
+struct ReservedWriteProbe <: Avro.WritePlan
     seen::Base.RefValue{Int}
 end
 
@@ -34,8 +34,8 @@ function Base.iterate(x::ArrayLengthMismatch, state::Int=1)
     return (Int64(state), state + 1)
 end
 
-function Avro.decodevalue(probe::PendingReadProbe, decoder::Avro.Decoder)
-    probe.seen[] = decoder.budget.pending
+function Avro.decodevalue(probe::ReservedReadProbe, decoder::Avro.Decoder)
+    probe.seen[] = decoder.budget.reserved
     return missing
 end
 
@@ -45,10 +45,10 @@ function Avro.stagewritervalue(::ChangingWriteProbe, value, state::Avro.WriterSt
     return (value, true)
 end
 
-function Avro.stagewritervalue(probe::PendingWriteProbe, value,
+function Avro.stagewritervalue(probe::ReservedWriteProbe, value,
                                state::Avro.WriterStageState, ::Int)
     Avro.countstaged!(state)
-    probe.seen[] = state.budget.pending
+    probe.seen[] = state.budget.reserved
     return (value, false)
 end
 
@@ -178,7 +178,6 @@ end
         skipdecoder = Avro.Decoder(UInt8[1, 2], skipbudget)
         @test_throws Avro.LimitError Avro.skip(Avro.readplan(fixedschema; budget=skipbudget),
                                                skipdecoder)
-        Avro.close!(skipbudget)
         g = Avro.FixedSchema("G", 2)
         @test_throws Avro.EncodeError enc(f, Avro.Fixed(g, UInt8[1, 2]))      # identity mismatch
         mutable_fixed = Avro.Fixed(P(f), UInt8[1, 2])
@@ -338,7 +337,6 @@ end
             Avro.addinput!(budget, length(impossiblebytes))
             decoder = Avro.Decoder(impossiblebytes, budget)
             @test_throws Avro.DataError operation(impossibleplan, decoder)
-            Avro.close!(budget)
         end
         # Java BlockingBinaryEncoder fixtures (sized blocks at every level) decode like the positive form
         arrmap = P(read(joinpath(FIXTURES, "generated", "blocking", "arrmap.avsc"), String))
@@ -394,28 +392,24 @@ end
 
         nullrecord = P("{\"type\":\"record\",\"name\":\"PendingRead\",\"fields\":[{\"name\":\"a\",\"type\":\"null\"}]}")
         baseplan = Avro.readplan(nullrecord)
-        readpending = Ref(-1)
-        probeplan = Avro.RecordPlan(nullrecord, Avro.ReadPlan[PendingReadProbe(readpending)],
+        readreserved = Ref(-1)
+        probeplan = Avro.RecordPlan(nullrecord, Avro.ReadPlan[ReservedReadProbe(readreserved)],
                                     baseplan.boxes)
         readbudget = Avro.Budget(Avro.Limits())
         decoded = Avro.decode(probeplan, Avro.Decoder(UInt8[], readbudget))
-        @test readpending[] == Avro.recordbytes(1) - Avro.vectorbytes(Any, 1)
-        @test readbudget.pending == 0
+        @test readreserved[] == Avro.recordbytes(1)        # the whole record is reserved before its fields decode
         @test isequal(decoded, Avro.Record(nullrecord, [missing]))
-        Avro.close!(readbudget)
 
         writerecord = P("{\"type\":\"record\",\"name\":\"PendingWrite\",\"fields\":[{\"name\":\"a\",\"type\":\"null\"},{\"name\":\"b\",\"type\":\"null\"}]}")
-        writepending = Ref(-1)
+        writereserved = Ref(-1)
         writeplan = Avro.WRecord(writerecord,
-                                 Avro.WritePlan[ChangingWriteProbe(), PendingWriteProbe(writepending)])
+                                 Avro.WritePlan[ChangingWriteProbe(), ReservedWriteProbe(writereserved)])
         writebudget = Avro.Budget(Avro.Limits())
         staged, changed = Avro.stagewriterrecord(writeplan, (a=missing, b=missing),
                                                   Avro.WriterStageState(writebudget, 0), 0)
         @test changed
-        @test writepending[] == Avro.recordbytes(2) - Avro.vectorbytes(Any, 2)
-        @test writebudget.pending == 0
+        @test writereserved[] == Avro.recordbytes(2) + Avro.boxbytes(Missing)   # the staged record and field a, before field b stages
         @test isequal(staged, Avro.Record(writerecord, [missing, missing]))
-        Avro.close!(writebudget)
     end
 
     @testset "logical types" begin
@@ -521,7 +515,6 @@ end
         end
         @test skipuuiderror isa Avro.DataError
         @test sizeof(skipuuiderror.msg) < 128
-        Avro.close!(skipuuidbudget)
         @test_throws Avro.EncodeError enc(us, "nope")
         @test enc(us, string(id)) == enc(us, id)
         uf = "{\"type\":\"fixed\",\"name\":\"U\",\"size\":16,\"logicalType\":\"uuid\"}"
@@ -541,7 +534,6 @@ end
         Avro.writeuuidfixed!(encoder, id)
         Avro.reset!(encoder)
         @test @allocated(Avro.writeuuidfixed!(encoder, id)) == 0
-        Avro.close!(budget)
     end
 
     @testset "positions, IO sources, prepared codecs, limits" begin
@@ -683,7 +675,6 @@ end
             append(external)
             @test length(external.path.data) > 16
             @test owner.reserved == Avro.encoderstorage(external)
-            Avro.close!(owner)
         end
         for appendfailure in (e -> Avro.encode!(e, deepowner,
                                                 deepownervalue(20; bad=true);
@@ -701,7 +692,6 @@ end
             @test err isa Avro.EncodeError
             @test length(external.path.data) > 16
             @test owner.reserved == Avro.encoderstorage(external)
-            Avro.close!(owner)
         end
 
         arr = P("{\"type\":\"array\",\"items\":\"null\"}")
@@ -796,18 +786,15 @@ end
         @test generous.reserved == expected
         @test generous.peak > generous.reserved
         exactpeak = generous.peak
-        Avro.close!(generous)
 
         insufficient = Avro.ledgerbudget(exactpeak - 1)
         @test_throws Avro.LimitError Avro.spanplan(schema; budget=insufficient)
-        @test insufficient.reserved == insufficient.pending == 0
-        Avro.close!(insufficient)
+        @test insufficient.reserved == 0
 
         exact = Avro.ledgerbudget(exactpeak)
         exactplan = Avro.spanplan(schema; budget=exact)
         @test retainedspanbytes(exactplan) == exact.reserved == expected
         @test exact.peak == exactpeak
-        Avro.close!(exact)
     end
 
     @testset "validation modes: strict walks skipped regions, fast jumps sized blocks" begin

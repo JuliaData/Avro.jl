@@ -211,7 +211,6 @@ mutable struct Budget
     members::Int
     resolution_work::Int
     allowance_used::Int     # the largest draw on work_allowance so far (maintained when input arrives)
-    pending::Int            # reserved bytes not yet allocated
     workcap::Int            # min(max_total_values, max_values_per_byte × input_bytes + work_allowance)
     workdeferred::Int       # root encode transactions whose exact byte denominator is not known yet
     default_position::Int   # reusable cursor into a resolved default's immutable branch tape
@@ -219,7 +218,7 @@ end
 
 function Budget(limits::Limits; direction::Symbol=:decode)
     direction in (:decode, :encode) || throw(ArgumentError("direction must be :decode or :encode"))
-    return Budget(limits, limits.max_total_bytes, direction, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    return Budget(limits, limits.max_total_bytes, direction, 0, 0, 0, 0, 0, 0, 0, 0, 0,
                   min(limits.max_total_values, limits.work_allowance), 0, 0)
 end
 
@@ -227,7 +226,7 @@ end
 function ledgerbudget(ceiling::Int)
     ceiling >= 0 || throw(ArgumentError("ledger ceiling must be non-negative"))
     limits = Limits()
-    return Budget(limits, ceiling, :decode, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    return Budget(limits, ceiling, :decode, 0, 0, 0, 0, 0, 0, 0, 0, 0,
                   min(limits.max_total_values, limits.work_allowance), 0, 0)
 end
 
@@ -257,107 +256,32 @@ function reserve!(b::Budget, n::Int)
     total <= b.ceiling || throw(limiterror(b, :max_total_bytes, total, b.ceiling))
     b.reserved = total
     b.peak = max(b.peak, total)
-    b.pending += n                                     # pending ≤ reserved ≤ ceiling
-    return b
-end
-
-# Drop `n` bytes from the budget's pending counter. Internal: the public entry points are `allocated!`,
-# `unreserve!` and `close!`, which validate their side of the contract.
-function settlepending!(b::Budget, n::Int)
-    n <= 0 && return b
-    b.pending -= n
-    return b
-end
-
-"""
-    allocated!(budget, n)
-
-Record that `n` previously reserved bytes are now resident. Settling more bytes than are pending is a
-settlement mismatch and throws instead of clamping.
-"""
-function allocated!(b::Budget, n::Int)
-    n >= 0 || throw(ArgumentError("settlement must be non-negative"))
-    n == 0 && return b
-    n <= b.pending || throw(ArgumentError("settlement of $n bytes exceeds the pending reservation $(b.pending)"))
-    return settlepending!(b, n)
-end
-
-"""
-    retain!(budget, n)
-
-Charge `n` bytes of storage that already exists and is being retained beyond the structure that
-allocated it — tree references a schema node keeps alive, or slot shifts inside prebuilt capacity.
-Nothing is allocated at the call site, so the reservation settles immediately: the storage is
-already resident. Storage allocated at the call site must use `reserve!` before the allocation and
-`allocated!` after it instead.
-"""
-function retain!(b::Budget, n::Int)
-    reserve!(b, n)
-    allocated!(b, n)
     return b
 end
 
 """
     release!(budget, n)
 
-Release `n` reserved **resident** bytes (after the corresponding storage became unreachable or was
-handed to the caller). Reservations that never became resident are returned with [`unreserve!`](@ref);
-asking to release more than the resident portion is a settlement mismatch and throws.
+Release `n` reserved bytes once their storage is unreachable, handed to the caller, or was never
+allocated. Releasing more than is reserved is an accounting mismatch and throws.
 """
 function release!(b::Budget, n::Int)
     n >= 0 || throw(ArgumentError("release must be non-negative"))
     n == 0 && return b
     n <= b.reserved || throw(ArgumentError("release of $n bytes exceeds the live reservation $(b.reserved)"))
-    resident = b.reserved - b.pending
-    n <= resident || throw(ArgumentError("release of $n bytes exceeds the resident portion $resident ($(b.pending) of $(b.reserved) reserved bytes are pending; unfulfilled reservations return through unreserve!)"))
     b.reserved -= n
     return b
 end
 
-"""
-    unreserve!(budget, n)
-
-Return `n` reserved bytes that never became resident (worst-case headroom, or the unwind of a failed
-allocation) to the budget.
-"""
-function unreserve!(b::Budget, n::Int)
-    n >= 0 || throw(ArgumentError("unreserve must be non-negative"))
-    n == 0 && return b
-    n <= b.pending || throw(ArgumentError("unreserve of $n bytes exceeds the pending reservation $(b.pending)"))
-    settlepending!(b, n)
-    b.reserved -= n
-    return b
-end
-
-"""
-    close!(budget)
-
-Settle every pending reservation (called in the `finally` of every operation).
-"""
-function close!(b::Budget)
-    settlepending!(b, b.pending)
-    return b
-end
-
-"Capture the counters `rollbackreservations!` needs to unwind an operation exactly."
+"The reservation `rollbackreservations!` unwinds to."
 function budgetcheckpoint(b::Budget)
-    return (b.reserved, b.pending)
+    return b.reserved
 end
 
-"""
-Unwind every reservation acquired after `checkpoint` (a `budgetcheckpoint`) on a failed ownership
-transfer. The pending delta since the checkpoint is this operation's in-flight remainder and returns
-through `unreserve!`; the settled rest — storage that dies with the failed operation — is released.
-The budget may carry unrelated pending headroom, so the split must come from the checkpoint.
-"""
-function rollbackreservations!(budget::Budget, checkpoint::NTuple{2,Int})
-    reserved0, pending0 = checkpoint
-    delta = budget.reserved - reserved0
-    delta <= 0 && return nothing
-    pend = budget.pending - pending0
-    pend > 0 && unreserve!(budget, pend)
-    resident = delta - max(pend, 0)
-    resident > 0 && release!(budget, resident)
+"Release every reservation made after `checkpoint` (a `budgetcheckpoint`) when an operation fails."
+function rollbackreservations!(budget::Budget, checkpoint::Int)
+    delta = budget.reserved - checkpoint
+    delta > 0 && release!(budget, delta)
     return nothing
 end
 
@@ -379,15 +303,13 @@ function BuildBuf{T}(budget::Union{Nothing,Budget}, cap::Int) where {T}
     try
         budget === nothing || reserve!(budget, vectorbytes(T, cap))
         data = Vector{T}(undef, cap)
-        budget === nothing || allocated!(budget, vectorbytes(T, cap))
         shell = shellbytes(BuildBuf{T})
         budget === nothing || reserve!(budget, shell)
         bb = BuildBuf{T}(data, 0)
-        budget === nothing || allocated!(budget, shell)
         return bb
     catch
         data = nothing
-        budget === nothing || rollbackreservations!(budget, checkpoint::NTuple{2,Int})
+        budget === nothing || rollbackreservations!(budget, checkpoint::Int)
         rethrow()
     end
 end
@@ -397,7 +319,6 @@ function Base.push!(bb::BuildBuf{T}, budget::Union{Nothing,Budget}, x) where {T}
         newcap = max(2 * length(bb.data), 4)
         budget === nothing || reserve!(budget, vectorbytes(T, newcap))
         nd = Vector{T}(undef, newcap)
-        budget === nothing || allocated!(budget, vectorbytes(T, newcap))
         copyto!(nd, 1, bb.data, 1, bb.len)
         oldbytes = vectorbytes(T, length(bb.data))
         bb.data = nd                                   # the old storage is unreachable only after the rebind
@@ -414,7 +335,6 @@ function finishbuild!(bb::BuildBuf{T}, budget::Union{Nothing,Budget}) where {T}
     if bb.len != length(out)
         budget === nothing || reserve!(budget, vectorbytes(T, bb.len))
         out = Vector{T}(undef, bb.len)
-        budget === nothing || allocated!(budget, vectorbytes(T, bb.len))
         copyto!(out, 1, bb.data, 1, bb.len)
         oldbytes = vectorbytes(T, length(bb.data))
         bb.data = out
@@ -431,7 +351,6 @@ function budgetedpush!(v::FrozenVector{T}, x, budget::Union{Nothing,Budget}) whe
         newcap = max(2 * v.cap, 4)
         budget === nothing || reserve!(budget, vectorbytes(T, newcap))
         nd = Vector{T}(undef, newcap)
-        budget === nothing || allocated!(budget, vectorbytes(T, newcap))
         resize!(nd, length(v.data))
         copyto!(nd, 1, v.data, 1, length(v.data))
         oldbytes = vectorbytes(T, v.cap)
@@ -463,7 +382,6 @@ function growdict!(d::FrozenDict{K,V}, budget::Union{Nothing,Budget}) where {K,V
     budget === nothing || reserve!(budget, growth)
     nk = Vector{K}(undef, newcap)
     nv = Vector{V}(undef, newcap)
-    budget === nothing || allocated!(budget, growth)
     resize!(nk, length(d.keys))
     resize!(nv, length(d.vals))
     copyto!(nk, 1, d.keys, 1, length(d.keys))
@@ -499,7 +417,6 @@ function budgetedsort!(d::FrozenDict{K,V}, budget::Union{Nothing,Budget}) where 
     budget === nothing || reserve!(budget, scratch)
     perm = Vector{Int32}(undef, n)
     tmp = Vector{Int32}(undef, cld(n, 2))
-    budget === nothing || allocated!(budget, scratch)
     try
         mergesort!(perm, tmp, d.keys)
         dup = 0
@@ -567,7 +484,6 @@ function NameIndex{V}(budget::Union{Nothing,Budget}) where {V}
     resize!(keys, 0)
     resize!(vals, 0)
     index = NameIndex{V}(keys, vals, 0)
-    budget === nothing || allocated!(budget, charge)
     return index
 end
 
@@ -599,7 +515,6 @@ function Base.insert!(index::NameIndex{V}, key::String, value, budget::Union{Not
     budget === nothing || reserve!(budget, runbytes(V, 1))
     ks = String[key]
     vs = V[value]
-    budget === nothing || allocated!(budget, runbytes(V, 1))
     while !isempty(index.keys) && length(index.keys[end]) == length(ks)
         ks, vs = mergeruns(pop!(index.keys), pop!(index.vals), ks, vs, budget)
     end
@@ -615,7 +530,6 @@ function mergeruns(ak::Vector{String}, av::Vector{V}, bk::Vector{String}, bv::Ve
     budget === nothing || reserve!(budget, runbytes(V, n))
     ks = Vector{String}(undef, n)
     vs = Vector{V}(undef, n)
-    budget === nothing || allocated!(budget, runbytes(V, n))
     i = j = 1
     for k in 1:n
         if j > length(bk) || (i <= length(ak) && isless(ak[i], bk[j]))
@@ -665,7 +579,6 @@ end
 
 "Zero a budget for reuse by a prepared per-call path."
 function resetbudget!(b::Budget)
-    close!(b)
     b.reserved = 0
     b.peak = 0
     b.values = 0
@@ -675,7 +588,6 @@ function resetbudget!(b::Budget)
     b.members = 0
     b.resolution_work = 0
     b.allowance_used = 0
-    b.pending = 0
     b.workcap = min(b.limits.max_total_values, b.limits.work_allowance)
     b.workdeferred = 0
     b.default_position = 0
@@ -852,13 +764,8 @@ end
 """
     withbudget(f, limits; direction=:decode)
 
-Run `f(budget)` with a fresh operation budget, settling every pending reservation on every exit path.
+Run `f(budget)` with a fresh operation budget.
 """
 function withbudget(f, limits::Limits; direction::Symbol=:decode)
-    b = Budget(limits; direction=direction)
-    try
-        return f(b)
-    finally
-        close!(b)
-    end
+    return f(Budget(limits; direction=direction))
 end

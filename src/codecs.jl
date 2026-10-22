@@ -141,17 +141,11 @@ end
 
 # ---- the member loop over a TranscodingStreams codec -------------------------------------------------
 
+# Both helpers run inside a `decompressblock` body, whose rollback releases their reservations
+# when an allocation or the codec throws.
 function growbuffer!(budget::Budget, buf::Vector{UInt8}, newcap::Int, len::Int)
-    charge = bytesbytes(newcap)
-    reserve!(budget, charge)
-    nb = try
-        out = Vector{UInt8}(undef, newcap)
-        allocated!(budget, charge)
-        out
-    catch
-        unreserve!(budget, charge)
-        rethrow()
-    end
+    reserve!(budget, bytesbytes(newcap))
+    nb = Vector{UInt8}(undef, newcap)
     copyto!(nb, 1, buf, 1, len)
     release!(budget, bytesbytes(length(buf)))          # the old buffer dies with the caller's rebind
     return nb
@@ -159,16 +153,8 @@ end
 
 function shrinkexact(budget::Budget, buf::Vector{UInt8}, len::Int)
     len == length(buf) && return buf
-    charge = bytesbytes(len)
-    reserve!(budget, charge)
-    out = try
-        o = Vector{UInt8}(undef, len)
-        allocated!(budget, charge)
-        o
-    catch
-        unreserve!(budget, charge)
-        rethrow()
-    end
+    reserve!(budget, bytesbytes(len))
+    out = Vector{UInt8}(undef, len)
     copyto!(out, 1, buf, 1, len)
     release!(budget, bytesbytes(length(buf)))          # the old buffer dies with the caller's rebind
     return out
@@ -186,10 +172,9 @@ under `budget`, capped at `maxout` → `LimitError(:max_block_bytes)`); a member
 and produces none with input exhausted is truncated (`CodecError`).
 """
 function transcodemember!(name::Symbol, codec::TranscodingStreams.Codec, input::AbstractVector{UInt8}, from::Int, to::Int,
-                          out::Vector{UInt8}, outlen::Int, maxout::Int, budget::Budget, workspace::Int=0)
+                          out::Vector{UInt8}, outlen::Int, maxout::Int, budget::Budget)
     err = TranscodingStreams.Error()
     TranscodingStreams.initialize(codec)
-    workspace > 0 && allocated!(budget, workspace)     # the native state initialize just malloc'd
     inpos = from
     try
         TranscodingStreams.startproc(codec, :read, err) === :ok || throw(CodecError(name, :decompress, codecmessage(err)))
@@ -208,7 +193,6 @@ function transcodemember!(name::Symbol, codec::TranscodingStreams.Codec, input::
             if probing && outlen == 0
                 reserve!(budget, bytesbytes(1))
                 scratch = Vector{UInt8}(undef, 1)
-                allocated!(budget, bytesbytes(1))
             end
             outpointer = probing ?
                 (outlen == 0 ? pointer(scratch::Vector{UInt8}) : pointer(out, outlen)) :
@@ -245,7 +229,6 @@ function initialoutput(budget::Budget, inputlen::Int, maxout::Int)
     cap = min(max(4 * inputlen, 1 << 12), maxout)
     reserve!(budget, bytesbytes(cap))
     out = Vector{UInt8}(undef, cap)
-    allocated!(budget, bytesbytes(cap))
     return out
 end
 
@@ -265,7 +248,6 @@ function decompressblock(name::Symbol, ::NullCodec, payload::AbstractVector{UInt
         addmembers!(budget)
         reserve!(budget, bytesbytes(length(payload)))
         out = Vector{UInt8}(payload)
-        allocated!(budget, bytesbytes(length(payload)))
         return out
     catch
         rollbackreservations!(budget, checkpoint)
@@ -276,11 +258,11 @@ end
 function decompressblock(name::Symbol, ::DeflateReader, payload::AbstractVector{UInt8}, limits::Limits, budget::Budget)
     checkpoint = budgetcheckpoint(budget)
     try
-        reserve!(budget, DEFLATE_DECODER_BYTES)        # settled inside transcodemember! once initialize runs
+        reserve!(budget, DEFLATE_DECODER_BYTES)        # the decoder's native state while it runs
         out = initialoutput(budget, length(payload), limits.max_block_bytes)
         # Bytes after the final deflate block are ignored, as Java and Python readers do: the Apache
         # Python writer and fastavro 1.13.1 and earlier leave 3 bytes of the zlib checksum there.
-        _, out, outlen = transcodemember!(:deflate, DeflateDecompressor(), payload, 1, length(payload), out, 0, limits.max_block_bytes, budget, DEFLATE_DECODER_BYTES)
+        _, out, outlen = transcodemember!(:deflate, DeflateDecompressor(), payload, 1, length(payload), out, 0, limits.max_block_bytes, budget)
         release!(budget, DEFLATE_DECODER_BYTES)
         addinput!(budget, outlen)
         addmembers!(budget)
@@ -304,7 +286,6 @@ function decompressblock(name::Symbol, ::SnappyCodec, payload::AbstractVector{UI
         m <= limits.max_block_bytes || throw(LimitError(:max_block_bytes, m, limits.max_block_bytes, :max_block_bytes, :decode))
         reserve!(budget, bytesbytes(m))
         out = Vector{UInt8}(undef, m)
-        allocated!(budget, bytesbytes(m))
         len = Ref{Csize_t}(m)
         st2 = GC.@preserve payload out Snappy.LibSnappy.snappy_uncompress(pointer(payload), datalen, pointer(out), len)
         (st2 == Snappy.LibSnappy.SNAPPY_OK && Int(len[]) == m) || throw(CodecError(:snappy, :decompress, "snappy decompression failed (status $st2)"))
@@ -339,9 +320,9 @@ function decompressblock(name::Symbol, z::ZstdReader, payload::AbstractVector{UI
             est = zstd_frameestimate(payload, pos, rem)
             est === nothing && throw(CodecError(:zstandard, :decompress, "unreadable zstandard frame header at payload byte $pos"))
             est <= limits.max_codec_memory || throw(CodecError(:zstandard, :decompress, "the frame at payload byte $pos needs $est bytes of decoder memory; max_codec_memory is $(limits.max_codec_memory)"))
-            reserve!(budget, est)                      # settled inside transcodemember! once initialize runs
+            reserve!(budget, est)                      # the frame decoder's native state while it runs
             before = outlen
-            consumed, out, outlen = transcodemember!(:zstandard, ZstdDecompressor(windowLogMax=z.windowlogmax), payload, pos, pos + fsz - 1, out, outlen, limits.max_block_bytes, budget, est)
+            consumed, out, outlen = transcodemember!(:zstandard, ZstdDecompressor(windowLogMax=z.windowlogmax), payload, pos, pos + fsz - 1, out, outlen, limits.max_block_bytes, budget)
             release!(budget, est)
             consumed == fsz || throw(CodecError(:zstandard, :decompress, "zstandard frame not exactly consumed"))
             addinput!(budget, outlen - before)
@@ -432,21 +413,13 @@ function compressbound(w::WriterCodec, n::Int)
     return bytesbytes(compresscapacity(Val(w.name), n))
 end
 
-function boundedtranscode(name::Symbol, codec::TranscodingStreams.Codec,
-                          bytes::Vector{UInt8}, cap::Int,
-                          budget::Union{Nothing,Budget}=nothing, workspace::Int=0)
+function boundedtranscode(name::Symbol, codec::TranscodingStreams.Codec, bytes::Vector{UInt8}, cap::Int)
     out = Vector{UInt8}(undef, cap)
-    budget === nothing || allocated!(budget, bytesbytes(cap))
     err = TranscodingStreams.Error()
     initialized = false
-    workspaceresident = false
     try
         TranscodingStreams.initialize(codec)
         initialized = true
-        if budget !== nothing && workspace > 0
-            allocated!(budget, workspace)
-            workspaceresident = true
-        end
         TranscodingStreams.startproc(codec, :write, err) === :ok ||
             throw(CodecError(name, :compress, codecmessage(err)))
         TranscodingStreams.pledgeinsize(codec, Int64(length(bytes)), err) === :ok ||
@@ -477,25 +450,16 @@ function boundedtranscode(name::Symbol, codec::TranscodingStreams.Codec,
                 throw(CodecError(name, :compress, "codec made no progress"))
         end
     finally
-        try
-            initialized && TranscodingStreams.finalize(codec)
-        finally
-            if workspaceresident
-                release!(budget::Budget, workspace)
-                reserve!(budget::Budget, workspace)
-            end
-        end
+        initialized && TranscodingStreams.finalize(codec)
     end
 end
 
 "Compress one block's encoded bytes (snappy appends the big-endian CRC32 of the uncompressed data)."
-function compressblock(w::WriterCodec, bytes::Vector{UInt8},
-                       budget::Union{Nothing,Budget}=nothing)
+function compressblock(w::WriterCodec, bytes::Vector{UInt8})
     w.name === :null && return bytes
     if w.name === :snappy
         maxlen = Snappy.LibSnappy.snappy_max_compressed_length(UInt(length(bytes)))
         out = Vector{UInt8}(undef, Int(maxlen) + 4)
-        budget === nothing || allocated!(budget, bytesbytes(Int(maxlen) + 4))
         len = Ref{Csize_t}(maxlen)
         st = GC.@preserve bytes out Snappy.LibSnappy.snappy_compress(pointer(bytes), length(bytes), pointer(out), len)
         st == Snappy.LibSnappy.SNAPPY_OK || throw(CodecError(:snappy, :compress, "snappy compression failed (status $st)"))
@@ -506,8 +470,7 @@ function compressblock(w::WriterCodec, bytes::Vector{UInt8},
         return out
     end
     cap = compresscapacity(Val(w.name), length(bytes))
-    return boundedtranscode(w.name, w.factory()::TranscodingStreams.Codec, bytes, cap,
-                            budget, w.workspace)
+    return boundedtranscode(w.name, w.factory()::TranscodingStreams.Codec, bytes, cap)
 end
 
 "Verify an emitted zstandard frame decodes under `max_codec_memory` (unreachable by construction; gated)."

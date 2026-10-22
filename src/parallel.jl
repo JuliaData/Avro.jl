@@ -41,7 +41,7 @@ end
 "Fixed per-block decoder and coordinator state outside schema-derived builders and value storage."
 const BLOCK_STATE_MAX = 8 * MiB
 
-"The settled charged per-worker state allowance (task stacks are runtime-owned, documented)."
+"The charged per-worker state allowance (task stacks are runtime-owned, documented)."
 const WORKER_STATE = 16 * 1024
 
 struct PrescanResult
@@ -56,7 +56,6 @@ function prescanblocks(r::Reader)
     tablecap = 64
     reserve!(r.budget, blocktablecharge(tablecap))     # the block table grows by reserved exact-capacity replacement
     entries = Vector{BlockEntry}(undef, tablecap)
-    allocated!(r.budget, blocktablecharge(tablecap))
     nentries = 0
     rows = 0
     pending = nothing
@@ -90,7 +89,6 @@ function prescanblocks(r::Reader)
                 newcap = checked_mul(2, tablecap)
                 reserve!(r.budget, blocktablecharge(newcap))
                 replacement = Vector{BlockEntry}(undef, newcap)
-                allocated!(r.budget, blocktablecharge(newcap))
                 copyto!(replacement, 1, entries, 1, nentries)
                 entries = replacement                  # the old table is unreachable only after the rebind
                 release!(r.budget, blocktablecharge(tablecap))
@@ -132,7 +130,7 @@ end
 
 "A per-block budget: the block's own caps and counters under a ceiling of exactly `W`."
 function blockbudget(limits::Limits, W::Int)
-    return Budget(limits, W, :decode, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    return Budget(limits, W, :decode, 0, 0, 0, 0, 0, 0, 0, 0, 0,
                   min(limits.max_total_values, limits.work_allowance), 0, 0)
 end
 
@@ -194,7 +192,6 @@ function maketyped(plan::P, data::Vector{E}, base::Int, budget::Budget) where {P
     charge = columnnodebytes(TypedColumn{E,P})
     reserve!(budget, charge)
     column = TypedColumn{E,P}(plan, data, base)
-    allocated!(budget, charge)
     return column
 end
 
@@ -208,7 +205,6 @@ function directbuilders(p::RecordPlan, projection::Union{Nothing,Projection},
         outer = vectorbytes(ColumnBuilder, length(p.fields))
         reserve!(budget, outer)
         cols = Vector{ColumnBuilder}(undef, length(p.fields))
-        allocated!(budget, outer)
         for i in eachindex(p.fields)
             position = projection === nothing ? i : projection.slots[i]
             if position == 0
@@ -236,7 +232,6 @@ function directbuilders(p::ResolvedRecordPlan, projection::Union{Nothing,Project
         planbytes = vectorbytes(Union{Nothing,ReadPlan}, n)
         reserve!(budget, planbytes)
         plans = Vector{Union{Nothing,ReadPlan}}(nothing, n)
-        allocated!(budget, planbytes)
         for (slot, plan) in p.steps
             slot == 0 || (plans[slot] = plan)
         end
@@ -246,7 +241,6 @@ function directbuilders(p::ResolvedRecordPlan, projection::Union{Nothing,Project
         outer = vectorbytes(ColumnBuilder, n)
         reserve!(budget, outer)
         cols = Vector{ColumnBuilder}(undef, n)
-        allocated!(budget, outer)
         for i in 1:n
             plan = plans[i]::ReadPlan
             position = projection === nothing ? i : projection.slots[i]
@@ -423,8 +417,7 @@ function abandonjobs!(jobs::Vector{Union{Nothing,BlockJob}}, b::Budget, stats::P
         job === nothing && continue
         st = @atomic job.state
         st === :done && (stats.speculative_decoded += 1)
-        unreserve!(b, job.W)                           # worst-case headroom: reserved, never resident
-        close!(job.budget)
+        release!(b, job.W)                           # worst-case headroom: reserved, never resident
     end
     return nothing
 end
@@ -441,10 +434,9 @@ function commitjob!(r::Reader, job::BlockJob, finals::Vector{AbstractVector}, ke
     committed = false
     try
         phook(:commit, e.index)
-        unreserve!(b, job.W)                         # worst-case headroom: reserved, never resident
+        release!(b, job.W)                         # worst-case headroom: reserved, never resident
         worstowned = false
         reserve!(b, retained)                        # the block's retained chunks and payload
-        allocated!(b, retained)                      # resident under the job budget; the charge transfers here
         retainedowned = true
         addblocks!(b)
         addinput!(b, job.budget.input_bytes)
@@ -469,14 +461,12 @@ function commitjob!(r::Reader, job::BlockJob, finals::Vector{AbstractVector}, ke
         stats.jobpeakmax = max(stats.jobpeakmax, job.budget.peak)
         job.budget.peak <= job.W || (stats.peak_violations += 1)
         release!(b, checked_add(chunkcap, builderstate))  # references moved; payload transfers, counted once
-        close!(job.budget)
         committed = true
         return nothing
     finally
         if !committed
-            worstowned && unreserve!(b, job.W)       # worst-case headroom: reserved, never resident
+            worstowned && release!(b, job.W)       # worst-case headroom: reserved, never resident
             retainedowned && release!(b, retained)
-            close!(job.budget)
         end
     end
 end
@@ -526,8 +516,7 @@ end
 
 """
 Reserve the complete pool before its first package-owned object, then start the workers. A partial
-startup drains started workers and returns the never-resident reservation through `unreserve!`.
-Returns a live `BlockPool` with the pool-state charge settled resident.
+startup drains started workers and releases the reservation. Returns a live `BlockPool`.
 """
 function startpool(r::Reader, plan, projection::Union{Nothing,Projection}, slotrow::Int, nblocks::Int,
                    inflightcap::Int, nworkers::Int, poolstate::Int, resolved::Bool)
@@ -549,7 +538,6 @@ function startpool(r::Reader, plan, projection::Union{Nothing,Projection}, slotr
         end
         phook(:poolwrap, 0)
         pool = BlockPool(fail, jobs, ch, workers, poolstate, true)
-        allocated!(b, poolstate)                      # publish only after the complete pool exists
         return pool
     catch
         if ch !== nothing
@@ -557,14 +545,14 @@ function startpool(r::Reader, plan, projection::Union{Nothing,Projection}, slotr
         end
         ch = nothing
         workers = nothing
-        unreserve!(b, poolstate)                     # never settled: the pool objects die with this frame
+        release!(b, poolstate)                     # the pool objects die with this frame
         rethrow()
     end
 end
 
 """
 Retire a live pool: settle the workers, drop every pool object so nothing outlives the reservation,
-then release the settled pool-state charge. All in-flight jobs have committed (the ordered commit
+then release the pool-state charge. All in-flight jobs have committed (the ordered commit
 wave drains every admitted job before the loop re-enters), so nothing is abandoned here.
 """
 function retirepool!(pool::BlockPool, b::Budget)

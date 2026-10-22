@@ -308,7 +308,6 @@ function ParseContext(limits::Limits, budget::Budget, allow_invalid_names::Bool,
     ctx = ParseContext(limits, budget, allow_invalid_names, allow_invalid_defaults,
         NameIndex{Schema}(budget), NameIndex{Schema}(budget), pending, metas, metascap,
         Ref(0), legacyfixednames, 0, false, false, 0, path)
-    allocated!(budget, state)
     return ctx
 end
 
@@ -400,7 +399,6 @@ function growmetas!(ctx::ParseContext)
     newcap = checked_mul(2, ctx.metascap)
     reserve!(ctx.budget, vectorbytes(NodeMeta, newcap))
     replacement = Vector{NodeMeta}(undef, newcap)
-    allocated!(ctx.budget, vectorbytes(NodeMeta, newcap))
     resize!(replacement, length(ctx.metas))
     copyto!(replacement, 1, ctx.metas, 1, length(ctx.metas))
     oldbytes = vectorbytes(NodeMeta, ctx.metascap)
@@ -417,13 +415,11 @@ function newmeta!(ctx::ParseContext)
     reserve!(ctx.budget, NODE_META_BYTES + NODE_SHELL_BYTES)
     m = NodeMeta()
     push!(ctx.metas, m)
-    allocated!(ctx.budget, NODE_META_BYTES)       # the node shell settles after the node is constructed
     return m
 end
 
 "Settle the node-shell reservation `newmeta!` made, right after the schema node exists."
 function settlednode(ctx::ParseContext, s::Schema)
-    allocated!(ctx.budget, NODE_SHELL_BYTES)
     return s
 end
 
@@ -449,10 +445,9 @@ function collectprops(ctx::ParseContext, obj::JSONObject, grammar)
     slots = vectorbytes(String, n) + vectorbytes(Any, n) + 32
     reserve!(ctx.budget, slots)                    # the exact key/value capacity and dict shell
     p = emptywithcapacity(Props, n)
-    allocated!(ctx.budget, slots)
     for (k, v) in obj.members                      # sorted keys, so every insert appends
         k in grammar && continue
-        retain!(ctx.budget, sizeof(k) + 32)        # the tree key and value this schema keeps alive
+        reserve!(ctx.budget, sizeof(k) + 32)        # the tree key and value this schema keeps alive
         budgetedinsert!(p, k, v, ctx.budget)
     end
     return freeze!(p)
@@ -606,7 +601,6 @@ function sourcebytes(src::AbstractString, maxbytes::Int, budget::Budget, ::Type{
     charge = bytesbytes(n)
     reserve!(budget, charge)
     out = Vector{UInt8}(undef, n)
-    allocated!(budget, charge)
     copyto!(out, 1, codeunits(src), 1, n)
     return out
 end
@@ -620,7 +614,6 @@ function sourcebytes(src::AbstractVector{UInt8}, maxbytes::Int, budget::Budget, 
     charge = bytesbytes(n)
     reserve!(budget, charge)
     out = Vector{UInt8}(undef, n)
-    allocated!(budget, charge)
     copyto!(out, 1, src, 1, n)
     return out
 end
@@ -636,11 +629,9 @@ function sourcebytes(io::IO, maxbytes::Int, budget::Budget, ::Type{E}) where {E}
     cap = min(64 * KiB, readlimit)
     reserve!(budget, bytesbytes(cap))
     out = Vector{UInt8}(undef, cap)
-    allocated!(budget, bytesbytes(cap))
     chunkcap = min(64 * KiB, readlimit)
     reserve!(budget, bytesbytes(chunkcap))
     chunk = Vector{UInt8}(undef, chunkcap)
-    allocated!(budget, bytesbytes(chunkcap))
     len = 0
     while !eof(io)
         n = readbytes!(io, chunk, min(length(chunk), readlimit - len))
@@ -651,7 +642,6 @@ function sourcebytes(io::IO, maxbytes::Int, budget::Budget, ::Type{E}) where {E}
             newcap = min(max(grown, need), readlimit)
             reserve!(budget, bytesbytes(newcap))
             replacement = Vector{UInt8}(undef, newcap)
-            allocated!(budget, bytesbytes(newcap))
             copyto!(replacement, 1, out, 1, len)
             out = replacement                          # the old buffer is unreachable only after the rebind
             release!(budget, bytesbytes(cap))
@@ -668,7 +658,6 @@ function sourcebytes(io::IO, maxbytes::Int, budget::Budget, ::Type{E}) where {E}
     if len != cap
         reserve!(budget, bytesbytes(len))
         exact = Vector{UInt8}(undef, len)
-        allocated!(budget, bytesbytes(len))
         copyto!(exact, 1, out, 1, len)
         out = exact                                    # the old buffer is unreachable only after the rebind
         release!(budget, bytesbytes(cap))
@@ -789,10 +778,8 @@ function parseunion(ctx::ParseContext, arr::JSONArray, enclosing::String, buf)
     branchbytes = vectorbytes(Schema, length(arr)) + 24
     reserve!(ctx.budget, branchbytes)              # the exact branch capacity and frozen shell
     branches = emptywithcapacity(FrozenVector{Schema}, length(arr))
-    allocated!(ctx.budget, branchbytes)
     reserve!(ctx.budget, frozendictshell())
     seen = FrozenDict{BranchIdentity,Int}()
-    allocated!(ctx.budget, frozendictshell())
     try
         for (i, b) in enumerate(arr)
             pushparseindex!(ctx, i - 1)
@@ -895,7 +882,6 @@ function parsenamed(ctx::ParseContext, obj::JSONObject, enclosing::String)
     reserve!(ctx.budget, 48)                                   # the two frozen wrappers
     wrapped = (full, freeze!(FrozenVector{String}(finishbuild!(aliases, ctx.budget), false)),
                freeze!(FrozenVector{String}(raw, false)))
-    allocated!(ctx.budget, 48)
     return wrapped
 end
 
@@ -950,10 +936,9 @@ function parseenum(ctx::ParseContext, obj::JSONObject, enclosing::String, buf)
     indexbytes = vectorbytes(String, length(syms)) + vectorbytes(Int, length(syms)) + 32
     reserve!(ctx.budget, indexbytes)               # the exact symbol-index capacity and shell
     index = emptywithcapacity(FrozenDict{String,Int}, length(syms))
-    allocated!(ctx.budget, indexbytes)
     for (i, sym) in enumerate(syms)
         checkname(ctx, sym, "enum symbol", "symbols", i - 1)
-        retain!(ctx.budget, sizeof(sym) + 32)      # the symbol string the schema keeps alive
+        reserve!(ctx.budget, sizeof(sym) + 32)      # the symbol string the schema keeps alive
         budgetedappend!(index, sym, i, ctx.budget)
     end
     dup = budgetedsort!(index, ctx.budget)
@@ -991,7 +976,6 @@ function rawspan(ctx::ParseContext, range::UnitRange{Int}, buf)
     charge = stringbytes(n)
     reserve!(ctx.budget, charge)
     span = GC.@preserve buf unsafe_string(pointer(buf, first(range)), n)
-    allocated!(ctx.budget, charge)
     return span
 end
 
@@ -1001,7 +985,6 @@ function rawmembers(ctx::ParseContext, obj::JSONObject, buf, skipvalues=())
     charge = 48 + vectorbytes(String, n) + vectorbytes(RawMember, n)
     reserve!(ctx.budget, charge)
     members = emptywithcapacity(FrozenDict{String,RawMember}, n)
-    allocated!(ctx.budget, charge)
     for i in 1:n
         decoded = ownedstringcopy(obj.order[i], ctx.budget)
         rawkey = rawspan(ctx, obj.spans[i].key, buf)
@@ -1024,7 +1007,6 @@ function capturelexemes(ctx::ParseContext, obj::JSONObject, buf, schema::Schema)
     charge = 24 + vectorbytes(FrozenDict{String,RawMember}, n)
     reserve!(ctx.budget, charge)
     fields = emptywithcapacity(FrozenVector{FrozenDict{String,RawMember}}, n)
-    allocated!(ctx.budget, charge)
     for field in fieldjson
         field isa JSONObject || continue
         push!(fields, rawmembers(ctx, field, buf, ("type",)))
@@ -1045,7 +1027,6 @@ function parserecord(ctx::ParseContext, obj::JSONObject, enclosing::String, buf,
     reserve!(ctx.budget, fieldstate)               # exact field-vector and index capacity plus shells
     fields = emptywithcapacity(FrozenVector{Field}, nfields)
     fieldindex = emptywithcapacity(FrozenDict{String,Int}, nfields)
-    allocated!(ctx.budget, fieldstate)
     aliasowners = NameIndex{Int}(ctx.budget)
     rec = settlednode(ctx, RecordSchema(full, aliases, raw, doc, iserror, p, fields, fieldindex, newmeta!(ctx)))
     register!(ctx, rec)                            # register before filling so self-references resolve
@@ -1058,7 +1039,7 @@ function parserecord(ctx::ParseContext, obj::JSONObject, enclosing::String, buf,
             try
                 f isa JSONObject || schemaerror(ctx, "each field must be a JSON object")
                 field = parsefield(ctx, f, ns, buf)
-                retain!(ctx.budget, sizeof(field.name) + 96)   # the field name, Field shell and index entry kept alive
+                reserve!(ctx.budget, sizeof(field.name) + 96)   # the field name, Field shell and index entry kept alive
                 push!(fields, field)
                 budgetedappend!(fieldindex, field.name, i, ctx.budget)
             finally
@@ -1139,7 +1120,6 @@ function parsefield(ctx::ParseContext, obj::JSONObject, ns::String, buf)
     end
     reserve!(ctx.budget, 24)                                   # the frozen wrapper (the Field shell is retained by its record)
     f = Field(name, schema, doc, default, order, freeze!(FrozenVector{String}(finishbuild!(aliases, ctx.budget), false)), p)
-    allocated!(ctx.budget, 24)
     return f
 end
 
@@ -1152,7 +1132,6 @@ function makedefault(ctx::ParseContext, schema::Schema, json, span::String)
         ctx.repaired_defaults = true
         DefaultValue(json, 0, span, 0, false)
     end
-    allocated!(ctx.budget, 64)
     return d
 end
 
@@ -1292,7 +1271,6 @@ function decimaldefaultmatches(json::String, logical::DecimalLogical,
     try
         budget === nothing || reserve!(budget, bytecharge)
         bytes = Vector{UInt8}(undef, n)
-        budget === nothing || allocated!(budget, bytecharge)
         for (index, char) in enumerate(json)
             bytes[index] = UInt8(char)
         end
@@ -1308,7 +1286,6 @@ function decimaldefaultmatches(json::String, logical::DecimalLogical,
         end
         budget === nothing || reserve!(budget, bigcharge)
         magnitude = BigInt(; nbits=checked_mul(8, n))
-        budget === nothing || allocated!(budget, bigcharge)
         importdecimal!(magnitude, bytes, 1, n, false)
         valid = ndigits(magnitude) <= logical.precision
         magnitude = nothing
@@ -1319,7 +1296,7 @@ function decimaldefaultmatches(json::String, logical::DecimalLogical,
         magnitude = nothing
         bytes = nothing
         budget === nothing || rollbackreservations!(budget,
-                                                     checkpoint::NTuple{2,Int})
+                                                     checkpoint::Int)
         rethrow()
     end
 end
@@ -1453,7 +1430,6 @@ function replacedefault!(record::RecordSchema, index::Int, branch::Int,
     old.branch == branch && old.valid == valid && return nothing
     reserve!(budget, 64)
     replacement = DefaultValue(old.json, branch, old.span, old.index, valid)
-    allocated!(budget, 64)
     record.fields.data[index] = Field(field.name, field.schema, field.doc,
                                       replacement, field.order, field.aliases,
                                       field.props)
@@ -1520,7 +1496,6 @@ function validategraphdefaults!(root::Schema, nodes::Int, limits::Limits,
         charge = vectorbytes(Bool, nodes)
         reserve!(budget, charge)
         seen = Vector{Bool}(undef, nodes)
-        allocated!(budget, charge)
         fill!(seen, false)
         state = DefaultValidationState(budget, limits.max_depth)
         validategraphdefaultnode!(root, seen, state, ctx)
@@ -1565,7 +1540,6 @@ function finalize!(ctx::ParseContext, root::Schema)
     reserve!(ctx.budget, GRAPH_INFO_BYTES)
     info = GraphInfo(ctx.limits, ctx.repaired_names, ctx.repaired_defaults,
                      length(ctx.metas), ctx.namedcount[])
-    allocated!(ctx.budget, GRAPH_INFO_BYTES)
     for m in ctx.metas
         fillonce!(m.graph, info)
         isfilled(m.lexemes) || fillonce!(m.lexemes, EMPTY_SCHEMA_LEXEMES)
@@ -1676,12 +1650,7 @@ function Base.:(==)(a::Schema, b::Schema)
     a === b && return true
     typeof(a) === typeof(b) || return false
     limits = larger(graphinfo(a).limits, graphinfo(b).limits)
-    budget = Budget(limits)
-    try
-        return budgetedschemaequal(a, b, budget)
-    finally
-        close!(budget)
-    end
+    return budgetedschemaequal(a, b, Budget(limits))
 end
 
 function larger(a::Limits, b::Limits)
@@ -1702,13 +1671,11 @@ function schemaequalitymemo(a::Schema, budget::Budget)
         outercharge = vectorbytes(Vector{Int32}, n)
         reserve!(budget, outercharge)
         partners = Vector{Vector{Int32}}(undef, n)
-        allocated!(budget, outercharge)
         total = outercharge
         for i in eachindex(partners)
             innercharge = vectorbytes(Int32, 0)
             reserve!(budget, innercharge)
             partners[i] = Int32[]
-            allocated!(budget, innercharge)
             total = checked_add(total, innercharge)
         end
         return SchemaEqualityMemo(partners, budget, total)
@@ -1740,7 +1707,6 @@ function visitpair!(memo::SchemaEqualityMemo, a::Schema, b::Schema, budget::Budg
     try
         reserve!(budget, replacementcharge)
         replacement = Vector{Int32}(undef, n)
-        allocated!(budget, replacementcharge)
         copyto!(replacement, 1, partners, 1, i - 1)
         replacement[i] = ib
         copyto!(replacement, i + 1, partners, i, n - i)
@@ -1861,10 +1827,9 @@ function BoundedWriter(budget::Budget, maxbytes::Int; limit::Symbol=:max_schema_
     reserve!(budget, charge)
     try
         buf = Vector{UInt8}(undef, cap)
-        allocated!(budget, charge)
         return BoundedWriter(buf, 0, budget, maxbytes, limit, credit)
     catch
-        unreserve!(budget, charge)
+        release!(budget, charge)
         rethrow()
     end
 end
@@ -1879,14 +1844,7 @@ function boundedgrow!(w::BoundedWriter, n::Int)
         newcap = max(grown, written)
         newcharge = bytesbytes(newcap)
         reserve!(w.budget, newcharge)                  # reserved exact-capacity replacement
-        nb = try
-            out = Vector{UInt8}(undef, newcap)
-            allocated!(w.budget, newcharge)
-            out
-        catch
-            unreserve!(w.budget, newcharge)
-            rethrow()
-        end
+        nb = Vector{UInt8}(undef, newcap)
         copyto!(nb, 1, w.buf, 1, w.len)
         w.buf = nb                                     # the old buffer is unreachable only after the rebind
         release!(w.budget, bytesbytes(cap))
@@ -1913,24 +1871,10 @@ end
 function boundedtake!(w::BoundedWriter)
     stringcharge = stringbytes(w.len)
     reserve!(w.budget, stringcharge)
-    out = try
-        text = unsafe_string(pointer(w.buf), w.len)
-        allocated!(w.budget, stringcharge)
-        text
-    catch
-        unreserve!(w.budget, stringcharge)
-        rethrow()
-    end
+    out = unsafe_string(pointer(w.buf), w.len)
     emptycharge = bytesbytes(0)
     reserve!(w.budget, emptycharge)
-    emptybuf = try
-        buf = UInt8[]
-        allocated!(w.budget, emptycharge)
-        buf
-    catch
-        unreserve!(w.budget, emptycharge)
-        rethrow()
-    end
+    emptybuf = UInt8[]
     oldcharge = bytesbytes(length(w.buf))
     w.buf = emptybuf
     w.len = 0
@@ -1943,14 +1887,7 @@ function boundedview(w::BoundedWriter)
     length(w.buf) == w.len && return w.buf
     charge = bytesbytes(w.len)
     reserve!(w.budget, charge)
-    exact = try
-        buf = Vector{UInt8}(undef, w.len)
-        allocated!(w.budget, charge)
-        buf
-    catch
-        unreserve!(w.budget, charge)
-        rethrow()
-    end
+    exact = Vector{UInt8}(undef, w.len)
     copyto!(exact, 1, w.buf, 1, w.len)
     oldcharge = bytesbytes(length(w.buf))
     w.buf = exact
@@ -1963,14 +1900,7 @@ function schemaseen(s::Schema, budget::Budget)
     n = graphinfo(s).nodes
     charge = vectorbytes(Bool, n)
     reserve!(budget, charge)
-    seen = try
-        values = Vector{Bool}(undef, n)
-        allocated!(budget, charge)
-        values
-    catch
-        unreserve!(budget, charge)
-        rethrow()
-    end
+    seen = Vector{Bool}(undef, n)
     fill!(seen, false)
     return seen
 end
@@ -2342,7 +2272,6 @@ function budgetedjsoninsert!(dict::FrozenDict{String,Any}, key::String, value, b
     box = isbits(value) ? boxbytes(typeof(value)) : 0
     box > 0 && reserve!(budget, box)
     budgetedinsert!(dict, key, value, budget)
-    box > 0 && allocated!(budget, box)
     return dict
 end
 
@@ -2354,7 +2283,6 @@ function makeprops(propsin, structural, logical, budget::Budget)
     slots = frozendictshell() + 16 * cap
     reserve!(budget, slots)                            # the shell and exact slot capacity
     p = emptywithcapacity(Props, cap)
-    allocated!(budget, slots)
     kvs = propsin isa NamedTuple ? pairs(propsin) : propsin
     for (k, v) in kvs
         k isa Union{AbstractString,Symbol} || throw(ArgumentError("`props` keys must be strings or symbols"))
@@ -2404,15 +2332,8 @@ function ownedstringcopy(x::AbstractString, budget::Budget)
     peak = bytesbytes(n) + stringbytes(0)
     reserve!(budget, peak)
     bytes = Vector{UInt8}(undef, n)
-    allocated!(budget, bytesbytes(n))
     copyto!(bytes, 1, codeunits(x), 1, n)
     text = String(bytes)                              # takes ownership of the byte vector
-    if n == 0
-        unreserve!(budget, stringbytes(0))
-        retain!(budget, stringbytes(0))
-    else
-        allocated!(budget, stringbytes(0))
-    end
     release!(budget, bytesbytes(0))
     return text
 end
@@ -2421,15 +2342,8 @@ function ownedstringcopy(x::AbstractString, from::Int, n::Int, budget::Budget)
     peak = bytesbytes(n) + stringbytes(0)
     reserve!(budget, peak)
     bytes = Vector{UInt8}(undef, n)
-    allocated!(budget, bytesbytes(n))
     copyto!(bytes, 1, codeunits(x), from, n)
     text = String(bytes)
-    if n == 0
-        unreserve!(budget, stringbytes(0))
-        retain!(budget, stringbytes(0))
-    else
-        allocated!(budget, stringbytes(0))
-    end
     release!(budget, bytesbytes(0))
     return text
 end
@@ -2439,12 +2353,6 @@ function takeownedstring!(bytes::Vector{UInt8}, budget::Budget)
     shell = stringbytes(0)
     reserve!(budget, shell)
     text = String(bytes)
-    if isempty(text)
-        unreserve!(budget, shell)
-        retain!(budget, shell)
-    else
-        allocated!(budget, shell)
-    end
     release!(budget, bytesbytes(0))
     return text
 end
@@ -2453,7 +2361,6 @@ function ownedstringcopy(x::Symbol, budget::Budget)
     charge = stringbytes(sizeof(x))
     reserve!(budget, charge)
     text = String(x)
-    allocated!(budget, charge)
     return text
 end
 
@@ -2464,7 +2371,6 @@ end
 function tojsonvalueimpl(x::JSONNumber, b::Budget)
     reserve!(b, 32)
     copy = JSONNumber(ownedstringcopy(x.text, b))
-    allocated!(b, 32)
     return copy
 end
 
@@ -2479,7 +2385,6 @@ function tojsonvalueimpl(x::JSONObject, b::Budget, depth::Int)
     reserve!(b, slots)
     members = emptywithcapacity(FrozenDict{String,Any}, n)
     order = emptywithcapacity(FrozenVector{String}, n)
-    allocated!(b, slots)
     for key in x.order
         copy = ownedstringcopy(key, b)
         value = getindex(x.members, key)
@@ -2501,10 +2406,8 @@ function tojsonvalueimpl(x::AbstractFloat, b::Budget)
     text = repr(Float64(x))
     actual = stringbytes(sizeof(text))
     actual <= maximum || throw(ArgumentError("internal error: Float64 representation exceeds 32 bytes"))
-    allocated!(b, actual)
-    unreserve!(b, maximum - actual)
+    release!(b, maximum - actual)
     number = JSONNumber(text)
-    allocated!(b, 32)
     return number
 end
 
@@ -2526,13 +2429,11 @@ function copyjsonarray(x::AbstractVector, b::Budget, depth::Int)
     slots = 64 + 24 + vectorbytes(Any, n)
     reserve!(b, slots)                                 # shell, exact capacity and wrapper
     v = emptywithcapacity(FrozenVector{Any}, n)
-    allocated!(b, slots)
     for e in x
         value = tojsonvalue(e, b, depth + 1)
         box = isbits(value) ? boxbytes(typeof(value)) : 0
         box > 0 && reserve!(b, box)
         push!(v, value)
-        box > 0 && allocated!(b, box)
     end
     return JSONArray(freeze!(v))
 end
@@ -2544,7 +2445,6 @@ function tojsonvalueimpl(x::Union{AbstractDict,NamedTuple}, b::Budget, depth::In
     reserve!(b, slots)                                 # shells, exact slot capacity and wrapper
     m = emptywithcapacity(FrozenDict{String,Any}, n)
     order = emptywithcapacity(FrozenVector{String}, n)
-    allocated!(b, slots)
     for (k, v) in (x isa NamedTuple ? pairs(x) : x)
         k isa Union{AbstractString,Symbol} || throw(ArgumentError("JSON object keys must be strings or symbols"))
         ks = ownedstringcopy(k, b)
@@ -2608,12 +2508,10 @@ function publicmeta()
     budget = constructionbudget()
     reserve!(budget, NODE_META_BYTES + NODE_SHELL_BYTES)
     meta = NodeMeta()
-    allocated!(budget, NODE_META_BYTES)
     return meta
 end
 
 function publicnode(schema::Schema)
-    allocated!(constructionbudget(), NODE_SHELL_BYTES)
     return schema
 end
 
@@ -2651,7 +2549,6 @@ function finalizepublic!(s::Schema, limits::Limits, nodes::Int, named::Int)
         walkmetas = Vector{NodeMeta}(undef, 16)
         resize!(walkmetas, 0)
         walk = MetaWalk(walkmetas, 16)
-        allocated!(budget, walkstate)
         namedtypes = NameIndex{Schema}(budget)
         identities = NameIndex{Schema}(budget)
         collectmetas!(s, walk, namedtypes, identities, limits, budget, 1)
@@ -2662,7 +2559,6 @@ function finalizepublic!(s::Schema, limits::Limits, nodes::Int, named::Int)
         validategraphdefaults!(s, length(metas), limits, budget)
         reserve!(budget, GRAPH_INFO_BYTES)
         info = GraphInfo(limits, false, false, length(metas), length(namedtypes))
-        allocated!(budget, GRAPH_INFO_BYTES)
         for m in metas
             fillonce!(m.graph, info)
             isfilled(m.lexemes) || fillonce!(m.lexemes, EMPTY_SCHEMA_LEXEMES)
@@ -2690,7 +2586,6 @@ function checkexistinggraph!(s::Schema, limits::Limits, budget::Budget)
     charge = vectorbytes(Bool, info.nodes)
     reserve!(budget, charge)
     seen = Vector{Bool}(undef, info.nodes)
-    allocated!(budget, charge)
     fill!(seen, false)
     try
         checkexistingnode!(s, seen, limits, budget, 1)
@@ -2799,7 +2694,6 @@ function collectmetas!(s::Schema, walk::MetaWalk, namedtypes::NameIndex{Schema},
         newcap = checked_mul(2, walk.cap)
         reserve!(budget, vectorbytes(NodeMeta, newcap))
         replacement = Vector{NodeMeta}(undef, newcap)
-        allocated!(budget, vectorbytes(NodeMeta, newcap))
         resize!(replacement, length(walk.metas))
         copyto!(replacement, 1, walk.metas, 1, length(walk.metas))
         oldbytes = vectorbytes(NodeMeta, walk.cap)
@@ -2877,7 +2771,6 @@ function ownedfullname(f::FullName, budget::Budget)
     charge = stringbytes(n)
     reserve!(budget, charge)
     out = string(f.namespace, ".", f.name)
-    allocated!(budget, charge)
     return out
 end
 
@@ -2888,7 +2781,6 @@ function ownednormalizedalias(alias::String, namespace::String, budget::Budget)
     charge = stringbytes(n)
     reserve!(budget, charge)
     out = string(namespace, ".", alias)
-    allocated!(budget, charge)
     return out
 end
 
@@ -2950,7 +2842,6 @@ function publicnamed(name::AbstractString, namespace::AbstractString, aliases, s
     reserve!(b, wrappers)                              # the frozen wrappers, built next
     out = (full, freeze!(FrozenVector{String}(finishbuild!(norm, b), false)),
            freeze!(FrozenVector{String}(finishbuild!(raw, b), false)), makeprops(propsin, structural, logical))
-    allocated!(b, wrappers)
     return out
 end
 
@@ -2988,7 +2879,6 @@ function EnumSchema(name::AbstractString, symbols; namespace::AbstractString="",
         idxbytes = 48 + vectorbytes(String, length(syms)) + vectorbytes(Int, length(syms))
         reserve!(b, idxbytes)                          # the index shell and exact capacity
         index = emptywithcapacity(FrozenDict{String,Int}, length(syms))
-        allocated!(b, idxbytes)
         for (i, sym) in enumerate(syms)
             checkpublicname(sym, "enum symbol")
             budgetedappend!(index, sym, i, b)
@@ -3010,7 +2900,6 @@ function EnumSchema(name::AbstractString, symbols; namespace::AbstractString="",
         doccopy = doc === nothing ? nothing : ownedstringcopy(doc, b)
         reserve!(b, 24)                                # the symbol wrapper, made next
         frozen_symbols = freeze!(FrozenVector{String}(syms, false))
-        allocated!(b, 24)
         meta = publicmeta()
         s = publicnode(EnumSchema(full, norm, raw, doccopy, frozen_symbols, d,
                                   freeze!(index), p, meta))
@@ -3052,7 +2941,6 @@ function UnionSchema(branches; limits::Limits=Limits())
         bs = BuildBuf{Schema}(b, 0)
         reserve!(b, frozendictshell())
         seen = FrozenDict{BranchIdentity,Int}()
-        allocated!(b, frozendictshell())
         try
             withbuilder() do
                 for branch in branches
@@ -3074,7 +2962,6 @@ function UnionSchema(branches; limits::Limits=Limits())
         data = finishbuild!(bs, b)
         reserve!(b, 24)
         frozen = freeze!(FrozenVector{Schema}(data, false))
-        allocated!(b, 24)
         schema = publicnode(UnionSchema(frozen, publicmeta()))
         return finalizepublic!(schema, limits, 0, 0)
     end
@@ -3125,7 +3012,6 @@ function Field(name::AbstractString, schema::Schema; default=nodefault, order::S
         f = Field(namecopy, schema, doccopy, d, order,
                   freeze!(FrozenVector{String}(finishbuild!(als, b), false)),
                   makeprops(props, FIELD_GRAMMAR, nothing))
-        allocated!(b, fbytes)
         return f
     end
 end
@@ -3157,7 +3043,6 @@ function recordschema_(f, name::AbstractString; namespace::AbstractString="", al
     reserve!(b, recbytes)                              # the field-vector and index shells, made next
     fields = FrozenVector{Field}()
     index = FrozenDict{String,Int}()
-    allocated!(b, recbytes)
     doccopy = doc === nothing ? nothing : ownedstringcopy(doc, b)
     rec = publicnode(RecordSchema(full, norm, raw, doccopy, iserror, p,
                                   fields, index, publicmeta()))
@@ -3254,7 +3139,6 @@ function copyjsonvalue(value, budget::Budget, depth::Int)
     if value isa JSONNumber
         reserve!(budget, 32)
         copy = JSONNumber(ownedstringcopy(value.text, budget))
-        allocated!(budget, 32)
         return copy
     end
     value isa JSONArray && return copyjsonarray(value, budget, depth)
@@ -3266,7 +3150,6 @@ function assignjsoncopy!(values::Vector{Any}, index::Int, value, budget::Budget)
     box = isbits(value) ? boxbytes(typeof(value)) : 0
     box > 0 && reserve!(budget, box)
     values[index] = value
-    box > 0 && allocated!(budget, box)
     return nothing
 end
 
@@ -3277,7 +3160,6 @@ function copyjsonarray(source::JSONArray, budget::Budget, depth::Int)
     reserve!(budget, charge)
     values = Vector{Any}(undef, n)
     copy = JSONArray(FrozenVector{Any}(values, false))
-    allocated!(budget, charge)
     for (i, value) in enumerate(source.items)
         assignjsoncopy!(values, i, copyjsonvalue(value, budget, depth + 1), budget)
     end
@@ -3291,7 +3173,6 @@ function copyrangevector(source::FrozenVector{JSONMemberSpan}, budget::Budget)
     reserve!(budget, charge)
     values = Base.copy(source.data)
     out = FrozenVector{JSONMemberSpan}(values, true)
-    allocated!(budget, charge)
     return out
 end
 
@@ -3303,7 +3184,6 @@ function copyjsonobject(source::JSONObject, budget::Budget, depth::Int)
     sortedkeys = Vector{String}(undef, n)
     sortedvalues = Vector{Any}(undef, n)
     order = Vector{String}(undef, n)
-    allocated!(budget, arrays)
     for (i, key) in enumerate(source.members.keys)
         sortedkeys[i] = ownedstringcopy(key, budget)
         assignjsoncopy!(sortedvalues, i,
@@ -3320,7 +3200,6 @@ function copyjsonobject(source::JSONObject, budget::Budget, depth::Int)
     members = FrozenDict{String,Any}(sortedkeys, sortedvalues, true)
     ordered = FrozenVector{String}(order, true)
     out = JSONObject(members, ordered, ranges)
-    allocated!(budget, wrappers)
     return out
 end
 
@@ -3330,7 +3209,6 @@ function copyprops(props::Props, budget::Budget, depth::Int)
     charge = 48 + vectorbytes(String, n) + vectorbytes(Any, n)
     reserve!(budget, charge)
     copy = emptywithcapacity(Props, n)
-    allocated!(budget, charge)
     for (key, value) in props
         copiedkey = ownedstringcopy(key, budget)
         copiedvalue = copyjsonvalue(value, budget, depth)
@@ -3346,7 +3224,6 @@ function copystringvector(source::FrozenVector{String}, budget::Budget)
     reserve!(budget, charge)
     values = Vector{String}(undef, n)
     copy = FrozenVector{String}(values, false)
-    allocated!(budget, charge)
     for (i, value) in enumerate(source)
         values[i] = ownedstringcopy(value, budget)
     end
@@ -3371,7 +3248,6 @@ function copyrawmembers(source::FrozenDict{String,RawMember}, budget::Budget)
     charge = 48 + vectorbytes(String, n) + vectorbytes(RawMember, n)
     reserve!(budget, charge)
     copy = emptywithcapacity(FrozenDict{String,RawMember}, n)
-    allocated!(budget, charge)
     for (key, member) in source
         copiedkey = ownedstringcopy(key, budget)
         rawkey = ownedstringcopy(member.key, budget)
@@ -3390,7 +3266,6 @@ function copyschemalexemes(source::SchemaLexemes, budget::Budget)
     reserve!(budget, charge)
     fields = Vector{FrozenDict{String,RawMember}}(undef, n)
     wrapped = FrozenVector{FrozenDict{String,RawMember}}(fields, false)
-    allocated!(budget, charge)
     for (i, field) in enumerate(source.fields)
         fields[i] = copyrawmembers(field, budget)
     end
@@ -3406,7 +3281,6 @@ function copyschemalexemes(source::SchemaLexemes, fields::Vector{Int}, budget::B
     reserve!(budget, charge)
     copiedfields = Vector{FrozenDict{String,RawMember}}(undef, length(fields))
     wrapped = FrozenVector{FrozenDict{String,RawMember}}(copiedfields, false)
-    allocated!(budget, charge)
     for (i, field) in enumerate(fields)
         copiedfields[i] = field <= length(source.fields) ?
                           copyrawmembers(source.fields[field], budget) : EMPTY_RAW_MEMBERS
@@ -3439,7 +3313,6 @@ function copyfield(source::Field, schema::Schema, budget::Budget, depth::Int)
     props = copyprops(source.props, budget, depth)
     reserve!(budget, 128)
     copy = Field(name, schema, doc, default, source.order, aliases, props)
-    allocated!(budget, 128)
     return copy
 end
 
@@ -3450,7 +3323,6 @@ function copystringindex(values::FrozenVector{String}, source::FrozenDict{String
     charge = 48 + vectorbytes(String, n) + vectorbytes(Int, n)
     reserve!(budget, charge)
     index = emptywithcapacity(FrozenDict{String,Int}, n)
-    allocated!(budget, charge)
     resize!(index.keys, n)
     resize!(index.vals, n)
     for i in 1:n
@@ -3496,7 +3368,6 @@ function deepcopyschema(s::Schema, memo::Union{NameIndex{Schema},NameIndex{Tuple
         charge = vectorbytes(Schema, n) + 24
         reserve!(constructionbudget(), charge)
         bs = emptywithcapacity(FrozenVector{Schema}, n)
-        allocated!(constructionbudget(), charge)
         for b in s.branches
             budgetedpush!(bs, deepcopyschema(b, memo, depth + 1), constructionbudget())
         end
@@ -3531,7 +3402,6 @@ function deepcopyschema(s::Schema, memo::Union{NameIndex{Schema},NameIndex{Tuple
         reserve!(constructionbudget(), charge)
         fields = emptywithcapacity(FrozenVector{Field}, n)
         index = emptywithcapacity(FrozenDict{String,Int}, n)
-        allocated!(constructionbudget(), charge)
         c = publicnode(RecordSchema(name, aliases, rawaliases, doc, s.iserror,
                                     props, fields, index, meta))
         remembercopy!(memo, s, c)
@@ -3580,7 +3450,6 @@ function minsize(s::Schema, budget::Union{Nothing,Budget})
     best = fill(INFINITE, n)
     seen = falses(n)
     done = falses(n)
-    budget === nothing || allocated!(budget, scratch)
     edges = BuildBuf{NTuple{3,Int32}}(budget, 8)       # (parent, branch position or 0 for a field, next edge)
     stack = BuildBuf{Int32}(budget, 8)
     heap = BuildBuf{Tuple{Int,Int32}}(budget, 8)

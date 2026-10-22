@@ -43,9 +43,9 @@ function Avro.decompressblock(name::Symbol, r::XzReader, payload::AbstractVector
                 break                                                  # trailing padding in multiples of four ends the payload
             end
             Avro.addmembers!(budget)
-            Avro.reserve!(budget, limits.max_codec_memory)        # settled inside transcodemember! once initialize runs
+            Avro.reserve!(budget, limits.max_codec_memory)        # the decoder's native state while it runs
             before = outlen
-            consumed, out, outlen = Avro.transcodemember!(:xz, XzDecompressor(memlimit=r.memlimit, flags=UInt32(0)), payload, pos, total, out, outlen, limits.max_block_bytes, budget, limits.max_codec_memory)
+            consumed, out, outlen = Avro.transcodemember!(:xz, XzDecompressor(memlimit=r.memlimit, flags=UInt32(0)), payload, pos, total, out, outlen, limits.max_block_bytes, budget)
             Avro.release!(budget, limits.max_codec_memory)
             consumed == 0 && throw(Avro.CodecError(:xz, :decompress, "invalid xz stream at payload byte $pos"))
             Avro.addinput!(budget, outlen - before)

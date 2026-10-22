@@ -476,12 +476,11 @@ function decodestring(buf::AbstractVector{UInt8}, i::Int, j::Int,
     if !hasescape
         n = j - i - 1
         if n == 0
-            budget === nothing || retain!(budget, stringbytes(0))
+            budget === nothing || reserve!(budget, stringbytes(0))
             text = ""
         else
             budget === nothing || reserve!(budget, stringbytes(n))
             text = GC.@preserve buf unsafe_string(pointer(buf, i + 1), n)
-            budget === nothing || allocated!(budget, stringbytes(n))
         end
         return text
     end
@@ -489,7 +488,6 @@ function decodestring(buf::AbstractVector{UInt8}, i::Int, j::Int,
     scratch = bytesbytes(n)
     budget === nothing || reserve!(budget, scratch)
     out = Vector{UInt8}(undef, n)
-    budget === nothing || allocated!(budget, scratch)
     position = 1
     k = i + 1
     while k < j
@@ -593,11 +591,6 @@ function reservecharge!(r::JSONReader, n::Int)
     return nothing
 end
 
-function settlecharge!(r::JSONReader, n::Int)
-    r.budget === nothing || allocated!(r.budget, n)
-    return nothing
-end
-
 function releasecharge!(r::JSONReader, n::Int)
     r.budget === nothing || release!(r.budget, n)
     return nothing
@@ -653,12 +646,10 @@ function parsevalue!(r::JSONReader)
         reservecharge!(r, toklen)
         buf = r.buf
         tok = GC.@preserve buf unsafe_string(pointer(buf, start), n)
-        settlecharge!(r, toklen)
         iv = parseinteger(tok)
         iv === nothing || (releasecharge!(r, toklen); return iv)   # the token dies with its integer value
         reservecharge!(r, 32)
         number = JSONNumber(tok)
-        settlecharge!(r, 32)
         return number
     else
         r.errfn("unexpected byte 0x$(string(b; base=16, pad=2))", r.pos)
@@ -687,7 +678,6 @@ function pushjsonvalue!(items::BuildBuf{Any}, r::JSONReader, value)
     box = isbits(value) ? boxbytes(typeof(value)) : 0
     reservecharge!(r, box)
     push!(items, r.budget, value)
-    settlecharge!(r, box)
     return items
 end
 
@@ -720,7 +710,6 @@ function parsearray!(r::JSONReader)
     data = finishbuild!(items, r.budget)
     reservecharge!(r, jsonarrayshell())
     a = JSONArray(freeze!(FrozenVector{Any}(data, false)))
-    settlecharge!(r, jsonarrayshell())
     return a
 end
 
@@ -785,7 +774,6 @@ function buildobject(r::JSONReader, keys::Vector{String}, vals::Vector{Any},
     reservecharge!(r, scratchbytes)                    # the sort permutation and merge scratch, transient
     perm = Vector{Int32}(undef, n)
     scratch = Vector{Int32}(undef, cld(n, 2))
-    settlecharge!(r, scratchbytes)
     mergesort!(perm, scratch, keys)
     for i in 2:n
         key = keys[perm[i]]
@@ -798,7 +786,6 @@ function buildobject(r::JSONReader, keys::Vector{String}, vals::Vector{Any},
     reservecharge!(r, sortedbytes)                     # the retained sorted key/value mirrors
     sortedkeys = Vector{String}(undef, n)
     sortedvals = Vector{Any}(undef, n)
-    settlecharge!(r, sortedbytes)
     for (i, p) in enumerate(perm)
         sortedkeys[i] = keys[p]
         sortedvals[i] = vals[p]
@@ -809,6 +796,5 @@ function buildobject(r::JSONReader, keys::Vector{String}, vals::Vector{Any},
     d = FrozenDict{String,Any}(sortedkeys, sortedvals, false)
     o = JSONObject(freeze!(d), freeze!(FrozenVector{String}(keys, false)),
                    freeze!(FrozenVector{JSONMemberSpan}(spans, false)))
-    settlecharge!(r, jsonobjectshell())
     return o
 end

@@ -128,7 +128,6 @@ end
         recycle = true
     finally
         d.buf = EMPTY_BYTES                            # never pin the caller's bytes from the pool
-        close!(d.budget)
         recycle && @atomicswap(r.scratch = d)          # a failed call drops its scratch instead
     end
     return (finishtyped(r.plan, v, r.names), next)
@@ -259,14 +258,14 @@ end
 
 "Reset the writer's retained encoder and charge its existing buffer to the new operation."
 function preparedencoder!(w::DatumWriter, budget::Budget)
-    retain!(budget, checked_add(w.fastbytes, w.fixedbytes))
+    reserve!(budget, checked_add(w.fastbytes, w.fixedbytes))
     e = w.encoder
     if e === nothing
         e = Encoder(budget)
         w.encoder = e
         return e
     end
-    retain!(budget, encoderstorage(e))
+    reserve!(budget, encoderstorage(e))
     e.budget = budget
     e.owner = budget
     return reset!(e)
@@ -279,7 +278,6 @@ function takeowned!(e::Encoder)
     try
         reserve!(e.budget, charge)
         out = take!(e)
-        allocated!(e.budget, charge)
         release!(e.budget, charge)                    # caller ownership starts at the return boundary
         return out
     catch
@@ -290,34 +288,26 @@ end
 
 function (w::DatumWriter)(x)
     budget = resetbudget!(w.callbudget)
+    e = preparedencoder!(w, budget)
     try
-        e = preparedencoder!(w, budget)
-        try
-            writeprepared!(w, e, x)
-            return takeowned!(e)
-        catch
-            reset!(e)
-            rethrow()
-        end
-    finally
-        close!(budget)
+        writeprepared!(w, e, x)
+        return takeowned!(e)
+    catch
+        reset!(e)
+        rethrow()
     end
 end
 
 function (w::DatumWriter)(io::IO, x)
     budget = resetbudget!(w.callbudget)
+    e = preparedencoder!(w, budget)
     try
-        e = preparedencoder!(w, budget)
-        try
-            writeprepared!(w, e, x)
-            buf = e.buf
-            GC.@preserve buf Base.unsafe_write(io, pointer(buf), UInt(e.pos))
-            return nothing
-        finally
-            reset!(e)
-        end
+        writeprepared!(w, e, x)
+        buf = e.buf
+        GC.@preserve buf Base.unsafe_write(io, pointer(buf), UInt(e.pos))
+        return nothing
     finally
-        close!(budget)
+        reset!(e)
     end
 end
 
@@ -328,8 +318,8 @@ function (w::DatumWriter{P,T,FP})(e::Encoder, x) where {P,T,FP}
     start = e.pos
     olddepth = e.depth
     oldcredited = e.credited
-    retain!(budget, checked_add(w.fastbytes, w.fixedbytes))
-    retain!(budget, encoderstorage(e))
+    reserve!(budget, checked_add(w.fastbytes, w.fixedbytes))
+    reserve!(budget, encoderstorage(e))
     e.budget = budget
     e.credited = start
     e.depth = 0
@@ -344,7 +334,6 @@ function (w::DatumWriter{P,T,FP})(e::Encoder, x) where {P,T,FP}
         e.budget = original
         e.depth = olddepth
         e.credited = oldcredited
-        close!(budget)
     end
 end
 
@@ -466,7 +455,7 @@ function encode!(e::Encoder, schema::Schema, x; limits::Limits=Limits())
         start = e.pos
         depth = e.depth
         credited = e.credited
-        retain!(budget, encoderstorage(e))
+        reserve!(budget, encoderstorage(e))
         e.budget = budget
         e.depth = 0
         e.credited = start

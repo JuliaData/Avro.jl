@@ -290,14 +290,7 @@ function printfloat(io::IO, v::AbstractFloat, budget::Budget)
     capacity = Base.Ryu.neededdigits(typeof(v))
     charge = bytesbytes(capacity)
     reserve!(budget, charge)
-    bytes = try
-        buffer = Vector{UInt8}(undef, capacity)
-        allocated!(budget, charge)
-        buffer
-    catch
-        unreserve!(budget, charge)
-        rethrow()
-    end
+    bytes = Vector{UInt8}(undef, capacity)
     try
         stop = Base.Ryu.writeshortest(bytes, 1, v)
         GC.@preserve bytes Base.unsafe_write(io, pointer(bytes), UInt(stop - 1))
@@ -595,7 +588,6 @@ function jsonkind(s::FixedSchema, j, ctx, depth)
     end
     reserve!(ctx.budget, STORAGE[].fixed)
     value = Fixed(s, bytes, Val(:unchecked))
-    allocated!(ctx.budget, STORAGE[].fixed)
     return value
 end
 
@@ -623,7 +615,6 @@ function jsonkind(s::EnumSchema, j, ctx, depth)
         jsonerror(ctx, boundedquoted(j), " is not a symbol of enum ", s.name)
     reserve!(ctx.budget, enumvaluebytes())
     v = EnumValue(s, Int32(getindex(s.symbolindex, j)), Val(:unchecked))
-    allocated!(ctx.budget, enumvaluebytes())
     return v
 end
 
@@ -634,7 +625,6 @@ function jsonkind(s::ArraySchema, j, ctx, depth)
     n = length(j)
     reserve!(ctx.budget, vectorbytes(E, n))
     out = Vector{E}(undef, n)
-    allocated!(ctx.budget, vectorbytes(E, n))
     for i in 1:n
         out[i] = jsontovalue(s.items, j[i], ctx, depth + 1)
     end
@@ -650,7 +640,6 @@ function jsonkind(s::MapSchema, j, ctx, depth)
     reserve!(ctx.budget, vectorbytes(String, n) + vectorbytes(V, n))   # buildmap charges the struct and permutation
     keys = Vector{String}(undef, n)
     vals = Vector{V}(undef, n)
-    allocated!(ctx.budget, vectorbytes(String, n) + vectorbytes(V, n))
     for i in 1:n
         k = ks[i]
         isstrictutf8(k) ||
@@ -682,7 +671,6 @@ function jsonkind(s::RecordSchema, j, ctx, depth)
     end
     reserve!(ctx.budget, recordbytes(n))
     vals = Vector{Any}(undef, n)
-    allocated!(ctx.budget, vectorbytes(Any, n))        # the Record shell settles at construction
     for (i, f) in enumerate(s.fields)
         b = boxcharge(juliatype(f.schema))
         b > 0 && reserve!(ctx.budget, b)                                # before the assignment can box
@@ -697,20 +685,17 @@ function jsonkind(s::RecordSchema, j, ctx, depth)
             jsonerror(ctx, "missing field ", boundedquoted(f.name),
                       " of record ", s.name)
         end
-        b > 0 && allocated!(ctx.budget, b)
     end
     r = Record(s, vals, Val(:unchecked))
-    allocated!(ctx.budget, recordbytes(n) - vectorbytes(Any, n))
     return r
 end
 
-# A `UnionValue` wrapper charged and settled under the JSON decode budget (shell plus the box an
+# A `UnionValue` wrapper charged under the JSON decode budget (shell plus the box an
 # isbits payload takes on assignment into the wrapper's Any field).
 function chargedunion(i::Int, v, ctx)
     box = isbits(v) ? boxbytes(typeof(v)) : 0
     reserve!(ctx.budget, unionvaluebytes() + box)
     u = UnionValue(i, v)
-    allocated!(ctx.budget, unionvaluebytes() + box)
     return u
 end
 
@@ -776,7 +761,6 @@ function bytesfromjson(j, size::Int, ctx::JSONContext)
     checkvaluebytes(ctx.budget, n)
     reserve!(ctx.budget, bytesbytes(n))
     out = Vector{UInt8}(undef, n)
-    allocated!(ctx.budget, bytesbytes(n))
     for (i, c) in enumerate(j)
         out[i] = UInt8(c)
     end

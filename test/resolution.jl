@@ -9,17 +9,13 @@
         @test rs isa Avro.ResolvedSchema && rs.union_resolution === :spec && rs.plan isa Avro.PromotePlan
         promote_budget = Avro.Budget(Avro.Limits())
         @test Avro.resolve(w, P("\"long\""); budget=promote_budget).plan isa Avro.PromotePlan
-        @test promote_budget.pending == 0
         @test promote_budget.reserved == 64
-        Avro.close!(promote_budget)
 
         array_budget = Avro.Budget(Avro.Limits())
         array_writer = P("{\"type\":\"array\",\"items\":\"int\"}")
         array_reader = P("{\"type\":\"array\",\"items\":\"long\"}")
         @test Avro.resolve(array_writer, array_reader; budget=array_budget).plan isa Avro.ArrayPlan
-        @test array_budget.pending == 0
         @test array_budget.reserved == 128
-        Avro.close!(array_budget)
 
         union_writer = P("[{\"type\":\"record\",\"name\":\"BranchRecord\",\"fields\":[{\"name\":\"a\",\"type\":\"int\"}]}]")
         late_reader = P("{\"type\":\"record\",\"name\":\"BranchRecord\",\"fields\":[{\"name\":\"a\",\"type\":\"long\"},{\"name\":\"z\",\"type\":\"int\"}]}")
@@ -34,7 +30,6 @@
                           Avro.stringbytes(sizeof(failedbranch.writerpath)) +
                           Avro.stringbytes(sizeof(failedbranch.readerpath))
             push!(branchcharges, branchbudget.reserved - diagnostics)
-            Avro.close!(branchbudget)
         end
         @test branchcharges[1] == branchcharges[2]
 
@@ -48,18 +43,14 @@
             diagnosticplan = Avro.resolve(diagnosticwriter, diagnosticreader;
                 budget=diagnosticbudget).plan
             @test diagnosticplan.branches[1] isa Avro.UnresolvableBranch
-            @test diagnosticbudget.pending == 0
             push!(diagnosticcharges, diagnosticbudget.reserved)
-            Avro.close!(diagnosticbudget)
 
             enumwriter = P("{\"type\":\"record\",\"name\":\"EnumDiagnosticRecord\",\"fields\":[{\"name\":\"$field\",\"type\":{\"type\":\"enum\",\"name\":\"DiagnosticEnum\",\"symbols\":[\"A\",\"B\"]}}]}")
             enumreader = P("{\"type\":\"record\",\"name\":\"EnumDiagnosticRecord\",\"fields\":[{\"name\":\"$field\",\"type\":{\"type\":\"enum\",\"name\":\"DiagnosticEnum\",\"symbols\":[\"B\",\"A\"]}}]}")
             enumbudget = Avro.Budget(Avro.Limits())
             enumplan = Avro.resolve(enumwriter, enumreader; budget=enumbudget).plan
             @test enumplan.steps[1].second isa Avro.EnumRemapPlan
-            @test enumbudget.pending == 0
             push!(enumdiagnosticcharges, enumbudget.reserved)
-            Avro.close!(enumbudget)
         end
         @test diagnosticcharges[2] - diagnosticcharges[1] >= 2 * 999
         @test enumdiagnosticcharges[2] - enumdiagnosticcharges[1] >= 2 * 999
@@ -334,7 +325,6 @@
         directvalue = Avro.jsonvalue(nesteddefault, directbudget)
         @test directvalue.u === Int32(7)
         @test directbudget.values == 3
-        Avro.close!(directbudget)
         nestedlimits = Avro.Limits(max_total_values=4)
         nestedtarget = @NamedTuple{outer::@NamedTuple{u::Union{Missing,Int32}}}
         nestedcontainer = take!(Avro.tobuffer([NamedTuple()]; schema=nestedwriter))
@@ -442,7 +432,6 @@
         GC.@preserve frozenvalue outputvalue begin
             @test pointer(frozenvalue) != pointer(outputvalue)
         end
-        Avro.close!(mapbudget)
 
         function distinctstringstorage(first::String, second::String)
             GC.@preserve first second begin
@@ -516,7 +505,6 @@
             budget = Avro.Budget(Avro.Limits(max_total_values=3))
             Avro.jsonvalue(dp, budget)
             @test budget.values == 3
-            Avro.close!(budget)
         end
         compoundtarget = @NamedTuple{
             array_default::Vector{Union{Missing,Int32}},

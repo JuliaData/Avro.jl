@@ -121,7 +121,6 @@ function checkorderable(s::Schema, budget::Budget)
     charge = vectorbytes(Bool, n)
     reserve!(budget, charge)
     visited = fill(false, n)
-    allocated!(budget, charge)
     try
         return checkorderable(s, visited, budget)
     finally

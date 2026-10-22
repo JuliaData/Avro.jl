@@ -378,7 +378,6 @@ end
 function diagnosticbuffer(n::Int, budget::Budget)
     reserve!(budget, bytesbytes(n))
     buf = Vector{UInt8}(undef, n)
-    allocated!(budget, bytesbytes(n))
     return buf
 end
 
@@ -525,7 +524,6 @@ function resolve(writer::Schema, reader::Schema; union_resolution::Symbol=:spec,
         readermemo = Vector{Union{Nothing,ReadPlan}}(nothing, rnodes)
         writermemo = Vector{Union{Nothing,ReadPlan}}(nothing, wnodes)
         memocaps = zeros(Int32, wnodes)
-        allocated!(budget, tables)
         ctx = ResolveContext(budget, union_resolution, decimal_little, memokeys, memoplans, memocaps,
                              readermemo, writermemo, BuildBuf{NTuple{2,Int32}}(budget, 8))
         writerpath = ResolutionPath(budget, 8)
@@ -603,7 +601,6 @@ function memostore!(ctx::ResolveContext, w::Schema, r::Schema, p::ReadPlan,
         reserve!(ctx.budget, growth)                   # the replacement partner vectors
         nk = Vector{Int32}(undef, newcap)
         np = Vector{ReadPlan}(undef, newcap)
-        allocated!(ctx.budget, growth)
         resize!(nk, length(keys))
         resize!(np, length(keys))
         copyto!(nk, 1, keys, 1, length(keys))
@@ -943,7 +940,6 @@ function plansnapshot(ctx::ResolveContext, memo::Vector{Union{Nothing,ReadPlan}}
     charge = vectorbytes(Bool, length(memo))
     reserve!(ctx.budget, charge)
     present = Vector{Bool}(undef, length(memo))
-    allocated!(ctx.budget, charge)
     for i in eachindex(memo)
         present[i] = memo[i] !== nothing
     end
@@ -959,13 +955,9 @@ function restoreplans!(memo::Vector{Union{Nothing,ReadPlan}}, present::Vector{Bo
 end
 
 "Roll back a failed branch but keep exact replacement growth in its reusable pair memo tables."
-function rollbackbranch!(budget::Budget, checkpoint::NTuple{2,Int}, keep::Int)
-    reserved0, pending0 = checkpoint
-    pend = budget.pending - pending0
-    pend > 0 && unreserve!(budget, pend)
-    resident = budget.reserved - reserved0 - max(pend, 0)
-    discard = resident - keep
-    discard >= 0 || throw(ArgumentError("branch rollback retained $keep bytes from only $resident resident bytes"))
+function rollbackbranch!(budget::Budget, checkpoint::Int, keep::Int)
+    discard = budget.reserved - checkpoint - keep
+    discard >= 0 || throw(ArgumentError("branch rollback retained $keep bytes from only $(budget.reserved - checkpoint) reserved bytes"))
     discard > 0 && release!(budget, discard)
     return nothing
 end
@@ -1020,7 +1012,6 @@ function resolvewriterunion(ctx::ResolveContext, w::UnionSchema, r::Schema,
     resize!(branches, 0)
     rindex = Vector{Int}(undef, n)
     resize!(rindex, 0)
-    allocated!(ctx.budget, vectors)
     for (i, b) in enumerate(w.branches)
         pushindex!(wp, i - 1, ctx.budget)
         try
@@ -1053,7 +1044,6 @@ function resolvewriterunion(ctx::ResolveContext, w::UnionSchema, r::Schema,
         end
     end
     plan = UnionResolvePlan(branches, rindex, r isa UnionSchema ? nullablebranch(r) : 0, r isa UnionSchema)
-    allocated!(ctx.budget, node)
     return plan
 end
 
@@ -1083,7 +1073,6 @@ function resolveenum(ctx::ResolveContext, w::EnumSchema, r::EnumSchema,
     try
         reserve!(ctx.budget, mapbytes + node)
         map = Vector{Int32}(undef, length(w.symbols))
-        allocated!(ctx.budget, mapbytes)
         for (i, sym) in enumerate(w.symbols)
             addresolution!(ctx.budget, 1)
             map[i] = Int32(get(r.symbolindex, sym, 0))
@@ -1093,7 +1082,6 @@ function resolveenum(ctx::ResolveContext, w::EnumSchema, r::EnumSchema,
         d = r.default
         plan = EnumRemapPlan(w, r, map, (d isa DefaultValue && d.valid) ? Int32(d.index) : Int32(0),
                              ownedwp, ownedrp)
-        allocated!(ctx.budget, node)
         return plan
     catch
         rollbackreservations!(ctx.budget, checkpoint)
@@ -1114,21 +1102,15 @@ function resolverecord(ctx::ResolveContext, w::RecordSchema, r::RecordSchema,
     boxes = Vector{Int}(undef, nr)
     resize!(boxes, 0)
     plan = ResolvedRecordPlan(r, steps, defaults, boxes)
-    allocated!(ctx.budget, slots)
     memostore!(ctx, w, r, plan, javasoft)              # before the fields, so recursive references resolve
     candcharge = vectorbytes(Int, nr)
     aliascharge = vectorbytes(UInt64, cld(nr, 64)) + 64
     claimedcharge = vectorbytes(Int, nw)
     scratch = candcharge + aliascharge + claimedcharge
     reserve!(ctx.budget, scratch)                      # the matching scratch, released when the plan is filled
-    settled = 0
     try
         cand = zeros(Int, nr)                          # the writer field each reader field names
-        allocated!(ctx.budget, candcharge)
-        settled += candcharge
         viaalias = falses(nr)
-        allocated!(ctx.budget, aliascharge)
-        settled += aliascharge
         for (j, rf) in enumerate(r.fields)
             for name in Iterators.flatten(((rf.name,), rf.aliases))
                 addresolution!(ctx.budget, 1)
@@ -1149,8 +1131,6 @@ function resolverecord(ctx::ResolveContext, w::RecordSchema, r::RecordSchema,
             end
         end
         claimed = zeros(Int, nw)                       # reader field per writer field; aliases claim first
-        allocated!(ctx.budget, claimedcharge)
-        settled += claimedcharge
         for pass in (true, false), (j, rf) in enumerate(r.fields)
             (cand[j] != 0 && viaalias[j] == pass) || continue
             i = cand[j]
@@ -1208,9 +1188,7 @@ function resolverecord(ctx::ResolveContext, w::RecordSchema, r::RecordSchema,
         end
         return plan
     finally
-        unsettled = scratch - settled
-        unsettled > 0 && unreserve!(ctx.budget, unsettled)
-        settled > 0 && release!(ctx.budget, settled)
+        release!(ctx.budget, scratch)
     end
 end
 
@@ -1425,7 +1403,6 @@ function fromraw(::BytesPlan, d::Decoder, raw::String)
     n = sizeof(raw)
     reserve!(d.budget, bytesbytes(n))
     out = Vector{UInt8}(codeunits(raw))
-    allocated!(d.budget, bytesbytes(n))
     release!(d.budget, stringbytes(n))                    # the promoted string dies with this frame
     return out
 end
@@ -1434,7 +1411,6 @@ function fromraw(p::DecimalPlan, d::Decoder, raw::String)
     n = sizeof(raw)
     reserve!(d.budget, bytesbytes(n))
     bytes = Vector{UInt8}(codeunits(raw))
-    allocated!(d.budget, bytesbytes(n))
     release!(d.budget, stringbytes(n))                    # the promoted string dies with this frame
     isempty(bytes) && dataerror(d, "empty decimal payload")
     v = decimalfrombytes(Decoder(bytes, d.budget), p, 1, n)
@@ -1477,7 +1453,6 @@ function decodevalue(p::EnumRemapPlan, d::Decoder)
     j = enumremapindex(p, d)
     reserve!(d.budget, enumvaluebytes())
     v = EnumValue(p.reader, j, Val(:unchecked))
-    allocated!(d.budget, enumvaluebytes())
     return v
 end
 
@@ -1499,7 +1474,6 @@ function wrapreader(d::Decoder, v, j::Int, nullable::Int)
     box = isbits(v) ? boxbytes(typeof(v)) : 0
     reserve!(d.budget, unionvaluebytes() + box)
     u = UnionValue(j, v)
-    allocated!(d.budget, unionvaluebytes() + box)
     return u
 end
 
@@ -1531,7 +1505,6 @@ function decodevalue(p::ResolvedRecordPlan, d::Decoder)
     n = length(p.schema.fields)
     reserve!(d.budget, recordbytes(n))
     vals = Vector{Any}(undef, n)
-    allocated!(d.budget, vectorbytes(Any, n))                # the Record shell settles at construction
     for (slot, plan) in p.steps
         if slot == 0
             skip(plan, d)
@@ -1540,7 +1513,6 @@ function decodevalue(p::ResolvedRecordPlan, d::Decoder)
             b = p.boxes[slot]
             b > 0 && reserve!(d.budget, b)
             vals[slot] = v                                   # an isbits value boxes on assignment
-            b > 0 && allocated!(d.budget, b)
         end
     end
     for (slot, dp) in p.defaults
@@ -1548,11 +1520,9 @@ function decodevalue(p::ResolvedRecordPlan, d::Decoder)
         b = p.boxes[slot]
         b > 0 && reserve!(d.budget, b)
         vals[slot] = v
-        b > 0 && allocated!(d.budget, b)
     end
     leave!(d)
     r = Record(p.schema, vals, Val(:unchecked))
-    allocated!(d.budget, recordbytes(n) - vectorbytes(Any, n))
     return r
 end
 
@@ -1638,7 +1608,6 @@ function columnbuilders(p::ResolvedRecordPlan, projection::Union{Nothing,Project
         planbytes = vectorbytes(Union{Nothing,ReadPlan}, n)
         reserve!(budget, planbytes)
         plans = Vector{Union{Nothing,ReadPlan}}(nothing, n)
-        allocated!(budget, planbytes)
         for (slot, plan) in p.steps
             slot == 0 || (plans[slot] = plan)
         end
@@ -1648,7 +1617,6 @@ function columnbuilders(p::ResolvedRecordPlan, projection::Union{Nothing,Project
         outer = vectorbytes(ColumnBuilder, n)
         reserve!(budget, outer)
         cols = Vector{ColumnBuilder}(undef, n)
-        allocated!(budget, outer)
         for (i, f) in enumerate(p.schema.fields)
             plan = plans[i]::ReadPlan
             if projection === nothing || projection.slots[i] != 0
