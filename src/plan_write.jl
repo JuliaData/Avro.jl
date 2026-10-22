@@ -1675,6 +1675,101 @@ function encodealignedfast!(plans::Tuple, e::Encoder, x::NamedTuple)
     end
 end
 
+# ---- the column-cell path ------------------------------------------------------------------------------
+#
+# A column table the aligned path does not take (wider than its tuple limit, or columns in another order)
+# writes each row through one cell per schema field: the field's plan and its column. Each cell is one
+# dynamic call to the same per-plan estimate and encode methods the aligned path uses, so the arithmetic,
+# validation and bytes are identical, without building a boxed `Record` per row. Cells take the row as a
+# mutable cursor so a dynamic call boxes neither the row index nor a returned estimate.
+
+abstract type WriteCell end
+
+struct ColumnCell{P<:WritePlan,C<:AbstractVector} <: WriteCell
+    plan::P
+    column::C
+end
+
+"The row a column-cell push is at, and the output estimate summed over its cells so far."
+mutable struct CellRow
+    i::Int
+    retained::Int
+    peakextra::Int
+    values::Int
+end
+
+function cellvalue(c::ColumnCell, row::CellRow)
+    return c.column[firstindex(c.column) + row.i - 1]
+end
+
+function estimatecell!(c::ColumnCell, row::CellRow, budget::Budget,
+                       diagnostics::Union{Nothing,Encoder}=nothing)
+    value = cellvalue(c, row)
+    estimate = estimatevalue(c.plan, value, budget, diagnostics)
+    row.retained = checked_add(row.retained,
+                               checked_add(estimate.retained, estimatedbox(c.plan, value)))
+    row.peakextra = max(row.peakextra, estimate.peakextra)
+    row.values = checkedvalueadd(budget, row.values, estimate.values)
+    return nothing
+end
+
+function encodecell!(c::ColumnCell, e::Encoder, row::CellRow)
+    encode(c.plan, e, cellvalue(c, row))
+    return nothing
+end
+
+function encodecellchild!(c::ColumnCell, e::Encoder, row::CellRow, field::Field)
+    return encodealignedchild(c.plan, e, cellvalue(c, row), field.schema, field.name)
+end
+
+"The output estimate of one row (the `estimatealigned` arithmetic over cells)."
+function estimatealigned(cells::Vector{WriteCell}, row::CellRow, budget::Budget, fields=nothing,
+                         diagnostics::Union{Nothing,Encoder}=nothing)
+    row.retained = row.peakextra = row.values = 0
+    for k in eachindex(cells)
+        if diagnostics === nothing
+            estimatecell!(cells[k], row, budget)
+        else
+            field = fields[k]
+            withencodepath!(diagnostics, field.schema, ENCODE_PATH_FIELD, field.name) do
+                estimatecell!(cells[k], row, budget, diagnostics)
+            end
+        end
+    end
+    root = checked_add(representationslot(Record), checked_add(recordbytes(length(cells)), row.retained))
+    return (root, row.peakextra, 1 + row.values)
+end
+
+function encodealignedfast!(cells::Vector{WriteCell}, e::Encoder, row::CellRow)
+    return encodedwork!(e) do
+        enter!(e)
+        try
+            countvalues!(e.budget)
+            for c in cells
+                encodecell!(c, e, row)
+            end
+        finally
+            leave!(e)
+        end
+    end
+end
+
+function encodealigned!(cells::Vector{WriteCell}, e::Encoder, row::CellRow, schema::RecordSchema)
+    return withencoderroot!(e, schema) do
+        encodedwork!(e) do
+            enter!(e)
+            try
+                countvalues!(e.budget)
+                for k in eachindex(cells)
+                    encodecellchild!(cells[k], e, row, schema.fields[k])
+                end
+            finally
+                leave!(e)
+            end
+        end
+    end
+end
+
 function encodevalue(p::WDecimal, e::Encoder, x::DataDecimals.AbstractDecimal)
     return encodevalue(p, e, _decimalinput(x))
 end

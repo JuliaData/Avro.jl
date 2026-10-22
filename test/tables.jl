@@ -331,6 +331,48 @@ import DataAPI
         @test_throws ArgumentError Avro.tobuffer((a=[1, 2], b=[1]))
     end
 
+    @testset "wide and reordered column tables write the same bytes as their rows" begin
+        n = 300
+        colfor(k) = k % 4 == 0 ? [isodd(i) ? missing : i * k for i in 1:n] :
+                    k % 4 == 1 ? ["r$(i)c$k" for i in 1:n] :
+                    k % 4 == 2 ? [i / k for i in 1:n] : [isodd(i + k) for i in 1:n]
+        cols = NamedTuple{Tuple(Symbol("c", k) for k in 1:40)}(Tuple(colfor(k) for k in 1:40))
+        ws = Avro.schema(Tables.schema(cols))
+        rs = Avro.RecordSchema("Reversed"; fields=reverse(collect(ws.fields)))
+        sync = UInt8.(1:16)
+        function rowwise(schema, table)                    # every row through the generic row path
+            io = IOBuffer()
+            Avro.Writer(io, schema; sync=sync, block_bytes=4096) do w
+                for row in Tables.rows(table)
+                    push!(w, row)
+                end
+            end
+            return take!(io)
+        end
+        for schema in (ws, rs)
+            bytes = take!(Avro.tobuffer(cols; schema=schema, sync=sync, block_bytes=4096))
+            @test bytes == rowwise(schema, cols)
+            back = Tables.columntable(Avro.Table(bytes))
+            @test all(isequal(back[k], cols[k]) for k in keys(cols))
+        end
+        bad = merge(cols, (c2=Union{Missing,Float64}[i == 200 ? missing : i / 2 for i in 1:n],))
+        failure(f) = try
+            f()
+            nothing
+        catch err
+            err
+        end
+        cellerror = failure(() -> Avro.tobuffer(bad; schema=ws))
+        rowerror = failure(() -> rowwise(ws, bad))
+        @test cellerror isa Avro.EncodeError && cellerror.path == "\$.c2"
+        @test rowerror isa Avro.EncodeError && cellerror.msg == rowerror.msg && cellerror.path == rowerror.path
+        # rows cost no allocations per cell (no boxed Record per row)
+        floats(rows) = NamedTuple{Tuple(Symbol("f", k) for k in 1:50)}(Tuple(collect(1.0:rows) for _ in 1:50))
+        f2, f4 = floats(2000), floats(4000)
+        Avro.tobuffer(f2)
+        @test @allocations(Avro.tobuffer(f4)) - @allocations(Avro.tobuffer(f2)) < 1_000
+    end
+
     @testset "zero rows, zero columns, empty records" begin
         e0 = Avro.tobuffer(rows[1:0]; schema=s)
         t0 = Avro.Table(e0)

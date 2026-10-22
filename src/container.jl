@@ -1543,8 +1543,8 @@ function pushdatum!(w::Writer, datum)
     return pushprepareddatum!(w, datum)
 end
 
-"Push one row through the aligned fast path (the plans match the row's `NamedTuple` type)."
-function pushalignedrow!(w::Writer, datum::NamedTuple, plans::Tuple)
+"Push one row through the aligned fast path: a `NamedTuple` and its plan tuple, or a `CellRow` and its column cells."
+function pushalignedrow!(w::Writer, datum, plans)
     nextrows = checked_add(w.budget.rows, 1)
     nextrows <= w.limits.max_rows ||
         throw(limiterror(w.budget, :max_rows, nextrows, w.limits.max_rows))
@@ -2042,7 +2042,7 @@ function writercandidatefits(w::Writer, count::Int, payload::Int, values::Int,
     return true
 end
 
-@noinline function diagnosealignedestimate!(w::Writer, plans::Tuple, datum::NamedTuple)
+@noinline function diagnosealignedestimate!(w::Writer, plans, datum)
     checkpoint = writerworkcheckpoint(w.budget)
     reset!(w.datumencoder)
     beginworkdefer!(w.budget)
@@ -2058,8 +2058,7 @@ end
     end
 end
 
-@noinline function diagnosealignedencode!(w::Writer, plans::Tuple,
-                                          datum::NamedTuple)
+@noinline function diagnosealignedencode!(w::Writer, plans, datum)
     checkpoint = writerworkcheckpoint(w.budget)
     reset!(w.datumencoder)
     beginworkdefer!(w.budget)
@@ -2074,7 +2073,7 @@ end
 end
 
 "Estimate and append one aligned row while its work counters remain deferred."
-@inline function preparealigneddatum!(w::Writer, datum::NamedTuple, plans::Tuple)
+@inline function preparealigneddatum!(w::Writer, datum, plans)
     checkpoint = writerworkcheckpoint(w.budget)
     start = w.encoder.pos
     credited = w.encoder.credited
@@ -2111,7 +2110,7 @@ end
 end
 
 "The aligned NamedTuple path encodes in place and stages bytes only at a block boundary."
-@inline function pushaligneddatum!(w::Writer, datum::NamedTuple, plans::Tuple, nextrows::Int)
+@inline function pushaligneddatum!(w::Writer, datum, plans, nextrows::Int)
     start = w.encoder.pos
     credited = w.encoder.credited
     eb, ep, datumbytes, datumvalues = try
@@ -2506,7 +2505,8 @@ end
 """
 Push one partition. A column table whose columns match the record schema's fields in order (up to the
 aligned-row width) is pushed as typed `NamedTuple` rows, which take the writer's aligned fast path, as
-is a vector of one concrete `NamedTuple` type; any other source is pushed row by row.
+is a vector of one concrete `NamedTuple` type. Any other column table with a column for every field
+is pushed through per-column cells; other sources are pushed row by row.
 """
 function pushpartition!(w::Writer, part, rows)
     rows isa AbstractVector && isconcretetype(eltype(rows)) && eltype(rows) <: NamedTuple &&
@@ -2518,6 +2518,7 @@ function pushpartition!(w::Writer, part, rows)
             keys = Tuple(Symbol(n) for n in names)
             return pushcolumns!(w, NamedTuple{keys}(Tuple(Tables.getcolumn(cols, i) for i in eachindex(keys))))
         end
+        pushcells!(w, cols) && return w
     end
     for row in rows
         push!(w, row isa Union{NamedTuple,Record,AbstractDict,Tables.AbstractRow} ? row : TableRow(row))
@@ -2544,6 +2545,54 @@ function pushcolumns!(w::Writer, cols::NamedTuple, ::Type{R}) where {R<:NamedTup
         length(c) == n || throw(ArgumentError("table columns have different lengths"))
     end
     return pushrowsof!(w, i -> R(map(c -> c[i], values(cols))), R, n)
+end
+
+"""
+Push every row of the column table `cols` through one cell per schema field. Returns `false`, having
+pushed nothing, when the writer stages values or a field has no vector column (the row path then
+applies).
+"""
+function pushcells!(w::Writer, cols)
+    p = w.plan
+    (p isa WRecord && !isempty(p.fields) && !w.stagevalues) || return false
+    positions = recordrowpositions(p, cols, w.budget)
+    reserved = vectorbytes(Int, length(positions))
+    try
+        any(==(0), positions) && return false
+        n = length(Tables.getcolumn(cols, positions[1]))
+        charge = checked_add(vectorbytes(WriteCell, length(positions)), shellbytes(CellRow))
+        for (k, j) in enumerate(positions)
+            column = Tables.getcolumn(cols, j)
+            column isa AbstractVector || return false
+            length(column) == n || throw(ArgumentError("table columns have different lengths"))
+            charge = checked_add(charge, boxbytes(ColumnCell{typeof(p.fields[k]),typeof(column)}))
+        end
+        reserve!(w.budget, charge)
+        reserved += charge
+        cells = Vector{WriteCell}(undef, length(positions))
+        for (k, j) in enumerate(positions)
+            cells[k] = ColumnCell(p.fields[k], Tables.getcolumn(cols, j))
+        end
+        pushcellrows!(w, cells, n)
+        return true
+    finally
+        release!(w.budget, reserved)
+    end
+end
+
+function pushcellrows!(w::Writer, cells::Vector{WriteCell}, n::Int)
+    checkwritable(w)
+    row = CellRow(0, 0, 0, 0)
+    try
+        for i in 1:n
+            row.i = i
+            pushalignedrow!(w, row, cells)
+        end
+    catch e
+        poison!(w, e)
+        rethrow()
+    end
+    return w
 end
 
 function pushnamedtuples!(w::Writer, rows::AbstractVector{R}) where {R<:NamedTuple}
