@@ -100,8 +100,9 @@ function fastskipkind(@nospecialize(p::ReadPlan))
         p isa NullPlan ? SKIP_NULL : SKIP_FALLBACK
 end
 
+# @nospecialize: called with runtime builder types per column per block, where a `Type{C}` dispatch allocates.
 "The package-owned heap storage of one builder held behind `ColumnBuilder`."
-function columnnodebytes(::Type{C}) where {C<:ColumnBuilder}
+function columnnodebytes(@nospecialize(C::Type))
     return Base.issingletontype(C) ? 0 : boxbytes(C)
 end
 

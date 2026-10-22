@@ -48,8 +48,8 @@
                     end
                     full = planned(2 << 30)
                     required = resident + full[4] +
-                        Avro.blockworstcase(limits, pre.entries[1], cols, builderpeak) +
-                        Avro.blockworstcase(limits, pre.entries[2], cols, builderpeak)
+                        Avro.blockworstcase(limits, pre.entries[1], length(cols), sum(Avro.slotbytes, cols), builderpeak) +
+                        Avro.blockworstcase(limits, pre.entries[2], length(cols), sum(Avro.slotbytes, cols), builderpeak)
                     if limits === raised
                         @test planned(required - 1)[3] == 0
                         @test planned(required)[3] == min(7, Threads.nthreads() - 1)
@@ -190,7 +190,7 @@
         Avro.reserve!(jobbudget, 200)
         entry = Avro.BlockEntry(1, 1, 0, 1, 1)
         job = Avro.BlockJob(entry, W, jobbudget, Threads.Event(), nothing, 0, nothing, :done)
-        @test_throws Avro.LimitError Avro.commitjob!(reader, job, AbstractVector[], Int[], Avro.ParallelStats())
+        @test_throws Avro.LimitError Avro.commitjob!(reader, job, AbstractVector[], Int[], Avro.ParallelStats(), 0)
         @test reader.budget.reserved == base
         close(reader)
     end

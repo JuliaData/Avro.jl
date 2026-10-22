@@ -54,6 +54,13 @@
     Avro.releasefused!(widecells, widecols, widebudget)
     Avro.releasecolumnbuilders!(widecols, widebudget)
     @test widebudget.reserved == beforewide
+    # builder state is summed per column for every block, so it must not dispatch or allocate per column
+    if VERSION >= v"1.12"
+        statecols = Avro.columnbuilders(plan, nothing, 1, Avro.Budget(Avro.Limits()))
+        stateallocs(c) = @allocated Avro.columnbuildersstate(c)
+        stateallocs(statecols)
+        @test stateallocs(statecols) == 0
+    end
     # storage is charged exactly at allocation
     budget = Avro.Budget(Avro.Limits())
     before = budget.reserved

@@ -111,12 +111,9 @@ The complete worst-case reservation `W` of one higher in-flight block: compresse
 decompressed-buffer cap, the codec decoder requirement, its exact chunk shells and capacities, chunk
 payload up to the block-output cap, and the scratch/state allowance.
 """
-function blockworstcase(limits::Limits, e::BlockEntry, cols::Vector{Type},
+function blockworstcase(limits::Limits, e::BlockEntry, ncols::Int, slotrow::Int,
                         builderpeak::Int)
-    chunk = 0
-    for E in cols
-        chunk = checked_add(chunk, vectorbytes(E, e.count))
-    end
+    chunk = chunkbytes(ncols, slotrow, e.count)
     # `max_block_output_bytes` first covers the retained chunk payload. A second copy bounds
     # construction scratch: every live replacement predecessor is no larger than its replacement,
     # map-sort/keep scratch is no larger than the retained map state, and WTF-8 scratch is no larger
@@ -126,6 +123,11 @@ function blockworstcase(limits::Limits, e::BlockEntry, cols::Vector{Type},
     scratch = checked_add(output, checked_add(builderpeak, BLOCK_STATE_MAX))
     return checked_add(checked_add(checked_add(e.size, limits.max_block_bytes), limits.max_codec_memory),
                        checked_add(checked_add(chunk, output), scratch))
+end
+
+"The chunk vectors of `n` rows over `ncols` columns whose slot bytes sum to `slotrow` (one `vectorbytes` each)."
+function chunkbytes(ncols::Int, slotrow::Int, n::Int)
+    return checked_add(checked_mul(ncols, STORAGE[].vector), checked_mul(n, slotrow))
 end
 
 "A per-block budget: the block's own caps and counters under a ceiling of exactly `W`."
@@ -425,7 +427,8 @@ end
 # ---- the coordinator --------------------------------------------------------------------------------
 
 "Commit one finished worker block in index order: cumulative checks, chunk copy, reservation swap."
-function commitjob!(r::Reader, job::BlockJob, finals::Vector{AbstractVector}, keptidx::Vector{Int}, stats::ParallelStats)
+function commitjob!(r::Reader, job::BlockJob, finals::Vector{AbstractVector}, keptidx::Vector{Int},
+                    stats::ParallelStats, slotrow::Int)
     b = r.budget
     e = job.entry
     retained = job.budget.reserved
@@ -447,16 +450,14 @@ function commitjob!(r::Reader, job::BlockJob, finals::Vector{AbstractVector}, ke
         addrows!(b, e.count)
         job.outputbytes <= r.limits.max_block_output_bytes ||
             throw(LimitError(:max_block_output_bytes, job.outputbytes, r.limits.max_block_output_bytes, :max_block_output_bytes, :decode))
-        chunkcap = 0
         cols = job.cols::Vector{ColumnBuilder}
         builderstate = columnbuildersstate(cols)
         for (pos, i) in enumerate(keptidx)
             c = cols[i]::TypedColumn
             copyto!(finals[pos], e.rowstart, c.data, 1, e.count)
-            moved = vectorbytes(eltype(c.data), e.count)
-            chunkcap = checked_add(chunkcap, moved)
-            stats.assembly_bytes = checked_add(stats.assembly_bytes, moved)
         end
+        chunkcap = chunkbytes(length(keptidx), slotrow, e.count)   # the kept chunks' vectorbytes
+        stats.assembly_bytes = checked_add(stats.assembly_bytes, chunkcap)
         stats.committed_bytes = checked_add(stats.committed_bytes, retained - builderstate)
         stats.jobpeakmax = max(stats.jobpeakmax, job.budget.peak)
         job.budget.peak <= job.W || (stats.peak_violations += 1)
@@ -491,8 +492,8 @@ function poolplan(r::Reader, cols::Vector{Type}, entries::BlockTable, ntasks::In
     nworkers = min(ntasks - 1, Threads.nthreads() - 1, inflightcap, max(length(entries) - 1, 0))
     poolstate = 0
     if nworkers > 0 && r.legacy === nothing          # legacy tolerance mutates reader state: direct path only
-        Whead = blockworstcase(r.limits, entries[1], cols, builderpeak)
-        W2 = blockworstcase(r.limits, entries[2], cols, builderpeak)
+        Whead = blockworstcase(r.limits, entries[1], length(cols), slotrow, builderpeak)
+        W2 = blockworstcase(r.limits, entries[2], length(cols), slotrow, builderpeak)
         workersstate = checked_mul(WORKER_STATE, nworkers)
         jobsstate = vectorbytes(Union{Nothing,BlockJob}, length(entries))
         channelstate = vectorbytes(BlockJob, inflightcap)
@@ -618,10 +619,11 @@ function runpool!(r::Reader, plan, projection::Union{Nothing,Projection}, finals
         head = entries[next]
         headidx = next
         next += 1
-        Whead = blockworstcase(r.limits, head, cols, builderpeak)
+        Whead = blockworstcase(r.limits, head, length(cols), slotrow, builderpeak)
         pool.alive && checked_add(b.reserved, Whead) > b.ceiling && retirepool!(pool, b)
         if pool.alive
-            next, inflight = admitjobs!(r, entries, cols, pool.jobs::Vector{Union{Nothing,BlockJob}},
+            next, inflight = admitjobs!(r, entries, length(cols), slotrow,
+                                        pool.jobs::Vector{Union{Nothing,BlockJob}},
                                         pool.ch::Channel{BlockJob}, stats, Whead, builderpeak,
                                         next, inflight, inflightcap)
         end
@@ -639,7 +641,8 @@ function runpool!(r::Reader, plan, projection::Union{Nothing,Projection}, finals
         phook(:headdone, headidx)
         if pool.alive
             tocommit, inflight = commitwave!(r, pool.jobs::Vector{Union{Nothing,BlockJob}}, finals,
-                                             keptidx, stats, pool.fail::FailBox, tocommit, inflight)
+                                             keptidx, stats, pool.fail::FailBox, tocommit, inflight,
+                                             slotrow)
         end
         next = tocommit
     end
@@ -647,14 +650,14 @@ function runpool!(r::Reader, plan, projection::Union{Nothing,Projection}, finals
 end
 
 "Admit higher blocks in order into ceiling headroom with complete worst-case reservations."
-function admitjobs!(r::Reader, entries::BlockTable, cols::Vector{Type},
+function admitjobs!(r::Reader, entries::BlockTable, ncols::Int, slotrow::Int,
                     jobs::Vector{Union{Nothing,BlockJob}}, ch::Channel{BlockJob}, stats::ParallelStats,
                     Whead::Int, builderpeak::Int, next::Int, inflight::Int,
                     inflightcap::Int)
     b = r.budget
     while next <= length(entries) && inflight < inflightcap
         e2 = entries[next]
-        Wi = blockworstcase(r.limits, e2, cols, builderpeak)
+        Wi = blockworstcase(r.limits, e2, ncols, slotrow, builderpeak)
         checked_add(checked_add(b.reserved, Whead), Wi) <= b.ceiling || break
         reserve!(b, Wi)
         job = BlockJob(e2, Wi, blockbudget(r.limits, Wi), Threads.Event(), nothing, 0, nothing, :pending)
@@ -670,7 +673,8 @@ end
 
 "Commit completed jobs in block order from `tocommit`; the lowest failing index propagates."
 function commitwave!(r::Reader, jobs::Vector{Union{Nothing,BlockJob}}, finals::Vector{AbstractVector},
-                     keptidx::Vector{Int}, stats::ParallelStats, fail::FailBox, tocommit::Int, inflight::Int)
+                     keptidx::Vector{Int}, stats::ParallelStats, fail::FailBox, tocommit::Int, inflight::Int,
+                     slotrow::Int)
     while tocommit <= length(jobs) && jobs[tocommit] !== nothing
         job = jobs[tocommit]::BlockJob
         wait(job.done)
@@ -679,7 +683,7 @@ function commitwave!(r::Reader, jobs::Vector{Union{Nothing,BlockJob}}, finals::V
         st === :done || throw(job.err::Exception)              # the lowest uncommitted block's own failure
         jobs[tocommit] = nothing
         try
-            commitjob!(r, job, finals, keptidx, stats)
+            commitjob!(r, job, finals, keptidx, stats, slotrow)
         catch
             recordfailure!(fail, job.entry.index)
             rethrow()
