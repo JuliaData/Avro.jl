@@ -126,6 +126,10 @@ function StructUtils.lift(::Avro.AvroStyle, ::Type{Hooked}, x)
     return Hooked(1.0, missing, Int32(0))
 end
 
+struct LateHooked                                      # gains a hook only after a first decode
+    a::Int64
+end
+
 mutable struct ShellMut
     a::Int64
     s::String
@@ -403,6 +407,19 @@ end
             err
         end
         @test nested_hook_error === SEMANTIC_HOOK_SENTINEL
+
+        # hook answers are cached per world: a hook defined after a first decode is still honored
+        late = P("{\"type\":\"record\",\"name\":\"LateHooked\",\"fields\":[{\"name\":\"a\",\"type\":\"long\"}]}")
+        latebytes = Avro.encode(late, (a=5,))
+        @test Avro.decode(late, latebytes, LateHooked) == LateHooked(5)
+        @test Avro.DatumReader(late, LateHooked).plan isa Avro.RecordTarget
+        @test haskey(Avro.HOOK_CACHE.answers, LateHooked)
+        @eval StructUtils.lift(::Avro.AvroStyle, ::Type{LateHooked}, x) = LateHooked(-1)
+        @test Base.invokelatest(Avro.DatumReader, late, LateHooked).plan isa Avro.SemanticTarget
+        for i in 1:(Avro.HOOK_CACHE_SIZE + 1)          # the cache stays bounded
+            Avro.customhooks(NamedTuple{(Symbol("hook", i),),Tuple{Int}})
+        end
+        @test length(Avro.HOOK_CACHE.answers) <= Avro.HOOK_CACHE_SIZE
     end
 
     @testset "Symbol admission on every typed path" begin

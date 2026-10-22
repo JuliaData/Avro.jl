@@ -442,15 +442,48 @@ function splitoptional(::Type{T}) where {T}
     return (Union{}, nothing)
 end
 
+const HOOK_MODULES = (StructUtils, @__MODULE__)
+
+"Answers of `customhooks` for the method tables of one world (a method query costs ~15 µs per type)."
+mutable struct HookCache
+    const lock::ReentrantLock
+    world::UInt
+    const answers::IdDict{Any,Bool}
+end
+
+"The process-wide `customhooks` cache: at most `HOOK_CACHE_SIZE` types, emptied when full or when any method is defined."
+const HOOK_CACHE = HookCache(ReentrantLock(), UInt(0), IdDict{Any,Bool}())
+const HOOK_CACHE_SIZE = 1024
+
 """
     customhooks(T) -> Bool
 
 Whether a `StructUtils.make` or `StructUtils.lift` method outside StructUtils and Avro applies to `T`
-under `AvroStyle` (such targets always take the semantic route).
+under `AvroStyle` (such targets always take the semantic route). Answers are cached in `HOOK_CACHE`
+until the next method definition anywhere in the process.
 """
-const HOOK_MODULES = (StructUtils, @__MODULE__)
+function customhooks(@nospecialize(T::Type))
+    world = Base.get_world_counter()
+    cache = HOOK_CACHE
+    @lock cache.lock begin
+        if cache.world != world
+            empty!(cache.answers)
+            cache.world = world
+        end
+        answer = get(cache.answers, T, nothing)
+        answer === nothing || return answer
+    end
+    answer = methodhooks(T)                            # outside the lock: the query may compile
+    @lock cache.lock begin
+        if cache.world == world                        # unless a newer world emptied the cache meanwhile
+            length(cache.answers) >= HOOK_CACHE_SIZE && empty!(cache.answers)
+            cache.answers[T] = answer
+        end
+    end
+    return answer
+end
 
-function customhooks(::Type{T}) where {T}
+function methodhooks(@nospecialize(T::Type))
     for sig in (Tuple{AvroStyle,Type{T},Any}, Tuple{AvroStyle,Type{T},Any,Any})
         for m in methods(StructUtils.make, sig)
             m.module in HOOK_MODULES || return true
