@@ -1754,6 +1754,12 @@ function encodealignedfast!(cells::Vector{WriteCell}, e::Encoder, row::CellRow)
     end
 end
 
+# Aligned plans pair with their own row kind (a tuple with a NamedTuple, cells with a `CellRow`); this
+# method only states that for the shared push path, which never mixes them.
+function encodealignedfast!(plans, e::Encoder, row)
+    throw(ArgumentError("internal error: aligned plans $(typeof(plans)) do not match the row $(typeof(row))"))
+end
+
 function encodealigned!(cells::Vector{WriteCell}, e::Encoder, row::CellRow, schema::RecordSchema)
     return withencoderroot!(e, schema) do
         encodedwork!(e) do
