@@ -1581,36 +1581,39 @@ function Base.push!(w::Writer, datum)
 end
 
 function pushdatum!(w::Writer, datum)
-    if !w.stagevalues
-        if datum isa NamedTuple && w.fasttype === typeof(datum) &&
-           w.fastplans !== nothing
-            nextrows = checked_add(w.budget.rows, 1)
-            nextrows <= w.limits.max_rows ||
-                throw(limiterror(w.budget, :max_rows, nextrows,
-                                 w.limits.max_rows))
-            return pushaligneddatum!(w, datum, w.fastplans, nextrows)
-        end
-        return pushprepareddatum!(w, datum)
-    end
+    w.stagevalues && return pushstageddatum!(w, datum)
+    datum isa NamedTuple && w.fasttype === typeof(datum) && w.fastplans !== nothing &&
+        return pushalignedrow!(w, datum, w.fastplans)
+    return pushprepareddatum!(w, datum)
+end
+
+"Push one row through the aligned fast path (the plans match the row's `NamedTuple` type)."
+function pushalignedrow!(w::Writer, datum::NamedTuple, plans::Tuple)
+    nextrows = checked_add(w.budget.rows, 1)
+    nextrows <= w.limits.max_rows ||
+        throw(limiterror(w.budget, :max_rows, nextrows, w.limits.max_rows))
+    return pushaligneddatum!(w, datum, plans, nextrows)
+end
+
+"Stage a datum whose schema needs its values collected before encoding, then push it."
+function pushstageddatum!(w::Writer, datum)
     work = writerworkcheckpoint(w.budget)
     rootcharge = 0
     staged = nothing
     beginworkdefer!(w.budget)
     prepared = false
     try
-        if w.stagevalues
-            reset!(w.datumencoder)
-            datum, rootcharge, staged = withencoderroot!(w.datumencoder, w.schema) do
-                preparedvalue = datum
-                charge = 0
-                if w.plan isa WRecord && !(preparedvalue isa NamedTuple)
-                    preparedvalue, charge = preparewriterrecord(w.plan,
-                        preparedvalue, w.budget, w.datumencoder)
-                end
-                stagedvalue = stagewriterdatum(w.plan, preparedvalue,
-                                                w.budget, w.datumencoder)
-                return (preparedvalue, charge, stagedvalue)
+        reset!(w.datumencoder)
+        datum, rootcharge, staged = withencoderroot!(w.datumencoder, w.schema) do
+            preparedvalue = datum
+            charge = 0
+            if w.plan isa WRecord && !(preparedvalue isa NamedTuple)
+                preparedvalue, charge = preparewriterrecord(w.plan,
+                    preparedvalue, w.budget, w.datumencoder)
             end
+            stagedvalue = stagewriterdatum(w.plan, preparedvalue,
+                                            w.budget, w.datumencoder)
+            return (preparedvalue, charge, stagedvalue)
         end
         value = staged === nothing ? datum : staged.value
         prepared = true
@@ -2544,9 +2547,7 @@ function write(dst::Union{AbstractString,IO}, table; schema::Union{Nothing,Schem
                     throw(ArgumentError("a partition has columns $(collect(ts.names)) but the schema was derived from $(collect(derivedfrom)); pass `schema=`"))
             end
             w === nothing && (w = Writer(dst, s; limits=limits, kw...))
-            for row in rows
-                push!(w, row isa Union{NamedTuple,Record,AbstractDict,Tables.AbstractRow} ? row : TableRow(row))
-            end
+            pushpartition!(w, part, rows)
             flushblock!(w)
         end
         if w === nothing
@@ -2558,6 +2559,81 @@ function write(dst::Union{AbstractString,IO}, table; schema::Union{Nothing,Schem
         w === nothing || (ok ? close(w) : close(w; abort=true))
     end
     return dst
+end
+
+"""
+Push one partition. A column table whose columns match the record schema's fields in order (up to the
+aligned-row width) is pushed as typed `NamedTuple` rows, which take the writer's aligned fast path, as
+is a vector of one concrete `NamedTuple` type; any other source is pushed row by row.
+"""
+function pushpartition!(w::Writer, part, rows)
+    rows isa AbstractVector && isconcretetype(eltype(rows)) && eltype(rows) <: NamedTuple &&
+        return pushnamedtuples!(w, rows)
+    if Tables.columnaccess(typeof(part))
+        cols = Tables.columns(part)
+        names = Tables.columnnames(cols)
+        if alignedcolumns(w.schema, names)
+            keys = Tuple(Symbol(n) for n in names)
+            return pushcolumns!(w, NamedTuple{keys}(Tuple(Tables.getcolumn(cols, i) for i in eachindex(keys))))
+        end
+    end
+    for row in rows
+        push!(w, row isa Union{NamedTuple,Record,AbstractDict,Tables.AbstractRow} ? row : TableRow(row))
+    end
+    return w
+end
+
+function alignedcolumns(s::Schema, names)
+    s isa RecordSchema || return false
+    0 < length(names) == length(s.fields) <= 32 || return false
+    for (i, n) in enumerate(names)
+        (n isa Union{Symbol,AbstractString} && String(n) == s.fields[i].name) || return false
+    end
+    return true
+end
+
+function pushcolumns!(w::Writer, cols::NamedTuple{K}) where {K}
+    return pushcolumns!(w, cols, NamedTuple{K,Tuple{map(eltype, values(cols))...}})
+end
+
+function pushcolumns!(w::Writer, cols::NamedTuple, ::Type{R}) where {R<:NamedTuple}
+    n = length(first(cols))
+    for c in cols
+        length(c) == n || throw(ArgumentError("table columns have different lengths"))
+    end
+    return pushrowsof!(w, i -> R(map(c -> c[i], values(cols))), R, n)
+end
+
+function pushnamedtuples!(w::Writer, rows::AbstractVector{R}) where {R<:NamedTuple}
+    return pushrowsof!(w, i -> @inbounds(rows[firstindex(rows) + i - 1]), R, length(rows))
+end
+
+"Push `row(i)` for `i` in `1:n`; after the first row, aligned rows skip the dynamic plan lookup."
+function pushrowsof!(w::Writer, row::F, ::Type{R}, n::Int) where {F,R<:NamedTuple}
+    n == 0 && return w
+    push!(w, row(1))                                   # the first row prepares the aligned plans
+    plans = w.fasttype === R && !w.stagevalues ? w.fastplans : nothing
+    if !(plans isa Tuple)
+        for i in 2:n
+            push!(w, row(i))
+        end
+        return w
+    end
+    return pushalignedrows!(w, row, plans, n)
+end
+
+"Rows `2:n`, specialised on the plans so no row is boxed."
+function pushalignedrows!(w::Writer, row::F, plans::P, n::Int) where {F,P<:Tuple}
+    checkwritable(w)
+    try
+        for i in 2:n
+            pushalignedrow!(w, row(i), plans)
+        end
+    catch e
+        poison!(w, e)
+        rethrow()
+    end
+    return w
 end
 
 """

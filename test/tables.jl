@@ -320,6 +320,17 @@ import DataAPI
         end
     end
 
+    @testset "column tables write through aligned rows or by name" begin
+        cols = (id=collect(1:5), x=[1.5, missing, 2.5, missing, 3.5], s=["a", "b", missing, "d", "e"])
+        back = Tables.columntable(Avro.Table(Avro.tobuffer(cols)))       # columns in schema order
+        @test all(isequal(back[k], cols[k]) for k in keys(cols))
+        reordered = Avro.parseschema("""{"type":"record","name":"Reordered","fields":[
+            {"name":"s","type":["null","string"]},{"name":"id","type":"long"},{"name":"x","type":["null","double"]}]}""")
+        byname = Tables.columntable(Avro.Table(Avro.tobuffer(cols; schema=reordered)))  # matched by name
+        @test keys(byname) == (:s, :id, :x) && all(isequal(byname[k], cols[k]) for k in keys(cols))
+        @test_throws ArgumentError Avro.tobuffer((a=[1, 2], b=[1]))
+    end
+
     @testset "zero rows, zero columns, empty records" begin
         e0 = Avro.tobuffer(rows[1:0]; schema=s)
         t0 = Avro.Table(e0)
