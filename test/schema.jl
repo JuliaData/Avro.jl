@@ -469,6 +469,30 @@
         @test_throws ArgumentError Avro.schema(Tables.Schema([:a, :b, :a], [Int, Int, Int]))
     end
 
+    @testset "named-type registries and alias sets grow as n log n" begin
+        # Named types, union branches, aliases and properties in reverse name order: insertion order must
+        # not make registries quadratic.
+        rev = ["T" * lpad(i, 5, '0') for i in 10_000:-1:1]
+        nested = P("{\"type\":\"record\",\"name\":\"Root\",\"fields\":[" *
+                   join(("{\"name\":\"f$i\",\"type\":{\"type\":\"record\",\"name\":\"$n\",\"fields\":[{\"name\":\"a\",\"type\":\"int\"}]}}"
+                         for (i, n) in enumerate(rev[1:9_999])), ",") * "]}")
+        @test length(nested.fields) == 9_999 && Avro.graphinfo(nested).namedtypes == 10_000
+        @test length(P("[" * join(("{\"type\":\"record\",\"name\":\"$n\",\"fields\":[]}" for n in rev[1:1_024]), ",") * "]").branches) == 1_024
+        records = [Avro.RecordSchema(n; fields=[Avro.Field("a", Avro.IntSchema())]) for n in rev[1:3_000]]
+        @test length(Avro.RecordSchema("Root"; fields=[Avro.Field("f$i", r) for (i, r) in enumerate(records)]).fields) == 3_000
+        t = @elapsed begin
+            aliased = P("{\"type\":\"fixed\",\"name\":\"F\",\"size\":1,\"aliases\":[" *
+                        join(("\"A$i\"" for i in 200_000:-1:1), ",") * "]}")
+            props = P("{\"type\":\"fixed\",\"name\":\"G\",\"size\":1," *
+                      join(("\"p$i\":$i" for i in 200_000:-1:1), ",") * "}")
+            fieldaliases = P("{\"type\":\"record\",\"name\":\"R\",\"fields\":[" *
+                             join(("{\"name\":\"f$i\",\"type\":\"int\",\"aliases\":[\"g$i\"]}" for i in 50_000:-1:1), ",") * "]}")
+        end
+        @test length(aliased.aliases) == 200_000 && length(props.props) == 200_000
+        @test length(fieldaliases.fields) == 50_000
+        @test t < 60                                   # quadratic insertion would take hours
+    end
+
     @testset "immutability, identity, equality and hashing on cycles" begin
         s = P("""{"type":"record","name":"N","fields":[{"name":"next","type":["null","N"]},{"name":"p","type":"int","k":[1,{"a":2}]}]}""")
         @test_throws Avro.FrozenError push!(s.fields, s.fields[1])
@@ -602,7 +626,8 @@ end
         parse_budget = Avro.Budget(parse_limits)
         parse_ctx = Avro.ParseContext(parse_limits, parse_budget, false, false)
         expected_parse_state = Avro.vectorbytes(Avro.RecordSchema, parse_limits.max_schema_depth) +
-                               Avro.vectorbytes(Avro.NodeMeta, 16) + Avro.frozendictshell() + 128 +
+                               Avro.vectorbytes(Avro.NodeMeta, 16) + 128 +
+                               2 * Avro.nameindexshellbytes(Avro.Schema) +   # the name registry and identities
                                Avro.vectorbytes(Avro.ParsePathSegment,
                                                 min(parse_limits.max_schema_depth, 16)) +
                                Avro.shellbytes(Avro.ParsePath)

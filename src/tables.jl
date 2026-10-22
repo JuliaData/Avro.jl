@@ -116,9 +116,9 @@ function projectschema(s::RecordSchema, sel::Vector{Int}, limits::Limits,
     end
     return withconstructionbudget(budget) do _
         n = length(sel)
-        charge = frozendictshell() + vectorbytes(Field, n) + vectorbytes(String, n) + vectorbytes(Int, n) + 128
+        memo = NameIndex{Schema}(budget)
+        charge = vectorbytes(Field, n) + vectorbytes(String, n) + vectorbytes(Int, n) + 128
         reserve!(budget, charge)
-        memo = FrozenDict{String,Schema}()
         fields = emptywithcapacity(FrozenVector{Field}, n)
         index = emptywithcapacity(FrozenDict{String,Int}, n)
         name = copyfullname(s.name, budget)
@@ -133,7 +133,7 @@ function projectschema(s::RecordSchema, sel::Vector{Int}, limits::Limits,
         allocated!(budget, charge)
         try
             rootkey = ownedfullname(s.name, budget)
-            budgetedinsert!(memo, rootkey, out, budget)
+            insert!(memo, rootkey, out, budget)
             for (k, i) in enumerate(sel)
                 f = s.fields[i]
                 field = copyfield(f, deepcopyschema(f.schema, memo), budget, 3)

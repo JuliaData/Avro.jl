@@ -19,7 +19,9 @@ materialises and therefore requires the whole result to fit.
 
 Decompression bombs are bounded by work rules, not guesses: `values ≤ max_values_per_byte ×
 input_bytes + work_allowance` is enforced per datum, per block and per operation (a million-empty-string
-block is legal; a datum claiming billions of values in a few bytes is not). The constants are calibrated so the worst-density legal input at default limits
+block is legal; a datum claiming billions of values in a few bytes is not). Name registries, alias sets
+and key indexes are sorted runs or sort-once vectors (no hashing of untrusted names), so their work grows
+as `n log n` in the input. The constants are calibrated so the worst-density legal input at default limits
 decodes in ≤ 10 s single-threaded on supported Julia versions.
 
 ## Selected limits

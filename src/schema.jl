@@ -281,8 +281,8 @@ mutable struct ParseContext
     const budget::Budget
     const allow_invalid_names::Bool
     const allow_invalid_defaults::Bool
-    const named::FrozenDict{String,Schema}    # fullname → schema (sorted vector; replacement growth)
-    const identities::FrozenDict{String,Schema} # every fullname and alias, for global uniqueness
+    const named::NameIndex{Schema}            # fullname → schema
+    const identities::NameIndex{Schema}       # every fullname and alias, for global uniqueness
     const pending::Vector{RecordSchema}       # records registered but not yet filled (≤ max_depth, prebuilt)
     metas::Vector{NodeMeta}                   # in creation order → dense ids
     metascap::Int
@@ -298,7 +298,7 @@ end
 function ParseContext(limits::Limits, budget::Budget, allow_invalid_names::Bool, allow_invalid_defaults::Bool, legacyfixednames::Bool=false)
     metascap = 16
     state = vectorbytes(RecordSchema, limits.max_schema_depth) + vectorbytes(NodeMeta, metascap) +
-            frozendictshell() + 128   # pending, metas, context and both table shells
+            128                       # pending, metas and the context
     reserve!(budget, state)
     pending = Vector{RecordSchema}(undef, limits.max_schema_depth)   # the fill stack never exceeds max_schema_depth
     resize!(pending, 0)
@@ -306,7 +306,7 @@ function ParseContext(limits::Limits, budget::Budget, allow_invalid_names::Bool,
     resize!(metas, 0)
     path = ParsePath(budget, min(limits.max_schema_depth, 16))
     ctx = ParseContext(limits, budget, allow_invalid_names, allow_invalid_defaults,
-        FrozenDict{String,Schema}(), FrozenDict{String,Schema}(), pending, metas, metascap,
+        NameIndex{Schema}(budget), NameIndex{Schema}(budget), pending, metas, metascap,
         Ref(0), legacyfixednames, 0, false, false, 0, path)
     allocated!(budget, state)
     return ctx
@@ -450,10 +450,10 @@ function collectprops(ctx::ParseContext, obj::JSONObject, grammar)
     reserve!(ctx.budget, slots)                    # the exact key/value capacity and dict shell
     p = emptywithcapacity(Props, n)
     allocated!(ctx.budget, slots)
-    for k in obj.order
+    for (k, v) in obj.members                      # sorted keys, so every insert appends
         k in grammar && continue
         retain!(ctx.budget, sizeof(k) + 32)        # the tree key and value this schema keeps alive
-        budgetedinsert!(p, k, obj[k], ctx.budget)
+        budgetedinsert!(p, k, v, ctx.budget)
     end
     return freeze!(p)
 end
@@ -868,9 +868,7 @@ function parsenamed(ctx::ParseContext, obj::JSONObject, enclosing::String)
         return full, EMPTY_STRING_LIST, EMPTY_STRING_LIST
     end
     aliases = BuildBuf{String}(ctx.budget, length(raw))
-    reserve!(ctx.budget, frozendictshell())
-    seen = FrozenDict{String,Bool}()
-        allocated!(ctx.budget, frozendictshell())
+    seen = NameIndex{Bool}(ctx.budget)
     try
         for (i, a) in enumerate(raw)
             checknamebytes(ctx, a)
@@ -888,11 +886,11 @@ function parsenamed(ctx::ParseContext, obj::JSONObject, enclosing::String)
                 release!(ctx.budget, stringbytes(sizeof(na)))
                 continue
             end
-            budgetedinsert!(seen, na, true, ctx.budget)
+            insert!(seen, na, true, ctx.budget)
             push!(aliases, ctx.budget, na)
         end
     finally
-        release!(ctx.budget, frozendictbytes(seen))
+        releasenameindex!(seen, ctx.budget)
     end
     reserve!(ctx.budget, 48)                                   # the two frozen wrappers
     wrapped = (full, freeze!(FrozenVector{String}(finishbuild!(aliases, ctx.budget), false)),
@@ -909,10 +907,10 @@ function register!(ctx::ParseContext, s::NamedSchema)
             schemaerror(ctx, "name or alias \"$alias\" is used by more than one type")
     end
     full = ownedfullname(s.name, ctx.budget)
-    budgetedinsert!(ctx.named, full, s, ctx.budget)
-    budgetedinsert!(ctx.identities, full, s, ctx.budget)
+    insert!(ctx.named, full, s, ctx.budget)
+    insert!(ctx.identities, full, s, ctx.budget)
     for alias in s.aliases
-        budgetedinsert!(ctx.identities, alias, s, ctx.budget)
+        insert!(ctx.identities, alias, s, ctx.budget)
     end
     return s
 end
@@ -1008,8 +1006,9 @@ function rawmembers(ctx::ParseContext, obj::JSONObject, buf, skipvalues=())
         decoded = ownedstringcopy(obj.order[i], ctx.budget)
         rawkey = rawspan(ctx, obj.spans[i].key, buf)
         rawvalue = decoded in skipvalues ? "" : rawspan(ctx, obj.spans[i].value, buf)
-        budgetedinsert!(members, decoded, RawMember(rawkey, rawvalue), ctx.budget)
+        budgetedappend!(members, decoded, RawMember(rawkey, rawvalue), ctx.budget)
     end
+    budgetedsort!(members, ctx.budget)             # object keys are distinct
     return freeze!(members)
 end
 
@@ -1047,9 +1046,7 @@ function parserecord(ctx::ParseContext, obj::JSONObject, enclosing::String, buf,
     fields = emptywithcapacity(FrozenVector{Field}, nfields)
     fieldindex = emptywithcapacity(FrozenDict{String,Int}, nfields)
     allocated!(ctx.budget, fieldstate)
-    reserve!(ctx.budget, frozendictshell())
-    aliasowners = FrozenDict{String,Int}()
-    allocated!(ctx.budget, frozendictshell())
+    aliasowners = NameIndex{Int}(ctx.budget)
     rec = settlednode(ctx, RecordSchema(full, aliases, raw, doc, iserror, p, fields, fieldindex, newmeta!(ctx)))
     register!(ctx, rec)                            # register before filling so self-references resolve
     push!(ctx.pending, rec)
@@ -1076,10 +1073,10 @@ function parserecord(ctx::ParseContext, obj::JSONObject, enclosing::String, buf,
                 fielderror(ctx, i, "field alias \"$(escapename(alias))\" collides with a field name", "aliases")
             haskey(aliasowners, alias) &&
                 fielderror(ctx, i, "field alias \"$(escapename(alias))\" is declared by two fields", "aliases")
-            budgetedinsert!(aliasowners, alias, i, ctx.budget)
+            insert!(aliasowners, alias, i, ctx.budget)
         end
     finally
-        release!(ctx.budget, frozendictbytes(aliasowners))
+        releasenameindex!(aliasowners, ctx.budget)
     end
     freeze!(fields)
     freeze!(fieldindex)
@@ -1115,19 +1112,17 @@ function parsefield(ctx::ParseContext, obj::JSONObject, ns::String, buf)
         rawaliases = String[]
     end
     aliases = BuildBuf{String}(ctx.budget, length(rawaliases))
-    reserve!(ctx.budget, frozendictshell())
-    seen = FrozenDict{String,Bool}()
-        allocated!(ctx.budget, frozendictshell())
+    seen = NameIndex{Bool}(ctx.budget)
     try
         for (i, a) in enumerate(rawaliases)
             checknamebytes(ctx, a)
             a == name && continue
             haskey(seen, a) && continue
-            budgetedinsert!(seen, a, true, ctx.budget)
+            insert!(seen, a, true, ctx.budget)
             push!(aliases, ctx.budget, a)
         end
     finally
-        release!(ctx.budget, frozendictbytes(seen))
+        releasenameindex!(seen, ctx.budget)
     end
     default = nodefault
     if haskey(obj, "default")
@@ -2627,10 +2622,7 @@ function withbuilder(f)
     task_local_storage(:avro_builder_depth, builderdepth() + 1)
     memo = nothing
     if outer
-        b = constructionbudget()
-        reserve!(b, frozendictshell())
-        memo = FrozenDict{String,Tuple{Schema,Schema}}()
-        allocated!(b, frozendictshell())
+        memo = NameIndex{Tuple{Schema,Schema}}(constructionbudget())
         task_local_storage(:avro_import_memo, memo)
     end
     try
@@ -2639,7 +2631,7 @@ function withbuilder(f)
         task_local_storage(:avro_builder_depth, builderdepth() - 1)
         if outer
             task_local_storage(:avro_import_memo, nothing)
-            releaseownedmemo!(constructionbudget(), memo::FrozenDict{String,Tuple{Schema,Schema}})
+            releaseownedmemo!(constructionbudget(), memo::NameIndex{Tuple{Schema,Schema}})
         end
     end
 end
@@ -2654,14 +2646,14 @@ per-record fields, union branches, enum symbols, and name/alias bytes — so a c
 function finalizepublic!(s::Schema, limits::Limits, nodes::Int, named::Int)
     builderdepth() > 0 && return s
     return withconstruction(limits) do budget
-        walkstate = vectorbytes(NodeMeta, 16) + 2 * frozendictshell() + 64
-        reserve!(budget, walkstate)                    # the walk's memo storage and table shells
+        walkstate = vectorbytes(NodeMeta, 16) + 64
+        reserve!(budget, walkstate)                    # the walk's memo storage
         walkmetas = Vector{NodeMeta}(undef, 16)
         resize!(walkmetas, 0)
         walk = MetaWalk(walkmetas, 16)
-        namedtypes = FrozenDict{String,Schema}()
-        identities = FrozenDict{String,Schema}()
         allocated!(budget, walkstate)
+        namedtypes = NameIndex{Schema}(budget)
+        identities = NameIndex{Schema}(budget)
         collectmetas!(s, walk, namedtypes, identities, limits, budget, 1)
         metas = walk.metas
         length(namedtypes) <= limits.max_named_types ||
@@ -2678,11 +2670,12 @@ function finalizepublic!(s::Schema, limits::Limits, nodes::Int, named::Int)
         checkpublicprint!(s, limits, budget)
         computehashes!(s, metas)
         namekeys = 0
-        for key in namedtypes.keys
+        for run in namedtypes.keys, key in run
             namekeys = checked_add(namekeys, stringbytes(sizeof(key)))
         end
-        release!(budget, vectorbytes(NodeMeta, walk.cap) + frozendictbytes(namedtypes) +
-                         frozendictbytes(identities) + namekeys + 64)
+        releasenameindex!(namedtypes, budget)
+        releasenameindex!(identities, budget)
+        release!(budget, vectorbytes(NodeMeta, walk.cap) + namekeys + 64)
         return s
     end
 end
@@ -2790,8 +2783,8 @@ mutable struct MetaWalk
     cap::Int
 end
 
-function collectmetas!(s::Schema, walk::MetaWalk, namedtypes::FrozenDict{String,Schema},
-                       identities::FrozenDict{String,Schema},
+function collectmetas!(s::Schema, walk::MetaWalk, namedtypes::NameIndex{Schema},
+                       identities::NameIndex{Schema},
                        limits::Limits, budget::Budget, depth::Int)
     depth <= limits.max_schema_depth ||
         throw(LimitError(:max_schema_depth, depth, limits.max_schema_depth,
@@ -2827,10 +2820,10 @@ function collectmetas!(s::Schema, walk::MetaWalk, namedtypes::FrozenDict{String,
                 throw(ArgumentError("named schema name or alias \"$alias\" is used by more than one type"))
         end
         fullkey = ownedfullname(s.name, budget)
-        budgetedinsert!(namedtypes, fullkey, s, budget)
-        budgetedinsert!(identities, fullkey, s, budget)
+        insert!(namedtypes, fullkey, s, budget)
+        insert!(identities, fullkey, s, budget)
         for alias in s.aliases
-            budgetedinsert!(identities, alias, s, budget)
+            insert!(identities, alias, s, budget)
         end
     end
     if s isa ArraySchema
@@ -2925,9 +2918,7 @@ function publicnamed(name::AbstractString, namespace::AbstractString, aliases, s
     isreservedfullname(full) && throw(ArgumentError("\"$n\" is a primitive type name and cannot be redefined in the null namespace"))
     raw = BuildBuf{String}(b, 2)
     norm = BuildBuf{String}(b, 2)
-    reserve!(b, frozendictshell())
-    seen = FrozenDict{String,Bool}()
-    allocated!(b, frozendictshell())
+    seen = NameIndex{Bool}(b)
     canonical = ownedfullname(full, b)
     canonicalcharge = stringbytes(sizeof(canonical))
     try
@@ -2948,11 +2939,12 @@ function publicnamed(name::AbstractString, namespace::AbstractString, aliases, s
                 release!(b, stringbytes(sizeof(na)))
                 continue
             end
-            budgetedinsert!(seen, na, true, b)
+            insert!(seen, na, true, b)
             push!(norm, b, na)
         end
     finally
-        release!(b, frozendictbytes(seen) + canonicalcharge)
+        releasenameindex!(seen, b)
+        release!(b, canonicalcharge)
     end
     wrappers = 48
     reserve!(b, wrappers)                              # the frozen wrappers, built next
@@ -3101,9 +3093,7 @@ function Field(name::AbstractString, schema::Schema; default=nodefault, order::S
         checkpublicname(name, "field name")
         order in (:ascending, :descending, :ignore) || throw(ArgumentError("order must be :ascending, :descending or :ignore"))
         als = BuildBuf{String}(b, 2)
-        reserve!(b, frozendictshell())
-        seen = FrozenDict{String,Bool}()
-        allocated!(b, frozendictshell())
+        seen = NameIndex{Bool}(b)
         try
             for a in aliases
                 a isa Union{AbstractString,Symbol} || throw(ArgumentError("aliases must be strings"))
@@ -3113,11 +3103,11 @@ function Field(name::AbstractString, schema::Schema; default=nodefault, order::S
                     release!(b, stringbytes(sizeof(sa)))
                     continue
                 end
-                budgetedinsert!(seen, sa, true, b)
+                insert!(seen, sa, true, b)
                 push!(als, b, sa)
             end
         finally
-            release!(b, frozendictbytes(seen))
+            releasenameindex!(seen, b)
         end
         d = nodefault
         if !(default isa NoDefault)
@@ -3183,19 +3173,17 @@ function recordschema_(f, name::AbstractString; namespace::AbstractString="", al
         dup = budgetedsort!(index, b)
         dup == 0 || throw(ArgumentError("duplicate field name \"$(fields[dup].name)\""))
     end
-    reserve!(b, frozendictshell())
-    aliasowners = FrozenDict{String,Int}()
-    allocated!(b, frozendictshell())
+    aliasowners = NameIndex{Int}(b)
     try
         for (i, field) in enumerate(fields), alias in field.aliases
             haskey(index, alias) &&
                 throw(ArgumentError("field alias \"$alias\" collides with a field name"))
             haskey(aliasowners, alias) &&
                 throw(ArgumentError("field alias \"$alias\" is declared by two fields"))
-            budgetedinsert!(aliasowners, alias, i, b)
+            insert!(aliasowners, alias, i, b)
         end
     finally
-        release!(b, frozendictbytes(aliasowners))
+        releasenameindex!(aliasowners, b)
     end
     freeze!(fields)
     freeze!(index)
@@ -3214,9 +3202,7 @@ function importchild(s::Schema)
     checkexistinggraph!(s, b.limits, b)
     memo = importmemo()
     memo !== nothing && return deepcopyschema(s, memo)
-    reserve!(b, frozendictshell())
-    localmemo = FrozenDict{String,Tuple{Schema,Schema}}()
-    allocated!(b, frozendictshell())
+    localmemo = NameIndex{Tuple{Schema,Schema}}(b)
     try
         return deepcopyschema(s, localmemo)
     finally
@@ -3224,34 +3210,36 @@ function importchild(s::Schema)
     end
 end
 
-function memocopy(s::Schema, memo::FrozenDict{String,Schema})
-    return getindex(memo, s.name)
+function memocopy(s::Schema, memo::NameIndex{Schema})
+    return get(memo, s.name, nothing)::Schema
 end
 
-function memocopy(s::Schema, memo::FrozenDict{String,Tuple{Schema,Schema}})
-    source, copy = getindex(memo, s.name)
+function memocopy(s::Schema, memo::NameIndex{Tuple{Schema,Schema}})
+    source, copy = get(memo, s.name, nothing)::Tuple{Schema,Schema}
     source === s || throw(ArgumentError("a named schema is defined by more than one child schema"))
     return copy
 end
 
-function remembercopy!(memo::FrozenDict{String,Schema}, s::Schema, copy::Schema)
+function remembercopy!(memo::NameIndex{Schema}, s::Schema, copy::Schema)
     key = ownedfullname(s.name, constructionbudget())
-    budgetedinsert!(memo, key, copy, constructionbudget())
+    insert!(memo, key, copy, constructionbudget())
     return copy
 end
 
-function remembercopy!(memo::FrozenDict{String,Tuple{Schema,Schema}}, s::Schema, copy::Schema)
+function remembercopy!(memo::NameIndex{Tuple{Schema,Schema}}, s::Schema, copy::Schema)
     key = ownedfullname(s.name, constructionbudget())
-    budgetedinsert!(memo, key, (s, copy), constructionbudget())
+    insert!(memo, key, (s, copy), constructionbudget())
     return copy
 end
 
-function releaseownedmemo!(budget::Budget, memo::FrozenDict{String})
-    charge = frozendictbytes(memo)
-    for key in memo.keys
+"Release a copy memo with the fullname keys it owns."
+function releaseownedmemo!(budget::Budget, memo::NameIndex)
+    charge = 0
+    for run in memo.keys, key in run
         charge = checked_add(charge, stringbytes(sizeof(key)))
     end
     release!(budget, charge)
+    releasenameindex!(memo, budget)
     return nothing
 end
 
@@ -3473,8 +3461,7 @@ function copystringindex(values::FrozenVector{String}, source::FrozenDict{String
     return freeze!(index)
 end
 
-function deepcopyschema(s::Schema,
-                        memo::Union{FrozenDict{String,Schema},FrozenDict{String,Tuple{Schema,Schema}}},
+function deepcopyschema(s::Schema, memo::Union{NameIndex{Schema},NameIndex{Tuple{Schema,Schema}}},
                         depth::Int=1)
     if s isa NamedSchema
         haskey(memo, s.name) && return memocopy(s, memo)

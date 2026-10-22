@@ -762,7 +762,7 @@ end
         write(defaultcodec, zeros(UInt8, 16))
         defaultreader = Avro.Reader(take!(defaultcodec))
         @test Avro.codec(defaultreader) === :null
-        @test defaultreader.budget.reserved == 4073
+        @test defaultreader.budget.reserved == 3945 + 2 * Avro.nameindexshellbytes(Avro.Schema)   # plus the parser's name indexes
         close(defaultreader)
 
         rows = [(x=Int64(i),) for i in 1:10]

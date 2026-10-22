@@ -526,6 +526,116 @@ function budgetedsort!(d::FrozenDict{K,V}, budget::Union{Nothing,Budget}) where 
     end
 end
 
+# ---- sorted-run name index -------------------------------------------------------------------------
+
+const NAME_INDEX_RUNS = 64   # a binary counter of an Int count has at most 63 set bits
+
+"""
+    NameIndex{V}(budget)
+
+An index of `String` keys (fullnames, aliases) that is built one insertion at a time with lookups in
+between: sorted runs whose lengths are distinct powers of two, merged like a binary counter, so `n`
+insertions move `O(n log n)` entries and a lookup binary-searches at most 64 runs. No hashing of
+untrusted keys; `FullName` keys find equal `String` keys (`isless` and `keymatches` compare them).
+"""
+mutable struct NameIndex{V}
+    const keys::Vector{Vector{String}}   # runs, longest first
+    const vals::Vector{Vector{V}}
+    count::Int
+end
+
+function nameindexshellbytes(::Type{V}) where {V}
+    return vectorbytes(Vector{String}, NAME_INDEX_RUNS) + vectorbytes(Vector{V}, NAME_INDEX_RUNS) +
+           shellbytes(NameIndex{V})
+end
+
+function runbytes(::Type{V}, n::Int) where {V}
+    return vectorbytes(String, n) + vectorbytes(V, n)
+end
+
+function NameIndex{V}(budget::Budget) where {V}
+    charge = nameindexshellbytes(V)
+    reserve!(budget, charge)
+    keys = Vector{Vector{String}}(undef, NAME_INDEX_RUNS)
+    vals = Vector{Vector{V}}(undef, NAME_INDEX_RUNS)
+    resize!(keys, 0)
+    resize!(vals, 0)
+    index = NameIndex{V}(keys, vals, 0)
+    allocated!(budget, charge)
+    return index
+end
+
+function Base.length(index::NameIndex)
+    return index.count
+end
+
+"The run and position of `key`, or `(0, 0)`."
+function runposition(index::NameIndex, key)
+    for r in eachindex(index.keys)
+        run = index.keys[r]
+        i = searchsortedfirst(run, key)
+        i <= length(run) && keymatches(run[i], key) && return (r, i)
+    end
+    return (0, 0)
+end
+
+function Base.haskey(index::NameIndex, key)
+    return first(runposition(index, key)) != 0
+end
+
+function Base.get(index::NameIndex, key, default)
+    r, i = runposition(index, key)
+    return r == 0 ? default : index.vals[r][i]
+end
+
+"Insert a key that is not present (callers check `haskey` first)."
+function Base.insert!(index::NameIndex{V}, key::String, value, budget::Budget) where {V}
+    reserve!(budget, runbytes(V, 1))
+    ks = String[key]
+    vs = V[value]
+    allocated!(budget, runbytes(V, 1))
+    while !isempty(index.keys) && length(index.keys[end]) == length(ks)
+        ks, vs = mergeruns(pop!(index.keys), pop!(index.vals), ks, vs, budget)
+    end
+    push!(index.keys, ks)                              # within the prebuilt NAME_INDEX_RUNS capacity
+    push!(index.vals, vs)
+    index.count += 1
+    return index
+end
+
+function mergeruns(ak::Vector{String}, av::Vector{V}, bk::Vector{String}, bv::Vector{V},
+                   budget::Budget) where {V}
+    n = length(ak) + length(bk)
+    reserve!(budget, runbytes(V, n))
+    ks = Vector{String}(undef, n)
+    vs = Vector{V}(undef, n)
+    allocated!(budget, runbytes(V, n))
+    i = j = 1
+    for k in 1:n
+        if j > length(bk) || (i <= length(ak) && isless(ak[i], bk[j]))
+            ks[k] = ak[i]
+            vs[k] = av[i]
+            i += 1
+        else
+            ks[k] = bk[j]
+            vs[k] = bv[j]
+            j += 1
+        end
+    end
+    release!(budget, runbytes(V, length(ak)) + runbytes(V, length(bk)))   # both inputs die with this frame
+    return (ks, vs)
+end
+
+"Release the index's own storage (its keys are owned and released by the caller)."
+function releasenameindex!(index::NameIndex{V}, budget::Budget) where {V}
+    total = nameindexshellbytes(V)
+    for run in index.keys
+        total = checked_add(total, runbytes(V, length(run)))
+    end
+    release!(budget, total)
+    return nothing
+end
+
 "Binary search one sorted partner-id vector and charge every inspected entry."
 function resolutionsearchsortedfirst(keys::Vector{Int32}, key::Int32, budget::Budget)
     lo = 1
