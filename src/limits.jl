@@ -1,9 +1,8 @@
 # Limits, budgets and the memory ceiling.
 #
 # One fixed-default, portable per-operation ceiling bounds package-owned memory through reservations made
-# before the corresponding allocation; work is bounded as a function of input bytes (the value rule), and
-# key comparisons by the comparison rule. Every `LimitError` names the limit, the observed value and the
-# keyword that raises it.
+# before the corresponding allocation, and work is bounded as a function of input bytes (the value rule).
+# Every `LimitError` names the limit, the observed value and the keyword that raises it.
 
 const KiB = 1 << 10
 const MiB = 1 << 20
@@ -19,7 +18,7 @@ Fields (defaults): `max_depth` (1024), `max_bytes` (64 MiB), `max_datum_bytes` (
 `max_json_depth` (1024), `max_block_bytes` (16 MiB), `max_block_count` (2^24),
 `max_block_output_bytes` (64 MiB), `max_blocks` (2^28), `max_codec_memory` (32 MiB),
 `max_total_bytes` (256 MiB), `max_total_values` (3*2^26), `max_rows` (2^28), `max_values_per_byte` (16),
-`work_allowance` (65,536), `max_compare_bytes_per_byte` (64), `max_resolution_work` (1,000,000),
+`work_allowance` (65,536), `max_resolution_work` (1,000,000),
 `max_schema_bytes` (16 MiB), `max_schema_depth` (256), `max_schema_nodes` (1,000,000), `max_fields`
 (65,535), `max_union_branches` (1,024), `max_enum_symbols` (65,535), `max_name_bytes` (1,024),
 `max_named_types` (10,000), `max_metadata_bytes` (16 MiB), `max_metadata_entries` (10,000),
@@ -40,7 +39,6 @@ struct Limits
     max_rows::Int
     max_values_per_byte::Int
     work_allowance::Int
-    max_compare_bytes_per_byte::Int
     max_resolution_work::Int
     max_schema_bytes::Int
     max_schema_depth::Int
@@ -70,7 +68,6 @@ const LIMIT_DEFAULTS = (
     max_rows = 1 << 28,
     max_values_per_byte = 16,
     work_allowance = 65_536,
-    max_compare_bytes_per_byte = 64,
     max_resolution_work = 1_000_000,
     max_schema_bytes = 16 * MiB,
     max_schema_depth = 256,
@@ -194,7 +191,7 @@ end
     Budget(limits; direction=:decode)
 
 The accumulator of one operation: live reservations against the `max_total_bytes` ceiling, the value
-and comparison work counters, rows, blocks, codec members, resolution work and the shared allowance.
+work counter, rows, blocks, codec members, resolution work and the shared allowance.
 """
 mutable struct Budget
     const limits::Limits
@@ -204,7 +201,6 @@ mutable struct Budget
     peak::Int
     values::Int
     input_bytes::Int
-    compare_bytes::Int
     rows::Int
     blocks::Int
     members::Int
@@ -218,7 +214,7 @@ end
 
 function Budget(limits::Limits; direction::Symbol=:decode)
     direction in (:decode, :encode) || throw(ArgumentError("direction must be :decode or :encode"))
-    return Budget(limits, limits.max_total_bytes, direction, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    return Budget(limits, limits.max_total_bytes, direction, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
                   min(limits.max_total_values, limits.work_allowance), 0, 0)
 end
 
@@ -226,7 +222,7 @@ end
 function ledgerbudget(ceiling::Int)
     ceiling >= 0 || throw(ArgumentError("ledger ceiling must be non-negative"))
     limits = Limits()
-    return Budget(limits, ceiling, :decode, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    return Budget(limits, ceiling, :decode, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
                   min(limits.max_total_values, limits.work_allowance), 0, 0)
 end
 
@@ -445,21 +441,11 @@ end
 "Sorted insert (or overwrite) with exact-replacement growth when the capacity is exhausted."
 function budgetedinsert!(d::FrozenDict{K,V}, k, v, budget::Union{Nothing,Budget}) where {K,V}
     d.frozen && throw(FrozenError("dict"))
-    i = budgetedsearchsortedfirst(d.keys, k, budget)
-    if i <= length(d.keys)
-        budget === nothing || addcompare!(budget, keycomparisonwork(d.keys[i], k))
-    end
+    i = searchsortedfirst(d.keys, k)
     if i <= length(d.keys) && keymatches(d.keys[i], k)
-        budget === nothing || addcompare!(budget, slotbytes(V))
         d.vals[i] = v
         return d
     end
-    n = length(d.keys)
-    moved = checked_mul(n - i + 2, checked_add(slotbytes(K), slotbytes(V)))
-    if n == d.cap
-        moved = checked_add(moved, checked_mul(n, checked_add(slotbytes(K), slotbytes(V))))
-    end
-    budget === nothing || addcompare!(budget, moved)   # all fallible work precedes allocation or mutation
     length(d.keys) == d.cap && growdict!(d, budget)
     insert!(d.keys, i, convert(K, k))
     insert!(d.vals, i, convert(V, v))
@@ -488,10 +474,7 @@ end
 "Append without ordering; `budgetedsort!` orders the complete dictionary once (sorted inserts move O(n²) entries)."
 function budgetedappend!(d::FrozenDict{K,V}, k, v, budget::Union{Nothing,Budget}) where {K,V}
     d.frozen && throw(FrozenError("dict"))
-    if length(d.keys) == d.cap
-        budget === nothing || addcompare!(budget, checked_mul(length(d.keys), checked_add(slotbytes(K), slotbytes(V))))
-        growdict!(d, budget)
-    end
+    length(d.keys) == d.cap && growdict!(d, budget)
     push!(d.keys, convert(K, k))
     push!(d.vals, convert(V, v))
     return d
@@ -500,7 +483,7 @@ end
 """
     budgetedsort!(d::FrozenDict, budget) -> Int
 
-Sort the entries appended with `budgetedappend!` by key, with one charged stable merge sort. Returns 0,
+Sort the entries appended with `budgetedappend!` by key, with one stable merge sort. Returns 0,
 or the append position of the first key that repeats an earlier key (`d` then stays unsorted).
 """
 function budgetedsort!(d::FrozenDict{K,V}, budget::Union{Nothing,Budget}) where {K,V}
@@ -513,14 +496,13 @@ function budgetedsort!(d::FrozenDict{K,V}, budget::Union{Nothing,Budget}) where 
     tmp = Vector{Int32}(undef, cld(n, 2))
     budget === nothing || allocated!(budget, scratch)
     try
-        mergesort!(perm, tmp, d.keys, budget)
+        mergesort!(perm, tmp, d.keys)
         dup = 0
         for i in 2:n
-            keyequal(d.keys[perm[i]], d.keys[perm[i - 1]], budget) || continue
+            keymatches(d.keys[perm[i]], d.keys[perm[i - 1]]) || continue
             dup = dup == 0 ? Int(perm[i]) : min(dup, Int(perm[i]))   # stable: perm[i] is the later one
         end
         dup == 0 || return dup
-        budget === nothing || addcompare!(budget, checked_mul(n, checked_add(slotbytes(K), slotbytes(V))))
         for start in 1:n                               # apply the permutation in place, one cycle at a time
             perm[start] > 0 || continue
             key, val = d.keys[start], d.vals[start]
@@ -544,21 +526,6 @@ function budgetedsort!(d::FrozenDict{K,V}, budget::Union{Nothing,Budget}) where 
     end
 end
 
-function budgetedsearchsortedfirst(keys::Vector, key, budget::Union{Nothing,Budget})
-    lo = 1
-    hi = length(keys) + 1
-    while lo < hi
-        mid = lo + ((hi - lo) >>> 1)
-        budget === nothing || addcompare!(budget, keycomparisonwork(keys[mid], key))
-        if isless(keys[mid], key)
-            lo = mid + 1
-        else
-            hi = mid
-        end
-    end
-    return lo
-end
-
 "Binary search one sorted partner-id vector and charge every inspected entry."
 function resolutionsearchsortedfirst(keys::Vector{Int32}, key::Int32, budget::Budget)
     lo = 1
@@ -575,39 +542,6 @@ function resolutionsearchsortedfirst(keys::Vector{Int32}, key::Int32, budget::Bu
     return lo
 end
 
-function budgetedkeyindex(d::FrozenDict, key, budget::Union{Nothing,Budget})
-    i = budgetedsearchsortedfirst(d.keys, key, budget)
-    if i <= length(d.keys)
-        budget === nothing || addcompare!(budget, keycomparisonwork(d.keys[i], key))
-        keymatches(d.keys[i], key) && return i
-    end
-    return 0
-end
-
-function budgetedhaskey(d::FrozenDict, key, budget::Union{Nothing,Budget})
-    return budgetedkeyindex(d, key, budget) != 0
-end
-
-function budgetedget(d::FrozenDict, key, default, budget::Union{Nothing,Budget})
-    i = budgetedkeyindex(d, key, budget)
-    i == 0 && return default
-    return d.vals[i]
-end
-
-function budgetedgetindex(d::FrozenDict, key, budget::Union{Nothing,Budget})
-    i = budgetedkeyindex(d, key, budget)
-    i == 0 && throw(KeyError(key))
-    return d.vals[i]
-end
-
-function keycomparisonwork(a::AbstractString, b::AbstractString)
-    return min(sizeof(a), sizeof(b)) + 1
-end
-
-function keycomparisonwork(a, b)
-    return max(slotbytes(typeof(a)), slotbytes(typeof(b)))
-end
-
 function keymatches(a, b)
     return a == b
 end
@@ -619,7 +553,6 @@ function resetbudget!(b::Budget)
     b.peak = 0
     b.values = 0
     b.input_bytes = 0
-    b.compare_bytes = 0
     b.rows = 0
     b.blocks = 0
     b.members = 0
@@ -636,7 +569,7 @@ end
     addinput!(budget, n)
 
 Credit `n` input bytes (decompressed block bytes plus framing, raw datum bytes, or JSON text) to the
-work and comparison rules.
+work rule.
 """
 function addinput!(b::Budget, n::Int)
     n <= 0 && return b
@@ -766,39 +699,6 @@ end
 function endworkdefer!(b::Budget)
     b.workdeferred > 0 || throw(ArgumentError("work transaction is not active"))
     b.workdeferred -= 1
-    return nothing
-end
-
-"""
-    addcompare!(budget, n)
-
-Charge `n` compared key bytes (or moved index entries, 4 or 8 bytes each) against the comparison rule
-`compare_bytes ≤ max_compare_bytes_per_byte × input_bytes + work_allowance`.
-"""
-function addcompare!(b::Budget, n::Int)
-    n <= 0 && return b
-    l = b.limits
-    cap = muladdcap(l.max_compare_bytes_per_byte, b.input_bytes,
-                    l.work_allowance)
-    n <= typemax(Int) - b.compare_bytes ||
-        throw(limiterror(b, :max_compare_bytes_per_byte, typemax(Int), cap))
-    b.compare_bytes += n
-    if b.workdeferred == 0
-        b.compare_bytes <= cap ||
-            throw(limiterror(b, :max_compare_bytes_per_byte, b.compare_bytes, cap))
-    end
-    return b
-end
-
-"Validate exact comparison work against the input bytes of its complete operation scope."
-function checkcomparisonwork!(b::Budget, compared::Int=b.compare_bytes,
-                              input::Int=b.input_bytes)
-    compared >= 0 || throw(ArgumentError("compared bytes must be non-negative"))
-    input >= 0 || throw(ArgumentError("comparison input must be non-negative"))
-    cap = muladdcap(b.limits.max_compare_bytes_per_byte, input,
-                    b.limits.work_allowance)
-    compared <= cap ||
-        throw(limiterror(b, :max_compare_bytes_per_byte, compared, cap))
     return nothing
 end
 

@@ -305,6 +305,21 @@ import DataAPI
         @test collect(Tables.columnnames(p)) == collect(sel) && Tables.getcolumn(p, :x2000) == [3999, 4000]
     end
 
+    @testset "acceptance does not depend on names interned earlier" begin
+        # Two 400-column files read alternately: acceptance is the same however many names exist already.
+        widefile(prefix) = Avro.tobuffer(NamedTuple{Tuple(Symbol(prefix, i) for i in 1:400)}(Tuple([i] for i in 1:400)))
+        a, b = take!(widefile("metric_a_")), take!(widefile("metric_b_"))
+        warm = Avro.SymbolAdmission()
+        for i in 1:5_000
+            Avro.admit!(warm, "warm-$i")
+        end
+        for names in (Avro.DEFAULT_ADMISSION, warm)
+            @test length(Avro.Table(a; names=names)) == 1
+            @test length(Avro.Table(b; names=names)) == 1
+            @test length(Avro.Table(a; names=names)) == 1
+        end
+    end
+
     @testset "zero rows, zero columns, empty records" begin
         e0 = Avro.tobuffer(rows[1:0]; schema=s)
         t0 = Avro.Table(e0)

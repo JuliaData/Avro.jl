@@ -150,7 +150,7 @@ function defaultvaluecount(schema::MapSchema, json::JSONObject, budget::Budget,
     for key in json.order
         values = checked_add(values,
                              defaultvaluecount(schema.values,
-                                               budgetedgetindex(json.members, key, budget),
+                                               getindex(json.members, key),
                                                budget, depth + 1, branches,
                                                maxdepth))
     end
@@ -166,8 +166,8 @@ function defaultvaluecount(schema::RecordSchema, json::JSONObject, budget::Budge
     maxdepth[] = max(maxdepth[], depth)
     values = 1
     for field in schema.fields
-        child, childbranch = if budgetedhaskey(json.members, field.name, budget)
-            (budgetedgetindex(json.members, field.name, budget), 0)
+        child, childbranch = if haskey(json.members, field.name)
+            (getindex(json.members, field.name), 0)
         else
             default = field.default
             default isa DefaultValue && default.valid ||
@@ -655,14 +655,11 @@ function resolvenode(ctx::ResolveContext, w::Schema, r::Schema,
 end
 
 "Named types match by normalised fullname, by a reader alias, or by the unqualified name (the spec's record rule)."
-function namesmatch(w::NamedSchema, r::NamedSchema, budget::Union{Nothing,Budget}=nothing)
-    budget === nothing || addcompare!(budget, fullnamecomparisonwork(w.name, r.name))
+function namesmatch(w::NamedSchema, r::NamedSchema)
     fullnameequal(w.name, r.name) && return true
     for alias in r.aliases
-        budget === nothing || addcompare!(budget, fullnamecomparisonwork(w.name, alias))
         fullnameequal(w.name, alias) && return true
     end
-    budget === nothing || addcompare!(budget, keycomparisonwork(w.name.name, r.name.name))
     return w.name.name == r.name.name
 end
 
@@ -674,7 +671,7 @@ function resolvekinds(ctx::ResolveContext, w::Schema, r::Schema,
     if r isa RecordSchema
         w isa RecordSchema || reserror(ctx, wp, rp, "writer ", SchemaDescription(w),
             " does not resolve to reader ", SchemaDescription(r))
-        javasoft || namesmatch(w, r, ctx.budget) ||
+        javasoft || namesmatch(w, r) ||
             reserror(ctx, wp, rp, "writer ", SchemaDescription(w),
                      " does not match reader ", SchemaDescription(r), " by name or alias")
         return resolverecord(ctx, w, r, wp, rp, javasoft)
@@ -682,14 +679,14 @@ function resolvekinds(ctx::ResolveContext, w::Schema, r::Schema,
     if r isa EnumSchema
         w isa EnumSchema || reserror(ctx, wp, rp, "writer ", SchemaDescription(w),
             " does not resolve to reader ", SchemaDescription(r))
-        namesmatch(w, r, ctx.budget) || reserror(ctx, wp, rp, "writer ", SchemaDescription(w),
+        namesmatch(w, r) || reserror(ctx, wp, rp, "writer ", SchemaDescription(w),
             " does not match reader ", SchemaDescription(r), " by name or alias")
         return resolveenum(ctx, w, r, wp, rp)
     end
     if r isa FixedSchema
         w isa FixedSchema || reserror(ctx, wp, rp, "writer ", SchemaDescription(w),
             " does not resolve to reader ", SchemaDescription(r))
-        namesmatch(w, r, ctx.budget) || reserror(ctx, wp, rp, "writer ", SchemaDescription(w),
+        namesmatch(w, r) || reserror(ctx, wp, rp, "writer ", SchemaDescription(w),
             " does not match reader ", SchemaDescription(r), " by name or alias")
         w.size == r.size || reserror(ctx, wp, rp, "fixed sizes differ (", w.size,
             " vs ", r.size, ")")
@@ -751,9 +748,9 @@ function resolveleaf(ctx::ResolveContext, w::Schema, r::Schema,
 end
 
 "Whether writer `w` matches reader branch `c` at the top level (the spec's matching rules, with promotion)."
-function matches(w::Schema, c::Schema, budget::Union{Nothing,Budget}=nothing)
+function matches(w::Schema, c::Schema)
     c isa UnionSchema && return false
-    w isa NamedSchema && return typeof(w) === typeof(c) && namesmatch(w, c, budget) &&
+    w isa NamedSchema && return typeof(w) === typeof(c) && namesmatch(w, c) &&
         (!(w isa FixedSchema) || w.size == c.size) && matchingdecimals(w, c)
     c isa NamedSchema && return false
     kw, kc = kind(w), kind(c)
@@ -770,12 +767,12 @@ function matchingdecimals(w::Schema, r::Schema)
 end
 
 "Apache Java's first pass: the same kind (named types by fullname or reader alias), no promotion."
-function exactmatch(w::Schema, c::Schema, budget::Union{Nothing,Budget}=nothing)
+function exactmatch(w::Schema, c::Schema)
     typeof(w) === typeof(c) || return false
     if w isa NamedSchema
-        budgetedfullnameequal(w.name, c.name, budget) && return true
+        fullnameequal(w.name, c.name) && return true
         for alias in c.aliases
-            budgetedfullnameequal(w.name, alias, budget) && return true
+            fullnameequal(w.name, alias) && return true
         end
         return false
     end
@@ -797,7 +794,7 @@ function softcandidate(ctx::ResolveContext, writer::RecordSchema, reader::Field)
     viaalias = false
     for name in Iterators.flatten(((reader.name,), reader.aliases))
         addresolution!(ctx.budget)
-        index = budgetedget(writer.fieldindex, name, 0, ctx.budget)
+        index = get(writer.fieldindex, name, 0)
         (index == 0 || index == candidate) && continue
         candidate == 0 || return (-1, false)
         candidate = index
@@ -845,10 +842,10 @@ function softrootactionok(ctx::ResolveContext, writer::Schema, reader::Schema,
         return kind(reader) in get(PROMOTIONS, kind(writer), ())
     writer isa Union{RecordSchema,ArraySchema,MapSchema} && return true
     writer isa FixedSchema &&
-        return namesmatch(writer, reader::FixedSchema, ctx.budget) &&
+        return namesmatch(writer, reader::FixedSchema) &&
                writer.size == reader.size && matchingdecimals(writer, reader)
     writer isa EnumSchema &&
-        return namesmatch(writer, reader::EnumSchema, ctx.budget)
+        return namesmatch(writer, reader::EnumSchema)
     return matchingdecimals(writer, reader)
 end
 
@@ -886,7 +883,7 @@ function selectbranch(ctx::ResolveContext, w::Schema, r::UnionSchema,
     if ctx.policy === :java
         for (j, c) in enumerate(r.branches)
             addresolution!(ctx.budget, 1)
-            exactmatch(w, c, ctx.budget) && return BranchMatch(j, false)
+            exactmatch(w, c) && return BranchMatch(j, false)
         end
         if w isa RecordSchema
             ownedpath = path === nothing
@@ -916,8 +913,8 @@ function selectbranch(ctx::ResolveContext, w::Schema, r::UnionSchema,
     first = 0                                          # the writer's own type beats an earlier promotion
     for (j, c) in enumerate(r.branches)
         addresolution!(ctx.budget, 1)
-        matches(w, c, ctx.budget) || continue
-        exactmatch(w, c, ctx.budget) && return BranchMatch(j, false)
+        matches(w, c) || continue
+        exactmatch(w, c) && return BranchMatch(j, false)
         first == 0 && (first = j)
     end
     return BranchMatch(first, false)
@@ -933,8 +930,8 @@ function namedbranch(ctx::ResolveContext, w::NamedSchema, r::UnionSchema)
     candidates = 0
     for (j, c) in enumerate(r.branches)
         addresolution!(ctx.budget, 1)
-        matches(w, c, ctx.budget) || continue
-        exactmatch(w, c, ctx.budget) && return BranchMatch(j, false)
+        matches(w, c) || continue
+        exactmatch(w, c) && return BranchMatch(j, false)
         candidates += 1
         found = j
     end
@@ -1136,7 +1133,7 @@ function resolverecord(ctx::ResolveContext, w::RecordSchema, r::RecordSchema,
             for name in Iterators.flatten(((rf.name,), rf.aliases))
                 addresolution!(ctx.budget, 1)
                 addinput!(ctx.budget, sizeof(name))   # matched names are this operation's input text
-                i = budgetedget(w.fieldindex, name, 0, ctx.budget)
+                i = get(w.fieldindex, name, 0)
                 (i == 0 || i == cand[j]) && continue
                 if cand[j] != 0
                     pushfield!(rp, rf.name, ctx.budget)

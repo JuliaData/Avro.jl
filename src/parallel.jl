@@ -132,7 +132,7 @@ end
 
 "A per-block budget: the block's own caps and counters under a ceiling of exactly `W`."
 function blockbudget(limits::Limits, W::Int)
-    return Budget(limits, W, :decode, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    return Budget(limits, W, :decode, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
                   min(limits.max_total_values, limits.work_allowance), 0, 0)
 end
 
@@ -451,7 +451,6 @@ function commitjob!(r::Reader, job::BlockJob, finals::Vector{AbstractVector}, ke
         countvalues!(b, job.budget.values)
         b.allowance_used = max(b.allowance_used, job.budget.allowance_used)
         checkoperationwork!(b)
-        addcompare!(b, job.budget.compare_bytes)
         b.members = checked_add(b.members, job.budget.members)
         addrows!(b, e.count)
         job.outputbytes <= r.limits.max_block_output_bytes ||

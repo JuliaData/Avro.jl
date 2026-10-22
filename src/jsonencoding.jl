@@ -48,7 +48,6 @@ function tojson(s::Schema, x; pretty::Bool=false, limits::Limits=Limits())
             endworkdefer!(budget)
         end
         checkoperationwork!(budget)
-        checkcomparisonwork!(budget)
         return text
     end
 end
@@ -193,7 +192,7 @@ end
 
 function printmember(out::JSONOut, s::UnionSchema, i::Int, v, depth, budget)
     branch = s.branches[i]
-    ambiguouslabel(s, i, budget) &&
+    ambiguouslabel(s, i) &&
         throw(EncodeError("union label is ambiguous (a named type and a kind share it)", "\$", s))
     io = out.io
     print(io, '{')
@@ -229,59 +228,43 @@ function unionkindlabel(s::Schema)
     throw(ArgumentError("internal error: a union label has no schema kind"))
 end
 
-function stringcomparisonwork(a::AbstractString, b::AbstractString)
-    aa = codeunits(a)
-    bb = codeunits(b)
-    n = min(length(aa), length(bb))
-    for i in 1:n
-        aa[i] == bb[i] || return i
-    end
-    return n + 1
-end
-
-function unionlabelmatches(s::NamedSchema, label::String, budget::Budget)
-    addcompare!(budget, fullnamecomparisonwork(s.name, label))
+function unionlabelmatches(s::NamedSchema, label::String)
     return fullnameequal(s.name, label)
 end
 
-function unionlabelmatches(s::Schema, label::String, budget::Budget)
-    expected = unionkindlabel(s)
-    addcompare!(budget, stringcomparisonwork(expected, label))
-    return expected == label
+function unionlabelmatches(s::Schema, label::String)
+    return unionkindlabel(s) == label
 end
 
-function sameunionlabel(a::NamedSchema, b::NamedSchema, budget::Budget)
-    return budgetedfullnameequal(a.name, b.name, budget)
+function sameunionlabel(a::NamedSchema, b::NamedSchema)
+    return fullnameequal(a.name, b.name)
 end
 
-function sameunionlabel(a::NamedSchema, b::Schema, budget::Budget)
-    return budgetedfullnameequal(a.name, unionkindlabel(b), budget)
+function sameunionlabel(a::NamedSchema, b::Schema)
+    return fullnameequal(a.name, unionkindlabel(b))
 end
 
-function sameunionlabel(a::Schema, b::NamedSchema, budget::Budget)
-    return sameunionlabel(b, a, budget)
+function sameunionlabel(a::Schema, b::NamedSchema)
+    return sameunionlabel(b, a)
 end
 
-function sameunionlabel(a::Schema, b::Schema, budget::Budget)
-    x = unionkindlabel(a)
-    y = unionkindlabel(b)
-    addcompare!(budget, stringcomparisonwork(x, y))
-    return x == y
+function sameunionlabel(a::Schema, b::Schema)
+    return unionkindlabel(a) == unionkindlabel(b)
 end
 
-function ambiguouslabel(s::UnionSchema, index::Int, budget::Budget)
+function ambiguouslabel(s::UnionSchema, index::Int)
     selected = s.branches[index]
     for (i, branch) in enumerate(s.branches)
         i == index && continue
-        sameunionlabel(selected, branch, budget) && return true
+        sameunionlabel(selected, branch) && return true
     end
     return false
 end
 
-function branchbylabel(s::UnionSchema, label::String, budget::Budget)
+function branchbylabel(s::UnionSchema, label::String)
     found = 0
     for (i, b) in enumerate(s.branches)
-        unionlabelmatches(b, label, budget) || continue
+        unionlabelmatches(b, label) || continue
         found == 0 || return -1
         found = i
     end
@@ -484,7 +467,6 @@ function jsonvalue(s::Schema, j, budget::Budget, branch::Int,
                                              "resolved default branch tape does not match its root"), 0))
     end
     position = budget.default_position
-    compared = budget.compare_bytes
     budget.default_position = 1
     countdatum || beginworkdefer!(budget)
     try
@@ -495,7 +477,6 @@ function jsonvalue(s::Schema, j, budget::Budget, branch::Int,
         return value
     finally
         countdatum || endworkdefer!(budget)
-        countdatum || (budget.compare_bytes = compared)
         budget.default_position = position
     end
 end
@@ -638,10 +619,10 @@ end
 function jsonkind(s::EnumSchema, j, ctx, depth)
     j isa String ||
         jsonerror(ctx, "expected an enum symbol string, got ", describejson(j))
-    budgetedhaskey(s.symbolindex, j, ctx.budget) ||
+    haskey(s.symbolindex, j) ||
         jsonerror(ctx, boundedquoted(j), " is not a symbol of enum ", s.name)
     reserve!(ctx.budget, enumvaluebytes())
-    v = EnumValue(s, Int32(budgetedgetindex(s.symbolindex, j, ctx.budget)), Val(:unchecked))
+    v = EnumValue(s, Int32(getindex(s.symbolindex, j)), Val(:unchecked))
     allocated!(ctx.budget, enumvaluebytes())
     return v
 end
@@ -681,7 +662,7 @@ function jsonkind(s::MapSchema, j, ctx, depth)
             keys[i] = k
         end
         vals[i] = jsontovalue(s.values,
-            budgetedgetindex(j.members, k, ctx.budget), ctx, depth + 1)
+            getindex(j.members, k), ctx, depth + 1)
     end
     return buildmap(V, keys, vals, ctx.budget)
 end
@@ -694,7 +675,7 @@ function jsonkind(s::RecordSchema, j, ctx, depth)
     n = length(s.fields)
     if ctx.unknownerror
         for k in j.order
-            budgetedhaskey(s.fieldindex, k, ctx.budget) ||
+            haskey(s.fieldindex, k) ||
                 jsonerror(ctx, "unknown member ", boundedquoted(k),
                           " of record ", s.name)
         end
@@ -705,9 +686,9 @@ function jsonkind(s::RecordSchema, j, ctx, depth)
     for (i, f) in enumerate(s.fields)
         b = boxcharge(juliatype(f.schema))
         b > 0 && reserve!(ctx.budget, b)                                # before the assignment can box
-        if budgetedhaskey(j.members, f.name, ctx.budget)
+        if haskey(j.members, f.name)
             vals[i] = jsontovalue(f.schema,
-                budgetedgetindex(j.members, f.name, ctx.budget), ctx, depth + 1)
+                getindex(j.members, f.name), ctx, depth + 1)
         elseif ctx.bareunion && f.default isa DefaultValue
             default = f.default
             vals[i] = jsontovalue(f.schema, default.json, ctx, depth + 1,
@@ -771,13 +752,13 @@ function jsonkind(s::UnionSchema, j, ctx, depth)
         jsonerror(ctx, "expected null or a one-member object for a union, got ",
                   describejson(j))
     label = j.order[1]
-    i = branchbylabel(s, label, ctx.budget)
+    i = branchbylabel(s, label)
     i == 0 && jsonerror(ctx, boundedquoted(label),
                         " names no branch of the union")
     i == -1 && jsonerror(ctx, "union label ", boundedquoted(label),
                          " is ambiguous (a named type and a kind share it)")
     v = jsontovalue(s.branches[i],
-        budgetedgetindex(j.members, label, ctx.budget), ctx, depth)
+        getindex(j.members, label), ctx, depth)
     return nb != 0 ? v : chargedunion(i, v, ctx)
 end
 

@@ -168,20 +168,18 @@ end
     buildmap(V, keys, vals, budget) -> Map{V}
 
 The construction used by decoding and the public constructors: reserve the `npairs` permutation plus
-the merge-sort scratch, sort the candidate indices by key bytes (every compared byte charged to the
-comparison rule), resolve duplicates last-wins into the first occurrence's position, and compact in
-place (the vectors keep their `npairs` capacity).
+the merge-sort scratch, sort the candidate indices by key bytes, resolve duplicates last-wins into the
+first occurrence's position, and compact in place (the vectors keep their `npairs` capacity).
 """
 function buildmap(::Type{V}, keys::Vector{String}, vals::Vector{V}, budget::Union{Nothing,Budget};
                   duplicateposition::Union{Nothing,Int}=nothing, ownvalues::Bool=true) where {V}
     n = length(keys)
-    valuemovework = isbitstype(V) || Base.isbitsunion(V) ? 0 : 8
     n <= typemax(Int32) || throw(ArgumentError("a map cannot hold more than $(typemax(Int32)) pairs"))
     budget === nothing || reserve!(budget, mapshellbytes(n) + vectorbytes(Int32, cld(n, 2)))   # struct, permutation and the sort scratch
     perm = Vector{Int32}(undef, n)
     scratch = Vector{Int32}(undef, cld(n, 2))
     budget === nothing || allocated!(budget, vectorbytes(Int32, n) + vectorbytes(Int32, cld(n, 2)))   # the Map shell settles at construction
-    mergesort!(perm, scratch, keys, budget)
+    mergesort!(perm, scratch, keys)
     # duplicates: the sorted run groups equal keys; the earliest index keeps the position, the last value wins
     ndup = 0
     discardbytes = 0
@@ -192,7 +190,7 @@ function buildmap(::Type{V}, keys::Vector{String}, vals::Vector{V}, budget::Unio
         i = 1
         while i <= n
             j = i
-            while j < n && keyequal(keys[perm[j + 1]], keys[perm[i]], budget)
+            while j < n && keymatches(keys[perm[j + 1]], keys[perm[i]])
                 j += 1
             end
             if j > i
@@ -210,7 +208,6 @@ function buildmap(::Type{V}, keys::Vector{String}, vals::Vector{V}, budget::Unio
                     p == last || (discardbytes = checked_add(discardbytes, mapvaluebytes(V, vals[p], ownvalues)))
                 end
                 vals[first] = vals[last]
-                budget === nothing || addcompare!(budget, valuemovework)
                 for k in i:j
                     perm[k] == first || (keep[perm[k]] = false; ndup += 1)
                 end
@@ -230,7 +227,6 @@ function buildmap(::Type{V}, keys::Vector{String}, vals::Vector{V}, budget::Unio
                     newindex[i] = Int32(w)
                 end
             end
-            budget === nothing || addcompare!(budget, checked_mul(12 + valuemovework, w))
             resize!(keys, w)
             resize!(vals, w)
             budget === nothing || release!(budget, discardbytes)
@@ -241,7 +237,6 @@ function buildmap(::Type{V}, keys::Vector{String}, vals::Vector{V}, budget::Unio
                 r += 1
                 perm[r] = newindex[p]
             end
-            budget === nothing || addcompare!(budget, checked_mul(4, r))
             resize!(perm, w)                                                 # keep the original `npairs` capacity
             budget === nothing || release!(budget, vectorbytes(Int32, n))   # the index map dies here
         end
@@ -259,72 +254,49 @@ function mapvaluebytes(::Type{V}, @nospecialize(value), ownvalues::Bool) where {
     return 0
 end
 
-function keyequal(a, b, budget::Union{Nothing,Budget})
-    budget === nothing || addcompare!(budget, keycomparisonwork(a, b))
-    return keymatches(a, b)
-end
-
 """
-    mergesort!(perm, scratch, keys, budget=nothing)
+    mergesort!(perm, scratch, keys)
 
-Stable merge sort of `perm` by `keys[perm[i]]` (`isless`; strings in byte order) using `scratch` of length `cld(n, 2)`;
-initialises `perm` and charges every key comparison and four-byte permutation move before doing it.
+Stable merge sort of `perm` by `keys[perm[i]]` (`isless`; strings in byte order) using `scratch` of length
+`cld(n, 2)`; initialises `perm` and allocates nothing.
 """
-function mergesort!(perm::Vector{Int32}, scratch::Vector{Int32}, keys::Vector,
-                    budget::Union{Nothing,Budget}=nothing)
+function mergesort!(perm::Vector{Int32}, scratch::Vector{Int32}, keys::Vector)
     for i in eachindex(perm)
-        budget === nothing || addcompare!(budget, 4)
         perm[i] = Int32(i)
     end
-    msort!(perm, 1, length(perm), scratch, keys, budget)
+    msort!(perm, 1, length(perm), scratch, keys)
     return nothing
 end
 
-function keyless(a, b, budget::Union{Nothing,Budget})
-    budget === nothing || addcompare!(budget, keycomparisonwork(a, b))
-    return isless(a, b)
-end
-
-function addpermutationmoves!(budget::Union{Nothing,Budget}, n::Int)
-    budget === nothing || addcompare!(budget, checked_mul(4, n))
-    return nothing
-end
-
-function msort!(v::Vector{Int32}, lo::Int, hi::Int, t::Vector{Int32}, keys::Vector, budget)
+function msort!(v::Vector{Int32}, lo::Int, hi::Int, t::Vector{Int32}, keys::Vector)
     if hi - lo < 16
         for i in lo + 1:hi
             x = v[i]
             j = i - 1
-            while j >= lo && keyless(keys[x], keys[v[j]], budget)
-                addpermutationmoves!(budget, 1)
+            while j >= lo && isless(keys[x], keys[v[j]])
                 v[j + 1] = v[j]
                 j -= 1
             end
-            addpermutationmoves!(budget, 1)
             v[j + 1] = x
         end
         return v
     end
     mid = (lo + hi) >>> 1
-    msort!(v, lo, mid, t, keys, budget)
-    msort!(v, mid + 1, hi, t, keys, budget)
-    keyless(keys[v[mid + 1]], keys[v[mid]], budget) || return v   # already ordered
+    msort!(v, lo, mid, t, keys)
+    msort!(v, mid + 1, hi, t, keys)
+    isless(keys[v[mid + 1]], keys[v[mid]]) || return v   # already ordered
     nl = mid - lo + 1
-    addpermutationmoves!(budget, nl)
     copyto!(t, 1, v, lo, nl)
     i = 1; j = mid + 1; k = lo
     while i <= nl && j <= hi
-        if keyless(keys[v[j]], keys[t[i]], budget)
-            addpermutationmoves!(budget, 1)
+        if isless(keys[v[j]], keys[t[i]])
             v[k] = v[j]; j += 1
         else
-            addpermutationmoves!(budget, 1)
             v[k] = t[i]; i += 1
         end
         k += 1
     end
     while i <= nl
-        addpermutationmoves!(budget, 1)
         v[k] = t[i]; i += 1; k += 1
     end
     return v
@@ -623,7 +595,6 @@ function EnumValue(schema::EnumSchema, symbol::AbstractString; limits::Limits=Li
         countvalues!(budget)
         addinput!(budget, sizeof(symbol))
         for (i, candidate) in enumerate(schema.symbols)
-            addcompare!(budget, min(sizeof(candidate), sizeof(symbol)) + 1)
             candidate == symbol && return publicenumvalue(schema, i, budget; counted=true)
         end
         throw(ArgumentError(diagnosticstring(

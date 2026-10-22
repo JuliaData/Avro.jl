@@ -714,9 +714,9 @@ function parsereference(ctx::ParseContext, name::String, enclosing::String)
     checknamebytes(ctx, name)
     dotted = findlast('.', name) !== nothing
     key = dotted || isempty(enclosing) ? name : FullName(name, enclosing)
-    s = budgetedget(ctx.named, key, nothing, ctx.budget)
+    s = get(ctx.named, key, nothing)
     s === nothing && !isempty(enclosing) &&
-        (s = budgetedget(ctx.named, name, nothing, ctx.budget))   # a bare reference may name a null-namespace type
+        (s = get(ctx.named, name, nothing))   # a bare reference may name a null-namespace type
     s === nothing && schemaerror(ctx, "undefined type \"$(escapename(name))\" (types must be defined before use)")
     return s
 end
@@ -750,13 +750,6 @@ function Base.isless(a::BranchIdentity, b::BranchIdentity)
     a.tag == b.tag || return a.tag < b.tag
     a.tag == 0 || return false
     return isless(FullName(a.name, a.namespace), FullName(b.name, b.namespace))
-end
-
-function keycomparisonwork(a::BranchIdentity, b::BranchIdentity)
-    a.tag == b.tag || return 2
-    a.tag == 0 || return 2
-    return 1 + fullnamecomparisonwork(FullName(a.name, a.namespace),
-                                      FullName(b.name, b.namespace))
 end
 
 function branchkindtag(s::Schema)
@@ -865,7 +858,7 @@ function parsenamed(ctx::ParseContext, obj::JSONObject, enclosing::String)
     checkname(ctx, full.name, "name", "name")
     checknamespace(ctx, full.namespace, "namespace")
     isreservedfullname(full) && schemaerror(ctx, "\"$(full.name)\" is a primitive type name and cannot be redefined in the null namespace", "name")
-    budgetedhaskey(ctx.named, full, ctx.budget) &&
+    haskey(ctx.named, full) &&
         schemaerror(ctx, "duplicate type name", "name")
     ctx.namedcount[] += 1
     ctx.namedcount[] <= ctx.limits.max_named_types ||
@@ -891,7 +884,7 @@ function parsenamed(ctx::ParseContext, obj::JSONObject, enclosing::String)
                 release!(ctx.budget, stringbytes(sizeof(na)))
                 continue
             end
-            if budgetedhaskey(seen, na, ctx.budget)
+            if haskey(seen, na)
                 release!(ctx.budget, stringbytes(sizeof(na)))
                 continue
             end
@@ -909,10 +902,10 @@ function parsenamed(ctx::ParseContext, obj::JSONObject, enclosing::String)
 end
 
 function register!(ctx::ParseContext, s::NamedSchema)
-    budgetedhaskey(ctx.identities, s.name, ctx.budget) &&
+    haskey(ctx.identities, s.name) &&
         schemaerror(ctx, "a name or alias is used by more than one type")
     for alias in s.aliases
-        budgetedhaskey(ctx.identities, alias, ctx.budget) &&
+        haskey(ctx.identities, alias) &&
             schemaerror(ctx, "name or alias \"$alias\" is used by more than one type")
     end
     full = ownedfullname(s.name, ctx.budget)
@@ -971,9 +964,9 @@ function parseenum(ctx::ParseContext, obj::JSONObject, enclosing::String, buf)
     default = nodefault
     if haskey(obj, "default")
         d = obj["default"]
-        if d isa String && budgetedhaskey(index, d, ctx.budget)
+        if d isa String && haskey(index, d)
             default = DefaultValue(d, 0, spanof(ctx, obj, "default", buf),
-                budgetedgetindex(index, d, ctx.budget), true)
+                getindex(index, d), true)
         else
             ctx.allow_invalid_defaults || schemaerror(ctx, "enum default must be one of the symbols", "default")
             ctx.repaired_defaults = true
@@ -1025,7 +1018,7 @@ function capturelexemes(ctx::ParseContext, obj::JSONObject, buf, schema::Schema)
               schema isa RecordSchema ? ("fields",) : ()
     members = rawmembers(ctx, obj, buf, skipped)
     schema isa RecordSchema || return SchemaLexemes(members, EMPTY_FIELD_LEXEMES)
-    fieldjson = budgetedget(obj.members, "fields", nothing, ctx.budget)
+    fieldjson = get(obj.members, "fields", nothing)
     fieldjson isa JSONArray || return SchemaLexemes(members, EMPTY_FIELD_LEXEMES)
     n = length(fieldjson)
     n == 0 && return SchemaLexemes(members, EMPTY_FIELD_LEXEMES)
@@ -1079,9 +1072,9 @@ function parserecord(ctx::ParseContext, obj::JSONObject, enclosing::String, buf,
         dup = budgetedsort!(fieldindex, ctx.budget)
         dup == 0 || fielderror(ctx, dup, "duplicate field name \"$(escapename(fields[dup].name))\"", "name")
         for (i, field) in enumerate(fields), alias in field.aliases
-            budgetedhaskey(fieldindex, alias, ctx.budget) &&
+            haskey(fieldindex, alias) &&
                 fielderror(ctx, i, "field alias \"$(escapename(alias))\" collides with a field name", "aliases")
-            budgetedhaskey(aliasowners, alias, ctx.budget) &&
+            haskey(aliasowners, alias) &&
                 fielderror(ctx, i, "field alias \"$(escapename(alias))\" is declared by two fields", "aliases")
             budgetedinsert!(aliasowners, alias, i, ctx.budget)
         end
@@ -1129,7 +1122,7 @@ function parsefield(ctx::ParseContext, obj::JSONObject, ns::String, buf)
         for (i, a) in enumerate(rawaliases)
             checknamebytes(ctx, a)
             a == name && continue
-            budgetedhaskey(seen, a, ctx.budget) && continue
+            haskey(seen, a) && continue
             budgetedinsert!(seen, a, true, ctx.budget)
             push!(aliases, ctx.budget, a)
         end
@@ -1432,7 +1425,7 @@ function completedefaultmatches(schema::MapSchema, json,
     json isa JSONObject || return false
     for key in json.order
         isstrictutf8(key) || return false
-        child = budgetedgetindex(json.members, key, state.budget)
+        child = getindex(json.members, key)
         completevalidatedefault(schema.values, child, state, depth + 1)[1] ||
             return false
     end
@@ -1443,9 +1436,8 @@ function completedefaultmatches(schema::RecordSchema, json,
                                 state::DefaultValidationState, depth::Int)
     json isa JSONObject || return false
     for field in schema.fields
-        child, childschema = if budgetedhaskey(json.members, field.name,
-                                              state.budget)
-            (budgetedgetindex(json.members, field.name, state.budget),
+        child, childschema = if haskey(json.members, field.name)
+            (getindex(json.members, field.name),
              field.schema)
         else
             default = field.default
@@ -2091,7 +2083,7 @@ function printbudget(io::BoundedWriter)
 end
 
 function rawmember(io::IO, members::FrozenDict{String,RawMember}, key::String)
-    return budgetedget(members, key, nothing, printbudget(io))
+    return get(members, key, nothing)
 end
 
 function printattribute(io::IO, members::FrozenDict{String,RawMember}, key::String,
@@ -2375,7 +2367,7 @@ function makeprops(propsin, structural, logical, budget::Budget)
         ks in structural && throw(ArgumentError("`props` key \"$ks\" collides with a structural attribute emitted by this constructor"))
         logical !== nothing && ks in ("logicalType", "precision", "scale") &&
             throw(ArgumentError("`props` key \"$ks\" is synthesised by `logical=`"))
-        budgetedhaskey(p, ks, budget) && throw(ArgumentError("duplicate `props` key \"$ks\""))
+        haskey(p, ks) && throw(ArgumentError("duplicate `props` key \"$ks\""))
         budgetedjsoninsert!(p, ks, tojsonvalue(v, budget), budget) # unsized inputs grow by exact replacement
     end
     if logical !== nothing
@@ -2495,7 +2487,7 @@ function tojsonvalueimpl(x::JSONObject, b::Budget, depth::Int)
     allocated!(b, slots)
     for key in x.order
         copy = ownedstringcopy(key, b)
-        value = budgetedgetindex(x.members, key, b)
+        value = getindex(x.members, key)
         budgetedjsoninsert!(members, copy, tojsonvalue(value, b, depth + 1), b)
         push!(order, copy)
     end
@@ -2561,7 +2553,7 @@ function tojsonvalueimpl(x::Union{AbstractDict,NamedTuple}, b::Budget, depth::In
     for (k, v) in (x isa NamedTuple ? pairs(x) : x)
         k isa Union{AbstractString,Symbol} || throw(ArgumentError("JSON object keys must be strings or symbols"))
         ks = ownedstringcopy(k, b)
-        budgetedhaskey(m, ks, b) && throw(ArgumentError("duplicate key \"$ks\""))
+        haskey(m, ks) && throw(ArgumentError("duplicate key \"$ks\""))
         budgetedjsoninsert!(m, ks, tojsonvalue(v, b, depth + 1), b)
         push!(order, ks)
     end
@@ -2825,13 +2817,13 @@ function collectmetas!(s::Schema, walk::MetaWalk, namedtypes::FrozenDict{String,
     push!(walk.metas, s.meta)
     if s isa NamedSchema
         checkgraphnames(s, limits, budget.direction)
-        if budgetedhaskey(namedtypes, s.name, budget)
+        if haskey(namedtypes, s.name)
             throw(ArgumentError("a named schema is defined more than once"))
         end
-        budgetedhaskey(identities, s.name, budget) &&
+        haskey(identities, s.name) &&
             throw(ArgumentError("a named schema name or alias is used by more than one type"))
         for alias in s.aliases
-            budgetedhaskey(identities, alias, budget) &&
+            haskey(identities, alias) &&
                 throw(ArgumentError("named schema name or alias \"$alias\" is used by more than one type"))
         end
         fullkey = ownedfullname(s.name, budget)
@@ -2952,7 +2944,7 @@ function publicnamed(name::AbstractString, namespace::AbstractString, aliases, s
                                  :max_name_bytes, b.direction))
             na = ownednormalizedalias(sa, full.namespace, b)
             push!(raw, b, sa)
-            if na == canonical || budgetedhaskey(seen, na, b)
+            if na == canonical || haskey(seen, na)
                 release!(b, stringbytes(sizeof(na)))
                 continue
             end
@@ -3017,11 +3009,11 @@ function EnumSchema(name::AbstractString, symbols; namespace::AbstractString="",
                 throw(ArgumentError("enum default must be one of the symbols"))
             checkgraphnamebytes(default, limits, b.direction)
             ds = ownedstringcopy(default, b)
-            budgetedhaskey(index, ds, b) ||
+            haskey(index, ds) ||
                 throw(ArgumentError("enum default must be one of the symbols"))
             jw = BoundedWriter(b, limits.max_schema_bytes)
             escapejson(jw, ds)
-            d = DefaultValue(ds, 0, boundedtake!(jw), budgetedgetindex(index, ds, b), true)
+            d = DefaultValue(ds, 0, boundedtake!(jw), getindex(index, ds), true)
         end
         doccopy = doc === nothing ? nothing : ownedstringcopy(doc, b)
         reserve!(b, 24)                                # the symbol wrapper, made next
@@ -3117,7 +3109,7 @@ function Field(name::AbstractString, schema::Schema; default=nodefault, order::S
                 a isa Union{AbstractString,Symbol} || throw(ArgumentError("aliases must be strings"))
                 checkgraphnamebytes(a, b.limits, b.direction)
                 sa = ownedstringcopy(a, b)
-                if sa == name || budgetedhaskey(seen, sa, b)
+                if sa == name || haskey(seen, sa)
                     release!(b, stringbytes(sizeof(sa)))
                     continue
                 end
@@ -3196,9 +3188,9 @@ function recordschema_(f, name::AbstractString; namespace::AbstractString="", al
     allocated!(b, frozendictshell())
     try
         for (i, field) in enumerate(fields), alias in field.aliases
-            budgetedhaskey(index, alias, b) &&
+            haskey(index, alias) &&
                 throw(ArgumentError("field alias \"$alias\" collides with a field name"))
-            budgetedhaskey(aliasowners, alias, b) &&
+            haskey(aliasowners, alias) &&
                 throw(ArgumentError("field alias \"$alias\" is declared by two fields"))
             budgetedinsert!(aliasowners, alias, i, b)
         end
@@ -3233,11 +3225,11 @@ function importchild(s::Schema)
 end
 
 function memocopy(s::Schema, memo::FrozenDict{String,Schema})
-    return budgetedgetindex(memo, s.name, constructionbudget())
+    return getindex(memo, s.name)
 end
 
 function memocopy(s::Schema, memo::FrozenDict{String,Tuple{Schema,Schema}})
-    source, copy = budgetedgetindex(memo, s.name, constructionbudget())
+    source, copy = getindex(memo, s.name)
     source === s || throw(ArgumentError("a named schema is defined by more than one child schema"))
     return copy
 end
@@ -3330,7 +3322,7 @@ function copyjsonobject(source::JSONObject, budget::Budget, depth::Int)
             copyjsonvalue(source.members.vals[i], budget, depth + 1), budget)
     end
     for (i, key) in enumerate(source.order)
-        index = budgetedkeyindex(source.members, key, budget)
+        index = keyindex(source.members, key)
         index == 0 && throw(ArgumentError("internal error: JSON object order contains an unknown key"))
         order[i] = sortedkeys[index]
     end
@@ -3485,7 +3477,7 @@ function deepcopyschema(s::Schema,
                         memo::Union{FrozenDict{String,Schema},FrozenDict{String,Tuple{Schema,Schema}}},
                         depth::Int=1)
     if s isa NamedSchema
-        budgetedhaskey(memo, s.name, constructionbudget()) && return memocopy(s, memo)
+        haskey(memo, s.name) && return memocopy(s, memo)
     end
     budget = constructionbudget()
     props = s isa UnionSchema ? EMPTY_PROPS : copyprops(s.props, budget, depth + 1)

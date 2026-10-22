@@ -124,23 +124,20 @@ function schedule_unlocked!(a::SymbolAdmission, prebuilt::Union{Nothing,Vector{S
     return nothing
 end
 
-"Stage and charge at most `MERGE_STEP` merge moves before publishing the new merge position."
-function step_unlocked!(a::SymbolAdmission, prebuilt::Union{Nothing,Vector{String}}=nothing,
-                        budget::Union{Nothing,Budget}=nothing)
+"Stage at most `MERGE_STEP` merge moves before publishing the new merge position."
+function step_unlocked!(a::SymbolAdmission, prebuilt::Union{Nothing,Vector{String}}=nothing)
     m = a.merge
     m === nothing && return nothing
     x, y, out = m.x, m.y, m.out
     i, j = m.i, m.j
     k = i + j - 1
     stop = min(k + MERGE_STEP - 1, length(out))
-    work = 0
     @inbounds while k <= stop
         takeleft = if i > length(x)
             false
         elseif j > length(y)
             true
         else
-            work = checked_add(work, min(sizeof(x[i]), sizeof(y[j])) + 1)
             x[i] <= y[j]
         end
         if takeleft
@@ -150,10 +147,8 @@ function step_unlocked!(a::SymbolAdmission, prebuilt::Union{Nothing,Vector{Strin
             out[k] = y[j]
             j += 1
         end
-        work = checked_add(work, 8)                    # one staged String reference
         k += 1
     end
-    budget === nothing || addcompare!(budget, work)   # failure leaves i/j and every published table field unchanged
     m.i = i
     m.j = j
     if k > length(out)
@@ -183,18 +178,15 @@ Build the carried run before any mutation: the full recent buffer plus the incom
 the fixed carry workspace, sorted through the package merge sort (no hidden allocation), and written
 into a fresh exact-capacity run whose slots the admitted names' per-name charges already cover.
 """
-function buildcarry(a::SymbolAdmission, retained::String, budget::Union{Nothing,Budget})
+function buildcarry(a::SymbolAdmission, retained::String)
     n0 = length(a.recent)
     for i in 1:n0
-        budget === nothing || addcompare!(budget, 8)
         a.carrybuf[i] = a.recent[i]
     end
-    budget === nothing || addcompare!(budget, 8)
     a.carrybuf[n0 + 1] = retained
-    mergesort!(a.carryperm, a.carryscratch, a.carrybuf, budget)
+    mergesort!(a.carryperm, a.carryscratch, a.carrybuf)
     run = Vector{String}(undef, RUN_BASE)
     for i in 1:RUN_BASE
-        budget === nothing || addcompare!(budget, 8)
         run[i] = a.carrybuf[a.carryperm[i]]
     end
     return run
@@ -262,9 +254,6 @@ Admit `s` (if new, counting it against the table's budgets) and return `Symbol(s
 function admit!(a::SymbolAdmission, s::AbstractString; budget::Union{Nothing,Budget}=nothing)
     nbytes0 = sizeof(s)                                # charged before any copy is made
     lock(a.lock) do
-        if budget !== nothing                          # charge the state that this locked lookup will search
-            addcompare!(budget, checked_mul(max(nbytes0, 1), length(a.recent) + 34 * (length(a.runs) + 1)))
-        end
         if contains_unlocked(a, s)
             # A repeat may advance maintenance, but it must remain admissible after the table reaches
             # its byte ceiling. Defer a cascade that has no scratch headroom; source runs remain live
@@ -273,7 +262,7 @@ function admit!(a::SymbolAdmission, s::AbstractString; budget::Union{Nothing,Bud
             mergebytes = nextlen == 0 ? 0 : mergeoverlapbytes(nextlen)
             if checked_add(a.bytes, mergebytes - released) <= a.max_bytes
                 scratch = nextlen > 0 && released > 0 ? Vector{String}(undef, nextlen) : nothing
-                step_unlocked!(a, scratch, budget)
+                step_unlocked!(a, scratch)
             end
             return nothing
         end
@@ -292,10 +281,10 @@ function admit!(a::SymbolAdmission, s::AbstractString; budget::Union{Nothing,Bud
         # copy, the fully sorted carried run and the next merge's output exist before the table changes,
         # so a failure here leaves the table unchanged.
         retained = admissionstringcopy(s)
-        run = carry ? buildcarry(a, retained, budget) : nothing
+        run = carry ? buildcarry(a, retained) : nothing
         willstage = nextlen > 0 && (released > 0 || (carry && a.merge === nothing))
         scratch = willstage ? Vector{String}(undef, nextlen) : nothing
-        step_unlocked!(a, scratch, budget)             # maintenance advances only for accepted admissions
+        step_unlocked!(a, scratch)                     # maintenance advances only for accepted admissions
         push!(a.recent, retained)                      # into the prebuilt RUN_BASE capacity: never grows
         a.count = ncount
         a.bytes += namebytes                           # a completion in the step above returned its old state

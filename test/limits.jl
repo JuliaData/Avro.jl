@@ -5,7 +5,6 @@
     @test l.max_codec_memory == 32 << 20
     @test l.max_values_per_byte == 16
     @test l.work_allowance == 65_536
-    @test l.max_compare_bytes_per_byte == 64
     @test l.max_inflight_blocks == 0
     @test Avro.Limits(max_total_bytes=1 << 30).max_total_bytes == 1 << 30
     @test_throws ArgumentError Avro.Limits(bogus=1)
@@ -168,7 +167,7 @@
         Avro.close!(datum_budget)
     end
 
-    @testset "Budget: work, comparison and count rules" begin
+    @testset "Budget: work and count rules" begin
         b = Avro.Budget(l)
         Avro.addinput!(b, 10)
         # values ≤ 16 × 10 + 65_536
@@ -179,10 +178,6 @@
         Avro.countvalues!(b2, 16)
         e = try Avro.countvalues!(b2, 1); nothing catch err; err end
         @test e isa Avro.LimitError && e.limit == :max_values_per_byte && e.observed == 17 && e.value == 16
-        b3 = Avro.Budget(Avro.Limits(work_allowance=0))
-        Avro.addinput!(b3, 1)
-        Avro.addcompare!(b3, 64)
-        @test_throws Avro.LimitError Avro.addcompare!(b3, 1)
         b4 = Avro.Budget(Avro.Limits(max_total_values=5, work_allowance=1 << 20))
         Avro.countvalues!(b4, 5)
         @test_throws Avro.LimitError Avro.countvalues!(b4, 1)
@@ -222,15 +217,12 @@
         @test_throws ArgumentError Avro.Limits(max_bytes=big(typemax(Int)) + 1)
         @test issorted(Avro.muladdcap(typemax(Int), input, 1)
                        for input in (0, 1, 2, typemax(Int)))
-        saturated = Avro.Limits(max_values_per_byte=typemax(Int),
-                                max_compare_bytes_per_byte=typemax(Int))
+        saturated = Avro.Limits(max_values_per_byte=typemax(Int))
         saturatedbudget = Avro.Budget(saturated)
         Avro.addinput!(saturatedbudget, 2)
         Avro.countvalues!(saturatedbudget, 4)
-        Avro.addcompare!(saturatedbudget, 4)
         @test saturatedbudget.workcap == saturated.max_total_values
         @test Avro.checkoperationwork!(saturatedbudget) == 0
-        @test Avro.checkcomparisonwork!(saturatedbudget) === nothing
         Avro.close!(saturatedbudget)
 
         ints = Avro.IntSchema()

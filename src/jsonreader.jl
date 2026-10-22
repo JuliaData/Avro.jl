@@ -775,8 +775,8 @@ end
 """
     buildobject(r, keys, vals) -> JSONObject
 
-Detect duplicate keys by sorting the decoded keys (no hashing; every compared byte charged to the
-comparison rule) and build the sorted member dictionary plus the source order.
+Detect duplicate keys by sorting the decoded keys (no hashing) and build the sorted member dictionary
+plus the source order.
 """
 function buildobject(r::JSONReader, keys::Vector{String}, vals::Vector{Any},
                      spans::Vector{JSONMemberSpan})
@@ -786,10 +786,10 @@ function buildobject(r::JSONReader, keys::Vector{String}, vals::Vector{Any},
     perm = Vector{Int32}(undef, n)
     scratch = Vector{Int32}(undef, cld(n, 2))
     settlecharge!(r, scratchbytes)
-    mergesort!(perm, scratch, keys, r.budget)
+    mergesort!(perm, scratch, keys)
     for i in 2:n
         key = keys[perm[i]]
-        if keyequal(key, keys[perm[i - 1]], r.budget)
+        if keymatches(key, keys[perm[i - 1]])
             r.errfn(diagnosticstring(r.budget, "duplicate object key ",
                                      boundedquoted(key)), r.pos)
         end
@@ -800,7 +800,6 @@ function buildobject(r::JSONReader, keys::Vector{String}, vals::Vector{Any},
     sortedvals = Vector{Any}(undef, n)
     settlecharge!(r, sortedbytes)
     for (i, p) in enumerate(perm)
-        r.budget === nothing || addcompare!(r.budget, 16)
         sortedkeys[i] = keys[p]
         sortedvals[i] = vals[p]
     end

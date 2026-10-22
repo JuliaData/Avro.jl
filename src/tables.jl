@@ -83,7 +83,7 @@ function selectindices(s::RecordSchema, select, budget::Budget)
         owned = nm isa Symbol
         name = owned ? ownedstringcopy(nm, budget) : nm
         try
-            i = budgetedget(s.fieldindex, name, 0, budget)
+            i = get(s.fieldindex, name, 0)
             i == 0 && throw(ArgumentError("select: the record has no selected field with that name"))
             slots[i] == 0 || throw(ArgumentError("select: a field name appears more than once"))
             push!(selected, budget, i)

@@ -532,9 +532,9 @@ end
 
 function registerderived!(ctx::DeriveContext, s::NamedSchema, ::Type{T}) where {T}
     full = ownedfullname(s.name, ctx.budget)
-    existing = budgetedget(ctx.named, full, nothing, ctx.budget)
+    existing = get(ctx.named, full, nothing)
     if existing !== nothing
-        origin = budgetedgetindex(ctx.origins, full, ctx.budget)
+        origin = getindex(ctx.origins, full)
         if origin === T
             release!(ctx.budget, stringbytes(sizeof(full)))
             return existing
@@ -553,7 +553,7 @@ end
 function lookupderived(ctx::DeriveContext, full::FullName)
     name = ownedfullname(full, ctx.budget)
     try
-        return budgetedget(ctx.named, name, nothing, ctx.budget)
+        return get(ctx.named, name, nothing)
     finally
         release!(ctx.budget, stringbytes(sizeof(name)))
     end
@@ -663,7 +663,7 @@ function deriveunion(ctx::DeriveContext, ::Type{U}, namespace) where {U}
                 ctx.budget, "union member ", m,
                 " derives a union; Avro unions cannot nest")))
             ident = branchidentity(s)
-            previous = budgetedget(seen, ident, 0, ctx.budget)
+            previous = get(seen, ident, 0)
             previous == 0 || throw(ArgumentError(typediagnostic(
                 ctx.budget, "union members ", members[previous], " and ", m,
                 " both map to the Avro branch ", boundedquoted(branchidentitylabel(s)),

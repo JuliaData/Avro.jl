@@ -446,8 +446,7 @@
     end
 
     @testset "wide schemas fit the default work rule" begin
-        # Name indexes are sorted once; inserting names one at a time in arrival order was quadratic and
-        # failed max_compare_bytes_per_byte for a few hundred unsorted names.
+        # Name indexes are sorted once; inserting names one at a time in arrival order is quadratic.
         names = ["x$i" for i in 5000:-1:1]
         rec = P("{\"type\":\"record\",\"name\":\"W\",\"fields\":[" *
                 join(("{\"name\":\"$n\",\"type\":\"long\"}" for n in names), ",") * "]}")

@@ -186,45 +186,6 @@ end
     @test ov.bytes >= Base.summarysize(ov)
     VERSION >= v"1.11" && @test Avro.capacity(ov.recent) == Avro.RUN_BASE      # reused, never regrown
 
-    # the admitting operation's lookup and merge-step work charges its own budget
-    ab = Avro.SymbolAdmission(max_names=1 << 16, max_bytes=1 << 24)
-    bud = Avro.Budget(Avro.Limits())
-    Avro.addinput!(bud, 1 << 20)
-    before = bud.compare_bytes
-    Avro.admit!(ab, "charged-name"; budget=bud)
-    @test bud.compare_bytes > before
-    @test Avro.admit!(:trusted, "any"; budget=bud) === :any
-    Avro.close!(bud)
-
-    # lookup work is charged from the table state protected by the admission lock
-    raced = Avro.SymbolAdmission(max_names=1 << 16, max_bytes=1 << 24)
-    racebudget = Avro.Budget(Avro.Limits(work_allowance=40, max_compare_bytes_per_byte=0))
-    lock(raced.lock)
-    local task
-    try
-        started = Channel{Nothing}(1)
-        task = errormonitor(Threads.@spawn try
-            put!(started, nothing)
-            Avro.admit!(raced, "z"; budget=racebudget)
-        catch err
-            err
-        end)
-        take!(started)
-        for _ in 1:100
-            yield()
-        end
-        @test racebudget.compare_bytes == 0
-        for i in 1:1000
-            Avro.admit!(raced, "race-$(lpad(i, 4, '0'))")
-        end
-    finally
-        unlock(raced.lock)
-    end
-    raceerror = fetch(task)
-    @test raceerror isa Avro.LimitError && raceerror.limit === :max_compare_bytes_per_byte
-    @test length(raced) == 1000
-    Avro.close!(racebudget)
-
     # a rejected admission advances no maintenance state
     tr = Avro.SymbolAdmission(max_names=Avro.RUN_BASE * 4, max_bytes=1 << 24)
     for i in 1:(2 * Avro.RUN_BASE + 100)              # leave a merge in progress

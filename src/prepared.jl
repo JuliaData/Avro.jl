@@ -410,10 +410,7 @@ function encodedwork!(f::F, e::Encoder) where {F}
     complete || return nothing
     values = budget.values - values0
     checkworkscope!(budget, values, e.pos - start)
-    if budget.workdeferred == 0
-        checkoperationwork!(budget)
-        checkcomparisonwork!(budget)
-    end
+    budget.workdeferred == 0 && checkoperationwork!(budget)
     return nothing
 end
 

@@ -589,7 +589,7 @@ function encodevalue(p::WEnum, e::Encoder, x::AbstractString)
 end
 
 function encodevalue(p::WEnum, e::Encoder, x::Symbol)
-    i = enumindex(p, x, e.budget)
+    i = enumindex(p, x)
     i == 0 && encodeerror("the symbol is not a member of enum $(fullname(p.schema))", x)
     return writelong!(e, Int64(i) - 1)
 end
@@ -603,7 +603,7 @@ function encodevalue(p::WEnum, e::Encoder, x)
 end
 
 function encodesymbol(p::WEnum, e::Encoder, sym::AbstractString)
-    i = budgetedget(p.schema.symbolindex, sym, 0, e.budget)
+    i = get(p.schema.symbolindex, sym, 0)
     i == 0 && encodeerror(diagnosticstring(e.budget,
                                            "the value is not a symbol of enum ",
                                            p.schema.name), sym)
@@ -611,25 +611,24 @@ function encodesymbol(p::WEnum, e::Encoder, sym::AbstractString)
     return nothing
 end
 
-function enumindex(p::WEnum, symbol::Symbol, budget::Union{Nothing,Budget})
+function enumindex(p::WEnum, symbol::Symbol)
     for (i, candidate) in enumerate(p.schema.symbols)
-        equal, work = symbolcomparison(candidate, symbol)
-        budget === nothing || addcompare!(budget, work)
-        equal && return i
+        symbolequal(candidate, symbol) && return i
     end
     return 0
 end
 
-function symbolcomparison(candidate::String, symbol::Symbol)
+"Whether `candidate` spells `symbol`, without allocating a `String` for the symbol."
+function symbolequal(candidate::String, symbol::Symbol)
     n = sizeof(candidate)
-    n == sizeof(symbol) || return (false, min(n, sizeof(symbol)) + 1)
+    n == sizeof(symbol) || return false
     source = Base.unsafe_convert(Ptr{UInt8}, symbol)
     GC.@preserve candidate symbol begin
         for i in 1:n
-            codeunit(candidate, i) == unsafe_load(source, i) || return (false, i)
+            codeunit(candidate, i) == unsafe_load(source, i) || return false
         end
     end
-    return (true, n + 1)
+    return true
 end
 
 function encodevalue(::WDate, e::Encoder, x::Date)
@@ -941,13 +940,12 @@ function encodevalue(p::WMap, e::Encoder, x)
                 encodechild(p.values, e, values[i], p.schema.values,
                             ENCODE_PATH_KEY, keys[i])
             end
-            creditoutput!(e)                           # comparisons use the exact produced-byte denominator
-            addcompare!(e.budget, checked_mul(16, n))  # collected key and value references
-            mergesort!(perm, scratch, keys, e.budget)
+            creditoutput!(e)
+            mergesort!(perm, scratch, keys)
             for i in 2:n
                 a = keys[perm[i - 1]]
                 b = keys[perm[i]]
-                keyequal(a, b, e.budget) && encodeerror("map keys are duplicates after conversion to strings", pairs)
+                keymatches(a, b) && encodeerror("map keys are duplicates after conversion to strings", pairs)
             end
         finally
             keys = values = perm = scratch = nothing
@@ -1063,7 +1061,7 @@ function selectbranch(p::WUnion, x, budget::Union{Nothing,Budget}=nothing)
         for (i, b) in enumerate(p.schema.branches)
             b isa NamedSchema || continue
             typeof(b) === typeof(s) || continue
-            budgetedfullnameequal(b.name, s.name, budget) || continue
+            fullnameequal(b.name, s.name) || continue
             b isa FixedSchema && b.size != (s::FixedSchema).size && continue
             return i
         end
@@ -1123,7 +1121,7 @@ function selectenumbranch(p::WUnion, x::Base.Enum, budget::Union{Nothing,Budget}
     symbol isa AbstractString || encodeerror("Avro.avrosymbol must return a string", x)
     for (i, branch) in enumerate(p.branches)
         branch isa WEnum || continue
-        budgetedhaskey(branch.schema.symbolindex, symbol, budget) && return (i, symbol)
+        haskey(branch.schema.symbolindex, symbol) && return (i, symbol)
     end
     encodeerror("no union enum branch accepts the symbol", x)
 end
@@ -1133,11 +1131,11 @@ function acceptsbranch(p::WritePlan, x, budget::Union{Nothing,Budget})
 end
 
 function acceptsbranch(p::WEnum, x::AbstractString, budget::Union{Nothing,Budget})
-    return budgetedhaskey(p.schema.symbolindex, x, budget)
+    return haskey(p.schema.symbolindex, x)
 end
 
 function acceptsbranch(p::WEnum, x::Symbol, budget::Union{Nothing,Budget})
-    return enumindex(p, x, budget) != 0
+    return enumindex(p, x) != 0
 end
 
 function accepts(::WNull, x)
@@ -1178,13 +1176,13 @@ end
 
 function accepts(p::WEnum, x)
     return (x isa EnumValue && fullnameequal(x.schema.name, p.schema.name)) ||
-           (x isa AbstractString && budgetedhaskey(p.schema.symbolindex, x, nothing)) ||
-           (x isa Symbol && enumindex(p, x, nothing) != 0)
+           (x isa AbstractString && haskey(p.schema.symbolindex, x)) ||
+           (x isa Symbol && enumindex(p, x) != 0)
 end
 
 function accepts(p::WEnum, x::Base.Enum)
     symbol = avrosymbol(typeof(x), x)
-    return symbol isa AbstractString && budgetedhaskey(p.schema.symbolindex, symbol, nothing)
+    return symbol isa AbstractString && haskey(p.schema.symbolindex, symbol)
 end
 
 function accepts(::WDate, x)
@@ -1259,10 +1257,10 @@ function encoderecord(p::WRecord, e::Encoder, x::Record)
     length(vals) == length(xs.fields) || encodeerror("record value has $(length(vals)) values for $(length(xs.fields)) fields", x)
     aligned = xs === p.schema
     if !aligned && length(xs.fields) == length(p.schema.fields)
-        aligned = budgetedfullnameequal(xs.name, p.schema.name, e.budget)
+        aligned = fullnameequal(xs.name, p.schema.name)
         for i in eachindex(p.fields)
             aligned || break
-            aligned = keyequal(xs.fields[i].name, p.schema.fields[i].name, e.budget)
+            aligned = keymatches(xs.fields[i].name, p.schema.fields[i].name)
         end
     end
     if aligned
@@ -1273,7 +1271,7 @@ function encoderecord(p::WRecord, e::Encoder, x::Record)
         return nothing
     end
     for (i, f) in enumerate(p.schema.fields)
-        j = budgetedget(xs.fieldindex, f.name, 0, e.budget)
+        j = get(xs.fieldindex, f.name, 0)
         j == 0 && encodeerror("record value lacks field \"$(f.name)\"", x)
         encodechild(p.fields[i], e, vals[j], f.schema, ENCODE_PATH_FIELD, f.name)
     end
@@ -1296,11 +1294,10 @@ end
 
 const DICT_MISSING = Val(:missing_field)
 
-function dictfield(x::AbstractDict, name::String, budget::Union{Nothing,Budget}=nothing)
+function dictfield(x::AbstractDict, name::String)
     for (k, v) in x
         (k isa Symbol || k isa AbstractString) ||
             encodeerror("record dictionary keys must be strings or symbols", k)
-        budget === nothing || addcompare!(budget, min(sizeof(name), sizeof(k)) + 1)
         fieldnamematches(name, k) && return v
     end
     return DICT_MISSING
@@ -1363,11 +1360,10 @@ function encoderecord(p::WRecord, e::Encoder, x::TableRow)
     return nothing
 end
 
-function rowfield(row, name::String, budget::Union{Nothing,Budget}=nothing)
+function rowfield(row, name::String)
     for (i, c) in enumerate(Tables.columnnames(row))
         (c isa Symbol || c isa AbstractString) ||
             encodeerror("row column names must be strings or symbols", c)
-        budget === nothing || addcompare!(budget, min(sizeof(name), sizeof(c)) + 1)
         fieldnamematches(name, c) &&
             return Tables.getcolumn(row, i)
     end
@@ -1391,7 +1387,7 @@ function recordpositions(n::Int, budget::Budget)
 end
 
 function recordfieldindex(p::WRecord, candidate::String, budget::Budget)
-    return budgetedget(p.schema.fieldindex, candidate, 0, budget)
+    return get(p.schema.fieldindex, candidate, 0)
 end
 
 function recordfieldindex(p::WRecord, candidate::Union{Symbol,AbstractString}, budget::Budget)
@@ -1496,16 +1492,12 @@ The position of the Julia field of `T` matching Avro field `i`, or zero when non
 does not intern schema names or retain source types. A stateless lookup also keeps recursive records
 correct when one schema node is encoded from different Julia layouts at different depths.
 """
-function fieldposition(p::WRecord, ::Type{T}, i::Int,
-                       budget::Union{Nothing,Budget}=nothing) where {T}
+function fieldposition(p::WRecord, ::Type{T}, i::Int) where {T}
     f = p.schema.fields[i]
     tags = T <: NamedTuple ? (;) : StructUtils.fieldtags(AvroStyle(), T)
     for (j, fname) in enumerate(fieldnames(T))
         tagged = T <: NamedTuple ? nothing : fieldtag(tags, fname, :name)
         candidate = tagged === nothing ? fname : tagged
-        if budget !== nothing && (candidate isa Symbol || candidate isa AbstractString)
-            addcompare!(budget, min(sizeof(f.name), sizeof(candidate)) + 1)
-        end
         fieldnamematches(f.name, candidate) && return j
     end
     return 0

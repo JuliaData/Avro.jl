@@ -121,7 +121,7 @@
         b = Avro.Budget(l)
         Avro.addinput!(b, 100)
         parse("{\"k\":[1,2,3],\"s\":\"abc\"}"; budget=b)
-        @test b.reserved > 0 && b.compare_bytes > 0
+        @test b.reserved > 0
         tiny = Avro.Budget(Avro.Limits(max_total_bytes=256 << 20))
         Avro.reserve!(tiny, tiny.ceiling - 10)
         @test_throws Avro.LimitError parse("[" * join(fill("\"xxxxxxxxxx\"", 100), ",") * "]"; budget=tiny)

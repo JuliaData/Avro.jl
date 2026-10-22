@@ -688,7 +688,6 @@ function resolvedfieldindex(index::FrozenDict{String,Int}, name::String, budget:
     while lo < hi
         mid = lo + ((hi - lo) >>> 1)
         addresolution!(budget)
-        addcompare!(budget, keycomparisonwork(keys[mid], name))
         if isless(keys[mid], name)
             lo = mid + 1
         else
@@ -697,7 +696,6 @@ function resolvedfieldindex(index::FrozenDict{String,Int}, name::String, budget:
     end
     if lo <= length(keys)
         addresolution!(budget)
-        addcompare!(budget, keycomparisonwork(keys[lo], name))
         keys[lo] == name && return index.vals[lo]
     end
     return 0

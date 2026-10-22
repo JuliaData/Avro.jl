@@ -225,7 +225,7 @@ function register!(c::SchemaCache, s::Schema; limits::Limits=Limits())
         releaseseen!(budget, seen)                     # dead before hashing and comparison
         fp = crc64avro(boundedview(w))
         lock(c.lock) do
-        i = cacheindex(c.fingerprints, fp, budget)
+        i = cacheindex(c.fingerprints, fp)
         if i <= length(c.fingerprints) && c.fingerprints[i] == fp
             existing = c.schemas[i]
             same = budgetedschemaequal(existing, s, budget)
@@ -235,7 +235,6 @@ function register!(c::SchemaCache, s::Schema; limits::Limits=Limits())
         n = length(c.fingerprints) + 1
         n <= c.max_entries || throw(LimitError(:max_entries, n, c.max_entries, :max_entries, :decode))
         schemacharge = schemaretainedbytes(s, budget)
-        addcompare!(budget, checked_mul(16, n - 1))            # both old indexes copied before publication
         checkpoint = budgetcheckpoint(c.ledger)
         nf, ns = try
             retain!(c.ledger, schemacharge)
@@ -295,26 +294,14 @@ end
 function lookup(c::SchemaCache, fp::UInt64, budget::Budget)
     return lock(c.lock) do
         n = length(c.fingerprints)
-        i = cacheindex(c.fingerprints, fp, budget)
+        i = cacheindex(c.fingerprints, fp)
         (i <= n && c.fingerprints[i] == fp) || throw(UnknownSchemaError(fp))
         return c.schemas[i]
     end
 end
 
-function cacheindex(fingerprints::Vector{UInt64}, fp::UInt64, budget::Budget)
-    lo = 1
-    hi = length(fingerprints) + 1
-    while lo < hi
-        mid = lo + ((hi - lo) >>> 1)
-        addcompare!(budget, 8)
-        if fingerprints[mid] < fp
-            lo = mid + 1
-        else
-            hi = mid
-        end
-    end
-    lo <= length(fingerprints) && addcompare!(budget, 8)
-    return lo
+function cacheindex(fingerprints::Vector{UInt64}, fp::UInt64)
+    return searchsortedfirst(fingerprints, fp)
 end
 
 """
@@ -342,7 +329,6 @@ function encodesingle(s::Schema, x; limits::Limits=Limits())
             endworkdefer!(budget)
         end
         checkoperationwork!(budget)
-        checkcomparisonwork!(budget)
         reserve!(budget, bytesbytes(10 + npayload))
         out = Vector{UInt8}(undef, 10 + npayload)
         allocated!(budget, bytesbytes(10 + npayload))
@@ -403,7 +389,6 @@ function decodesingleoperation(src::AbstractVector{UInt8}, store::SchemaStore, b
         endworkdefer!(budget)
     end
     checkoperationwork!(budget)
-    checkcomparisonwork!(budget)
     d.stop = span.next - 1
     planneddatumspan!(tplan, d, span; resolved=reader_schema !== nothing)
     span = decoderspan(d)

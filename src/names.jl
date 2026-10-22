@@ -59,39 +59,12 @@ function fullnamecompare(a::AbstractString, b::FullName)
     return -fullnamecompare(b, a)
 end
 
-function fullnamecomparisonwork(a::FullName, b::FullName)
-    n = min(fullnamesize(a), fullnamesize(b))
-    for i in 1:n
-        fullnamebyte(a, i) == fullnamebyte(b, i) || return i
-    end
-    return n + 1
-end
-
-function fullnamecomparisonwork(a::FullName, b::AbstractString)
-    n = min(fullnamesize(a), sizeof(b))
-    bytes = codeunits(b)
-    for i in 1:n
-        fullnamebyte(a, i) == bytes[i] || return i
-    end
-    return n + 1
-end
-
 function fullnameequal(a::FullName, b::FullName)
     return a.name == b.name && a.namespace == b.namespace
 end
 
 function fullnameequal(a::FullName, b::AbstractString)
     return fullnamecompare(a, b) == 0
-end
-
-function budgetedfullnameequal(a::FullName, b::FullName, budget::Union{Nothing,Budget})
-    budget === nothing || addcompare!(budget, fullnamecomparisonwork(a, b))
-    return fullnameequal(a, b)
-end
-
-function budgetedfullnameequal(a::FullName, b::AbstractString, budget::Union{Nothing,Budget})
-    budget === nothing || addcompare!(budget, fullnamecomparisonwork(a, b))
-    return fullnameequal(a, b)
 end
 
 function writefullname(io::IO, f::FullName)
@@ -123,18 +96,6 @@ function Base.show(io::IO, f::FullName)
     print(io, "FullName(\"")
     writefullname(io, f)
     return print(io, "\")")
-end
-
-function keycomparisonwork(a::FullName, b::FullName)
-    return fullnamecomparisonwork(a, b)
-end
-
-function keycomparisonwork(a::FullName, b::AbstractString)
-    return fullnamecomparisonwork(a, b)
-end
-
-function keycomparisonwork(a::AbstractString, b::FullName)
-    return fullnamecomparisonwork(b, a)
 end
 
 function keymatches(a::FullName, b::FullName)

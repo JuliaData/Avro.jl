@@ -1081,13 +1081,13 @@ function valuelength(x)
     return x isa AbstractVector{UInt8} ? length(x) : 0
 end
 
-function recordfieldvalue(p::WRecord, x, i::Int, budget::Union{Nothing,Budget}=nothing)
+function recordfieldvalue(p::WRecord, x, i::Int)
     x isa Record && return getfield(x, :values)[i]
-    x isa TableRow && return rowfield(x.row, p.schema.fields[i].name, budget)
+    x isa TableRow && return rowfield(x.row, p.schema.fields[i].name)
     name = p.schema.fields[i].name
-    x isa AbstractDict && return dictfield(x, name, budget)
-    x isa Tables.AbstractRow && return rowfield(x, name, budget)
-    j = fieldposition(p, typeof(x), i, budget)
+    x isa AbstractDict && return dictfield(x, name)
+    x isa Tables.AbstractRow && return rowfield(x, name)
+    j = fieldposition(p, typeof(x), i)
     j == 0 && encodeerror("record value lacks field \"$name\"", x)
     return getfield(x, j)
 end
@@ -1143,7 +1143,7 @@ function estimaterecordvalue(p::WRecord, x::Record,
     positions = recordpositions(length(p.fields), budget)
     try
         for (i, field) in enumerate(p.schema.fields)
-            positions[i] = budgetedget(source.fieldindex, field.name, 0, budget)
+            positions[i] = get(source.fieldindex, field.name, 0)
         end
         return estimaterecordvalues(p, values, positions, columns, budget,
                                     diagnostics)
@@ -1425,7 +1425,6 @@ mutable struct Writer
     pendingbytes::Int
     pendingpeak::Int
     pendingvalues::Int
-    pendingcompare::Int
     pendingallowance::Int
     closed::Bool
     poison::Union{Nothing,Exception}
@@ -1622,7 +1621,7 @@ function Writer(dst::Union{AbstractString,IO}, schema::Schema; codec::Symbol=:nu
         stagevalues = schemaneedsstaging(schema, budget)
         writer = Writer(sink, path, atomic ? temppath : nothing, schema, plan, wcodec, syncmarker, limits, budget,
                         Int(block_bytes), fsync, ownsink, encoder, datumencoder, preflightbase,
-                        preflight, stagevalues, nothing, nothing, 0, 0, 0, 0, 0, 0, false, nothing)
+                        preflight, stagevalues, nothing, nothing, 0, 0, 0, 0, 0, false, nothing)
         try
             writecontainerheader!(sink, entries, syncmarker)
         catch e
@@ -1719,14 +1718,13 @@ function pushdatum!(w::Writer, datum)
                 throw(limiterror(w.budget, :max_rows, nextrows,
                                  w.limits.max_rows))
             return pushaligneddatum!(w, datum, w.fastplans, w.preflight,
-                                     nextrows, 0)
+                                     nextrows)
         end
         return pushprepareddatum!(w, datum)
     end
     work = writerworkcheckpoint(w.budget)
     rootcharge = 0
     staged = nothing
-    stagedcompare = 0
     beginworkdefer!(w.budget)
     prepared = false
     try
@@ -1745,7 +1743,6 @@ function pushdatum!(w::Writer, datum)
             end
         end
         value = staged === nothing ? datum : staged.value
-        stagedcompare = w.budget.compare_bytes - work[3]
         prepared = true
     finally
         endworkdefer!(w.budget)
@@ -1757,7 +1754,7 @@ function pushdatum!(w::Writer, datum)
     end
     try
         value = staged === nothing ? datum : staged.value
-        return pushprepareddatum!(w, value, stagedcompare)
+        return pushprepareddatum!(w, value)
     finally
         staged === nothing || release!(w.budget, staged.charge)
         rootcharge > 0 && release!(w.budget, rootcharge)
@@ -1950,13 +1947,13 @@ function stagedrecordfield(plan::WRecord, value::Record, index::Int, budget::Bud
     values = getfield(value, :values)
     source === plan.schema && return values[index]
     target = plan.schema.fields[index].name
-    position = budgetedget(source.fieldindex, target, 0, budget)
+    position = get(source.fieldindex, target, 0)
     position == 0 && encodeerror("record value lacks field \"$target\"", value)
     return values[position]
 end
 
 function stagedrecordfield(plan::WRecord, value, index::Int, budget::Budget)
-    return recordfieldvalue(plan, value, index, budget)
+    return recordfieldvalue(plan, value, index)
 end
 
 function assignstagedrecord!(values::Vector{Any}, index::Int, value, budget::Budget)
@@ -2089,8 +2086,7 @@ function preparewriterrecord(p::WRecord, value::Record, budget::Budget,
         boxes = 0
         for (i, field) in enumerate(p.schema.fields)
             box = withwriterpreparepath(diagnostics, field) do
-                sourceindex = budgetedget(source.fieldindex, field.name, 0,
-                                          budget)
+                sourceindex = get(source.fieldindex, field.name, 0)
                 sourceindex == 0 &&
                     encodeerror("record value lacks field \"$(field.name)\"", value)
                 assignpreparedrecord!(values, i, sourcevalues[sourceindex],
@@ -2194,23 +2190,22 @@ end
 
 "The work counters that one staged Writer datum must restore before it joins a block."
 function writerworkcheckpoint(budget::Budget)
-    return (budget.values, budget.input_bytes, budget.compare_bytes,
-            budget.allowance_used, budget.workcap, budget.workdeferred)
+    return (budget.values, budget.input_bytes, budget.allowance_used, budget.workcap,
+            budget.workdeferred)
 end
 
-function restorewriterwork!(budget::Budget, checkpoint::NTuple{6,Int})
+function restorewriterwork!(budget::Budget, checkpoint::NTuple{5,Int})
     budget.values = checkpoint[1]
     budget.input_bytes = checkpoint[2]
-    budget.compare_bytes = checkpoint[3]
-    budget.allowance_used = checkpoint[4]
-    budget.workcap = checkpoint[5]
-    budget.workdeferred = checkpoint[6]
+    budget.allowance_used = checkpoint[3]
+    budget.workcap = checkpoint[4]
+    budget.workdeferred = checkpoint[5]
     return nothing
 end
 
 "Whether a pending block is safe under the one-byte lower bound of its size varint."
 function writercandidatefits(w::Writer, count::Int, payload::Int, values::Int,
-                             compared::Int, sizevarint::Int=1)
+                             sizevarint::Int=1)
     framing = checked_add(checked_add(varintlength(count), sizevarint), 16)
     blockinput = checked_add(payload, framing)
     values < typemax(Int) || return false
@@ -2222,10 +2217,6 @@ function writercandidatefits(w::Writer, count::Int, payload::Int, values::Int,
     totalinput = checked_add(w.budget.input_bytes, blockinput)
     totalvalues <= muladdcap(w.limits.max_values_per_byte, totalinput,
                              w.limits.work_allowance) || return false
-    totalcompare = checked_add(w.budget.compare_bytes, compared)
-    totalcompare <= muladdcap(w.limits.max_compare_bytes_per_byte,
-                              totalinput, w.limits.work_allowance) ||
-        return false
     return true
 end
 
@@ -2265,8 +2256,7 @@ end
 
 "Estimate and append one aligned row while its work counters remain deferred."
 @inline function preparealigneddatum!(w::Writer, datum::NamedTuple, plans::Tuple,
-                                      pf::Union{Nothing,TablePreflight},
-                                      stagedcompare::Int)
+                                      pf::Union{Nothing,TablePreflight})
     checkpoint = writerworkcheckpoint(w.budget)
     start = w.encoder.pos
     credited = w.encoder.credited
@@ -2286,8 +2276,6 @@ end
         encodealignedfast!(plans, w.encoder, datum)
         datumbytes = w.encoder.pos - start
         datumvalues = w.budget.values - checkpoint[1]
-        datumcompare = checked_add(stagedcompare,
-                                   w.budget.compare_bytes - checkpoint[3])
         datumvalues == ev ||
             throw(ArgumentError("internal error: datum estimate counted $ev values but encoding counted $datumvalues"))
         datumbytes <= w.limits.max_block_bytes ||
@@ -2295,7 +2283,7 @@ end
                              w.limits.max_block_bytes,
                              :max_block_bytes, :encode))
         complete = true
-        return (eb, ep, pp, datumbytes, datumvalues, datumcompare)
+        return (eb, ep, pp, datumbytes, datumvalues)
     finally
         endworkdefer!(w.budget)
         restorewriterwork!(w.budget, checkpoint)
@@ -2308,12 +2296,11 @@ end
 
 "The aligned NamedTuple path encodes in place and stages bytes only at a block boundary."
 @inline function pushaligneddatum!(w::Writer, datum::NamedTuple, plans::Tuple,
-                                   pf::Union{Nothing,TablePreflight}, nextrows::Int,
-                                   stagedcompare::Int)
+                                   pf::Union{Nothing,TablePreflight}, nextrows::Int)
     start = w.encoder.pos
     credited = w.encoder.credited
-    eb, ep, pp, datumbytes, datumvalues, datumcompare = try
-        preparealigneddatum!(w, datum, plans, pf, stagedcompare)
+    eb, ep, pp, datumbytes, datumvalues = try
+        preparealigneddatum!(w, datum, plans, pf)
     catch err
         if err isa EncodeError
             isempty(err.path) ? diagnosealignedestimate!(w, plans, datum, pf) :
@@ -2322,16 +2309,14 @@ end
         rethrow()
     end
 
-    nextcount = nextpayload = nextoutput = nextvalues = nextcompare = 0
+    nextcount = nextpayload = nextoutput = nextvalues = 0
     lowerfits = false
     try
         nextcount = checked_add(w.pendingcount, 1)
         nextpayload = w.encoder.pos
         nextoutput = checked_add(w.pendingbytes, eb)
         nextvalues = satadd(w.pendingvalues, datumvalues)
-        nextcompare = checked_add(w.pendingcompare, datumcompare)
-        lowerfits = writercandidatefits(w, nextcount, nextpayload, nextvalues,
-                                        nextcompare)
+        lowerfits = writercandidatefits(w, nextcount, nextpayload, nextvalues)
     catch
         w.encoder.pos = start
         w.encoder.credited = credited
@@ -2366,14 +2351,13 @@ end
         nextpayload = datumbytes
         nextoutput = eb
         nextvalues = datumvalues
-        nextcompare = datumcompare
         boundary = true
     end
     nextpendingpayload = 0
     try
         boundary &&
             (lowerfits = writercandidatefits(w, nextcount, nextpayload,
-                                             nextvalues, nextcompare))
+                                             nextvalues))
         nextpendingpayload = pf === nothing ? 0 :
             checked_add(pf.pendingpayload, pp)
         nextcount <= w.limits.max_block_count ||
@@ -2396,7 +2380,6 @@ end
     w.pendingbytes = nextoutput
     w.pendingpeak = max(w.pendingpeak, ep)
     w.pendingvalues = nextvalues
-    w.pendingcompare = nextcompare
     w.pendingallowance = max(w.pendingallowance,
                              workdeficit(w.budget, datumvalues, datumbytes))
     pf === nothing || (pf.pendingpayload = nextpendingpayload)
@@ -2404,7 +2387,7 @@ end
     return w
 end
 
-function pushprepareddatum!(w::Writer, datum, stagedcompare::Int=0)
+function pushprepareddatum!(w::Writer, datum)
     nextrows = checked_add(w.budget.rows, 1)
     nextrows <= w.limits.max_rows || throw(limiterror(w.budget, :max_rows, nextrows, w.limits.max_rows))
     pf = w.preflight
@@ -2421,10 +2404,10 @@ function pushprepareddatum!(w::Writer, datum, stagedcompare::Int=0)
         end
     end
     fp !== nothing && !w.stagevalues &&
-        return pushaligneddatum!(w, datum, fp, pf, nextrows, stagedcompare)
+        return pushaligneddatum!(w, datum, fp, pf, nextrows)
     checkpoint = writerworkcheckpoint(w.budget)
     preparedcharge = 0
-    eb = ep = ev = pp = datumbytes = datumvalues = datumcompare = 0
+    eb = ep = ev = pp = datumbytes = datumvalues = 0
     reset!(w.datumencoder)
     beginworkdefer!(w.budget)
     complete = false
@@ -2459,8 +2442,6 @@ function pushprepareddatum!(w::Writer, datum, stagedcompare::Int=0)
                                         w.schema::RecordSchema)
         datumbytes = w.datumencoder.pos
         datumvalues = w.budget.values - checkpoint[1]
-        datumcompare = checked_add(stagedcompare,
-                                   w.budget.compare_bytes - checkpoint[3])
         datumvalues == ev ||
             throw(ArgumentError("internal error: datum estimate counted $ev values but encoding counted $datumvalues"))
         datumbytes <= w.limits.max_block_bytes ||
@@ -2481,9 +2462,7 @@ function pushprepareddatum!(w::Writer, datum, stagedcompare::Int=0)
         nextpayload = checked_add(w.encoder.pos, datumbytes)
         nextoutput = checked_add(w.pendingbytes, eb)
         nextvalues = satadd(w.pendingvalues, datumvalues)
-        nextcompare = checked_add(w.pendingcompare, datumcompare)
-        lowerfits = writercandidatefits(w, nextcount, nextpayload, nextvalues,
-                                        nextcompare)
+        lowerfits = writercandidatefits(w, nextcount, nextpayload, nextvalues)
         if w.pendingcount > 0 &&
            (nextoutput > w.limits.max_block_output_bytes ||
             nextcount > w.limits.max_block_count ||
@@ -2493,9 +2472,7 @@ function pushprepareddatum!(w::Writer, datum, stagedcompare::Int=0)
             nextpayload = datumbytes
             nextoutput = eb
             nextvalues = datumvalues
-            nextcompare = datumcompare
-            lowerfits = writercandidatefits(w, nextcount, nextpayload, nextvalues,
-                                            nextcompare)
+            lowerfits = writercandidatefits(w, nextcount, nextpayload, nextvalues)
         end
         nextcount <= w.limits.max_block_count ||
             throw(limiterror(w.budget, :max_block_count, nextcount,
@@ -2513,7 +2490,6 @@ function pushprepareddatum!(w::Writer, datum, stagedcompare::Int=0)
         w.pendingbytes = nextoutput
         w.pendingpeak = max(w.pendingpeak, ep)
         w.pendingvalues = nextvalues
-        w.pendingcompare = nextcompare
         w.pendingallowance = max(w.pendingallowance,
                                  workdeficit(w.budget, datumvalues, datumbytes))
         pf === nothing || (pf.pendingpayload = checked_add(pf.pendingpayload, pp))
@@ -2542,17 +2518,10 @@ function writerflushprojection(w::Writer, payloadbytes::Int, compressedbytes::In
     totalvalues <= operationcap ||
         throw(limiterror(w.budget, :max_values_per_byte, totalvalues,
                          operationcap))
-    totalcompare = checked_add(w.budget.compare_bytes, w.pendingcompare)
-    comparecap = muladdcap(w.limits.max_compare_bytes_per_byte,
-                           totalinput, w.limits.work_allowance)
-    totalcompare <= comparecap ||
-        throw(limiterror(w.budget, :max_compare_bytes_per_byte, totalcompare,
-                         comparecap))
     allowance = max(w.budget.allowance_used, w.pendingallowance,
                     workdeficit(w.budget, blockvalues, blockinput),
                     workdeficit(w.budget, totalvalues, totalinput))
-    return (; values=totalvalues, input=totalinput, compared=totalcompare,
-            allowance, framing)
+    return (; values=totalvalues, input=totalinput, allowance, framing)
 end
 
 "Commit a block's exact work counters after its complete bytes reached the sink."
@@ -2560,7 +2529,6 @@ function commitwriterwork!(w::Writer, projection, nextblocks::Int)
     budget = w.budget
     budget.values = projection.values
     budget.input_bytes = projection.input
-    budget.compare_bytes = projection.compared
     budget.allowance_used = projection.allowance
     budget.workcap = min(w.limits.max_total_values,
                          muladdcap(w.limits.max_values_per_byte,
@@ -2712,7 +2680,6 @@ function flushblock!(w::Writer)
     w.pendingbytes = 0
     w.pendingpeak = 0
     w.pendingvalues = 0
-    w.pendingcompare = 0
     w.pendingallowance = 0
     return nothing
 end

@@ -237,13 +237,11 @@
         jsonwork = P("{\"type\":\"record\",\"name\":\"JSONWork\",\"fields\":[{\"name\":\"averylongname\",\"type\":\"null\"}]}")
         jsonvalue = (averylongname=missing,)
         jsonworklimits = Avro.Limits(work_allowance=0,
-                                     max_values_per_byte=1,
-                                     max_compare_bytes_per_byte=typemax(Int))
+                                     max_values_per_byte=1)
         @test Avro.tojson(jsonwork, jsonvalue;
                           limits=jsonworklimits) == "{\"averylongname\":null}"
         jsoncomparelimits = Avro.Limits(work_allowance=2,
-                                        max_values_per_byte=1,
-                                        max_compare_bytes_per_byte=2)
+                                        max_values_per_byte=1)
         @test Avro.tojson(jsonwork, jsonvalue;
                           limits=jsoncomparelimits) == "{\"averylongname\":null}"
         @test Avro.tojson(Avro.DoubleSchema(), 0.0;

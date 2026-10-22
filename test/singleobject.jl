@@ -189,7 +189,6 @@
         comparecache = Avro.SchemaCache()
         Avro.register!(comparecache, compareschema)
         comparelimits = Avro.Limits(work_allowance=0,
-                                    max_compare_bytes_per_byte=1,
                                     max_values_per_byte=1)
         comparevalue = repeat("x", 20)
         comparemessage = Avro.encodesingle(compareschema, comparevalue)
@@ -202,22 +201,12 @@
         shortvalue = repeat("x", 14)
         shortmessage = Avro.encodesingle(compareschema, shortvalue)
         @test length(shortmessage) - 10 == 15
-        compareerror = try
-            Avro.decodesingle(shortmessage, comparecache; limits=comparelimits)
-            nothing
-        catch error
-            error
-        end
-        @test compareerror isa Avro.LimitError
-        @test compareerror.limit === :max_compare_bytes_per_byte
-        @test compareerror.observed == 16
-        @test compareerror.value == 15
+        @test Avro.decodesingle(shortmessage, comparecache; limits=comparelimits) == shortvalue
 
         workschema = P("{\"type\":\"record\",\"name\":\"WorkSymmetry\",\"fields\":[{\"name\":\"n\",\"type\":\"null\"},{\"name\":\"s\",\"type\":\"string\"}]}")
         workvalue = Avro.Record(workschema, Any[missing, "xxx"])
         strictwork = Avro.Limits(work_allowance=0,
-                                 max_values_per_byte=1,
-                                 max_compare_bytes_per_byte=typemax(Int))
+                                 max_values_per_byte=1)
         encodeerror = try
             Avro.encodesingle(workschema, workvalue; limits=strictwork)
             nothing
@@ -230,8 +219,7 @@
         @test encodeerror.value == 4
 
         boundarywork = Avro.Limits(work_allowance=2,
-                                   max_values_per_byte=1,
-                                   max_compare_bytes_per_byte=typemax(Int))
+                                   max_values_per_byte=1)
         workmessage = Avro.encodesingle(workschema, workvalue;
                                         limits=boundarywork)
         @test length(workmessage) - 10 == 4

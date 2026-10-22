@@ -112,7 +112,6 @@ function compare(s::Schema, a, b; limits::Limits=Limits())
             endworkdefer!(budget)
         end
         checkoperationwork!(budget)
-        checkcomparisonwork!(budget)
         return result
     end
 end
@@ -211,8 +210,7 @@ function admitcomparekind!(schema::Union{BytesSchema,StringSchema}, plan,
         validutf8(db.buf, db.pos, db.pos + nb - 1) ||
             dataerror(db, "invalid UTF-8 in string")
     end
-    result = comparebuffers(da.buf, da.pos, na, db.buf, db.pos, nb,
-                            da.budget)
+    result = comparebuffers(da.buf, da.pos, na, db.buf, db.pos, nb)
     da.pos += na
     db.pos += nb
     return result
@@ -225,8 +223,7 @@ function admitcomparekind!(schema::FixedSchema, plan, da, db, ca, cb)
         dataerror(da, "fixed of $count bytes exceeds the remaining $(remaining(da)) bytes")
     count <= remaining(db) ||
         dataerror(db, "fixed of $count bytes exceeds the remaining $(remaining(db)) bytes")
-    result = comparebuffers(da.buf, da.pos, count, db.buf, db.pos, count,
-                            da.budget)
+    result = comparebuffers(da.buf, da.pos, count, db.buf, db.pos, count)
     da.pos += count
     db.pos += count
     return result
@@ -378,7 +375,7 @@ function comparekind(s::Union{BytesSchema,StringSchema}, p, da::Decoder, db::Dec
         validutf8(da.buf, da.pos, da.pos + na - 1) || dataerror(da, "invalid UTF-8 in string")
         validutf8(db.buf, db.pos, db.pos + nb - 1) || dataerror(db, "invalid UTF-8 in string")
     end
-    c = comparebuffers(da.buf, da.pos, na, db.buf, db.pos, nb, da.budget)
+    c = comparebuffers(da.buf, da.pos, na, db.buf, db.pos, nb)
     da.pos += na
     db.pos += nb
     return c
@@ -388,24 +385,20 @@ function comparekind(s::FixedSchema, p, da::Decoder, db::Decoder)
     n = s.size
     n <= remaining(da) || dataerror(da, "fixed of $n bytes exceeds the remaining $(remaining(da)) bytes")
     n <= remaining(db) || dataerror(db, "fixed of $n bytes exceeds the remaining $(remaining(db)) bytes")
-    c = comparebuffers(da.buf, da.pos, n, db.buf, db.pos, n, da.budget)
+    c = comparebuffers(da.buf, da.pos, n, db.buf, db.pos, n)
     da.pos += n
     db.pos += n
     return c
 end
 
 "Unsigned lexicographic order of two byte ranges (the spec rule for bytes, fixed and UTF-8 strings)."
-function comparebuffers(a::AbstractVector{UInt8}, ap::Int, na::Int, b::AbstractVector{UInt8}, bp::Int, nb::Int, budget::Budget)
+function comparebuffers(a::AbstractVector{UInt8}, ap::Int, na::Int, b::AbstractVector{UInt8}, bp::Int, nb::Int)
     n = min(na, nb)
     for i in 0:n - 1
         x = a[ap + i]
         y = b[bp + i]
-        if x != y
-            addcompare!(budget, i + 1)
-            return x < y ? -1 : 1
-        end
+        x != y && return x < y ? -1 : 1
     end
-    addcompare!(budget, n)
     return cmp(na, nb)
 end
 

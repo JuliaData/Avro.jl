@@ -149,7 +149,7 @@ end
 
 function keyindex(d::FrozenDict{K}, k) where {K}
     i = searchsortedfirst(d.keys, k)
-    i <= length(d.keys) && d.keys[i] == k && return i
+    i <= length(d.keys) && keymatches(d.keys[i], k) && return i
     return 0
 end
 

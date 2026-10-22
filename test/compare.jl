@@ -111,8 +111,7 @@
         operationschema = P("{\"type\":\"record\",\"name\":\"CompareOperation\",\"fields\":[{\"name\":\"abcdefghij\",\"type\":\"string\"}]}")
         operationa = (abcdefghij="",)
         operationb = (abcdefghij=repeat("x", 100),)
-        operationlimits = Avro.Limits(max_compare_bytes_per_byte=1,
-                                      work_allowance=0,
+        operationlimits = Avro.Limits(work_allowance=0,
                                       max_values_per_byte=16,
                                       max_datum_bytes=1000,
                                       max_bytes=1000)
@@ -138,23 +137,9 @@
         fixeda = zeros(UInt8, 1000)
         fixedb = copy(fixeda)
         fixedb[1] = 0x01
-        exactcomparison = Avro.Limits(max_compare_bytes_per_byte=0, work_allowance=1)
-        @test Avro.comparebytes(fixed, fixeda, fixedb; limits=exactcomparison) == -1
+        @test Avro.comparebytes(fixed, fixeda, fixedb; limits=Avro.Limits(work_allowance=1)) == -1
         @test Avro.comparebytes(fixed, fixeda, fixeda; validate=:fast,
-                                limits=Avro.Limits(max_compare_bytes_per_byte=0,
-                                                   work_allowance=1000)) == 0
-        comparisonerror = try
-            Avro.comparebytes(fixed, fixeda, fixedb;
-                              limits=Avro.Limits(max_compare_bytes_per_byte=0, work_allowance=0))
-            nothing
-        catch err
-            err
-        end
-        @test comparisonerror isa Avro.LimitError
-        if comparisonerror isa Avro.LimitError
-            @test comparisonerror.limit == :max_compare_bytes_per_byte
-            @test comparisonerror.observed == 1
-        end
+                                limits=Avro.Limits(work_allowance=1000)) == 0
         paircount = 1000
         pairarray = Avro.ArraySchema(Avro.UnionSchema([Avro.NullSchema(),
                                                        Avro.IntSchema()]))

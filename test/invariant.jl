@@ -119,13 +119,13 @@
             bytes = take!(io)
             writerstate = (values=writer.budget.values, input_bytes=writer.budget.input_bytes,
                            rows=writer.budget.rows, blocks=writer.budget.blocks,
-                           members=writer.budget.members, compare_bytes=writer.budget.compare_bytes,
+                           members=writer.budget.members,
                            allowance_used=Avro.allowanceused(writer.budget))
             values, readerstate = Avro.Reader(IOBuffer(bytes); limits=limits) do reader
                 decoded = collect(Avro.eachdatum(reader))
                 state = (values=reader.budget.values, input_bytes=reader.budget.input_bytes,
                          rows=reader.budget.rows, blocks=reader.budget.blocks,
-                         members=reader.budget.members, compare_bytes=reader.budget.compare_bytes,
+                         members=reader.budget.members,
                          allowance_used=Avro.allowanceused(reader.budget))
                 return decoded, state
             end
@@ -166,7 +166,6 @@
                              rows=recordwriter.budget.rows,
                              blocks=recordwriter.budget.blocks,
                              members=recordwriter.budget.members,
-                             compare_bytes=recordwriter.budget.compare_bytes,
                              allowance_used=Avro.allowanceused(recordwriter.budget))
         recordvalues, recordreaderstate = Avro.Reader(recordbytes;
                                                        limits=recordlimits) do reader
@@ -176,7 +175,6 @@
                      rows=reader.budget.rows,
                      blocks=reader.budget.blocks,
                      members=reader.budget.members,
-                     compare_bytes=reader.budget.compare_bytes,
                      allowance_used=Avro.allowanceused(reader.budget))
             return values, state
         end
@@ -191,14 +189,6 @@
                     allowance_used=state.allowance_used)
         end
         @test sharedwork(recordwriterstate) == sharedwork(recordreaderstate)
-        @test recordwriterstate.compare_bytes >= recordreaderstate.compare_bytes
-
-        referencewriter = Avro.Writer(IOBuffer(), recordschema)
-        for row in recordrows
-            push!(referencewriter, row)
-        end
-        close(referencewriter)
-        @test recordwriterstate.compare_bytes == referencewriter.budget.compare_bytes
     end
     @testset "schema printing does not subsidise datum work" begin
         dense = fill(nothing, 67_000)
