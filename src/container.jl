@@ -1253,7 +1253,8 @@ function schemaneedsstaging(schema::Schema, seen::Vector{Bool}, budget::Budget, 
     addresolution!(budget)
     schema isa ArraySchema && return true
     schema isa MapSchema && return true
-    schema isa UnionSchema && return true
+    schema isa UnionSchema &&                          # a union of leaves selects the same branch twice
+        return any(b -> b isa Union{ArraySchema,MapSchema,RecordSchema,UnionSchema}, schema.branches)
     schema isa RecordSchema && depth > 0 && return true
     id = Int(nodeid(schema)) + 1
     seen[id] && return false
