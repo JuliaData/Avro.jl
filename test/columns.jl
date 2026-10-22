@@ -108,6 +108,15 @@
     cols = Avro.columnbuilders(bp, nothing, 100, budget)
     kernel(cols, d, 100)
     @test @allocated(kernel(cols, d, 100)) == 0
+    # nullable leaf columns too: the union plan carries its non-null branch's concrete plan type
+    ns = P("{\"type\":\"record\",\"name\":\"N\",\"fields\":[{\"name\":\"a\",\"type\":[\"null\",\"long\"]},{\"name\":\"b\",\"type\":[\"double\",\"null\"]}]}")
+    nrows = [(a=isodd(i) ? missing : 1000 * i, b=i % 3 == 0 ? missing : i / 3) for i in 1:100]
+    nb = reduce(vcat, [Avro.encode(ns, r) for r in nrows])
+    ncols = Avro.columnbuilders(Avro.readplan(ns), nothing, 100, budget)
+    nd = Avro.Decoder(nb, budget)
+    kernel(ncols, nd, 100)
+    @test @allocated(kernel(ncols, nd, 100)) == 0
+    @test isequal(ncols[1].data, [r.a for r in nrows]) && isequal(ncols[2].data, [r.b for r in nrows])
     # a string column allocates exactly one String per cell
     ss = P("{\"type\":\"record\",\"name\":\"S\",\"fields\":[{\"name\":\"s\",\"type\":\"string\"}]}")
     sb = reduce(vcat, [Avro.encode(ss, (s="row$i",)) for i in 1:200])

@@ -48,9 +48,15 @@ struct MapPlan <: ReadPlan
     eltype::Type
     minsize::Int
 end
-struct UnionPlan <: ReadPlan
+"`Q` is the concrete plan type of a nullable union's non-null branch (`Nothing` for other unions)."
+struct UnionPlan{Q} <: ReadPlan
     branches::Vector{ReadPlan}
     nullable::Int        # position of the null branch in the two-branch nullable form; 0 otherwise
+end
+
+function UnionPlan(branches::Vector{ReadPlan}, nullable::Int)
+    Q = nullable == 0 ? Nothing : typeof(branches[3 - nullable])
+    return UnionPlan{Q}(branches, nullable)
 end
 mutable struct RecordPlan <: ReadPlan
     const schema::RecordSchema
@@ -598,14 +604,19 @@ function decodevalue(p::MapPlan, d::Decoder)
     return buildmap(p.eltype, keys, vals, d.budget)
 end
 
-function decodevalue(p::UnionPlan, d::Decoder)
+# A nullable union decodes its non-null branch through the concrete `Q` (counting the branch value as
+# `decode` does); calling `decode` here would recurse into the same method and lose that type.
+function decodevalue(p::UnionPlan{Q}, d::Decoder) where {Q<:ReadPlan}
+    i = readindex(d, 2)
+    countvalues!(d.budget)
+    i == p.nullable && return missing
+    return decodevalue(p.branches[i]::Q, d)
+end
+
+function decodevalue(p::UnionPlan{Nothing}, d::Decoder)
     n = length(p.branches)
     n == 0 && dataerror(d, "empty union has no datum")
     i = readindex(d, n)
-    if p.nullable != 0
-        value = decode(p.branches[i], d)
-        return i == p.nullable ? missing : value
-    end
     reserve!(d.budget, unionvaluebytes())
     v = decode(p.branches[i], d)
     box = isbits(v) ? boxbytes(typeof(v)) : 0
@@ -771,7 +782,14 @@ function skipvalue(p::MapPlan, d::Decoder)
     return nothing
 end
 
-function skipvalue(p::UnionPlan, d::Decoder)
+function skipvalue(p::UnionPlan{Q}, d::Decoder) where {Q<:ReadPlan}
+    i = readindex(d, 2)
+    countvalues!(d.budget)
+    i == p.nullable && return nothing
+    return skipvalue(p.branches[i]::Q, d)
+end
+
+function skipvalue(p::UnionPlan{Nothing}, d::Decoder)
     n = length(p.branches)
     n == 0 && dataerror(d, "empty union has no datum")
     i = readindex(d, n)
