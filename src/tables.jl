@@ -261,7 +261,7 @@ function Table(src; reader_schema::Union{Nothing,Schema}=nothing, union_resoluti
             colstypes[index] = juliatype(field.schema)
         end
         pre = r.source isa BytesSource ? prescanblocks(r) : nothing
-        if pre !== nothing && !preallocatable(colstypes, pre.totalrows, r.source)
+        if pre !== nothing && !preallocatable(colstypes, pre.totalrows, r.source::BytesSource)
             release!(r.budget, blocktablecharge(capacity(pre.entries)))
             pre = nothing
         end
