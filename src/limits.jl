@@ -105,6 +105,7 @@ function limitvalue(name::Symbol, value)
 end
 
 function Limits(; kwargs...)
+    isempty(kwargs) && return DEFAULT_LIMITS          # every one-shot call defaults to this
     for k in keys(kwargs)
         haskey(LIMIT_DEFAULTS, k) || throw(ArgumentError("unknown Avro.Limits keyword `$k`"))
     end
@@ -186,6 +187,8 @@ function first_unit_bytes(l::Limits)
                          satadd(l.max_codec_memory, 4 * MiB)),
                   l.max_datum_bytes)
 end
+
+const DEFAULT_LIMITS = validate(Limits(values(LIMIT_DEFAULTS)...))
 
 # ---- per-operation budget -------------------------------------------------------------------------
 
