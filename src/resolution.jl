@@ -1,9 +1,8 @@
 # Schema resolution: `resolve(writer, reader)` builds a writer-driven read plan whose values
 # are the reader schema's generic values. Pairs are memoised on (writer, reader) node ids and
 # every match attempt, memo step and plan node is charged to `max_resolution_work`; unions follow the
-# spec policy (the first reader branch matching with promotion; a named type takes its fullname's branch,
-# else the only branch with its unqualified name) or Apache Java's exact-match-first policy; failures are
-# `ResolutionError`s carrying both paths.
+# spec policy (the writer's own type, else the only branch with a named type's unqualified name, else the
+# first promotion) or Apache Java's policy; failures are `ResolutionError`s carrying both paths.
 
 """
     Avro.ResolvedSchema
@@ -498,10 +497,11 @@ Resolve data written with `writer` for a `reader`: kinds, promotions
 (`int→long/float/double`, `long→float/double`, `float→double`, `string↔bytes`), named types by fullname,
 reader aliases or unqualified name, record fields by name and reader field aliases (an alias consumes the
 writer field), reader-only fields from valid defaults, enum symbols by name with the reader default,
-unions under `union_resolution=:spec` (first reader branch matching with promotion; a named writer type
-takes the branch with its fullname or a reader alias of it, else the only branch with its unqualified name,
-and several unqualified-name matches raise `ResolutionError`) or `:java` (Java's choice: exact match
-first, then structural record matches). Values follow the reader schema. Bounded by `max_resolution_work`.
+unions under `union_resolution=:spec` (the reader branch of the writer's own type — the same primitive,
+or a named type with the writer's fullname or a reader alias of it — else the only branch with a named
+writer type's unqualified name, else the first branch the writer promotes to; several unqualified-name
+matches raise `ResolutionError`) or `:java` (Java's choice, which adds structural record matches). Values
+follow the reader schema. Bounded by `max_resolution_work`.
 """
 function resolve(writer::Schema, reader::Schema; union_resolution::Symbol=:spec, limits::Limits=Limits(),
                  budget::Union{Nothing,Budget}=nothing, decimal_little::Bool=false)
@@ -913,11 +913,14 @@ function selectbranch(ctx::ResolveContext, w::Schema, r::UnionSchema,
     elseif w isa NamedSchema
         return namedbranch(ctx, w, r)
     end
+    first = 0                                          # the writer's own type beats an earlier promotion
     for (j, c) in enumerate(r.branches)
         addresolution!(ctx.budget, 1)
-        matches(w, c, ctx.budget) && return BranchMatch(j, false)
+        matches(w, c, ctx.budget) || continue
+        exactmatch(w, c, ctx.budget) && return BranchMatch(j, false)
+        first == 0 && (first = j)
     end
-    return BranchMatch(0, false)
+    return BranchMatch(first, false)
 end
 
 """

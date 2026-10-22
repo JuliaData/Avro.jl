@@ -21,11 +21,12 @@ The full "Schema Resolution" rules are implemented:
   fields take their defaults; writer-only fields are skipped.
 * promotions: `int → long → float → double`, `string ↔ bytes`.
 * enums remap by symbol; unknown writer symbols fall to the reader's `default` symbol.
-* unions resolve per branch. `union_resolution=:spec` (default) takes the first reader branch the
-  writer matches, except that a named writer type takes the branch with its fullname or a reader alias
-  of it, else the only branch sharing its unqualified name; when several branches share that name and
-  none has the fullname, resolution raises `Avro.ResolutionError` instead of guessing. `:java`
-  reproduces Java's choice (exact match first, then structural record matches) where they differ.
+* unions resolve per branch. `union_resolution=:spec` (default) takes the reader branch of the
+  writer's own type (the same primitive, or a named type with the writer's fullname or a reader alias of
+  it), else the only branch sharing a named writer type's unqualified name, else the first branch the
+  writer promotes to: `long` data read with `["double","long"]` stays `long`. When several branches share
+  the unqualified name and none has the fullname, resolution raises `Avro.ResolutionError` instead of
+  guessing. `:java` reproduces Java's choice, which also matches records structurally.
 * the decoded representation follows the **reader** schema (a resolved value looks as if it had been
   written under the reader schema).
 

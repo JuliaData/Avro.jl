@@ -162,10 +162,13 @@
     end
     @testset "unions: policies, directions, unresolvable branches" begin
         wi = P("\"int\"")
-        @test rt(wi, P("[\"long\",\"int\"]"), Int32(5)) == Avro.UnionValue(1, Int64(5))                       # :spec: first match incl. promotion
+        @test rt(wi, P("[\"long\",\"int\"]"), Int32(5)) == Avro.UnionValue(2, Int32(5))                       # the writer's own type first
         @test rt(wi, P("[\"long\",\"int\"]"), Int32(5); union_resolution=:java) == Avro.UnionValue(2, Int32(5))
-        @test rt(wi, P("[\"double\",\"int\"]"), Int32(5)) == Avro.UnionValue(1, 5.0)
+        @test rt(wi, P("[\"double\",\"int\"]"), Int32(5)) == Avro.UnionValue(2, Int32(5))
         @test rt(wi, P("[\"double\",\"int\"]"), Int32(5); union_resolution=:java) == Avro.UnionValue(2, Int32(5))
+        @test rt(wi, P("[\"string\",\"double\",\"long\"]"), Int32(5)) == Avro.UnionValue(2, 5.0)             # else the first promotion
+        big = typemax(Int64) - 1                                                                               # not exact in a double
+        @test rt(P("\"long\""), P("[\"double\",\"long\"]"), big) == Avro.UnionValue(2, big)
         @test rt(wi, P("[\"null\",\"long\"]"), Int32(5)) === Int64(5)                                          # nullable readers stay bare
         @test_throws Avro.ResolutionError Avro.resolve(wi, P("[\"string\",\"boolean\"]"))
         wu = P("[\"int\",\"string\"]")
