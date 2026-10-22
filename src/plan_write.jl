@@ -1390,7 +1390,27 @@ function recordfieldindex(p::WRecord, candidate::String, budget::Budget)
     return get(p.schema.fieldindex, candidate, 0)
 end
 
-function recordfieldindex(p::WRecord, candidate::Union{Symbol,AbstractString}, budget::Budget)
+function recordfieldindex(p::WRecord, candidate::Symbol, budget::Budget)
+    keys = p.schema.fieldindex.keys
+    i = searchsortedfirst(keys, candidate; lt=symbolless)   # no String copy of the symbol per lookup
+    i <= length(keys) && symbolequal(keys[i], candidate) && return p.schema.fieldindex.vals[i]
+    return 0
+end
+
+"Byte order of a field name against a column `Symbol` (either argument order), without allocating."
+function symbolless(a, b)
+    a isa Symbol && return symbolcmp(b::String, a) > 0
+    return symbolcmp(a::String, b::Symbol) < 0
+end
+
+function symbolcmp(s::String, sym::Symbol)
+    n = sizeof(sym)
+    c = GC.@preserve s sym ccall(:memcmp, Cint, (Ptr{UInt8}, Ptr{UInt8}, Csize_t),
+                                 pointer(s), Base.unsafe_convert(Ptr{UInt8}, sym), min(sizeof(s), n))
+    return c != 0 ? Int(c) : cmp(sizeof(s), n)
+end
+
+function recordfieldindex(p::WRecord, candidate::AbstractString, budget::Budget)
     charge = stringbytes(sizeof(candidate))
     reserve!(budget, charge)
     name = try
@@ -1432,11 +1452,29 @@ function recordfieldpositions(p::WRecord, ::Type{T}, budget::Budget) where {T}
     end
 end
 
+"Whether the column names spell the record's field names in schema order."
+function alignednames(p::WRecord, names)
+    length(names) == length(p.fields) || return false
+    for (i, n) in enumerate(names)
+        field = p.schema.fields[i].name
+        same = n isa Symbol ? symbolequal(field, n) : (n isa AbstractString && n == field)
+        same || return false
+    end
+    return true
+end
+
 function recordrowpositions(p::WRecord, row, budget::Budget)
     positions = recordpositions(length(p.fields), budget)
     isempty(p.fields) && return positions
     try
-        for (j, candidate) in enumerate(Tables.columnnames(row))
+        names = Tables.columnnames(row)
+        if alignednames(p, names)                     # columns already in schema order
+            for i in eachindex(positions)
+                positions[i] = i
+            end
+            return positions
+        end
+        for (j, candidate) in enumerate(names)
             (candidate isa Symbol || candidate isa AbstractString) ||
                 encodeerror("row column names must be strings or symbols", candidate)
             i = recordfieldindex(p, candidate, budget)

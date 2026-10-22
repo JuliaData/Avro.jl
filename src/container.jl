@@ -1990,6 +1990,14 @@ function preparewriterrecord(p::WRecord, value::AbstractDict, budget::Budget,
     end
 end
 
+# A closure per field would copy the whole row object into each one: build the field's diagnostic path
+# only for the error.
+@noinline function rowlackscolumn(field::Field, row, diagnostics::Union{Nothing,Encoder})
+    withwriterpreparepath(diagnostics, field) do
+        encodeerror("row lacks column \"$(field.name)\"", row)
+    end
+end
+
 function preparewriterrow(p::WRecord, row, budget::Budget,
                           diagnostics::Union{Nothing,Encoder}=nothing)
     checkpoint = budgetcheckpoint(budget)
@@ -2000,14 +2008,9 @@ function preparewriterrow(p::WRecord, row, budget::Budget,
         values = preparedrecordstorage(p, budget)
         boxes = 0
         for i in eachindex(p.fields)
-            field = p.schema.fields[i]
-            box = withwriterpreparepath(diagnostics, field) do
-                positions[i] == 0 &&
-                    encodeerror("row lacks column \"$(field.name)\"", row)
-                assignpreparedrecord!(values, i,
-                    Tables.getcolumn(row, positions[i]), budget)
-            end
-            boxes = checked_add(boxes, box)
+            positions[i] == 0 && rowlackscolumn(p.schema.fields[i], row, diagnostics)
+            boxes = checked_add(boxes, assignpreparedrecord!(values, i,
+                                                             Tables.getcolumn(row, positions[i]), budget))
         end
         release!(budget, vectorbytes(Int, length(positions)))
         positions = nothing
