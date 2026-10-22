@@ -44,6 +44,7 @@ end
 
 struct UnionSpan <: SpanPlan
     branches::Vector{SpanPlan}
+    values::Int     # 1 + the value count every branch shares, or -1 when branches differ
 end
 
 struct SpanStep
@@ -71,7 +72,7 @@ end
 function spanvalues(p::SpanPlan)
     p isa Union{FixedSpan,FixedValueSpan} && return p.values
     p isa Union{IntSpan,LongSpan,BytesSpan,EnumSpan} && return 1
-    p isa RecordSpan && return p.values
+    p isa Union{RecordSpan,UnionSpan} && return p.values
     return -1
 end
 
@@ -221,7 +222,13 @@ function buildspanplan(s::UnionSchema, memo, budget)
     for (i, branch) in enumerate(s.branches)
         branches[i] = spanplan(branch, memo, budget)
     end
-    plan = UnionSpan(branches)
+    # Equal branch value counts make the union's count static (["null","long"] is always 2 values),
+    # so records of such unions skip the per-datum span pass. A record still being built reports -1.
+    shared = n == 0 ? -1 : spanvalues(branches[1])
+    for i in 2:n
+        spanvalues(branches[i]) == shared || (shared = -1; break)
+    end
+    plan = UnionSpan(branches, shared < 0 ? -1 : satadd(shared, 1))
     return plan
 end
 
@@ -667,8 +674,8 @@ function spanstatic!(plan::SpanPlan, cursor::SpanState)
     elseif plan isa LongSpan
         spanlong!(cursor)
     elseif plan isa BytesSpan
-        length = spanlength!(cursor, cursor.limits.max_bytes, :max_bytes)
-        spanadvance!(cursor, length)
+        nbytes = spanlength!(cursor, cursor.limits.max_bytes, :max_bytes)
+        spanadvance!(cursor, nbytes)
     elseif plan isa EnumSpan
         index = spanlong!(cursor)
         0 <= index < plan.symbols ||
@@ -678,6 +685,11 @@ function spanstatic!(plan::SpanPlan, cursor::SpanState)
         spanadvance!(cursor, plan.width)
     elseif plan isa FixedSpan
         spanadvance!(cursor, plan.width)
+    elseif plan isa UnionSpan
+        index = spanlong!(cursor)
+        0 <= index < length(plan.branches) ||
+            spanerror(cursor, "index $index out of range (0:$(length(plan.branches) - 1))")
+        spanstatic!(plan.branches[Int(index) + 1], cursor)
     elseif plan isa RecordSpan
         if plan.width >= 0
             checkspanfixed(cursor, plan.maxfixed)

@@ -797,6 +797,27 @@ end
         @test exact.peak == exactpeak
     end
 
+    @testset "unions whose branches share a value count are static" begin
+        span(schema) = Avro.spanplan(schema; budget=Avro.ledgerbudget(1 << 30))
+        nullable = P("{\"type\":\"record\",\"name\":\"StaticUnions\",\"fields\":[{\"name\":\"a\",\"type\":[\"null\",\"long\"]},{\"name\":\"s\",\"type\":[\"string\",\"null\"]}]}")
+        @test Avro.spanvalues(span(nullable)) == 5     # the record plus two values per union: no span pass
+        @test Avro.spanvalues(span(P("[\"null\",{\"type\":\"record\",\"name\":\"Two\",\"fields\":[{\"name\":\"x\",\"type\":\"long\"}]}]"))) == -1
+        @test Avro.spanvalues(span(P("{\"type\":\"record\",\"name\":\"Rec\",\"fields\":[{\"name\":\"n\",\"type\":[\"null\",\"Rec\"]}]}"))) == -1
+        rows = [(a=isodd(i) ? missing : Int64(i), s=i % 3 == 0 ? missing : "v$i") for i in 1:100]
+        buf = take!(Avro.tobuffer(rows; schema=nullable))
+        @test isequal(Tables.columntable(Avro.Table(buf; ntasks=1)), Tables.columntable(rows))
+        hlen = length(take!(Avro.tobuffer(rows[1:0]; schema=nullable)))
+        @test buf[hlen + 1:hlen + 2] == [0xc8, 0x01]   # one block of 100 datums
+        badindex = copy(buf)
+        badindex[hlen + 5] = 0x06                      # the first datum selects union branch 3 of 2
+        @test_throws Avro.DataError Avro.Table(badindex; ntasks=1)
+        @test_throws Avro.DataError Avro.Table(badindex)
+        overcount = copy(buf)
+        overcount[hlen + 1] = 0xca                     # 101 datums declared, 100 encoded
+        @test_throws Avro.DataError Avro.Table(overcount; ntasks=1)
+        @test_throws Avro.DataError Avro.DatumReader(nullable)(UInt8[0x02, 0x06])     # truncated long
+    end
+
     @testset "validation modes: strict walks skipped regions, fast jumps sized blocks" begin
         s = P("{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"a\",\"type\":{\"type\":\"array\",\"items\":\"boolean\"}},{\"name\":\"b\",\"type\":\"int\"}]}")
         good = Avro.encode(s, (a=[true, false], b=1))
