@@ -195,20 +195,46 @@
         aliasrecordreader = P("[{\"type\":\"record\",\"name\":\"x.Foo\",\"fields\":[{\"name\":\"a\",\"type\":\"long\"}]},{\"type\":\"record\",\"name\":\"r.Bar\",\"aliases\":[\"w.Foo\"],\"fields\":[{\"name\":\"a\",\"type\":\"int\"}]}]")
         specrecord = rt(aliasrecordwriter, aliasrecordreader, (a=Int32(7),))
         javarecord = rt(aliasrecordwriter, aliasrecordreader, (a=Int32(7),); union_resolution=:java)
-        @test specrecord.index == 1 && specrecord.value["a"] === Int64(7)
+        @test specrecord.index == 2 && specrecord.value["a"] === Int32(7)       # a reader alias beats an unqualified name
         @test javarecord.index == 2 && javarecord.value["a"] === Int32(7)
 
         aliasenumwriter = P("{\"type\":\"enum\",\"name\":\"w.Kind\",\"symbols\":[\"A\"]}")
         aliasenumreader = P("[{\"type\":\"enum\",\"name\":\"x.Kind\",\"symbols\":[\"A\"]},{\"type\":\"enum\",\"name\":\"r.Other\",\"aliases\":[\"w.Kind\"],\"symbols\":[\"A\"]}]")
         enumvalue = Avro.EnumValue(aliasenumwriter, 1)
-        @test rt(aliasenumwriter, aliasenumreader, enumvalue).index == 1
+        @test rt(aliasenumwriter, aliasenumreader, enumvalue).index == 2
         @test rt(aliasenumwriter, aliasenumreader, enumvalue; union_resolution=:java).index == 2
 
         aliasfixedwriter = P("{\"type\":\"fixed\",\"name\":\"w.Blob\",\"size\":2}")
         aliasfixedreader = P("[{\"type\":\"fixed\",\"name\":\"x.Blob\",\"size\":2},{\"type\":\"fixed\",\"name\":\"r.OtherBlob\",\"aliases\":[\"w.Blob\"],\"size\":2}]")
         fixedvalue = Avro.Fixed(aliasfixedwriter, UInt8[1, 2])
-        @test rt(aliasfixedwriter, aliasfixedreader, fixedvalue).index == 1
+        @test rt(aliasfixedwriter, aliasfixedreader, fixedvalue).index == 2
         @test rt(aliasfixedwriter, aliasfixedreader, fixedvalue; union_resolution=:java).index == 2
+
+        # :spec takes the branch with the writer's fullname over an earlier one sharing its unqualified name,
+        # and refuses to guess between unqualified-name matches
+        event(ns, t="int") = """{"type":"record","name":"Event","namespace":"$ns","fields":[{"name":"x","type":"$t"}]}"""
+        eventreader = P("[" * event("com.a", "long") * "," * event("com.b") * "]")
+        exactevent = rt(P(event("com.b")), eventreader, (x=Int32(7),))
+        @test exactevent.index == 2 && exactevent.value["x"] === Int32(7)
+        @test Avro.fullname(Avro.schema(exactevent.value)) == "com.b.Event"
+        color(ns) = """{"type":"enum","name":"Color","namespace":"$ns","symbols":["R","G"]}"""
+        colorwriter = P(color("com.b"))
+        colorvalue = rt(colorwriter, P("[" * color("com.a") * "," * color("com.b") * "]"),
+                        Avro.EnumValue(colorwriter, 2))
+        @test colorvalue.index == 2 && String(colorvalue.value) == "G"
+        ambiguous = try
+            Avro.resolve(P(event("com.c")), eventreader)
+            nothing
+        catch err
+            err
+        end
+        @test ambiguous isa Avro.ResolutionError && occursin("more than one reader union branch", ambiguous.msg)
+        @test rt(P(event("com.c")), P("[\"null\"," * event("com.a", "long") * "]"), (x=Int32(3),))["x"] === Int64(3)
+        unionwriter = P("[\"null\"," * event("com.c") * "]")
+        nullablereader = P("[\"null\"," * event("com.a", "long") * "," * event("com.b") * "]")
+        @test Avro.resolve(unionwriter, nullablereader) isa Avro.ResolvedSchema   # an ambiguous branch fails only when used
+        @test isequal(rt(unionwriter, nullablereader, missing), Avro.UnionValue(1, missing))
+        @test_throws Avro.ResolutionError rt(unionwriter, nullablereader, (x=Int32(1),))
 
         softrecordwriter = P("""{"type":"record","name":"w.W","fields":[{"name":"x","type":"int"}]}""")
         softrecordreader = P("""[

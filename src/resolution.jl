@@ -1,8 +1,9 @@
 # Schema resolution: `resolve(writer, reader)` builds a writer-driven read plan whose values
 # are the reader schema's generic values. Pairs are memoised on (writer, reader) node ids and
 # every match attempt, memo step and plan node is charged to `max_resolution_work`; unions follow the
-# spec policy (the first reader branch matching with promotion) or Apache Java's exact-match-first
-# policy; failures are `ResolutionError`s carrying both paths.
+# spec policy (the first reader branch matching with promotion; a named type takes its fullname's branch,
+# else the only branch with its unqualified name) or Apache Java's exact-match-first policy; failures are
+# `ResolutionError`s carrying both paths.
 
 """
     Avro.ResolvedSchema
@@ -497,8 +498,10 @@ Resolve data written with `writer` for a `reader`: kinds, promotions
 (`int→long/float/double`, `long→float/double`, `float→double`, `string↔bytes`), named types by fullname,
 reader aliases or unqualified name, record fields by name and reader field aliases (an alias consumes the
 writer field), reader-only fields from valid defaults, enum symbols by name with the reader default,
-unions under `union_resolution=:spec` (first reader branch matching with promotion) or `:java`
-(exact match first). Values follow the reader schema. Bounded by `max_resolution_work`.
+unions under `union_resolution=:spec` (first reader branch matching with promotion; a named writer type
+takes the branch with its fullname or a reader alias of it, else the only branch with its unqualified name,
+and several unqualified-name matches raise `ResolutionError`) or `:java` (Java's choice: exact match
+first, then structural record matches). Values follow the reader schema. Bounded by `max_resolution_work`.
 """
 function resolve(writer::Schema, reader::Schema; union_resolution::Symbol=:spec, limits::Limits=Limits(),
                  budget::Union{Nothing,Budget}=nothing, decimal_little::Bool=false)
@@ -782,6 +785,11 @@ end
 struct BranchMatch
     index::Int
     softrecord::Bool
+    ambiguous::Bool   # `:spec`: two or more branches match only by unqualified name
+end
+
+function BranchMatch(index::Int, softrecord::Bool)
+    return BranchMatch(index, softrecord, false)
 end
 
 function softcandidate(ctx::ResolveContext, writer::RecordSchema, reader::Field)
@@ -902,12 +910,32 @@ function selectbranch(ctx::ResolveContext, w::Schema, r::UnionSchema,
             end
             structurematch != 0 && return BranchMatch(structurematch, true)
         end
+    elseif w isa NamedSchema
+        return namedbranch(ctx, w, r)
     end
     for (j, c) in enumerate(r.branches)
         addresolution!(ctx.budget, 1)
         matches(w, c, ctx.budget) && return BranchMatch(j, false)
     end
     return BranchMatch(0, false)
+end
+
+"""
+The `:spec` reader branch for a named writer type: the branch with the writer's fullname or a reader
+alias of it, else the only branch with the writer's unqualified name. Two or more unqualified-name
+matches and no exact one are ambiguous, so no branch is chosen.
+"""
+function namedbranch(ctx::ResolveContext, w::NamedSchema, r::UnionSchema)
+    found = 0
+    candidates = 0
+    for (j, c) in enumerate(r.branches)
+        addresolution!(ctx.budget, 1)
+        matches(w, c, ctx.budget) || continue
+        exactmatch(w, c, ctx.budget) && return BranchMatch(j, false)
+        candidates += 1
+        found = j
+    end
+    return candidates == 1 ? BranchMatch(found, false) : BranchMatch(0, false, candidates > 1)
 end
 
 "Snapshot which plain-plan memo slots existed before a fallible union-member attempt."
@@ -979,6 +1007,8 @@ function resolvebranch(ctx::ResolveContext, w::Schema, r::Schema,
     end
 end
 
+const AMBIGUOUS_BRANCH = " matches more than one reader union branch by unqualified name and none by fullname or alias"
+
 function resolvewriterunion(ctx::ResolveContext, w::UnionSchema, r::Schema,
                             wp::ResolutionPath, rp::ResolutionPath,
                             javasoft::Bool=false)
@@ -1000,7 +1030,7 @@ function resolvewriterunion(ctx::ResolveContext, w::UnionSchema, r::Schema,
                 if j == 0
                     skipper = writerplan(ctx, b)
                     msg = diagnosticstring(ctx.budget, "writer union branch ",
-                        SchemaDescription(b), " matches no reader branch")
+                        SchemaDescription(b), selected.ambiguous ? AMBIGUOUS_BRANCH : " matches no reader branch")
                     writerpath = formatpath(wp, ctx.budget)
                     readerpath = formatpath(rp, ctx.budget)
                     push!(branches, unresolvablebranch(msg, writerpath, readerpath, skipper, ctx.budget))
@@ -1033,7 +1063,7 @@ function resolvereaderunion(ctx::ResolveContext, w::Schema, r::UnionSchema,
     selected = selectbranch(ctx, w, r)
     j = selected.index
     j == 0 && reserror(ctx, wp, rp, "writer ", SchemaDescription(w),
-        " matches no branch of the reader union")
+        selected.ambiguous ? AMBIGUOUS_BRANCH : " matches no branch of the reader union")
     pushindex!(rp, j - 1, ctx.budget)
     inner = try
         resolvenode(ctx, w, r.branches[j], wp, rp,
