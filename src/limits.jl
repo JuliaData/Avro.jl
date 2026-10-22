@@ -139,6 +139,9 @@ function validate(l::Limits)
     metadatacap = satadd(l.max_metadata_bytes, l.max_schema_bytes)
     metadatacap <= half ||
         throw(ArgumentError("Avro.Limits: `max_metadata_bytes` + `max_schema_bytes` ($metadatacap) must be ≤ `max_total_bytes` ÷ 2 ($half)"))
+    first = first_unit_bytes(l)
+    first <= l.max_total_bytes ||
+        throw(ArgumentError("Avro.Limits: two `max_block_bytes` + `max_codec_memory` + 4 MiB + `max_datum_bytes` ($first) must be ≤ `max_total_bytes` ($(l.max_total_bytes)): one block and one datum must fit"))
     return l
 end
 
@@ -159,11 +162,6 @@ function muladdcap(multiplier::Int, input::Int, allowance::Int)
     available = typemax(Int) - allowance
     input > available ÷ multiplier && return typemax(Int)
     return multiplier * input + allowance
-end
-
-# clamped addition for counters that must never throw (guard state)
-function clamped_add(a::Int, b::Int)
-    return (r = a + b; (b > 0 && r < a) ? typemax(Int) : ((b < 0 && r > a) ? typemin(Int) : r))
 end
 
 function Base.show(io::IO, l::Limits)
@@ -190,98 +188,13 @@ function first_unit_bytes(l::Limits)
                   l.max_datum_bytes)
 end
 
-# ---- available-memory guard (best-effort) ------------------------------------------------
-
-mutable struct GuardState
-    @atomic pending::Int   # bytes reserved by live operations but not yet allocated
-end
-
-const GUARD = GuardState(0)
-
-function cgroup_remaining()
-    Sys.islinux() || return typemax(Int)
-    return something(cgroup_v2_remaining(), cgroup_v1_remaining(), typemax(Int))
-end
-
-function read_int_file(path::AbstractString)
-    isfile(path) || return nothing
-    txt = try
-        strip(Base.read(path, String))
-    catch
-        return nothing
-    end
-    txt == "max" && return typemax(Int)
-    return tryparse(Int, txt)
-end
-
-function cgroup_v2_remaining()
-    mx = read_int_file("/sys/fs/cgroup/memory.max")
-    cur = read_int_file("/sys/fs/cgroup/memory.current")
-    (mx === nothing || cur === nothing) && return nothing
-    mx == typemax(Int) && return typemax(Int)
-    return max(mx - cur, 0)
-end
-
-function cgroup_v1_remaining()
-    mx = read_int_file("/sys/fs/cgroup/memory/memory.limit_in_bytes")
-    cur = read_int_file("/sys/fs/cgroup/memory/memory.usage_in_bytes")
-    (mx === nothing || cur === nothing) && return nothing
-    mx >= typemax(Int) ÷ 2 && return typemax(Int)   # "unlimited" is reported as a huge number
-    return max(mx - cur, 0)
-end
-
-"""
-    available_memory()
-
-Best-effort estimate of the memory this process may still use: the minimum of the host's free memory,
-the (cgroup-constrained) total memory and the cgroup's remaining memory, minus the package's pending
-reservations. `Sys.free_memory()` is host-wide on Julia ≤ 1.12 (documented); on macOS it counts only
-truly free pages, so the reclaimable inactive page cache is added (`host_free_memory`).
-"""
-function available_memory()
-    free = host_free_memory()
-    total = Int(min(Sys.total_memory(), typemax(Int) % UInt64))
-    avail = min(free, total, cgroup_remaining())
-    return max(clamped_add(avail, -(@atomic GUARD.pending)), 0)
-end
-
-# `Sys.free_memory()`, except on macOS where free + inactive pages (the `vm_stat` convention) is the
-# reclaimable figure: free pages alone routinely fall to a few hundred MB on a busy host.
-# Optional samples keep comparisons tied to those readings without resampling the OS.
-function host_free_memory(free::UInt64=Sys.free_memory(),
-                          reclaimable::Union{Nothing,Int}=Sys.isapple() ? darwin_available_memory() : nothing)
-    return max(Int(min(free, typemax(Int) % UInt64)), something(reclaimable, 0))
-end
-
-function darwin_available_memory()
-    stats = zeros(UInt32, 38)   # vm_statistics64_data_t as HOST_VM_INFO64_COUNT integer_t
-    count = Ref{UInt32}(length(stats))
-    host = ccall(:mach_host_self, UInt32, ())
-    kr = ccall(:host_statistics64, Cint, (UInt32, Cint, Ptr{UInt32}, Ptr{UInt32}), host, 4, stats, count)
-    ccall(:mach_port_deallocate, Cint, (UInt32, UInt32), unsafe_load(cglobal(:mach_task_self_, UInt32)), host)
-    (kr == 0 && count[] >= 3) || return nothing
-    pagesize = Int(ccall(:getpagesize, Cint, ()))
-    return clamped_add(Int(stats[1]), Int(stats[3])) * pagesize   # free + inactive pages
-end
-
-"""
-    effective_ceiling(limits; available=available_memory())
-
-`min(limits.max_total_bytes, available ÷ 2)` — the ceiling an operation actually runs under.
-"""
-function effective_ceiling(l::Limits; available::Int=available_memory())
-    return min(l.max_total_bytes, max(available, 0) ÷ 2)
-end
-
 # ---- per-operation budget -------------------------------------------------------------------------
 
 """
-    Budget(limits; direction=:decode, available=available_memory())
+    Budget(limits; direction=:decode)
 
-The accumulator of one operation: live reservations against the effective ceiling, the value and
-comparison work counters, rows, blocks, codec members, resolution work and the shared allowance.
-Constructing a budget fails with `LimitError(:available_memory)` when the effective
-ceiling cannot admit the operation's first unit of progress.
+The accumulator of one operation: live reservations against the `max_total_bytes` ceiling, the value
+and comparison work counters, rows, blocks, codec members, resolution work and the shared allowance.
 """
 mutable struct Budget
     const limits::Limits
@@ -297,19 +210,15 @@ mutable struct Budget
     members::Int
     resolution_work::Int
     allowance_used::Int     # the largest draw on work_allowance so far (maintained when input arrives)
-    pending::Int            # this operation's contribution to GUARD.pending
-    published::Int          # the part of `pending` already pushed to GUARD (batched, best-effort)
+    pending::Int            # reserved bytes not yet allocated
     workcap::Int            # min(max_total_values, max_values_per_byte × input_bytes + work_allowance)
     workdeferred::Int       # root encode transactions whose exact byte denominator is not known yet
     default_position::Int   # reusable cursor into a resolved default's immutable branch tape
 end
 
-function Budget(limits::Limits; direction::Symbol=:decode, available::Int=available_memory())
+function Budget(limits::Limits; direction::Symbol=:decode)
     direction in (:decode, :encode) || throw(ArgumentError("direction must be :decode or :encode"))
-    ceiling = effective_ceiling(limits; available=available)
-    need = first_unit_bytes(limits)
-    ceiling >= need || throw(LimitError(:available_memory, available, need, :max_total_bytes, direction))
-    return Budget(limits, ceiling, direction, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    return Budget(limits, limits.max_total_bytes, direction, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
                   min(limits.max_total_values, limits.work_allowance), 0, 0)
 end
 
@@ -317,7 +226,7 @@ end
 function ledgerbudget(ceiling::Int)
     ceiling >= 0 || throw(ArgumentError("ledger ceiling must be non-negative"))
     limits = Limits()
-    return Budget(limits, ceiling, :decode, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    return Budget(limits, ceiling, :decode, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
                   min(limits.max_total_values, limits.work_allowance), 0, 0)
 end
 
@@ -336,19 +245,8 @@ end
     reserve!(budget, n)
 
 Reserve `n` bytes of package-owned memory before allocating them. Throws `LimitError(:max_total_bytes)`
-when the reservation would exceed the operation's effective ceiling.
+when the reservation would exceed the operation's ceiling.
 """
-const GUARD_CHUNK = 1 << 20   # guard publication batch: each budget's unpublished slack stays < 1 MiB
-
-function updateguard!(delta::Int)
-    while true
-        old = @atomic GUARD.pending
-        new = max(clamped_add(old, delta), 0)
-        result = @atomicreplace GUARD.pending old => new
-        result.success && return new
-    end
-end
-
 function reserve!(b::Budget, n::Int)
     n >= 0 || throw(ArgumentError("reservation must be non-negative"))
     n == 0 && return b
@@ -358,35 +256,23 @@ function reserve!(b::Budget, n::Int)
     total <= b.ceiling || throw(limiterror(b, :max_total_bytes, total, b.ceiling))
     b.reserved = total
     b.peak = max(b.peak, total)
-    b.pending = clamped_add(b.pending, n)
-    if b.pending - b.published >= GUARD_CHUNK          # batched: the global atomic is off the per-cell path
-        delta = b.pending - b.published
-        updateguard!(delta)
-        b.published = b.pending
-    end
+    b.pending += n                                     # pending ≤ reserved ≤ ceiling
     return b
 end
 
-# Drop `n` bytes from the budget's pending counter and (batched) from the guard. Internal: the public
-# entry points are `allocated!`, `unreserve!` and `close!`, which validate their side of the contract.
+# Drop `n` bytes from the budget's pending counter. Internal: the public entry points are `allocated!`,
+# `unreserve!` and `close!`, which validate their side of the contract.
 function settlepending!(b::Budget, n::Int)
     n <= 0 && return b
     b.pending -= n
-    if b.published - b.pending >= GUARD_CHUNK || (b.pending == 0 && b.published > 0)
-        delta = b.published - b.pending
-        updateguard!(-delta)
-        b.published = b.pending
-    end
     return b
 end
 
 """
     allocated!(budget, n)
 
-Record that `n` previously reserved bytes are now resident: they leave the guard's pending counter,
-which must only carry reservations not yet backed by storage (the OS counters already see
-resident pages, so leaving them pending would subtract them twice from `available_memory()`). Settling
-more bytes than are pending is a settlement mismatch and throws instead of clamping.
+Record that `n` previously reserved bytes are now resident. Settling more bytes than are pending is a
+settlement mismatch and throws instead of clamping.
 """
 function allocated!(b::Budget, n::Int)
     n >= 0 || throw(ArgumentError("settlement must be non-negative"))
@@ -431,7 +317,7 @@ end
     unreserve!(budget, n)
 
 Return `n` reserved bytes that never became resident (worst-case headroom, or the unwind of a failed
-allocation) to the guard and the budget.
+allocation) to the budget.
 """
 function unreserve!(b::Budget, n::Int)
     n >= 0 || throw(ArgumentError("unreserve must be non-negative"))
@@ -445,7 +331,7 @@ end
 """
     close!(budget)
 
-Return every pending reservation to the guard (called in the `finally` of every operation).
+Settle every pending reservation (called in the `finally` of every operation).
 """
 function close!(b::Budget)
     settlepending!(b, b.pending)
@@ -726,7 +612,7 @@ function keymatches(a, b)
     return a == b
 end
 
-"Zero a budget for reuse by a prepared per-call path (guard bookkeeping settled first)."
+"Zero a budget for reuse by a prepared per-call path."
 function resetbudget!(b::Budget)
     close!(b)
     b.reserved = 0
@@ -740,7 +626,6 @@ function resetbudget!(b::Budget)
     b.resolution_work = 0
     b.allowance_used = 0
     b.pending = 0
-    b.published = 0
     b.workcap = min(b.limits.max_total_values, b.limits.work_allowance)
     b.workdeferred = 0
     b.default_position = 0
@@ -950,11 +835,10 @@ end
 """
     withbudget(f, limits; direction=:decode)
 
-Run `f(budget)` with a fresh operation budget, returning every pending reservation to the guard on every
-exit path.
+Run `f(budget)` with a fresh operation budget, settling every pending reservation on every exit path.
 """
-function withbudget(f, limits::Limits; direction::Symbol=:decode, available::Int=available_memory())
-    b = Budget(limits; direction=direction, available=available)
+function withbudget(f, limits::Limits; direction::Symbol=:decode)
+    b = Budget(limits; direction=direction)
     try
         return f(b)
     finally

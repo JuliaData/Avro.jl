@@ -59,7 +59,7 @@ end
 
     function codecworkfailure(name::Symbol, payload)
         limits = Avro.Limits(max_values_per_byte=0, work_allowance=1, max_total_values=100)
-        budget = Avro.Budget(limits; available=1 << 40)
+        budget = Avro.Budget(limits)
         sym, rc = Avro.readercodec(String(name), limits, nothing)
         err = try
             Avro.decompressblock(sym, rc, payload, limits, budget)
@@ -205,7 +205,7 @@ end
         bad[:bzip2] = vcat(good[:bzip2], UInt8[0x00])
         bad[:xz] = vcat(good[:xz], zeros(UInt8, 3))
         for name in (:deflate, :snappy, :zstandard, :bzip2, :xz)
-            budget = Avro.Budget(L; available=1 << 40)
+            budget = Avro.Budget(L)
             sym, reader = Avro.readercodec(String(name), L, nothing)
             baseline = budget.reserved
             @test_throws Avro.CodecError Avro.decompressblock(sym, reader, bad[name], L, budget)

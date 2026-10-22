@@ -145,7 +145,7 @@
         longschema = P("\"long\"")
         probe = Avro.SchemaCache(max_bytes=1 << 20)
         Avro.register!(probe, nullschema)
-        chargebudget = Avro.Budget(Avro.Limits(); available=1 << 30)
+        chargebudget = Avro.Budget(Avro.Limits())
         longcharge = Avro.schemaretainedbytes(longschema, chargebudget)
         Avro.close!(chargebudget)
         exactlimit = probe.bytes + longcharge + Avro.cacheindexbytes(2)
@@ -171,10 +171,10 @@
         stringmessage = Avro.encodesingle(stringschema, (s="abc",))
         viewbytes = vcat(UInt8[0xff], stringmessage, UInt8[0xff])
         viewmessage = view(viewbytes, 2:length(viewbytes) - 1)
-        vectorbudget = Avro.Budget(Avro.Limits(); available=1 << 30)
+        vectorbudget = Avro.Budget(Avro.Limits())
         vectorvalue, _, _ = Avro.decodesingleoperation(stringmessage, stringcache, vectorbudget;
                                                        limits=vectorbudget.limits)
-        viewbudget = Avro.Budget(Avro.Limits(); available=1 << 30)
+        viewbudget = Avro.Budget(Avro.Limits())
         viewvalue, _, _ = Avro.decodesingleoperation(viewmessage, stringcache, viewbudget;
                                                      limits=viewbudget.limits)
         @test viewvalue == vectorvalue == Avro.Record(stringschema, ["abc"])

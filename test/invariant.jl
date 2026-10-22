@@ -8,7 +8,7 @@
                 "{\"type\":\"fixed\",\"name\":\"PlanFixed\",\"size\":4}",
                 "{\"type\":\"enum\",\"name\":\"PlanEnum\",\"symbols\":[\"A\"]}",
                 "{\"type\":\"bytes\",\"logicalType\":\"decimal\",\"precision\":4,\"scale\":2}")
-            budget = Avro.Budget(Avro.Limits(); available=1 << 40)
+            budget = Avro.Budget(Avro.Limits())
             plan = Avro.writeplan(P(json); budget=budget)
             @test budget.pending == 0
             @test budget.reserved >= 64
@@ -17,7 +17,7 @@
         limited = Avro.Limits(max_resolution_work=1)
         union = P("[\"null\",\"long\"]")
         for build in (Avro.readplan, Avro.writeplan)
-            budget = Avro.Budget(limited; available=1 << 40)
+            budget = Avro.Budget(limited)
             @test_throws Avro.LimitError build(union; budget=budget)
             @test budget.pending == budget.reserved == 0
             Avro.close!(budget)

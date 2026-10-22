@@ -136,7 +136,7 @@ end
     @test Avro.sanitize("a-b--c") == "a_b_c" && Avro.sanitize("9x") == "_9x" && Avro.sanitize("__") == "_" && Avro.sanitize("") == "_"
     longname = Avro.avroname(NTuple{40,T.Box{Int64}})[1]
     @test sizeof(longname) == 100 + 1 + 16 && longname[101] == '_' && all(c -> c in "0123456789abcdef", longname[102:end])
-    namebudget = Avro.Budget(Avro.Limits(); available=1 << 30, direction=:encode)
+    namebudget = Avro.Budget(Avro.Limits(); direction=:encode)
     namectx = Avro.derivecontext(Avro.Limits(), namebudget, 0)
     for namedtype in (T.Box{Int64}, T.Box{T.Box{Int64}},
                       Dict{String,Vector{Int64}}, NTuple{40,T.Box{Int64}})
@@ -189,7 +189,7 @@ end
     @test [f.name for f in Avro.schema(ts; names=Dict(:a => "alpha")).fields] == ["alpha", "b"]
     @test_throws ArgumentError Avro.schema(Tables.Schema((Symbol("my col"),), (Int64,)))
     @test Avro.fullname(Avro.schema(ts; name="T", namespace="n")) == "n.T"
-    derive_budget = Avro.Budget(Avro.Limits(); available=1 << 40)
+    derive_budget = Avro.Budget(Avro.Limits())
     derive_ctx = Avro.derivecontext(Avro.Limits(), derive_budget, 0)
     first_derived = Avro.derive(derive_ctx, T.SelfRef, nothing, nothing)
     first_charge = derive_budget.reserved

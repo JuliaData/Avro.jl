@@ -1,6 +1,6 @@
 # The peak-RSS gate: a fresh warmed child process faults the input
 # buffer before the baseline, the parent samples `ps -o rss=` every 10 ms between an acknowledged READY
-# and DONE, and `peak − baseline ≤ effective_ceiling + 128 MiB` with an in-flight high-water ≥ 2.
+# and DONE, and `peak − baseline ≤ max_total_bytes + 128 MiB` with an in-flight high-water ≥ 2.
 # Opt-in: AVRO_RSS_GATE=true (Unix; needs a multi-thread-capable host).
 
 @testset "Parallel peak RSS" begin
@@ -81,7 +81,7 @@
     maxrss = parse(Int, fields["maxrss"])
     livehw = parse(Int, fields["live"])
     peak = max(maximum(samples) * 1024, maxrss, livehw)
-    ceiling = Avro.effective_ceiling(lim)
+    ceiling = lim.max_total_bytes
     @info "rss gate" baseline_mb = round(baseline / 1 << 20; digits=1) peak_mb = round(peak / 1 << 20; digits=1) ceiling_mb = ceiling ÷ 1 << 20 inflight = fields["inflight"] nworkers = fields["nworkers"]
     @test parse(Int, fields["rows"]) == nrows
     @test parse(Int, fields["peakviol"]) == 0

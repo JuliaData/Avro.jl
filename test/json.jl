@@ -118,14 +118,14 @@
 
     @testset "budget charging" begin
         l = Avro.Limits()
-        b = Avro.Budget(l; available=1 << 40)
+        b = Avro.Budget(l)
         Avro.addinput!(b, 100)
         parse("{\"k\":[1,2,3],\"s\":\"abc\"}"; budget=b)
         @test b.reserved > 0 && b.compare_bytes > 0
-        tiny = Avro.Budget(Avro.Limits(max_total_bytes=256 << 20); available=1 << 40)
+        tiny = Avro.Budget(Avro.Limits(max_total_bytes=256 << 20))
         Avro.reserve!(tiny, tiny.ceiling - 10)
         @test_throws Avro.LimitError parse("[" * join(fill("\"xxxxxxxxxx\"", 100), ",") * "]"; budget=tiny)
-        bc = Avro.Budget(Avro.Limits(work_allowance=0); available=1 << 40)
+        bc = Avro.Budget(Avro.Limits(work_allowance=0))
         Avro.addinput!(bc, 1)
         wide = "{" * join(["\"k$(i)\":$i" for i in 1:200], ",") * "}"
         @test_throws Avro.LimitError parse(wide; budget=bc)

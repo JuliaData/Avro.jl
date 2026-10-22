@@ -31,108 +31,57 @@
         # max_metadata_bytes + max_schema_bytes ≤ ceiling ÷ 2
         @test Avro.Limits(max_metadata_bytes=112 << 20).max_metadata_bytes == 112 << 20
         @test_throws ArgumentError Avro.Limits(max_metadata_bytes=(112 << 20) + 1)
-        # the first unit of progress fits under the default ceiling
+        # the first unit of progress fits under the default ceiling, and must fit any ceiling
         @test Avro.first_unit_bytes(l) <= l.max_total_bytes
+        lowceiling = 4 * ((32 << 20) + (4 << 20))   # the smallest ceiling the codec relation admits
+        @test Avro.first_unit_bytes(Avro.Limits(max_total_bytes=lowceiling)) <= lowceiling
+        @test_throws ArgumentError Avro.Limits(max_total_bytes=lowceiling, max_bytes=100 << 20,
+                                               max_datum_bytes=101 << 20)
     end
 
-    @testset "effective ceiling and the available-memory guard" begin
-        @test Avro.effective_ceiling(l; available=1 << 40) == l.max_total_bytes
-        @test Avro.effective_ceiling(l; available=100 << 20) == 50 << 20
-        @test Avro.effective_ceiling(l; available=0) == 0
-        @test Avro.available_memory() > 0
-        @test Avro.host_free_memory() > 0
-        @test Avro.host_free_memory(UInt64(1024), nothing) == 1024
-        @test Avro.host_free_memory(UInt64(1024), 512) == 1024
-        @test Avro.host_free_memory(UInt64(1024), 2048) == 2048
-        @test Avro.host_free_memory(typemax(UInt64), nothing) == typemax(Int)
-        Sys.isapple() && @test Avro.darwin_available_memory() > 0
-        # injected available memory below the first unit of progress fails before any allocation
-        e = try
-            Avro.Budget(l; available=2 * Avro.first_unit_bytes(l) - 2)
-            nothing
-        catch err
-            err
-        end
-        @test e isa Avro.LimitError
-        @test e.limit == :available_memory
-        @test e.keyword == :max_total_bytes
-        @test Avro.Budget(l; available=2 * Avro.first_unit_bytes(l)) isa Avro.Budget
-        @test occursin("raise `Avro.Limits(max_total_bytes=...)`", sprint(showerror, e))
+    @testset "the ceiling is max_total_bytes, independent of host memory" begin
+        @test Avro.Budget(l).ceiling == l.max_total_bytes
+        @test Avro.Budget(Avro.Limits(max_total_bytes=1 << 40)).ceiling == 1 << 40
+        @test !isdefined(Avro, :available_memory) && !isdefined(Avro, :GUARD)
     end
 
     @testset "Budget: reservations, pending counter, release" begin
-        b = Avro.Budget(l; available=1 << 40)
-        pending0 = @atomic Avro.GUARD.pending
-        Avro.reserve!(b, 1000)
-        @test b.reserved == 1000 && b.peak == 1000 && b.pending == 1000
-        @test (@atomic Avro.GUARD.pending) == pending0                              # publication batches at GUARD_CHUNK
-        Avro.reserve!(b, Avro.GUARD_CHUNK)
-        @test (@atomic Avro.GUARD.pending) == pending0 + 1000 + Avro.GUARD_CHUNK    # crossing the batch publishes all slack
+        b = Avro.Budget(l)
+        Avro.reserve!(b, 1000 + (1 << 20))
+        @test b.reserved == 1000 + (1 << 20) && b.peak == b.reserved && b.pending == b.reserved
         Avro.allocated!(b, 400)
-        @test b.pending == 600 + Avro.GUARD_CHUNK
-        @test (@atomic Avro.GUARD.pending) == pending0 + 1000 + Avro.GUARD_CHUNK    # removals batch too
+        @test b.pending == 600 + (1 << 20)
         @test_throws ArgumentError Avro.release!(b, 401)                            # only the resident 400 can release
-        @test_throws ArgumentError Avro.allocated!(b, 601 + Avro.GUARD_CHUNK)       # settlement mismatch fails, no clamp
-        @test_throws ArgumentError Avro.unreserve!(b, 601 + Avro.GUARD_CHUNK)       # only pending returns via unreserve!
+        @test_throws ArgumentError Avro.allocated!(b, 601 + (1 << 20))              # settlement mismatch fails, no clamp
+        @test_throws ArgumentError Avro.unreserve!(b, 601 + (1 << 20))              # only pending returns via unreserve!
         Avro.release!(b, 400)                                                       # the resident portion
-        Avro.unreserve!(b, 600 + Avro.GUARD_CHUNK)                                  # the never-resident headroom
+        Avro.unreserve!(b, 600 + (1 << 20))                                         # the never-resident headroom
         @test b.reserved == 0 && b.pending == 0
-        @test (@atomic Avro.GUARD.pending) == pending0                              # a full drain withdraws the publication
         Avro.reserve!(b, 10)
-        pending_underflow = @atomic Avro.GUARD.pending
-        underflow_state = (b.reserved, b.pending, pending_underflow)
+        underflow_state = (b.reserved, b.pending)
         @test_throws ArgumentError Avro.release!(b, 11)
         @test_throws ArgumentError Avro.release!(b, 10)                             # reserved but pending: nothing resident yet
-        pending_after_underflow = @atomic Avro.GUARD.pending
-        @test (b.reserved, b.pending, pending_after_underflow) == underflow_state
+        @test (b.reserved, b.pending) == underflow_state
         Avro.unreserve!(b, 10)
         @test_throws Avro.LimitError Avro.reserve!(b, b.ceiling + 1)
         Avro.reserve!(b, b.ceiling)   # exactly the ceiling is admitted
         @test_throws Avro.LimitError Avro.reserve!(b, 1)
         Avro.close!(b)
-        @test (@atomic Avro.GUARD.pending) == pending0
+        @test b.pending == 0
         @test_throws ArgumentError Avro.reserve!(b, -1)
-        r = Avro.withbudget(l; available=1 << 40) do bb
+        r = Avro.withbudget(l) do bb
             Avro.reserve!(bb, 10)
             42
         end
-        @test r == 42 && (@atomic Avro.GUARD.pending) == pending0
-        # every exit path restores the guard
-        @test_throws ErrorException Avro.withbudget(l; available=1 << 40) do bb
+        @test r == 42
+        @test_throws ErrorException Avro.withbudget(l) do bb
             Avro.reserve!(bb, 10)
             error("boom")
-        end
-        @test (@atomic Avro.GUARD.pending) == pending0
-
-        if Threads.nthreads() > 1
-            concurrent = min(Threads.nthreads(), 8)
-            iterations = 10_000
-            large = Avro.Limits(max_total_bytes=16 << 30)
-            budgets = [Avro.Budget(large; available=typemax(Int)) for _ in 1:concurrent]
-            tasks = Task[]
-            for i in 1:concurrent
-                push!(tasks, Threads.@spawn begin
-                    for _ in 1:iterations
-                        Avro.reserve!(budgets[i], Avro.GUARD_CHUNK)
-                    end
-                end)
-            end
-            foreach(errormonitor, tasks)
-            foreach(fetch, tasks)
-            expected = pending0 + concurrent * iterations * Avro.GUARD_CHUNK
-            @test (@atomic Avro.GUARD.pending) == expected
-            drains = Task[]
-            for b in budgets
-                push!(drains, Threads.@spawn Avro.close!(b))
-            end
-            foreach(errormonitor, drains)
-            foreach(fetch, drains)
-            @test (@atomic Avro.GUARD.pending) == pending0
         end
     end
 
     @testset "BuildBuf accounts for its mutable shell" begin
-        b = Avro.Budget(l; available=1 << 40)
+        b = Avro.Budget(l)
         bb = Avro.BuildBuf{Int}(b, 4)
         @test b.pending == 0
         @test b.reserved == Avro.vectorbytes(Int, 4) + Avro.shellbytes(typeof(bb))
@@ -146,8 +95,8 @@
         Avro.close!(b)
     end
 
-    @testset "guard residency: settlement contract" begin
-        b = Avro.Budget(l; available=1 << 40)
+    @testset "settlement contract" begin
+        b = Avro.Budget(l)
         Avro.reserve!(b, 1000)
         @test b.pending == 1000 && b.reserved == 1000
         @test_throws ArgumentError Avro.allocated!(b, -1)               # negative settlements are mismatches too
@@ -164,45 +113,9 @@
         Avro.release!(b, 600)
         @test b.reserved == 0
         Avro.close!(b)
-
-        # the guard batches by GUARD_CHUNK: a large unsettled reservation is published, settlement
-        # withdraws it, and resident bytes never linger in the pending counter
-        g0 = @atomic Avro.GUARD.pending
-        big = Avro.Budget(l; available=1 << 40)
-        n = 8 << 20
-        Avro.reserve!(big, n)
-        @test (@atomic Avro.GUARD.pending) - g0 >= n - Avro.GUARD_CHUNK  # published as pending
-        Avro.allocated!(big, n)
-        @test (@atomic Avro.GUARD.pending) <= g0                         # resident bytes left the guard
-        Avro.release!(big, n)
-        Avro.close!(big)
-        @test (@atomic Avro.GUARD.pending) <= g0
-
-        # LimitError(:available_memory).observed is pure: another budget's resident storage does not
-        # perturb the observed value of an identical failing admission (resident bytes must not be
-        # subtracted twice from available_memory())
-        tiny = Avro.Limits(max_total_bytes=1 << 30)
-        need = Avro.first_unit_bytes(tiny)
-        observed = Int[]
-        for _ in 1:2
-            holder = Avro.Budget(l; available=1 << 40)
-            Avro.reserve!(holder, 4 << 20)
-            Avro.allocated!(holder, 4 << 20)                             # resident, settled
-            e = try
-                Avro.Budget(tiny; available=2 * need - 1)
-                nothing
-            catch err
-                err
-            end
-            @test e isa Avro.LimitError && e.limit === :available_memory
-            push!(observed, e.observed)
-            Avro.release!(holder, 4 << 20)
-            Avro.close!(holder)
-        end
-        @test observed[1] == observed[2] == 2 * need - 1
     end
 
-    @testset "guard residency: a live Writer publishes only its preflight model" begin
+    @testset "a live Writer settles everything but its preflight model" begin
         meta = Dict("user.blob" => rand(UInt8, 2 << 20))
         s = Avro.parseschema("{\"type\":\"record\",\"name\":\"RP\",\"fields\":[{\"name\":\"a\",\"type\":\"long\"}]}")
         io = IOBuffer()
@@ -213,7 +126,6 @@
             # only the preflight reader-model (never materialised in this process) may stay pending
             @test b.pending <= w.preflightbase
             @test b.reserved - b.pending >= Avro.bytesbytes(2 << 20)     # the resident metadata copy
-            @test b.published <= b.pending
         finally
             close(w)
         end
@@ -227,87 +139,25 @@
         Avro.close!(db)
     end
 
-    @testset "overlapping guard residency under real memory" begin
-        if Threads.nthreads() > 1
-            N = 64 << 20
-            tol = 24 << 20                             # host free-memory noise allowance
-            ready = Channel{Nothing}(1)
-            settle = Channel{Nothing}(1)
-            done = Channel{Nothing}(1)
-            pending0 = @atomic Avro.GUARD.pending
-            holder = Threads.@spawn begin
-                hb = Avro.Budget(Avro.Limits(max_total_bytes=1 << 30); available=1 << 40)
-                Avro.reserve!(hb, Avro.bytesbytes(N))
-                put!(ready, nothing)
-                take!(settle)
-                block = fill(0x5a, N)                  # the real backing storage, then the settlement
-                Avro.allocated!(hb, Avro.bytesbytes(N))
-                GC.@preserve block begin
-                    put!(ready, nothing)
-                    take!(done)
-                end
-                Avro.release!(hb, Avro.bytesbytes(N))
-                Avro.close!(hb)
-                block[1]
-            end
-            errormonitor(holder)
-            take!(ready)                               # N bytes pending on the overlapping task
-            # Sample unreserved host memory after the worker is parked: its startup
-            # and any collection can change the host figure before the reservation.
-            base0 = min(Avro.host_free_memory(), Int(min(Sys.total_memory(), typemax(Int) % UInt64)),
-                        Avro.cgroup_remaining())
-            pending_avail = Avro.available_memory()
-            @test (@atomic Avro.GUARD.pending) - pending0 == Avro.bytesbytes(N)
-            @test base0 - pending_avail > N - Avro.GUARD_CHUNK - tol   # the guard subtracts pending reservations
-            @test base0 - pending_avail < Avro.bytesbytes(N) + tol
-            put!(settle, nothing)
-            take!(ready)                               # the holder allocated the block and settled it
-            resident_avail = Avro.available_memory()
-            @test (@atomic Avro.GUARD.pending) == pending0
-            # settled bytes leave the guard while their pages enter the OS figure: available_memory()
-            # does not fall by another N (a leaked pending counter would subtract the storage twice)
-            @test pending_avail - resident_avail < tol
-            # identical failing admissions beside the resident holder observe the live figure, stably:
-            # a real pending wall collapses available_memory() below the first unit of progress
-            need = 2 * Avro.first_unit_bytes(Avro.Limits())
-            wall = resident_avail - need + (8 << 20)
-            if wall > 0
-                squeeze = Avro.Budget(Avro.Limits(max_total_bytes=1 << 40); available=1 << 60)
-                Avro.reserve!(squeeze, wall)
-                e1 = try Avro.Budget(Avro.Limits()); nothing catch err; err end
-                e2 = try Avro.Budget(Avro.Limits()); nothing catch err; err end
-                @test e1 isa Avro.LimitError && e1.limit === :available_memory
-                @test e2 isa Avro.LimitError && e2.limit === :available_memory
-                @test abs(e1.observed - e2.observed) < tol
-                Avro.unreserve!(squeeze, wall)
-                Avro.close!(squeeze)
-            end
-            put!(done, nothing)
-            @test fetch(holder) == 0x5a
-        end
-    end
-
-    @testset "prepared reader restores guard after failure" begin
+    @testset "a prepared reader recovers after a failed call" begin
         schema = Avro.parseschema("""{"type":"record","name":"Guarded","fields":[{"name":"payload","type":"bytes"},{"name":"valid","type":"boolean"}]}""")
-        bytes = Avro.encode(schema, (payload=zeros(UInt8, 1 << 20), valid=true))
-        bytes[end] = 0x02
+        good = Avro.encode(schema, (payload=zeros(UInt8, 1 << 20), valid=true))
+        bad = copy(good)
+        bad[end] = 0x02
         reader = Avro.DatumReader(schema)
-        pending0 = @atomic Avro.GUARD.pending
-        @test_throws Avro.DataError reader(bytes)
-        pending1 = @atomic Avro.GUARD.pending
-        @test pending1 == pending0
-        @atomic Avro.GUARD.pending = pending0
+        @test_throws Avro.DataError reader(bad)
+        @test reader(good).valid === true
     end
 
     @testset "guarded IO source normalization" begin
         input = fill(UInt8(' '), 64 << 10)
-        budget = Avro.Budget(l; available=1 << 40)
+        budget = Avro.Budget(l)
         bytes = Avro.sourcebytes(IOBuffer(input), length(input), budget, Avro.SchemaError)
         @test bytes == input
         @test budget.peak >= 2 * Avro.bytesbytes(length(input))
         Avro.close!(budget)
 
-        datum_budget = Avro.Budget(l; available=1 << 40)
+        datum_budget = Avro.Budget(l)
         err = try
             Avro.sourcebytes(IOBuffer(UInt8[0x01, 0x02]), 1, datum_budget, Avro.DataError)
             nothing
@@ -319,37 +169,37 @@
     end
 
     @testset "Budget: work, comparison and count rules" begin
-        b = Avro.Budget(l; available=1 << 40)
+        b = Avro.Budget(l)
         Avro.addinput!(b, 10)
         # values ≤ 16 × 10 + 65_536
         Avro.countvalues!(b, 16 * 10 + 65_536)
         @test_throws Avro.LimitError Avro.countvalues!(b, 1)
-        b2 = Avro.Budget(Avro.Limits(work_allowance=0); available=1 << 40)
+        b2 = Avro.Budget(Avro.Limits(work_allowance=0))
         Avro.addinput!(b2, 1)
         Avro.countvalues!(b2, 16)
         e = try Avro.countvalues!(b2, 1); nothing catch err; err end
         @test e isa Avro.LimitError && e.limit == :max_values_per_byte && e.observed == 17 && e.value == 16
-        b3 = Avro.Budget(Avro.Limits(work_allowance=0); available=1 << 40)
+        b3 = Avro.Budget(Avro.Limits(work_allowance=0))
         Avro.addinput!(b3, 1)
         Avro.addcompare!(b3, 64)
         @test_throws Avro.LimitError Avro.addcompare!(b3, 1)
-        b4 = Avro.Budget(Avro.Limits(max_total_values=5, work_allowance=1 << 20); available=1 << 40)
+        b4 = Avro.Budget(Avro.Limits(max_total_values=5, work_allowance=1 << 20))
         Avro.countvalues!(b4, 5)
         @test_throws Avro.LimitError Avro.countvalues!(b4, 1)
-        b5 = Avro.Budget(Avro.Limits(max_rows=2, max_blocks=1, max_resolution_work=3); available=1 << 40)
+        b5 = Avro.Budget(Avro.Limits(max_rows=2, max_blocks=1, max_resolution_work=3))
         Avro.addrows!(b5, 2); @test_throws Avro.LimitError Avro.addrows!(b5, 1)
         Avro.addblocks!(b5); @test_throws Avro.LimitError Avro.addblocks!(b5)
         Avro.addresolution!(b5, 3); @test_throws Avro.LimitError Avro.addresolution!(b5)
         @test Avro.checkdepth(b5, l.max_depth) === nothing
         @test_throws Avro.LimitError Avro.checkdepth(b5, l.max_depth + 1)
         # codec members count as values
-        b6 = Avro.Budget(Avro.Limits(work_allowance=0); available=1 << 40)
+        b6 = Avro.Budget(Avro.Limits(work_allowance=0))
         Avro.addinput!(b6, 1)
         Avro.addmembers!(b6, 16)
         @test_throws Avro.LimitError Avro.addmembers!(b6, 1)
-        @test_throws ArgumentError Avro.Budget(l; direction=:sideways, available=1 << 40)
+        @test_throws ArgumentError Avro.Budget(l; direction=:sideways)
         e2 = try
-            Avro.reserve!(Avro.Budget(l; direction=:encode, available=1 << 40), typemax(Int))
+            Avro.reserve!(Avro.Budget(l; direction=:encode), typemax(Int))
         catch err
             err
         end
@@ -368,13 +218,13 @@
                                    max_total_bytes=typemax(Int))
         @test raisedlimits.max_bytes == typemax(Int)
         @test Avro.first_unit_bytes(raisedlimits) == typemax(Int)
-        @test_throws Avro.LimitError Avro.Budget(raisedlimits; available=typemax(Int))
+        @test Avro.Budget(raisedlimits).ceiling == typemax(Int)
         @test_throws ArgumentError Avro.Limits(max_bytes=big(typemax(Int)) + 1)
         @test issorted(Avro.muladdcap(typemax(Int), input, 1)
                        for input in (0, 1, 2, typemax(Int)))
         saturated = Avro.Limits(max_values_per_byte=typemax(Int),
                                 max_compare_bytes_per_byte=typemax(Int))
-        saturatedbudget = Avro.Budget(saturated; available=1 << 40)
+        saturatedbudget = Avro.Budget(saturated)
         Avro.addinput!(saturatedbudget, 2)
         Avro.countvalues!(saturatedbudget, 4)
         Avro.addcompare!(saturatedbudget, 4)

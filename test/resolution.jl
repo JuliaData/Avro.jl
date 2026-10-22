@@ -7,13 +7,13 @@
         w = P("\"int\"")
         rs = Avro.resolve(w, P("\"long\""))
         @test rs isa Avro.ResolvedSchema && rs.union_resolution === :spec && rs.plan isa Avro.PromotePlan
-        promote_budget = Avro.Budget(Avro.Limits(); available=1 << 40)
+        promote_budget = Avro.Budget(Avro.Limits())
         @test Avro.resolve(w, P("\"long\""); budget=promote_budget).plan isa Avro.PromotePlan
         @test promote_budget.pending == 0
         @test promote_budget.reserved == 64
         Avro.close!(promote_budget)
 
-        array_budget = Avro.Budget(Avro.Limits(); available=1 << 40)
+        array_budget = Avro.Budget(Avro.Limits())
         array_writer = P("{\"type\":\"array\",\"items\":\"int\"}")
         array_reader = P("{\"type\":\"array\",\"items\":\"long\"}")
         @test Avro.resolve(array_writer, array_reader; budget=array_budget).plan isa Avro.ArrayPlan
@@ -26,7 +26,7 @@
         early_reader = P("{\"type\":\"record\",\"name\":\"OtherRecord\",\"fields\":[{\"name\":\"a\",\"type\":\"long\"},{\"name\":\"z\",\"type\":\"int\"}]}")
         branchcharges = Int[]
         for branchreader in (late_reader, early_reader)
-            branchbudget = Avro.Budget(Avro.Limits(); available=1 << 40)
+            branchbudget = Avro.Budget(Avro.Limits())
             branchplan = Avro.resolve(union_writer, branchreader; budget=branchbudget).plan
             @test branchplan.branches[1] isa Avro.UnresolvableBranch
             failedbranch = branchplan.branches[1]
@@ -44,7 +44,7 @@
             field = "x"^n
             diagnosticwriter = P("[{\"type\":\"record\",\"name\":\"DiagnosticRecord\",\"fields\":[{\"name\":\"$field\",\"type\":\"string\"}]},\"null\"]")
             diagnosticreader = P("{\"type\":\"record\",\"name\":\"DiagnosticRecord\",\"fields\":[{\"name\":\"$field\",\"type\":\"long\"}]}")
-            diagnosticbudget = Avro.Budget(Avro.Limits(); available=1 << 40)
+            diagnosticbudget = Avro.Budget(Avro.Limits())
             diagnosticplan = Avro.resolve(diagnosticwriter, diagnosticreader;
                 budget=diagnosticbudget).plan
             @test diagnosticplan.branches[1] isa Avro.UnresolvableBranch
@@ -54,7 +54,7 @@
 
             enumwriter = P("{\"type\":\"record\",\"name\":\"EnumDiagnosticRecord\",\"fields\":[{\"name\":\"$field\",\"type\":{\"type\":\"enum\",\"name\":\"DiagnosticEnum\",\"symbols\":[\"A\",\"B\"]}}]}")
             enumreader = P("{\"type\":\"record\",\"name\":\"EnumDiagnosticRecord\",\"fields\":[{\"name\":\"$field\",\"type\":{\"type\":\"enum\",\"name\":\"DiagnosticEnum\",\"symbols\":[\"B\",\"A\"]}}]}")
-            enumbudget = Avro.Budget(Avro.Limits(); available=1 << 40)
+            enumbudget = Avro.Budget(Avro.Limits())
             enumplan = Avro.resolve(enumwriter, enumreader; budget=enumbudget).plan
             @test enumplan.steps[1].second isa Avro.EnumRemapPlan
             @test enumbudget.pending == 0
@@ -330,7 +330,7 @@
         @test nesteddefault.values == 3
         @test nesteddefault.branches == [2]
         directlimits = Avro.Limits(max_total_values=3, work_allowance=3)
-        directbudget = Avro.Budget(directlimits; available=1 << 30)
+        directbudget = Avro.Budget(directlimits)
         directvalue = Avro.jsonvalue(nesteddefault, directbudget)
         @test directvalue.u === Int32(7)
         @test directbudget.values == 3
@@ -428,7 +428,7 @@
              "default":{"map-key":"map-value"}}]}""")
         ownedplan = Avro.resolve(nestedwriter, ownedreader).plan
         mapdefault = ownedplan.defaults[3].second
-        mapbudget = Avro.Budget(Avro.Limits(); available=1 << 30)
+        mapbudget = Avro.Budget(Avro.Limits())
         directmap = Avro.jsonvalue(mapdefault, mapbudget)
         @test mapbudget.reserved == Avro.storagebytes(directmap)
         frozenmap = mapdefault.json
@@ -513,8 +513,7 @@
         @test [dp.values for (_, dp) in compoundplan.defaults] == fill(3, 4)
         @test [dp.branches for (_, dp) in compoundplan.defaults] == fill([2], 4)
         for (_, dp) in compoundplan.defaults
-            budget = Avro.Budget(Avro.Limits(max_total_values=3);
-                                 available=1 << 30)
+            budget = Avro.Budget(Avro.Limits(max_total_values=3))
             Avro.jsonvalue(dp, budget)
             @test budget.values == 3
             Avro.close!(budget)

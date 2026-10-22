@@ -10,8 +10,8 @@ can reject valid data by design — every one is raisable for trusted bulk workl
 
 One per-operation memory ceiling — `max_total_bytes`, default **256 MiB** — bounds package-owned
 memory through reservations made before every allocation (buffers, decoded values, column storage,
-codec workspaces, scratch). The effective ceiling is `min(max_total_bytes, available ÷ 2)` with a
-best-effort available-memory guard. Streaming consumers (`Rows`, `eachdatum`, `eachblock`,
+codec workspaces, scratch). Acceptance depends only on the input bytes and the options: the ceiling
+does not shrink with the host's free memory or with other operations in the process. Streaming consumers (`Rows`, `eachdatum`, `eachblock`,
 `mmap=false`) hold one block at a time and read files far larger than the ceiling; `Avro.Table`
 materialises and therefore requires the whole result to fit.
 

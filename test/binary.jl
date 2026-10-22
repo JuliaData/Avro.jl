@@ -174,7 +174,7 @@ end
         @test_throws Avro.LimitError Avro.decode(fixedschema, UInt8[1, 2]; limits=fixedover)
         @test_throws Avro.LimitError Avro.Fixed(fixedschema, UInt8[1, 2]; limits=fixedover)
         @test_throws Avro.LimitError Avro.DatumWriter(fixedschema; limits=fixedover)(UInt8[1, 2])
-        skipbudget = Avro.Budget(fixedover; available=1 << 40)
+        skipbudget = Avro.Budget(fixedover)
         skipdecoder = Avro.Decoder(UInt8[1, 2], skipbudget)
         @test_throws Avro.LimitError Avro.skip(Avro.readplan(fixedschema; budget=skipbudget),
                                                skipdecoder)
@@ -334,7 +334,7 @@ end
         @test_throws Avro.DataError Avro.decode(impossiblemap, impossiblebytes)
         impossibleplan = Avro.readplan(impossiblemap)
         for operation in (Avro.skip, Avro.structuralskip)
-            budget = Avro.Budget(Avro.Limits(); available=1 << 40)
+            budget = Avro.Budget(Avro.Limits())
             Avro.addinput!(budget, length(impossiblebytes))
             decoder = Avro.Decoder(impossiblebytes, budget)
             @test_throws Avro.DataError operation(impossibleplan, decoder)
@@ -397,7 +397,7 @@ end
         readpending = Ref(-1)
         probeplan = Avro.RecordPlan(nullrecord, Avro.ReadPlan[PendingReadProbe(readpending)],
                                     baseplan.boxes)
-        readbudget = Avro.Budget(Avro.Limits(); available=1 << 30)
+        readbudget = Avro.Budget(Avro.Limits())
         decoded = Avro.decode(probeplan, Avro.Decoder(UInt8[], readbudget))
         @test readpending[] == Avro.recordbytes(1) - Avro.vectorbytes(Any, 1)
         @test readbudget.pending == 0
@@ -408,7 +408,7 @@ end
         writepending = Ref(-1)
         writeplan = Avro.WRecord(writerecord,
                                  Avro.WritePlan[ChangingWriteProbe(), PendingWriteProbe(writepending)])
-        writebudget = Avro.Budget(Avro.Limits(); available=1 << 30)
+        writebudget = Avro.Budget(Avro.Limits())
         staged, changed = Avro.stagewriterrecord(writeplan, (a=missing, b=missing),
                                                   Avro.WriterStageState(writebudget, 0), 0)
         @test changed
@@ -510,7 +510,7 @@ end
         @test uuiderror isa Avro.DataError
         @test sizeof(uuiderror.msg) < 128
         @test uuidallocation < 512 * 1024
-        skipuuidbudget = Avro.Budget(uuidlimits; available=1 << 40)
+        skipuuidbudget = Avro.Budget(uuidlimits)
         skipuuidplan = Avro.readplan(uuidschema; budget=skipuuidbudget)
         skipuuiddecoder = Avro.Decoder(hugeuuid, skipuuidbudget)
         skipuuiderror = try
@@ -532,7 +532,7 @@ end
         @test dec(dur, enc(dur, x)) == x && hex(enc(dur, x)) == "0100000002000000ffffffff"
         @test_throws Avro.EncodeError enc(dur, UInt8[1])
 
-        budget = Avro.Budget(Avro.Limits(); available=1 << 30)
+        budget = Avro.Budget(Avro.Limits())
         encoder = Avro.Encoder(budget; capacity=128)
         Avro.writeuuidstring!(encoder, id)
         Avro.reset!(encoder)
@@ -678,8 +678,7 @@ end
         for append in (e -> Avro.encode!(e, deepowner, deepownervalue(20);
                                          limits=deeplimits),
                        e -> prepareddeep(e, deepownervalue(20)))
-            owner = Avro.Budget(deeplimits; direction=:encode,
-                                available=1 << 40)
+            owner = Avro.Budget(deeplimits; direction=:encode)
             external = Avro.Encoder(owner)
             append(external)
             @test length(external.path.data) > 16
@@ -691,8 +690,7 @@ end
                                                 limits=deeplimits),
                               e -> prepareddeep(e,
                                                 deepownervalue(20; bad=true)))
-            owner = Avro.Budget(deeplimits; direction=:encode,
-                                available=1 << 40)
+            owner = Avro.Budget(deeplimits; direction=:encode)
             external = Avro.Encoder(owner)
             err = try
                 appendfailure(external)
@@ -944,7 +942,7 @@ end
         # skip() directly:
         plan = Avro.readplan(s)
         for mode in (:strict, :fast)
-            b = Avro.Budget(Avro.Limits(); available=1 << 40)
+            b = Avro.Budget(Avro.Limits())
             Avro.addinput!(b, length(bad))
             d = Avro.Decoder(bad, b; validate=mode)
             if mode === :strict
@@ -957,13 +955,13 @@ end
         # skipped strings are length-validated but not UTF-8-validated (documented exception)
         bs = P("{\"type\":\"array\",\"items\":\"string\"}")
         badstr = hex2bytes("02" * "02ff" * "00")
-        b = Avro.Budget(Avro.Limits(); available=1 << 40); Avro.addinput!(b, 4)
+        b = Avro.Budget(Avro.Limits()); Avro.addinput!(b, 4)
         d = Avro.Decoder(badstr, b)
         @test Avro.skip(Avro.readplan(bs), d) === nothing && d.pos == length(badstr) + 1
         @test_throws Avro.DataError Avro.decode(bs, badstr)
         # skipped logical values are domain-checked like decoded ones (fuzz findings): uuid text, time ranges, decimals
         function skipverdict(s, bytes)
-            b = Avro.Budget(Avro.Limits(); available=1 << 40); Avro.addinput!(b, length(bytes))
+            b = Avro.Budget(Avro.Limits()); Avro.addinput!(b, length(bytes))
             d = Avro.Decoder(bytes, b)
             try
                 Avro.skip(Avro.readplan(s), d)

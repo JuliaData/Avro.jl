@@ -1689,7 +1689,7 @@ function Base.:(==)(a::Schema, b::Schema)
     a === b && return true
     typeof(a) === typeof(b) || return false
     limits = larger(graphinfo(a).limits, graphinfo(b).limits)
-    budget = Budget(limits; available=typemax(Int) ÷ 4)
+    budget = Budget(limits)
     try
         return budgetedschemaequal(a, b, budget)
     finally

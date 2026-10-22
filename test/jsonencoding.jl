@@ -149,7 +149,7 @@
         x = Avro.Duration(UInt32(1), UInt32(2), UInt32(3))
         @test tj(dur, x) == "\"\\u0001\\u0000\\u0000\\u0000\\u0002\\u0000\\u0000\\u0000\\u0003\\u0000\\u0000\\u0000\"" && fj(dur, tj(dur, x)) == x
 
-        budget = Avro.Budget(Avro.Limits(); available=1 << 30)
+        budget = Avro.Budget(Avro.Limits())
         sink = Avro.BoundedWriter(budget, 1024; limit=:max_datum_bytes)
         for printer in (Avro.printuuidstring, Avro.printuuidbytestring)
             printer(sink, id)
@@ -175,7 +175,7 @@
                                   bytelimit=:max_datum_bytes, depthlimit=:max_json_depth)
         end
 
-        stringbudget = Avro.Budget(Avro.Limits(); available=1 << 30)
+        stringbudget = Avro.Budget(Avro.Limits())
         parsedstring = parsedjson("\"x\"", stringbudget)
         parsedcharge = stringbudget.reserved
         convertedstring = Avro.jsontovalue(P("\"string\""), parsedstring,
@@ -194,7 +194,7 @@
         for (itemschema, itemjson, payloadbytes) in cases
             schema = P("{\"type\":\"array\",\"items\":" * itemschema * "}")
             text = "[" * join(fill(itemjson, 8), ",") * "]"
-            budget = Avro.Budget(Avro.Limits(); available=1 << 30)
+            budget = Avro.Budget(Avro.Limits())
             parsed = parsedjson(text, budget)
             before = budget.reserved
             value = Avro.jsontovalue(schema, parsed, Avro.JSONContext(budget, false, false), 1)
@@ -202,7 +202,7 @@
             @test budget.reserved - before == Avro.vectorbytes(Avro.elementtype(schema.items), 8)
             Avro.close!(budget)
 
-            tight = Avro.Budget(Avro.Limits(); available=1 << 30)
+            tight = Avro.Budget(Avro.Limits())
             tightparsed = parsedjson(text, tight)
             finalbytes = Avro.vectorbytes(Avro.elementtype(schema.items), 8)
             needed = finalbytes + Avro.bytesbytes(payloadbytes)
@@ -216,7 +216,7 @@
         end
 
         fixedschema = P("{\"type\":\"fixed\",\"name\":\"OwnedFixed\",\"size\":1}")
-        fixedbudget = Avro.Budget(Avro.Limits(); available=1 << 30)
+        fixedbudget = Avro.Budget(Avro.Limits())
         fixedparsed = parsedjson("\"x\"", fixedbudget)
         fixedbefore = fixedbudget.reserved
         fixedvalue = Avro.jsontovalue(fixedschema, fixedparsed,
@@ -326,7 +326,7 @@
             {"name":"v","type":["int","null"],"default":3},
             {"name":"w","type":["string",{"type":"record","name":"In","fields":[{"name":"x","type":"int","default":7},{"name":"y","type":["null","In"],"default":null}]}],"default":{"x":1}},
             {"name":"f","type":"float","default":"NaN"}]}""")
-        b = Avro.Budget(Avro.Limits(); available=1 << 40)
+        b = Avro.Budget(Avro.Limits())
         Avro.addinput!(b, 1 << 20)
         d = Dict(f.name => Avro.jsonvalue(f.schema, f.default.json, b) for f in s.fields)
         @test d["u"] === missing && d["v"] === Int32(3)

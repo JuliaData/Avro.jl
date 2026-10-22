@@ -37,12 +37,12 @@
     @test length(cols2[1]) == 50
     cols3 = decodeall(50; capacity=100)
     @test length(cols3[1]) == 50 && length(cols3[5]) == 50
-    @test_throws ArgumentError Avro.columnbuilders(plan, nothing, -1, Avro.Budget(Avro.Limits(); available=1 << 30))
+    @test_throws ArgumentError Avro.columnbuilders(plan, nothing, -1, Avro.Budget(Avro.Limits()))
     # schema-width-dependent builder and fused-skip state is part of the guarded operation
     nwide = 1000
     widefields = join(("{\"name\":\"f$i\",\"type\":\"null\"}" for i in 1:nwide), ",")
     wideschema = P("{\"type\":\"record\",\"name\":\"WideNull\",\"fields\":[" * widefields * "]}")
-    widebudget = Avro.Budget(Avro.Limits(); available=1 << 40)
+    widebudget = Avro.Budget(Avro.Limits())
     wideplan = Avro.readplan(wideschema; budget=widebudget)
     wideprojection = Avro.positionalprojection(Int[], nwide, widebudget)
     beforewide = widebudget.reserved
@@ -55,7 +55,7 @@
     Avro.releasecolumnbuilders!(widecols, widebudget)
     @test widebudget.reserved == beforewide
     # storage is charged exactly at allocation
-    budget = Avro.Budget(Avro.Limits(); available=1 << 40)
+    budget = Avro.Budget(Avro.Limits())
     before = budget.reserved
     c = Avro.makecolumn(Union{Missing,Int32}, Avro.IntPlan(), 1000, budget)
     @test budget.reserved - before == 40 + 1000 * (4 + 1) +
@@ -68,7 +68,7 @@
     floatcolumn = Avro.makecolumn(Float64, Avro.DoublePlan(), 10, budget)
     @test budget.reserved - before == 40 + 80 +
           Avro.columnnodebytes(typeof(floatcolumn))
-    @test_throws Avro.LimitError Avro.makecolumn(Float64, Avro.DoublePlan(), 1 << 30, Avro.Budget(Avro.Limits(); available=1 << 40))
+    @test_throws Avro.LimitError Avro.makecolumn(Float64, Avro.DoublePlan(), 1 << 30, Avro.Budget(Avro.Limits()))
     # malformed cells surface as DataErrors; skipped cells are validated under :strict
     bad = copy(bytes); bad[end] = 0x09                                         # enum index zigzag 9 → -5: out of range
     @test_throws Avro.DataError decodeall(50; bytes=bad)
@@ -95,7 +95,7 @@
         end
         return nothing
     end
-    budget = Avro.Budget(Avro.Limits(); available=1 << 40)
+    budget = Avro.Budget(Avro.Limits())
     Avro.addinput!(budget, 1 << 20)
     d = Avro.Decoder(bb, budget)
     cols = Avro.columnbuilders(bp, nothing, 100, budget)

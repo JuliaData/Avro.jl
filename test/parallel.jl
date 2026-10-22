@@ -30,7 +30,6 @@
     end
     @testset "worker admission at the fixture's minimum budget" begin
         if Threads.nthreads() > 1
-            pending0 = @atomic Avro.GUARD.pending
             for limits in (raised, workerlimits)
                 Avro.Reader(bytes; limits) do reader
                     pre = Avro.prescanblocks(reader)
@@ -40,7 +39,7 @@
                         Avro.vectorbytes(Type, length(cols)) + Avro.vectorbytes(AbstractVector, length(cols)) +
                         sum(Avro.vectorbytes(E, pre.totalrows) for E in cols)
                     function planned(ceiling)
-                        budget = Avro.Budget(limits; available=2 * ceiling)
+                        budget = Avro.blockbudget(limits, ceiling)
                         Avro.reserve!(budget, resident)
                         Avro.allocated!(budget, resident)
                         controlled = Avro.Reader(nothing, reader.schema, reader.plan, reader.span,
@@ -67,7 +66,6 @@
                     Avro.release!(reader.budget, Avro.blocktablecharge(Avro.capacity(pre.entries)))
                 end
             end
-            @test (@atomic Avro.GUARD.pending) == pending0
         end
     end
     @testset "block-table growth retains only the charged capacity" begin
@@ -193,7 +191,7 @@
         base = reader.budget.reserved
         W = 500
         Avro.reserve!(reader.budget, W)
-        jobbudget = Avro.Budget(reader.limits; available=1 << 40)
+        jobbudget = Avro.Budget(reader.limits)
         Avro.reserve!(jobbudget, 200)
         entry = Avro.BlockEntry(1, 1, 0, 1, 1)
         job = Avro.BlockJob(entry, W, jobbudget, Threads.Event(), nothing, 0, nothing, :done)
@@ -221,7 +219,6 @@
     end
     @testset "worker startup failure settles and poisons the ordered job" begin
         if Threads.nthreads() > 1
-            pending0 = @atomic Avro.GUARD.pending
             Avro.PARALLEL_HOOK[] = (event, index) -> begin
                 event === :workerstart && error("worker startup failure $index")
                 return nothing
@@ -232,14 +229,12 @@
                 Avro.PARALLEL_HOOK[] = nothing
             end
             @test err isa ErrorException && occursin("worker startup failure", err.msg)
-            @test (@atomic Avro.GUARD.pending) == pending0
             recovered = Tables.columntable(Avro.Table(IOBuffer(bytes); ntasks=1, limits=workerlimits))
             @test all(isequal(recovered[name], reference[name]) for name in keys(reference))
         end
     end
     @testset "pool wrapper failure returns the pending startup reservation" begin
         if Threads.nthreads() > 1
-            pending0 = @atomic Avro.GUARD.pending
             Avro.PARALLEL_HOOK[] = (event, _) -> begin
                 event === :poolwrap && error("pool wrapper failure")
                 return nothing
@@ -250,7 +245,6 @@
                 Avro.PARALLEL_HOOK[] = nothing
             end
             @test err isa ErrorException && err.msg == "pool wrapper failure"
-            @test (@atomic Avro.GUARD.pending) == pending0
         end
     end
     @testset "failure selection: the lowest failing index wins for every kind pairing" begin

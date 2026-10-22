@@ -346,7 +346,7 @@ mutable struct Reader
     warned::Bool
 end
 
-"Close a reader source and its budget. Explicit close reports the source failure after guard cleanup."
+"Close a reader source and its budget. Explicit close reports the source failure after the budget is settled."
 function closereaderresources(source, budget::Budget; suppress::Bool=false)
     failure = nothing
     try

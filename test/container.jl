@@ -167,7 +167,7 @@ end
     valuereference = WeakRef(value)
     keypointer = pointer(key)
     valuepointer = pointer(value)
-    budget = Avro.Budget(Avro.Limits(); direction=:encode, available=1 << 40)
+    budget = Avro.Budget(Avro.Limits(); direction=:encode)
     _, entries = Avro.writerheaderentries(
         schema, :zstandard, Dict(key => value), Avro.Limits(), budget)
     return entries, keyreference, valuereference, keypointer, valuepointer, budget
@@ -321,7 +321,7 @@ end
         (c1, b1), _ = iterate(it)
         rest = collect(it)
         @test !isempty(rest)
-        d = Avro.Budget(L; available=1 << 40)
+        d = Avro.Budget(L)
         Avro.addinput!(d, length(b1))
         dec = Avro.Decoder(b1, d)
         @test Avro.decode(Avro.readplan(Avro.writerschema(r)), dec).a == 1
@@ -465,8 +465,7 @@ end
         @test writeerror.path == "\$.xs[0]"
         @test writeerror.schema === stagepathrecord.fields[1].schema.items
 
-        estimatebudget = Avro.Budget(Avro.Limits(); direction=:encode,
-                                     available=1 << 40)
+        estimatebudget = Avro.Budget(Avro.Limits(); direction=:encode)
         estimateplan = Avro.writeplan(stagepathrecord; budget=estimatebudget)
         estimateencoder = Avro.Encoder(estimatebudget)
         estimateerror = try
@@ -586,7 +585,7 @@ end
 
         widebytes = P("{\"type\":\"bytes\",\"logicalType\":\"decimal\",\"precision\":1000000000}")
         wideplan = Avro.writeplan(widebytes)
-        estimatebudget = Avro.Budget(Avro.Limits(); available=1 << 40)
+        estimatebudget = Avro.Budget(Avro.Limits())
         positiveestimate = Avro.estimatevalue(wideplan, Avro.WideDecimal(big(1), 0), estimatebudget)
         negativeestimate = Avro.estimatevalue(wideplan, Avro.WideDecimal(big(-1), 0), estimatebudget)
         @test positiveestimate.retained == Avro.widedecimalbytes(1)
@@ -599,11 +598,11 @@ end
         peakschema = Avro.ArraySchema(Avro.ArraySchema(Avro.IntSchema()))
         peakvalue = [Int32[] for _ in 1:1500]
         peakvalue[1499] = fill(Int32(1), 100_000)
-        writebudget = Avro.Budget(peaklimits; direction=:encode, available=1 << 40)
+        writebudget = Avro.Budget(peaklimits; direction=:encode)
         writeplan = Avro.writeplan(peakschema; budget=writebudget)
         outputestimate = Avro.estimaterootvalue(writeplan, peakvalue, writebudget)
         peakbytes = Avro.encode(peakschema, peakvalue; limits=peaklimits)
-        readbudget = Avro.Budget(peaklimits; available=1 << 40)
+        readbudget = Avro.Budget(peaklimits)
         Avro.addinput!(readbudget, length(peakbytes))
         readplan = Avro.readplan(peakschema; budget=readbudget)
         baseline = readbudget.reserved
@@ -615,11 +614,11 @@ end
         mapvalues = Any[Int32[] for _ in 1:1500]
         mapvalues[1499] = fill(Int32(1), 100_000)
         mappeakvalue = Avro.StagedWriterMap(mapkeys, mapvalues)
-        mapwritebudget = Avro.Budget(peaklimits; direction=:encode, available=1 << 40)
+        mapwritebudget = Avro.Budget(peaklimits; direction=:encode)
         mapwriteplan = Avro.writeplan(mappeakschema; budget=mapwritebudget)
         mapestimate = Avro.estimaterootvalue(mapwriteplan, mappeakvalue, mapwritebudget)
         mapbytes = Avro.encode(mappeakschema, mappeakvalue; limits=peaklimits)
-        mapreadbudget = Avro.Budget(peaklimits; available=1 << 40)
+        mapreadbudget = Avro.Budget(peaklimits)
         Avro.addinput!(mapreadbudget, length(mapbytes))
         mapreadplan = Avro.readplan(mappeakschema; budget=mapreadbudget)
         mapbaseline = mapreadbudget.reserved
@@ -708,7 +707,6 @@ end
         append!(badheader, zeros(UInt8, 16))
         constructorcloses = Ref(0)
         constructorio = ReaderLifecycleIO(IOBuffer(badheader), constructorcloses, true)
-        guardbefore = @atomic Avro.GUARD.pending
         constructorerror = try
             Avro.Reader(OwnedReaderLifecycleSource(constructorio))
             nothing
@@ -717,7 +715,6 @@ end
         end
         @test constructorerror isa Avro.SchemaError
         @test constructorcloses[] == 1
-        @test (@atomic Avro.GUARD.pending) == guardbefore
     end
     @testset "legacy 1.x files and decimal byte order" begin
         legacy_schema_json = """{"type":"record","name":"LegacyFixedOrdinals","fields":[
@@ -1091,13 +1088,11 @@ end
         @test isopen(limitio)
         @test readall(limitio) == []
         close(limitwriter)
-        pending0 = @atomic Avro.GUARD.pending
         abandoned_io = IOBuffer()
         abandoned = abandonedwriter(abandoned_io, s)
         GC.gc(true)
         GC.gc(true)
         @test abandoned.value === nothing
-        @test (@atomic Avro.GUARD.pending) == pending0
         @test isopen(abandoned_io)
         # atomic path: the destination is untouched until close, replaced on close, kept on abort
         dir = mktempdir()
@@ -1194,7 +1189,6 @@ end
             rm(constructionpath)
         end
 
-        cleanupguard = @atomic Avro.GUARD.pending
         cleanupwriter = Avro.Writer(dest, s)
         cleanupcause = try
             push!(cleanupwriter, (x="bad",))
@@ -1217,7 +1211,6 @@ end
             @test cleanuperror isa Exception
             @test isdir(cleanuptemp)
             @test cleanupwriter.budget.pending == 0
-            @test (@atomic Avro.GUARD.pending) == cleanupguard
             cleanupfollowup = try
                 push!(cleanupwriter, (x=Int64(2),))
                 nothing

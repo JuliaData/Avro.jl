@@ -91,13 +91,13 @@
 
         @testset "fingerprint workspace is reserved before hashing" begin
             for algorithm in (:md5, :sha256)
-                ample = Avro.Budget(Avro.Limits(); available=1 << 40)
+                ample = Avro.Budget(Avro.Limits())
                 digest = Avro.hashfingerprint(UInt8[0x01], algorithm, ample)
                 @test ample.reserved == Base.summarysize(digest)
                 peak = ample.peak
                 Avro.close!(ample)
 
-                tight = Avro.Budget(Avro.Limits(); available=1 << 40)
+                tight = Avro.Budget(Avro.Limits())
                 err = try
                     Avro.reserve!(tight, tight.ceiling - peak + 1)
                     Avro.hashfingerprint(UInt8[0x01], algorithm, tight)
@@ -150,7 +150,7 @@
         rec = P("""{"type":"record","name":"LongList","fields":[{"name":"value","type":"long"},{"name":"next","type":["null","LongList"]}]}""")
         @test rec.fields[2].schema.branches[2] === rec
         @test rec == P(Avro.json(rec))
-        equalbudget = Avro.Budget(Avro.Limits(); available=1 << 40)
+        equalbudget = Avro.Budget(Avro.Limits())
         @test Avro.budgetedschemaequal(rec, P(Avro.json(rec)), equalbudget)
         @test equalbudget.pending == equalbudget.reserved == 0              # equality memo is operation scratch
         Avro.close!(equalbudget)
@@ -600,7 +600,7 @@ end
 
     @testset "construction scope enforces graph limits" begin
         parse_limits = Avro.Limits(max_depth=1, max_schema_depth=7)
-        parse_budget = Avro.Budget(parse_limits; available=1 << 40)
+        parse_budget = Avro.Budget(parse_limits)
         parse_ctx = Avro.ParseContext(parse_limits, parse_budget, false, false)
         expected_parse_state = Avro.vectorbytes(Avro.RecordSchema, parse_limits.max_schema_depth) +
                                Avro.vectorbytes(Avro.NodeMeta, 16) + Avro.frozendictshell() + 128 +

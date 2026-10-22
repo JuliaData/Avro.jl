@@ -256,7 +256,7 @@ end
         @test_throws Avro.ConversionError Avro.decode(P("\"string\""), Avro.encode(P("\"string\""), "ab"), Char)
         @test Avro.decode(P("\"string\""), Avro.encode(P("\"string\""), "😀"), Char) === '😀'
         longchar = "x"^100_000
-        charbudget = Avro.Budget(Avro.Limits(); available=1 << 30)
+        charbudget = Avro.Budget(Avro.Limits())
         charerror = try
             Avro.convertleaf(Char, longchar, charbudget)
             nothing
@@ -440,7 +440,7 @@ end
         reader = Avro.DatumReader(bs, Bits)
         bb = Avro.encode(bs, Bits(3, 1.5f0, true))
         @test reader(bb) === Bits(3, 1.5f0, true)
-        budget = Avro.Budget(Avro.Limits(); available=1 << 40)
+        budget = Avro.Budget(Avro.Limits())
         Avro.addinput!(budget, 1 << 20)
         d = Avro.Decoder(bb, budget)
         function kernel(plan, d, names)
@@ -495,7 +495,7 @@ end
         Avro.close!(b)
         @test_throws InterruptException Avro.measuredshell(InterruptingSummary)
         @test_throws ArgumentError Avro.measuredshell(FailingSummary)
-        summarybudget = Avro.Budget(Avro.Limits(); available=1 << 40)
+        summarybudget = Avro.Budget(Avro.Limits())
         @test_throws InterruptException Avro.measuredinlineshell(InterruptingSummary,
                                                                  summarybudget)
         @test summarybudget.reserved == summarybudget.pending == 0
@@ -534,7 +534,7 @@ end
             function chargedtyped(s::Avro.Schema, ::Type{T}, x, names=:trusted) where {T}
                 bytes = Avro.encode(s, x)
                 target = Avro.typedplan(T, s, Avro.readplan(s), Avro.Limits())
-                budget = Avro.Budget(Avro.Limits(); available=1 << 40)
+                budget = Avro.Budget(Avro.Limits())
                 Avro.addinput!(budget, length(bytes))
                 try
                     d = Avro.Decoder(bytes, budget)
@@ -675,7 +675,7 @@ end
         @test_throws Avro.LimitError Avro.DatumReader(wdflt; reader_schema=rdflt, limits=tiny)(UInt8[])
         @test_throws Avro.LimitError Avro.DatumReader(wdflt, TD; reader_schema=rdflt, limits=tiny)(UInt8[])
         resolveddefault = Avro.resolve(wdflt, rdflt).plan.defaults[1].second
-        defaultbudget = Avro.Budget(Avro.Limits(); available=1 << 40)
+        defaultbudget = Avro.Budget(Avro.Limits())
         defaultnode = Avro.checkedreaderdefault(Vector{Int64}, resolveddefault, defaultbudget)
         defaultnodecharge = Avro.nodebytes(typeof(defaultnode))
         @test defaultbudget.pending == 0
@@ -684,13 +684,13 @@ end
         Avro.close!(defaultbudget)
         probereader = P("{\"type\":\"record\",\"name\":\"D\",\"fields\":[{\"name\":\"value\",\"type\":\"string\",\"default\":\"x\"}]}")
         probeplan = Avro.resolve(wdflt, probereader).plan.defaults[1].second
-        probebudget = Avro.Budget(Avro.Limits(); available=1 << 40)
+        probebudget = Avro.Budget(Avro.Limits())
         @test_throws DefaultProbeError Avro.checkedreaderdefault(
             DefaultProbe, probeplan, probebudget)
         @test probebudget.pending == probebudget.reserved == 0
         Avro.close!(probebudget)
 
-        failedplanbudget = Avro.Budget(Avro.Limits(); available=1 << 40)
+        failedplanbudget = Avro.Budget(Avro.Limits())
         onlya = P("{\"type\":\"record\",\"name\":\"OnlyA\",\"fields\":[{\"name\":\"a\",\"type\":\"long\"}]}")
         @test_throws ArgumentError Avro.typedplan(NoDefault, onlya, Avro.readplan(onlya), Avro.Limits();
             budget=failedplanbudget)
@@ -699,7 +699,7 @@ end
 
         directschema = P("{\"type\":\"record\",\"name\":\"DirectCharge\",\"fields\":[{\"name\":\"a\",\"type\":\"long\"}]}")
         directread = Avro.readplan(directschema)
-        directbudget = Avro.Budget(Avro.Limits(); available=1 << 40)
+        directbudget = Avro.Budget(Avro.Limits())
         directplan = Avro.typedplan(@NamedTuple{a::Int64}, directschema, directread,
             Avro.Limits(); budget=directbudget)
         directreachable = Avro.nodebytes(typeof(directplan)) + Avro.vectorbytes(Any, length(directplan.defaults))
@@ -709,19 +709,19 @@ end
         @test directwork > 0
         Avro.close!(directbudget)
         zerowork = Avro.Limits(max_resolution_work=0)
-        zerobudget = Avro.Budget(zerowork; available=1 << 40)
+        zerobudget = Avro.Budget(zerowork)
         @test_throws Avro.LimitError Avro.typedplan(@NamedTuple{a::Int64}, directschema, directread,
             zerowork; budget=zerobudget)
         @test zerobudget.pending == zerobudget.reserved == 0
         Avro.close!(zerobudget)
         exactwork = Avro.Limits(max_resolution_work=directwork)
-        exactbudget = Avro.Budget(exactwork; available=1 << 40)
+        exactbudget = Avro.Budget(exactwork)
         @test Avro.typedplan(@NamedTuple{a::Int64}, directschema, directread,
             exactwork; budget=exactbudget) isa Avro.RecordTarget
         @test exactbudget.resolution_work == directwork
         Avro.close!(exactbudget)
         shortwork = Avro.Limits(max_resolution_work=directwork - 1)
-        shortbudget = Avro.Budget(shortwork; available=1 << 40)
+        shortbudget = Avro.Budget(shortwork)
         @test_throws Avro.LimitError Avro.typedplan(@NamedTuple{a::Int64}, directschema, directread,
             shortwork; budget=shortbudget)
         Avro.close!(shortbudget)
@@ -729,7 +729,7 @@ end
         resolvedwriter = P("{\"type\":\"record\",\"name\":\"ResolvedCharge\",\"fields\":[{\"name\":\"a\",\"type\":\"int\"}]}")
         resolvedreader = P("{\"type\":\"record\",\"name\":\"ResolvedCharge\",\"fields\":[{\"name\":\"a\",\"type\":\"long\"}]}")
         resolvedplan = Avro.resolve(resolvedwriter, resolvedreader).plan
-        resolvedbudget = Avro.Budget(Avro.Limits(); available=1 << 40)
+        resolvedbudget = Avro.Budget(Avro.Limits())
         resolvedtarget = Avro.typedplan(@NamedTuple{a::Int64}, resolvedreader, resolvedplan,
             Avro.Limits(); budget=resolvedbudget)
         resolvedreachable = Avro.nodebytes(typeof(resolvedtarget)) + Avro.vectorbytes(Any, length(resolvedtarget.defaults))
@@ -745,7 +745,7 @@ end
                 "[{\"name\":\"y\",\"type\":\"string\",\"default\":\"a\"},{\"name\":\"x\",\"type\":\"int\",\"default\":1}]")
             fallbackreader = P("{\"type\":\"record\",\"name\":\"FallbackDefaults\",\"fields\":" * fieldsjson * "}")
             fallbackplan = Avro.resolve(fallbackwriter, fallbackreader).plan
-            fallbackbudget = Avro.Budget(Avro.Limits(); available=1 << 40)
+            fallbackbudget = Avro.Budget(Avro.Limits())
             @test Avro.typedplan(FallbackTarget, fallbackreader, fallbackplan, Avro.Limits();
                 budget=fallbackbudget) isa Avro.SemanticTarget
             push!(fallbackcharges, fallbackbudget.reserved)
@@ -754,7 +754,7 @@ end
         @test fallbackcharges[1] == fallbackcharges[2]
 
         enumfallbackschema = P("{\"type\":\"record\",\"name\":\"EnumFallback\",\"fields\":[{\"name\":\"f\",\"type\":{\"type\":\"enum\",\"name\":\"FallbackEnum\",\"symbols\":[\"red\",\"green\",\"blue\"]}},{\"name\":\"bad\",\"type\":\"string\"}]}")
-        enumfallbackbudget = Avro.Budget(Avro.Limits(); available=1 << 40)
+        enumfallbackbudget = Avro.Budget(Avro.Limits())
         enumfallback = Avro.typedplan(EnumFallback, enumfallbackschema, Avro.readplan(enumfallbackschema),
             Avro.Limits(); budget=enumfallbackbudget)
         @test enumfallback isa Avro.SemanticTarget
@@ -763,7 +763,7 @@ end
         Avro.close!(enumfallbackbudget)
 
         unionfallbackschema = P("[{\"type\":\"enum\",\"name\":\"UnionFallbackEnum\",\"symbols\":[\"red\",\"green\",\"blue\"]},\"string\"]")
-        unionfallbackbudget = Avro.Budget(Avro.Limits(); available=1 << 40)
+        unionfallbackbudget = Avro.Budget(Avro.Limits())
         unionfallback = Avro.typedplan(Union{Colour,Int64}, unionfallbackschema,
             Avro.readplan(unionfallbackschema), Avro.Limits(); budget=unionfallbackbudget)
         @test unionfallback isa Avro.SemanticTarget
@@ -773,10 +773,10 @@ end
 
         transactionschema = P("[{\"type\":\"record\",\"name\":\"TransactionOuter\",\"fields\":[{\"name\":\"child\",\"type\":{\"type\":\"record\",\"name\":\"TransactionChild\",\"fields\":[{\"name\":\"f\",\"type\":{\"type\":\"enum\",\"name\":\"TransactionColour\",\"symbols\":[\"red\",\"green\",\"blue\"]}}]}},{\"name\":\"bad\",\"type\":\"string\"}]},\"long\"]")
         transactionplan = Avro.readplan(transactionschema)
-        failedfirstbudget = Avro.Budget(Avro.Limits(); available=1 << 40)
+        failedfirstbudget = Avro.Budget(Avro.Limits())
         failedfirst = Avro.typedplan(Union{TransactionFail,TransactionGood,Int64}, transactionschema,
             transactionplan, Avro.Limits(); budget=failedfirstbudget)
-        successfulbudget = Avro.Budget(Avro.Limits(); available=1 << 40)
+        successfulbudget = Avro.Budget(Avro.Limits())
         successful = Avro.typedplan(Union{TransactionGood,Int64}, transactionschema,
             transactionplan, Avro.Limits(); budget=successfulbudget)
         @test typeof.(failedfirst.branches) == typeof.(successful.branches)
@@ -789,7 +789,7 @@ end
         for (T, json) in ((Vector{Int64}, "{\"type\":\"array\",\"items\":\"string\"}"),
                           (Dict{String,Int64}, "{\"type\":\"map\",\"values\":\"string\"}"))
             compositeschema = P(json)
-            compositebudget = Avro.Budget(Avro.Limits(); available=1 << 40)
+            compositebudget = Avro.Budget(Avro.Limits())
             composite = Avro.typedplan(T, compositeschema, Avro.readplan(compositeschema),
                 Avro.Limits(); budget=compositebudget)
             @test composite isa Avro.SemanticTarget
