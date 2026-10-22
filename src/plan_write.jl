@@ -1560,16 +1560,12 @@ function alignedplans(p::WritePlan, ::Type{T}, budget::Union{Nothing,Budget}=not
     return plans
 end
 
-@inline function estfields(::Tuple{}, ::Tuple{}, fields,
-                           cols::Union{Nothing,Vector{Type}}, i::Int,
-                           budget::Budget,
+@inline function estfields(::Tuple{}, ::Tuple{}, fields, i::Int, budget::Budget,
                            diagnostics::Union{Nothing,Encoder})
-    return (0, 0, 0, 0)
+    return (0, 0, 0)
 end
 
-@inline function estfields(plans::Tuple, vals::Tuple, fields,
-                           cols::Union{Nothing,Vector{Type}}, i::Int,
-                           budget::Budget,
+@inline function estfields(plans::Tuple, vals::Tuple, fields, i::Int, budget::Budget,
                            diagnostics::Union{Nothing,Encoder})
     plan = first(plans)
     value = first(vals)
@@ -1583,28 +1579,19 @@ end
         end
     end
     retained = checked_add(estimate.retained, estimatedbox(plan, value))
-    payload = cols === nothing ? 0 : estimatedelement(cols[i], estimate, plan, value)
-    restretained, restpeak, restvalues, restpayload =
-        estfields(Base.tail(plans), Base.tail(vals), fields, cols, i + 1,
-                  budget, diagnostics)
+    restretained, restpeak, restvalues =
+        estfields(Base.tail(plans), Base.tail(vals), fields, i + 1, budget, diagnostics)
     return (checked_add(retained, restretained), max(estimate.peakextra, restpeak),
-            checkedvalueadd(budget, estimate.values, restvalues),
-            checked_add(payload, restpayload))
+            checkedvalueadd(budget, estimate.values, restvalues))
 end
 
-"The output estimate of one aligned row (the `estimaterootrecord` arithmetic, monomorphized)."
-function estimatealigned(plans::Tuple, x::NamedTuple,
-                         cols::Union{Nothing,Vector{Type}}, budget::Budget,
-                         fields=nothing,
+"The output estimate of one aligned row (the `estimaterootvalue` arithmetic, monomorphized)."
+function estimatealigned(plans::Tuple, x::NamedTuple, budget::Budget, fields=nothing,
                          diagnostics::Union{Nothing,Encoder}=nothing)
     schemafields = fields === nothing ? () : fields
-    retained, peakextra, nvalues, payload =
-        diagnostics === nothing ?
-        estfields(plans, values(x), schemafields, cols, 1, budget, nothing) :
-        estfields(plans, values(x), schemafields, cols, 1, budget,
-                  diagnostics)
+    retained, peakextra, nvalues = estfields(plans, values(x), schemafields, 1, budget, diagnostics)
     root = checked_add(representationslot(Record), checked_add(recordbytes(length(plans)), retained))
-    return (root, peakextra, 1 + nvalues, payload)
+    return (root, peakextra, 1 + nvalues)
 end
 
 @inline function encfields(e::Encoder, ::Tuple{}, ::Tuple{}, fields, i::Int)

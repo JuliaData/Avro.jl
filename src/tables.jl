@@ -211,6 +211,22 @@ struct Table
     syncmarker::NTuple{16,UInt8}
 end
 
+# Block counts are claims until each block is decompressed and decoded. Final columns are preallocated
+# from the claimed total only while it is no more than this floor or this multiple of the file's block
+# bytes; larger claims decode block by block, so a small file cannot make the reader allocate gigabytes
+# before its first block is checked.
+const PREALLOC_CLAIM_FLOOR = 256 * MiB
+const PREALLOC_CLAIM_RATIO = 256
+
+"Whether the claimed final columns of a pre-scanned byte source may be allocated before decoding."
+function preallocatable(colstypes::Vector{Type}, nrows::Int, source::BytesSource)
+    claimed = 0
+    for E in colstypes
+        claimed = satadd(claimed, muladdcap(slotbytes(E), nrows, STORAGE[].vector))
+    end
+    return claimed <= max(PREALLOC_CLAIM_FLOOR, muladdcap(PREALLOC_CLAIM_RATIO, source.stop - source.pos + 1, 0))
+end
+
 function exactvector(::Type{T}, n::Int, budget::Budget) where {T}
     charge = vectorbytes(T, n)
     reserve!(budget, charge)
@@ -244,9 +260,13 @@ function Table(src; reader_schema::Union{Nothing,Schema}=nothing, union_resoluti
         for (index, field) in enumerate(outschema.fields)
             colstypes[index] = juliatype(field.schema)
         end
-        if r.source isa BytesSource
+        pre = r.source isa BytesSource ? prescanblocks(r) : nothing
+        if pre !== nothing && !preallocatable(colstypes, pre.totalrows, r.source)
+            release!(r.budget, blocktablecharge(capacity(pre.entries)))
+            pre = nothing
+        end
+        if pre !== nothing
             # byte and mapped sources: pre-scan, exact final preallocation, direct/parallel decode
-            pre = prescanblocks(r)
             nrows = pre.totalrows
             finals = exactvector(AbstractVector, nkept, r.budget)
             for (index, E) in enumerate(colstypes)

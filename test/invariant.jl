@@ -27,17 +27,6 @@
         @test isequal(Avro.decode(recursive, Avro.encode(recursive, value)), Avro.Record(recursive, Any[
             Avro.Record(recursive, Any[missing, Int32(2)]), Int32(1)]))
     end
-    @testset "the writer preflight equals a stream reader's construction retention" begin
-        s = P("{\"type\":\"record\",\"name\":\"R\",\"namespace\":\"inv\",\"fields\":[{\"name\":\"a\",\"type\":\"long\"},{\"name\":\"b\",\"type\":\"string\"},{\"name\":\"c\",\"type\":[\"null\",{\"type\":\"array\",\"items\":\"double\"}]}]}")
-        path = joinpath(dir, "pf.avro")
-        w = Avro.Writer(path, s; metadata=Dict("k" => Vector{UInt8}("v"), "blob" => zeros(UInt8, 1000)))
-        @test w.preflightbase > 0
-        push!(w, (a=Int64(1), b="x", c=[1.0, 2.0]))
-        close(w)
-        r = Avro.Reader(path; mmap=false)
-        @test r.budget.reserved == w.preflightbase              # the same graph, metadata and read plan
-        close(r)
-    end
     @testset "byte and stream headers have identical near-ceiling acceptance" begin
         maxmetadata = (40 << 20) - 6
         smallkeys = ["k$(lpad(i, 4, '0'))" for i in 1:1024]
@@ -222,32 +211,6 @@
         bytes = take!(io)
         @test_throws Avro.LimitError Avro.Reader(r -> collect(Avro.eachdatum(r)), IOBuffer(bytes); limits=Avro.Limits(max_rows=0))
     end
-    @testset "writer preflight combines prior Table payload with the current block peak" begin
-        schema = P("""{"type":"record","name":"TablePeak","fields":[
-            {"name":"xs","type":{"type":"array","items":"string"}}]}""")
-        limits = Avro.Limits(max_block_bytes=3 << 20,
-            max_block_output_bytes=49 << 20, max_codec_memory=16 << 20,
-            max_total_bytes=112 << 20, max_values_per_byte=16)
-        values = fill("", (1 << 21) + 1)
-        io = IOBuffer()
-        writer = Avro.Writer(io, schema; block_bytes=3 << 20, limits=limits)
-        push!(writer, (xs=values,))
-        flush(writer)
-        push!(writer, (xs=values,))
-        before = position(io)
-        err = try
-            flush(writer)
-            nothing
-        catch e
-            e
-        end
-        @test err isa Avro.LimitError
-        @test err.limit === :max_total_bytes
-        @test err.observed > err.value == 112 << 20
-        @test position(io) == before
-        @test writer.poison === err
-        close(writer)
-    end
     @testset "a near-ceiling record file through every source mode and guaranteed consumer" begin
         lim = Avro.Limits(max_total_bytes=96 << 20, max_block_bytes=8 << 20, max_codec_memory=16 << 20,
                           max_block_output_bytes=32 << 20, max_bytes=8 << 20, max_datum_bytes=8 << 20)
@@ -311,44 +274,52 @@
             end
         end
     end
-    @testset "wide mostly-null records over one-row blocks: chunk shells dominate" begin
+    @testset "ordinary tables write and read under default limits" begin
+        # A 4-column Int64 table of 4.4M rows (a 17 MiB file, 141 MB of columns) under default limits.
+        n = 4_400_000
+        cols = (a=collect(1:n), b=collect(n:-1:1), c=fill(7, n), d=collect(1:n) .% 97)
+        path = joinpath(dir, "ordinary.avro")
+        Avro.write(path, cols)
+        t = Avro.Table(path)
+        @test length(t) == n && Tables.getcolumn(t, :b)[1] == n && Tables.getcolumn(t, :d)[end] == n % 97
+        @test Avro.Rows(rr -> count(Returns(true), rr), path) == n
+        # one-row blocks of a wide mostly-null record: every consumer accepts what the writer wrote
         fields = join(("{\"name\":\"f$i\",\"type\":[\"null\",\"long\"]}" for i in 1:1001), ",")
         ws = P("{\"type\":\"record\",\"name\":\"W\",\"fields\":[$fields]}")
         row = Dict{String,Any}("f$i" => nothing for i in 1:1001)
-        w = Avro.Writer(IOBuffer(), ws; block_bytes=1)          # every datum flushes: one-row blocks
-        e = try
-            for _ in 1:10_000
-                push!(w, row)
-            end
-            close(w)
-            nothing
-        catch err
-            err
-        end
-        @test e isa Avro.LimitError && e.limit === :max_total_bytes && e.direction === :encode
-        raised = Avro.Limits(max_total_bytes=4 << 30, max_block_bytes=64 << 20, max_block_output_bytes=2 << 30,
-                             max_codec_memory=512 << 20, max_bytes=256 << 20, max_datum_bytes=256 << 20)
         wide = joinpath(dir, "wide.avro")
-        w2 = Avro.Writer(wide, ws; block_bytes=1, limits=raised)
+        w = Avro.Writer(wide, ws; block_bytes=1)                 # every datum flushes: one-row blocks
         for _ in 1:10_000
-            push!(w2, row)
+            push!(w, row)
         end
-        close(w2)
-        e2 = try
-            Avro.Table(open(wide))                               # the streamed consumer: chunk shells cross the ceiling
-            nothing
-        catch err
-            err
+        close(w)
+        for t in (Avro.Table(open(wide)), Avro.Table(wide))      # streamed and mapped consumers
+            @test length(t) == 10_000 && length(Tables.columnnames(t)) == 1001
+            @test all(ismissing, Tables.getcolumn(t, :f1))
         end
-        @test e2 isa Avro.LimitError && e2.limit === :max_total_bytes && e2.direction === :decode
-        tm = Avro.Table(wide)                                    # the mapped direct path preallocates exactly and fits
-        @test length(tm) == 10_000 && length(Tables.columnnames(tm)) == 1001
-        @test all(ismissing, Tables.getcolumn(tm, :f1))
-        rl = Avro.Rows(wide)                                     # streaming stays bounded and accepts
-        @test count(Returns(true), rl) == 10_000
-        close(rl)
-        cnt = Avro.Reader(rr -> sum(first(b) for b in Avro.eachblock(rr); init=0), wide)
-        @test cnt == 10_000
+        @test Avro.Rows(rr -> count(Returns(true), rr), wide) == 10_000
+        @test Avro.Reader(rr -> sum(first(b) for b in Avro.eachblock(rr); init=0), wide) == 10_000
+    end
+    @testset "claimed block counts cannot drive the Table preallocation" begin
+        # 50 two-byte blocks claim 2^24 rows each: preallocating 2^24 x 50 rows would commit gigabytes
+        # before the first block is decoded, so such claims decode block by block and fail there.
+        schema = """{"type":"record","name":"Claim","fields":[{"name":"a","type":"long"},{"name":"s","type":"string"}]}"""
+        long = Avro.LongSchema()
+        io = IOBuffer()
+        write(io, b"Obj\x01", Avro.encode(long, Int64(1)), Avro.encode(long, Int64(11)), "avro.schema",
+              Avro.encode(long, Int64(sizeof(schema))), schema, Avro.encode(long, Int64(0)))
+        sync = zeros(UInt8, 16)
+        write(io, sync)
+        for _ in 1:50
+            write(io, Avro.encode(long, Int64(1) << 24), Avro.encode(long, Int64(2)), UInt8[0, 0], sync)
+        end
+        claims = take!(io)
+        cols = Type[Int64, String]
+        @test Avro.Reader(r -> Avro.preallocatable(cols, Avro.prescanblocks(r).totalrows, r.source), claims) == false
+        @test Avro.Reader(r -> Avro.preallocatable(cols, Avro.prescanblocks(r).totalrows, r.source),
+                          take!(Avro.tobuffer((a=collect(1:1000), s=fill("x", 1000))))) == true
+        @test_throws Avro.LimitError Avro.Table(claims)
+        @test_throws Avro.LimitError Avro.Table(claims; ntasks=1)
     end
     @testset "admission across repeated files; exhausted admission" begin
         s = P("{\"type\":\"record\",\"name\":\"A\",\"fields\":[{\"name\":\"p\",\"type\":\"long\"},{\"name\":\"q\",\"type\":\"long\"}]}")

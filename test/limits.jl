@@ -1,6 +1,7 @@
 @testset "Limits" begin
     l = Avro.Limits()
-    @test l.max_total_bytes == 256 << 20
+    @test l.max_total_bytes == 16 << 30
+    @test l.max_total_values == l.max_rows == l.max_blocks == typemax(Int)
     @test l.max_block_bytes == 16 << 20
     @test l.max_codec_memory == 32 << 20
     @test l.max_values_per_byte == 16
@@ -18,18 +19,19 @@
         # max_datum_bytes ≤ max_bytes + 1 MiB
         @test Avro.Limits(max_datum_bytes=(64 << 20) + (1 << 20)).max_datum_bytes == (64 << 20) + (1 << 20)
         @test_throws ArgumentError Avro.Limits(max_datum_bytes=(64 << 20) + (1 << 20) + 1)
+        ceiling = 256 << 20                            # the relations below scale with max_total_bytes
         # max_block_bytes ≤ ceiling ÷ 4
-        @test Avro.Limits(max_block_bytes=64 << 20).max_block_bytes == 64 << 20
-        @test_throws ArgumentError Avro.Limits(max_block_bytes=(64 << 20) + 1)
+        @test Avro.Limits(max_total_bytes=ceiling, max_block_bytes=64 << 20).max_block_bytes == 64 << 20
+        @test_throws ArgumentError Avro.Limits(max_total_bytes=ceiling, max_block_bytes=(64 << 20) + 1)
         # max_codec_memory + 4 MiB ≤ ceiling ÷ 4
-        @test Avro.Limits(max_codec_memory=60 << 20).max_codec_memory == 60 << 20
-        @test_throws ArgumentError Avro.Limits(max_codec_memory=(60 << 20) + 1)
+        @test Avro.Limits(max_total_bytes=ceiling, max_codec_memory=60 << 20).max_codec_memory == 60 << 20
+        @test_throws ArgumentError Avro.Limits(max_total_bytes=ceiling, max_codec_memory=(60 << 20) + 1)
         # max_block_output_bytes ≤ ceiling ÷ 2
-        @test Avro.Limits(max_block_output_bytes=128 << 20).max_block_output_bytes == 128 << 20
-        @test_throws ArgumentError Avro.Limits(max_block_output_bytes=(128 << 20) + 1)
+        @test Avro.Limits(max_total_bytes=ceiling, max_block_output_bytes=128 << 20).max_block_output_bytes == 128 << 20
+        @test_throws ArgumentError Avro.Limits(max_total_bytes=ceiling, max_block_output_bytes=(128 << 20) + 1)
         # max_metadata_bytes + max_schema_bytes ≤ ceiling ÷ 2
-        @test Avro.Limits(max_metadata_bytes=112 << 20).max_metadata_bytes == 112 << 20
-        @test_throws ArgumentError Avro.Limits(max_metadata_bytes=(112 << 20) + 1)
+        @test Avro.Limits(max_total_bytes=ceiling, max_metadata_bytes=112 << 20).max_metadata_bytes == 112 << 20
+        @test_throws ArgumentError Avro.Limits(max_total_bytes=ceiling, max_metadata_bytes=(112 << 20) + 1)
         # the first unit of progress fits under the default ceiling, and must fit any ceiling
         @test Avro.first_unit_bytes(l) <= l.max_total_bytes
         lowceiling = 4 * ((32 << 20) + (4 << 20))   # the smallest ceiling the codec relation admits
@@ -114,16 +116,14 @@
         Avro.close!(b)
     end
 
-    @testset "a live Writer settles everything but its preflight model" begin
+    @testset "a live Writer's header copies are resident" begin
         meta = Dict("user.blob" => rand(UInt8, 2 << 20))
         s = Avro.parseschema("{\"type\":\"record\",\"name\":\"RP\",\"fields\":[{\"name\":\"a\",\"type\":\"long\"}]}")
         io = IOBuffer()
         w = Avro.Writer(io, s; metadata=meta)
         try
             b = w.budget
-            # the retained header copies (schema json, codec, metadata) are resident and settled;
-            # only the preflight reader-model (never materialised in this process) may stay pending
-            @test b.pending <= w.preflightbase
+            # the retained header copies (schema json, codec, metadata) are resident and settled
             @test b.reserved - b.pending >= Avro.bytesbytes(2 << 20)     # the resident metadata copy
         finally
             close(w)

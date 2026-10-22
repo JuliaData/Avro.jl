@@ -48,12 +48,11 @@ The design guarantees, at every `ntasks`:
 * **identical results, acceptance and errors** — the lowest uncommitted block always decodes under
   the sequential rules, and a failing file fails with the same error at the same block;
 * **bounded memory** — higher blocks are admitted strictly in order, each under a complete worst-case
-  reservation, and only into headroom under the ceiling. With default limits there is essentially no
-  headroom (that is by design); parallel speedups need raised limits:
+  reservation, and only into headroom under the ceiling (a lowered `max_total_bytes` limits the
+  parallelism):
 
 ```julia
-lim = Avro.Limits(max_total_bytes=4 << 30)
-t = Avro.Table("big.avro"; ntasks=8, limits=lim)
+t = Avro.Table("big.avro"; ntasks=8)
 ```
 
 ## Symbol admission

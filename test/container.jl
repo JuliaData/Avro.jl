@@ -1276,7 +1276,8 @@ end
         @test_throws ArgumentError Avro.Writer(IOBuffer(), s; sync=UInt8[1, 2])
         @test_throws ArgumentError Avro.Writer(IOBuffer(), s; block_bytes=0)
         @test_throws ArgumentError Avro.Writer(IOBuffer(), s; codec=:snappy, level=3)
-        @test_throws Avro.LimitError Avro.Writer(IOBuffer(), s; codec=:zstandard, level=22)       # ≈ 834 MB workspace > the 256 MiB ceiling
+        @test_throws Avro.LimitError Avro.Writer(IOBuffer(), s; codec=:zstandard, level=22,
+                                                 limits=Avro.Limits(max_total_bytes=256 << 20))   # ≈ 834 MB workspace
         headerentries, metadatakeyref, metadatavalueref, metadatakeypointer,
             metadatavaluepointer, headerbudget = writerheaderownership(s)
         retainedentry = only(entry for entry in headerentries if entry[1] == "caller-metadata")

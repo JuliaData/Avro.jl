@@ -68,7 +68,7 @@
     floatcolumn = Avro.makecolumn(Float64, Avro.DoublePlan(), 10, budget)
     @test budget.reserved - before == 40 + 80 +
           Avro.columnnodebytes(typeof(floatcolumn))
-    @test_throws Avro.LimitError Avro.makecolumn(Float64, Avro.DoublePlan(), 1 << 30, Avro.Budget(Avro.Limits()))
+    @test_throws Avro.LimitError Avro.makecolumn(Float64, Avro.DoublePlan(), 1 << 31, Avro.Budget(Avro.Limits()))  # 16 GiB of slots
     # malformed cells surface as DataErrors; skipped cells are validated under :strict
     bad = copy(bytes); bad[end] = 0x09                                         # enum index zigzag 9 → -5: out of range
     @test_throws Avro.DataError decodeall(50; bytes=bad)

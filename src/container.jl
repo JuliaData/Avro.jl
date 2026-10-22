@@ -1006,9 +1006,7 @@ function estimatevalue(p::WritePlan, x, budget::Budget,
         return OutputEstimate(retained, max(peak - retained, 0), values)
     end
     if p isa WRecord
-        estimate, _ = estimaterecordvalue(p, x, nothing, budget,
-                                          diagnostics)
-        return estimate
+        return estimaterecordvalue(p, x, budget, diagnostics)
     end
     return OutputEstimate(0, 0, 1)
 end
@@ -1092,9 +1090,8 @@ function recordfieldvalue(p::WRecord, x, i::Int)
     return getfield(x, j)
 end
 
-function addrecordestimate(retained::Int, peakextra::Int, values::Int, payload::Int,
-                           field::WritePlan, fieldvalue, column::Union{Nothing,Type},
-                           budget::Budget, schemafield::Field,
+function addrecordestimate(retained::Int, peakextra::Int, values::Int,
+                           field::WritePlan, fieldvalue, budget::Budget, schemafield::Field,
                            diagnostics::Union{Nothing,Encoder})
     estimate = estimatewithpath(diagnostics, schemafield.schema,
                                 ENCODE_PATH_FIELD, schemafield.name) do
@@ -1104,130 +1101,109 @@ function addrecordestimate(retained::Int, peakextra::Int, values::Int, payload::
         checked_add(estimate.retained, estimatedbox(field, fieldvalue)))
     peakextra = max(peakextra, estimate.peakextra)
     values = checkedvalueadd(budget, values, estimate.values)
-    column === nothing ||
-        (payload = checked_add(payload, estimatedelement(column, estimate, field, fieldvalue)))
-    return (retained, peakextra, values, payload)
+    return (retained, peakextra, values)
 end
 
-function estimaterecordvalues(p::WRecord, values, positions,
-                              columns::Union{Nothing,Vector{Type}}, budget::Budget,
+function estimaterecordvalues(p::WRecord, values, positions, budget::Budget,
                               diagnostics::Union{Nothing,Encoder}=nothing)
     retained = recordbytes(length(p.fields))
     peakextra = 0
     count = 1
-    payload = 0
     for (i, field) in enumerate(p.fields)
         position = positions === nothing ? i : positions[i]
         position == 0 && continue
         fieldvalue = values[position]
         fieldvalue === DICT_MISSING && continue
-        column = columns === nothing ? nothing : columns[i]
-        retained, peakextra, count, payload =
-            addrecordestimate(retained, peakextra, count, payload,
-                              field, fieldvalue, column, budget,
+        retained, peakextra, count =
+            addrecordestimate(retained, peakextra, count, field, fieldvalue, budget,
                               p.schema.fields[i], diagnostics)
     end
-    return (OutputEstimate(retained, peakextra, count), payload)
+    return OutputEstimate(retained, peakextra, count)
 end
 
-function estimaterecordvalue(p::WRecord, x::Record,
-                             columns::Union{Nothing,Vector{Type}}, budget::Budget,
+function estimaterecordvalue(p::WRecord, x::Record, budget::Budget,
                              diagnostics::Union{Nothing,Encoder}=nothing)
     source = getfield(x, :schema)
     values = getfield(x, :values)
     length(values) == length(source.fields) ||
-        return (OutputEstimate(recordbytes(length(p.fields)), 0, 1), 0)
+        return OutputEstimate(recordbytes(length(p.fields)), 0, 1)
     source === p.schema &&
-        return estimaterecordvalues(p, values, nothing, columns, budget,
-                                    diagnostics)
+        return estimaterecordvalues(p, values, nothing, budget, diagnostics)
     positions = recordpositions(length(p.fields), budget)
     try
         for (i, field) in enumerate(p.schema.fields)
             positions[i] = get(source.fieldindex, field.name, 0)
         end
-        return estimaterecordvalues(p, values, positions, columns, budget,
-                                    diagnostics)
+        return estimaterecordvalues(p, values, positions, budget, diagnostics)
     finally
         release!(budget, vectorbytes(Int, length(positions)))
     end
 end
 
-function estimaterecordvalue(p::WRecord, x::AbstractDict,
-                             columns::Union{Nothing,Vector{Type}}, budget::Budget,
+function estimaterecordvalue(p::WRecord, x::AbstractDict, budget::Budget,
                              diagnostics::Union{Nothing,Encoder}=nothing)
     values, boxes = recorddictvalues(p, x, budget)
     try
-        return estimaterecordvalues(p, values, nothing, columns, budget,
-                                    diagnostics)
+        return estimaterecordvalues(p, values, nothing, budget, diagnostics)
     finally
         release!(budget, checked_add(vectorbytes(Any, length(values)), boxes))
     end
 end
 
-function estimaterecordvalue(p::WRecord, x::TableRow,
-                             columns::Union{Nothing,Vector{Type}}, budget::Budget,
+function estimaterecordvalue(p::WRecord, x::TableRow, budget::Budget,
                              diagnostics::Union{Nothing,Encoder}=nothing)
-    return estimaterecordrow(p, x.row, columns, budget, diagnostics)
+    return estimaterecordrow(p, x.row, budget, diagnostics)
 end
 
-function estimaterecordvalue(p::WRecord, x::Tables.AbstractRow,
-                             columns::Union{Nothing,Vector{Type}}, budget::Budget,
+function estimaterecordvalue(p::WRecord, x::Tables.AbstractRow, budget::Budget,
                              diagnostics::Union{Nothing,Encoder}=nothing)
-    return estimaterecordrow(p, x, columns, budget, diagnostics)
+    return estimaterecordrow(p, x, budget, diagnostics)
 end
 
-function estimaterecordrow(p::WRecord, row,
-                           columns::Union{Nothing,Vector{Type}}, budget::Budget,
+function estimaterecordrow(p::WRecord, row, budget::Budget,
                            diagnostics::Union{Nothing,Encoder}=nothing)
     positions = recordrowpositions(p, row, budget)
     try
         retained = recordbytes(length(p.fields))
         peakextra = 0
         count = 1
-        payload = 0
         for (i, field) in enumerate(p.fields)
             positions[i] == 0 && continue
             fieldvalue = Tables.getcolumn(row, positions[i])
-            column = columns === nothing ? nothing : columns[i]
-            retained, peakextra, count, payload =
-                addrecordestimate(retained, peakextra, count, payload,
-                                  field, fieldvalue, column, budget,
+            retained, peakextra, count =
+                addrecordestimate(retained, peakextra, count, field, fieldvalue, budget,
                                   p.schema.fields[i], diagnostics)
         end
-        return (OutputEstimate(retained, peakextra, count), payload)
+        return OutputEstimate(retained, peakextra, count)
     finally
         release!(budget, vectorbytes(Int, length(positions)))
     end
 end
 
-function estimaterecordvalue(p::WRecord, x::T,
-                             columns::Union{Nothing,Vector{Type}}, budget::Budget,
+function estimaterecordvalue(p::WRecord, x::T, budget::Budget,
                              diagnostics::Union{Nothing,Encoder}=nothing) where {T}
     valid = x isa NamedTuple ||
         (isstructtype(T) && !(x isa AbstractArray) && !(x isa AbstractString))
-    valid || return (OutputEstimate(recordbytes(length(p.fields)), 0, 1), 0)
+    valid || return OutputEstimate(recordbytes(length(p.fields)), 0, 1)
     positions = recordfieldpositions(p, T, budget)
     try
         retained = recordbytes(length(p.fields))
         peakextra = 0
         count = 1
-        payload = 0
         for (i, field) in enumerate(p.fields)
             positions[i] == 0 && continue
             fieldvalue = getfield(x, positions[i])
-            column = columns === nothing ? nothing : columns[i]
-            retained, peakextra, count, payload =
-                addrecordestimate(retained, peakextra, count, payload,
-                                  field, fieldvalue, column, budget,
+            retained, peakextra, count =
+                addrecordestimate(retained, peakextra, count, field, fieldvalue, budget,
                                   p.schema.fields[i], diagnostics)
         end
-        return (OutputEstimate(retained, peakextra, count), payload)
+        return OutputEstimate(retained, peakextra, count)
     finally
         release!(budget, vectorbytes(Int, length(positions)))
     end
 end
 
-# ---- the writer's reader preflight -------------------------------------------------------
+# ---- the reader's per-block peak -------------------------------------------------------------
 
 "The reader-retained charge of the block table: one entry per block (offset, size, count, cumulative rows)."
 function blocktablecharge(nblocks::Int)
@@ -1236,109 +1212,13 @@ end
 
 """
 One block's transient reader-side peak: the compressed and decompressed buffers, the codec's
-decoder requirement, and the block's decoded output. One function for the writer preflight, sequential
-reading, and the parallel admission arithmetic.
+decoder requirement, and the block's decoded output. One function for the writer's per-block check,
+sequential reading, and the parallel admission arithmetic.
 """
 function readerblockpeak(compressedbytes::Int, decompressedbytes::Int, outputbytes::Int, codecmemory::Int, samebuffer::Bool)
     peak = checked_add(checked_add(bytesbytes(decompressedbytes), outputbytes), codecmemory)
     samebuffer || (peak = checked_add(peak, bytesbytes(compressedbytes)))
     return peak
-end
-
-"The streamed `Avro.Table` consumer projection of a record-root writer."
-mutable struct TablePreflight
-    const cols::Vector{Type}
-    const builderstate::Int
-    chunkbytes::Int      # chunk shells and capacities of the flushed blocks
-    payload::Int         # referenced payload of the flushed blocks, counted once
-    rows::Int
-    nblocks::Int
-    pendingpayload::Int  # referenced payload of the pending block
-end
-
-function TablePreflight(readerschema::RecordSchema, p::WRecord,
-                        readerplan::RecordPlan, budget::Budget)
-    n = length(readerschema.fields)
-    charge = checked_add(vectorbytes(Type, n), shellbytes(TablePreflight))
-    reserve!(budget, charge)
-    cols = Vector{Type}(undef, n)
-    for (index, field) in enumerate(readerschema.fields)
-        cols[index] = juliatype(field.schema)
-    end
-    preflight = TablePreflight(cols, columnbuildersstate(readerplan),
-                               0, 0, 0, 0, 0)
-    allocated!(budget, charge)
-    return preflight
-end
-
-"The final outer state retained by a materialised Table, excluding its column payload."
-function tableouterstate(ncols::Int, nblocks::Int)
-    wrappers = checked_add(shellbytes(Table),
-                           shellbytes(Tables.Schema{nothing,nothing}))
-    return checked_add(wrappers,
-        checked_add(vectorbytes(AbstractVector, ncols),
-        checked_add(vectorbytes(Symbol, ncols),
-        checked_add(vectorbytes(Symbol, ncols),
-        checked_add(vectorbytes(Type, ncols),
-                    vectorbytes(UnitRange{Int}, nblocks))))))
-end
-
-"The capacity of a zero-hint `BuildBuf` after `n` pushes."
-function tablebuildcapacity(n::Int)
-    capacity = 0
-    while capacity < n
-        capacity = max(checked_mul(2, capacity), 4)
-    end
-    return capacity
-end
-
-"The two streamed-Table index builders after `n` complete block pushes."
-function tablebuildstate(n::Int)
-    capacity = tablebuildcapacity(n)
-    shells = checked_add(shellbytes(BuildBuf{Int}),
-                         shellbytes(BuildBuf{Vector{AbstractVector}}))
-    return checked_add(shells,
-        checked_add(vectorbytes(Int, capacity),
-                    vectorbytes(Vector{AbstractVector}, capacity)))
-end
-
-"The exact index-builder peak while the `n`th block is pushed into both builders."
-function tablebuildpushpeak(n::Int)
-    oldcapacity = tablebuildcapacity(n - 1)
-    newcapacity = tablebuildcapacity(n)
-    oldcapacity == newcapacity && return tablebuildstate(n)
-    shells = checked_add(shellbytes(BuildBuf{Int}),
-                         shellbytes(BuildBuf{Vector{AbstractVector}}))
-    chunkgrowth = checked_add(vectorbytes(Vector{AbstractVector}, oldcapacity),
-        checked_add(vectorbytes(Vector{AbstractVector}, newcapacity),
-                    vectorbytes(Int, oldcapacity)))
-    countgrowth = checked_add(vectorbytes(Vector{AbstractVector}, newcapacity),
-        checked_add(vectorbytes(Int, oldcapacity), vectorbytes(Int, newcapacity)))
-    return checked_add(shells, max(chunkgrowth, countgrowth))
-end
-
-"The exact index-builder peak while both builders shrink to `n` entries."
-function tablebuildfinishpeak(n::Int)
-    capacity = tablebuildcapacity(n)
-    capacity == n && return tablebuildstate(n)
-    chunkshell = shellbytes(BuildBuf{Vector{AbstractVector}})
-    countshell = shellbytes(BuildBuf{Int})
-    chunkfinish = checked_add(checked_add(chunkshell, countshell),
-        checked_add(vectorbytes(Vector{AbstractVector}, capacity),
-        checked_add(vectorbytes(Vector{AbstractVector}, n), vectorbytes(Int, capacity))))
-    countfinish = checked_add(countshell,
-        checked_add(vectorbytes(Vector{AbstractVector}, n),
-        checked_add(vectorbytes(Int, capacity), vectorbytes(Int, n))))
-    return max(chunkfinish, countfinish)
-end
-
-"The output estimate of one record-root datum plus its column-consumer payload beyond the chunk slots."
-function estimaterootrecord(p::WRecord, pf::TablePreflight, x, budget::Budget,
-                            diagnostics::Union{Nothing,Encoder}=nothing)
-    estimate, payload = estimaterecordvalue(p, x, pf.cols, budget,
-                                            diagnostics)
-    return (checked_add(planrootslot(p), estimate.retained),
-            estimate.peakextra, estimate.values, payload)
 end
 
 # ---- Writer -----------------------------------------------------------------------------------------
@@ -1416,8 +1296,6 @@ mutable struct Writer
     const ownsink::Bool
     const encoder::Encoder
     const datumencoder::Encoder
-    const preflightbase::Int
-    const preflight::Union{Nothing,TablePreflight}
     const stagevalues::Bool
     fasttype::Any                    # single-entry aligned-NamedTuple cache
     fastplans::Any
@@ -1522,33 +1400,27 @@ function writerheaderentries(schema::Schema, codec::Symbol, metadata, limits::Li
 end
 
 """
-The reader's construction retention, preflighted under the writer's budget: the parsed
-schema graph a reader builds from the same JSON, the materialised metadata of a stream reader (key
-and value buffers plus the retained entries and map), and the generic read and datum-span plans. Returns
-`(preflightbase, preflight)`.
+Charge the writer with the work and memory a `Reader` spends constructing itself from this header — the
+parsed schema graph, the metadata map and the read and span plans — so writer and reader work counters
+agree and a schema a reader would reject under the same limits fails here.
 """
-function writerpreflight(schemajson::String, entries, plan, limits::Limits, budget::Budget;
-                         allow_invalid_names::Bool, allow_invalid_defaults::Bool)
-    base0 = budget.reserved
-    pfschema = parseschema(schemajson; allow_invalid_names=allow_invalid_names, allow_invalid_defaults=allow_invalid_defaults,
-                           limits=limits, budget=budget)
+function readerconstruction!(schemajson::String, entries, limits::Limits, budget::Budget;
+                             allow_invalid_names::Bool, allow_invalid_defaults::Bool)
+    schema = parseschema(schemajson; allow_invalid_names=allow_invalid_names,
+                         allow_invalid_defaults=allow_invalid_defaults, limits=limits, budget=budget)
     reserve!(budget, 2 * STORAGE[].vector + 16 * length(entries))   # the mirror key/value vectors, exact capacity
-    pfkeys = Vector{String}(undef, length(entries))
-    pfvals = Vector{Vector{UInt8}}(undef, length(entries))
+    keys = Vector{String}(undef, length(entries))
+    vals = Vector{Vector{UInt8}}(undef, length(entries))
     allocated!(budget, 2 * STORAGE[].vector + 16 * length(entries))
     for (j, (k, v)) in enumerate(entries)
-        reserve!(budget, checked_add(stringbytes(sizeof(k)), bytesbytes(length(v))))  # the retained metadata entry (byte and stream readers now charge identically)
-        pfkeys[j] = k
-        pfvals[j] = v
+        reserve!(budget, checked_add(stringbytes(sizeof(k)), bytesbytes(length(v))))  # the reader's own entry copy
+        keys[j] = k
+        vals[j] = v
     end
-    buildmap(Vector{UInt8}, pfkeys, pfvals, budget)
-    pfreadplan = readplan(pfschema; budget=budget)
-    spanplan(pfschema; budget=budget)
-    preflightbase = budget.reserved - base0
-    preflight = pfschema isa RecordSchema ?
-        TablePreflight(pfschema, plan::WRecord, pfreadplan::RecordPlan,
-                       budget) : nothing
-    return (preflightbase, preflight)
+    buildmap(Vector{UInt8}, keys, vals, budget)
+    readplan(schema; budget=budget)
+    spanplan(schema; budget=budget)
+    return nothing
 end
 
 "Write the container magic, the metadata block and the sync marker to the sink."
@@ -1610,9 +1482,8 @@ function Writer(dst::Union{AbstractString,IO}, schema::Schema; codec::Symbol=:nu
         reserve!(budget, wcodec.workspace)
         schemajson, entries = writerheaderentries(schema, codec, metadata, limits, budget)
         plan = writeplan(schema; budget=budget)
-        preflightbase, preflight = writerpreflight(schemajson, entries, plan, limits, budget;
-                                                   allow_invalid_names=allow_invalid_names,
-                                                   allow_invalid_defaults=allow_invalid_defaults)
+        readerconstruction!(schemajson, entries, limits, budget; allow_invalid_names=allow_invalid_names,
+                            allow_invalid_defaults=allow_invalid_defaults)
         path = dst isa AbstractString ?
             joinpath(realpath(joinpath(dirname(dst), ".")), basename(dst)) : nothing
         sink, temppath, ownsink = openwritersink(path === nothing ? dst : path, atomic)
@@ -1620,8 +1491,8 @@ function Writer(dst::Union{AbstractString,IO}, schema::Schema; codec::Symbol=:nu
         datumencoder = Encoder(budget)
         stagevalues = schemaneedsstaging(schema, budget)
         writer = Writer(sink, path, atomic ? temppath : nothing, schema, plan, wcodec, syncmarker, limits, budget,
-                        Int(block_bytes), fsync, ownsink, encoder, datumencoder, preflightbase,
-                        preflight, stagevalues, nothing, nothing, 0, 0, 0, 0, 0, false, nothing)
+                        Int(block_bytes), fsync, ownsink, encoder, datumencoder, stagevalues,
+                        nothing, nothing, 0, 0, 0, 0, 0, false, nothing)
         try
             writecontainerheader!(sink, entries, syncmarker)
         catch e
@@ -1717,8 +1588,7 @@ function pushdatum!(w::Writer, datum)
             nextrows <= w.limits.max_rows ||
                 throw(limiterror(w.budget, :max_rows, nextrows,
                                  w.limits.max_rows))
-            return pushaligneddatum!(w, datum, w.fastplans, w.preflight,
-                                     nextrows)
+            return pushaligneddatum!(w, datum, w.fastplans, nextrows)
         end
         return pushprepareddatum!(w, datum)
     end
@@ -2220,16 +2090,13 @@ function writercandidatefits(w::Writer, count::Int, payload::Int, values::Int,
     return true
 end
 
-@noinline function diagnosealignedestimate!(w::Writer, plans::Tuple,
-                                            datum::NamedTuple,
-                                            pf::Union{Nothing,TablePreflight})
+@noinline function diagnosealignedestimate!(w::Writer, plans::Tuple, datum::NamedTuple)
     checkpoint = writerworkcheckpoint(w.budget)
     reset!(w.datumencoder)
     beginworkdefer!(w.budget)
     try
         return withencoderroot!(w.datumencoder, w.schema) do
-            estimatealigned(plans, datum, pf === nothing ? nothing : pf.cols,
-                            w.budget, (w.schema::RecordSchema).fields,
+            estimatealigned(plans, datum, w.budget, (w.schema::RecordSchema).fields,
                             w.datumencoder)
         end
     finally
@@ -2255,17 +2122,14 @@ end
 end
 
 "Estimate and append one aligned row while its work counters remain deferred."
-@inline function preparealigneddatum!(w::Writer, datum::NamedTuple, plans::Tuple,
-                                      pf::Union{Nothing,TablePreflight})
+@inline function preparealigneddatum!(w::Writer, datum::NamedTuple, plans::Tuple)
     checkpoint = writerworkcheckpoint(w.budget)
     start = w.encoder.pos
     credited = w.encoder.credited
     complete = false
     beginworkdefer!(w.budget)
     try
-        eb, ep, ev, pp = estimatealigned(plans, datum,
-                                         pf === nothing ? nothing : pf.cols,
-                                         w.budget)
+        eb, ep, ev = estimatealigned(plans, datum, w.budget)
         eb <= w.limits.max_block_output_bytes ||
             throw(LimitError(:max_block_output_bytes, eb,
                              w.limits.max_block_output_bytes,
@@ -2283,7 +2147,7 @@ end
                              w.limits.max_block_bytes,
                              :max_block_bytes, :encode))
         complete = true
-        return (eb, ep, pp, datumbytes, datumvalues)
+        return (eb, ep, datumbytes, datumvalues)
     finally
         endworkdefer!(w.budget)
         restorewriterwork!(w.budget, checkpoint)
@@ -2295,15 +2159,14 @@ end
 end
 
 "The aligned NamedTuple path encodes in place and stages bytes only at a block boundary."
-@inline function pushaligneddatum!(w::Writer, datum::NamedTuple, plans::Tuple,
-                                   pf::Union{Nothing,TablePreflight}, nextrows::Int)
+@inline function pushaligneddatum!(w::Writer, datum::NamedTuple, plans::Tuple, nextrows::Int)
     start = w.encoder.pos
     credited = w.encoder.credited
-    eb, ep, pp, datumbytes, datumvalues = try
-        preparealigneddatum!(w, datum, plans, pf)
+    eb, ep, datumbytes, datumvalues = try
+        preparealigneddatum!(w, datum, plans)
     catch err
         if err isa EncodeError
-            isempty(err.path) ? diagnosealignedestimate!(w, plans, datum, pf) :
+            isempty(err.path) ? diagnosealignedestimate!(w, plans, datum) :
                                 diagnosealignedencode!(w, plans, datum)
         end
         rethrow()
@@ -2353,13 +2216,10 @@ end
         nextvalues = datumvalues
         boundary = true
     end
-    nextpendingpayload = 0
     try
         boundary &&
             (lowerfits = writercandidatefits(w, nextcount, nextpayload,
                                              nextvalues))
-        nextpendingpayload = pf === nothing ? 0 :
-            checked_add(pf.pendingpayload, pp)
         nextcount <= w.limits.max_block_count ||
             throw(limiterror(w.budget, :max_block_count, nextcount,
                              w.limits.max_block_count))
@@ -2382,7 +2242,6 @@ end
     w.pendingvalues = nextvalues
     w.pendingallowance = max(w.pendingallowance,
                              workdeficit(w.budget, datumvalues, datumbytes))
-    pf === nothing || (pf.pendingpayload = nextpendingpayload)
     (!lowerfits || w.encoder.pos >= w.blockbytes) && flushblock!(w)
     return w
 end
@@ -2390,7 +2249,6 @@ end
 function pushprepareddatum!(w::Writer, datum)
     nextrows = checked_add(w.budget.rows, 1)
     nextrows <= w.limits.max_rows || throw(limiterror(w.budget, :max_rows, nextrows, w.limits.max_rows))
-    pf = w.preflight
     fp = nothing
     if datum isa NamedTuple
         if w.fasttype === typeof(datum)
@@ -2404,15 +2262,15 @@ function pushprepareddatum!(w::Writer, datum)
         end
     end
     fp !== nothing && !w.stagevalues &&
-        return pushaligneddatum!(w, datum, fp, pf, nextrows)
+        return pushaligneddatum!(w, datum, fp, nextrows)
     checkpoint = writerworkcheckpoint(w.budget)
     preparedcharge = 0
-    eb = ep = ev = pp = datumbytes = datumvalues = 0
+    eb = ep = ev = datumbytes = datumvalues = 0
     reset!(w.datumencoder)
     beginworkdefer!(w.budget)
     complete = false
     try
-        datum, preparedcharge, eb, ep, ev, pp =
+        datum, preparedcharge, eb, ep, ev =
             withencoderroot!(w.datumencoder, w.schema) do
                 preparedvalue = datum
                 charge = 0
@@ -2420,20 +2278,11 @@ function pushprepareddatum!(w::Writer, datum)
                     preparedvalue, charge = preparewriterrecord(w.plan,
                         preparedvalue, w.budget, w.datumencoder)
                 end
-                if fp !== nothing
-                    estimate = estimatealigned(fp, preparedvalue,
-                        pf === nothing ? nothing : pf.cols, w.budget,
-                        (w.schema::RecordSchema).fields, w.datumencoder)
-                    return (preparedvalue, charge, estimate...)
-                elseif pf === nothing
-                    output, peak, values = estimaterootvalue(w.plan,
-                        preparedvalue, w.budget, w.datumencoder)
-                    return (preparedvalue, charge, output, peak, values, 0)
-                else
-                    estimate = estimaterootrecord(w.plan::WRecord, pf,
-                        preparedvalue, w.budget, w.datumencoder)
-                    return (preparedvalue, charge, estimate...)
-                end
+                estimate = fp !== nothing ?
+                    estimatealigned(fp, preparedvalue, w.budget,
+                                    (w.schema::RecordSchema).fields, w.datumencoder) :
+                    estimaterootvalue(w.plan, preparedvalue, w.budget, w.datumencoder)
+                return (preparedvalue, charge, estimate...)
             end
         eb > w.limits.max_block_output_bytes &&
             throw(LimitError(:max_block_output_bytes, eb, w.limits.max_block_output_bytes, :max_block_output_bytes, :encode))
@@ -2492,7 +2341,6 @@ function pushprepareddatum!(w::Writer, datum)
         w.pendingvalues = nextvalues
         w.pendingallowance = max(w.pendingallowance,
                                  workdeficit(w.budget, datumvalues, datumbytes))
-        pf === nothing || (pf.pendingpayload = checked_add(pf.pendingpayload, pp))
         (!lowerfits || w.encoder.pos >= w.blockbytes) && flushblock!(w)
         return w
     finally
@@ -2550,84 +2398,6 @@ function flushblock!(w::Writer)
         nextblocks = checked_add(w.budget.blocks, 1)
         nextblocks <= w.limits.max_blocks ||
             throw(limiterror(w.budget, :max_blocks, nextblocks, w.limits.max_blocks))
-        pf = w.preflight
-        chunk = payload = rows = 0
-        tableprojected = directbase = streambase = 0
-        if pf !== nothing
-            # The complete mapped and streamed Table peaks with this block included: retained value
-            # payload once, exact column/chunk vectors, construction scratch, and final outer state.
-            n = w.pendingcount
-            chunk = pf.chunkbytes
-            finals = 0
-            rows = pf.rows + n
-            ncols = length(pf.cols)
-            nblocks = pf.nblocks + 1
-            currentcolumns = 0
-            for E in pf.cols
-                currentcolumn = vectorbytes(E, n)
-                currentcolumns = checked_add(currentcolumns, currentcolumn)
-                chunk = checked_add(chunk, currentcolumn)
-                finals = checked_add(finals, vectorbytes(E, rows))
-            end
-            chunk = checked_add(chunk, vectorbytes(AbstractVector, ncols))
-            payload = checked_add(pf.payload, pf.pendingpayload)
-            finalouter = vectorbytes(AbstractVector, ncols)
-            counts = vectorbytes(Int, nblocks)
-            coltypes = vectorbytes(Type, ncols)
-            kept = vectorbytes(Int, ncols)
-            chunkindex = vectorbytes(Vector{AbstractVector}, nblocks)
-            assembly = checked_add(w.preflightbase,
-                checked_add(payload,
-                checked_add(chunk,
-                checked_add(finals,
-                checked_add(finalouter,
-                checked_add(coltypes,
-                checked_add(kept, checked_add(counts, chunkindex))))))))
-            streamfinish = checked_add(w.preflightbase,
-                checked_add(payload,
-                checked_add(chunk,
-                checked_add(coltypes,
-                checked_add(kept, tablebuildfinishpeak(nblocks))))))
-            streampush = checked_add(w.preflightbase,
-                checked_add(payload,
-                checked_add(chunk,
-                checked_add(coltypes,
-                checked_add(kept,
-                checked_add(pf.builderstate, tablebuildpushpeak(nblocks)))))))
-            finalstate = checked_add(w.preflightbase,
-                checked_add(payload,
-                checked_add(finals,
-                checked_add(tableouterstate(ncols, nblocks),
-                            checked_add(coltypes, checked_add(kept, counts))))))
-            direct = checked_add(w.preflightbase,
-                checked_add(payload,
-                checked_add(finals,
-                checked_add(finalouter,
-                checked_add(coltypes,
-                checked_add(kept,
-                checked_add(counts,
-                checked_add(pf.builderstate,
-                            blocktablecharge(nextpow2rows(nblocks))))))))))
-            tableprojected = max(assembly, streamfinish, streampush, finalstate, direct)
-            directbase = checked_add(w.preflightbase,
-                checked_add(pf.payload,
-                checked_add(finals,
-                checked_add(finalouter,
-                checked_add(coltypes,
-                checked_add(kept,
-                checked_add(pf.builderstate,
-                            blocktablecharge(nextpow2rows(nblocks)))))))))
-            streambase = checked_add(w.preflightbase,
-                checked_add(pf.payload,
-                checked_add(pf.chunkbytes,
-                checked_add(currentcolumns,
-                checked_add(coltypes,
-                checked_add(kept,
-                checked_add(pf.builderstate, tablebuildstate(pf.nblocks))))))))
-            tableprojected <= w.budget.ceiling ||
-                throw(LimitError(:max_total_bytes, tableprojected, w.budget.ceiling,
-                                 :max_total_bytes, :encode))
-        end
         reserve!(w.budget, bytesbytes(w.encoder.pos))              # the pending-block copy, before take!
         blockbytes = take!(w.encoder)
         allocated!(w.budget, bytesbytes(length(blockbytes)))
@@ -2641,17 +2411,6 @@ function flushblock!(w::Writer)
         outputpeak = checked_add(w.pendingbytes, w.pendingpeak)
         peak = readerblockpeak(length(compressed), length(blockbytes), outputpeak,
                                w.wcodec.name === :null ? 0 : w.limits.max_codec_memory, w.wcodec.name === :null)
-        if pf !== nothing
-            tableoutput = checked_add(pf.pendingpayload, w.pendingpeak)
-            tableblock = readerblockpeak(length(compressed), length(blockbytes), tableoutput,
-                                         w.wcodec.name === :null ? 0 : w.limits.max_codec_memory,
-                                         w.wcodec.name === :null)
-            tableprojected = max(tableprojected, checked_add(directbase, tableblock),
-                                 checked_add(streambase, tableblock))
-            tableprojected <= w.budget.ceiling ||
-                throw(LimitError(:max_total_bytes, tableprojected, w.budget.ceiling,
-                                 :max_total_bytes, :encode))
-        end
         reserve!(w.budget, peak)                       # one block's transient reader peak fits the ceiling
         unreserve!(w.budget, peak)                     # a pure admission probe; nothing was allocated
         writevarint(w.sink, w.pendingcount)
@@ -2661,13 +2420,6 @@ function flushblock!(w::Writer)
             Base.write(w.sink, b)
         end
         commitwriterwork!(w, projection, nextblocks)
-        if pf !== nothing
-            pf.chunkbytes = chunk
-            pf.payload = payload
-            pf.rows = rows
-            pf.nblocks += 1
-            pf.pendingpayload = 0
-        end
     catch e
         poison!(w, e)
         rethrow()

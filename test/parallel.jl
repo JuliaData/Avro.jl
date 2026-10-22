@@ -297,11 +297,12 @@
         @test es1 isa Avro.DataError && es8 isa Avro.DataError && es1.msg == es8.msg
         both = geterr(() -> Avro.Table(IOBuffer(corrupt(cut, 5)); ntasks=8, limits=workerlimits))
         @test both isa Avro.DataError && both.msg == e1.msg                      # the content failure at 5 wins
-        # a file whose total exceeds the default ceiling fails identically before any decode
+        # a file whose total exceeds the ceiling fails identically at every ntasks
         bigrows = [(a=Int64(i), b="x"^1500, c=1.0, e="X") for i in 1:250_000]
         bigraised = take!(Avro.tobuffer(bigrows; schema=s, codec=:deflate, block_bytes=1 << 20, limits=raised))
-        eb1 = geterr(() -> Avro.Table(IOBuffer(bigraised); ntasks=1))
-        eb8 = geterr(() -> Avro.Table(IOBuffer(bigraised); ntasks=8))
+        ceiling = Avro.Limits(max_total_bytes=256 << 20)
+        eb1 = geterr(() -> Avro.Table(IOBuffer(bigraised); ntasks=1, limits=ceiling))
+        eb8 = geterr(() -> Avro.Table(IOBuffer(bigraised); ntasks=8, limits=ceiling))
         @test eb1 isa Avro.LimitError && eb8 isa Avro.LimitError
         @test eb1.limit === eb8.limit && eb1.observed == eb8.observed
     end

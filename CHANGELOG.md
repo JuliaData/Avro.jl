@@ -29,12 +29,13 @@ deferred.
   an effective schema that `Avro.write` round-trips.
 - Parallel container decoding: `Avro.Table(src; ntasks=…)` — identical results, acceptance and errors
   at every `ntasks`; parallelism only uses headroom under the memory ceiling.
-- Fixed, validated resource limits (`Avro.Limits`) with one 256 MiB per-operation default ceiling, a
+- Fixed, validated resource limits (`Avro.Limits`) with one 16 GiB per-operation default ceiling, a
   decompression work rule, per-block caps, and an opt-in `Symbol`-admission table
   (`Avro.SymbolAdmission`, `names=` everywhere `Symbol`s are produced).
 - Validation modes: `validate=:strict` (default) and `:fast`.
-- Writer safety: atomic file replacement, failure poisoning, and a preflight that guarantees every
-  successfully written file is readable by every guaranteed consumer under identical limits.
+- Writer safety: atomic file replacement, failure poisoning, and the reader's per-schema, per-block
+  and per-datum limits enforced at write time, so every successfully written file streams through
+  `Reader` and `Rows` under identical limits.
 - Codecs: `zstandard`, `snappy`, `deflate`, `null` built in; `bzip2` and `xz` via package extensions
   (`using CodecBzip2` / `using CodecXz`); per-frame decoder-memory verification on write.
 - `Avro.inspect`: bounded container header and framing diagnostics (codec, schema, block structure).

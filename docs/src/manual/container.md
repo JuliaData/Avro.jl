@@ -31,9 +31,9 @@ end
 close(w)
 ```
 
-A `Writer` enforces every limit a reader enforces and preflights the reader's complete memory peak,
-so **everything a successfully closed writer emits is accepted by every guaranteed consumer under
-identical limits** (see [Limits and security](limits-and-security.md)). The first failure poisons the
+A `Writer` enforces every per-schema, per-block and per-datum limit a reader enforces, so **everything
+a successfully closed writer emits is accepted by `Reader` and `Rows` under identical limits**, and by
+`Avro.Table` when the table fits `max_total_bytes` (see [Limits and security](limits-and-security.md)). The first failure poisons the
 writer, including a rejected datum or limit failure from `push!`; further use throws
 `Avro.WriterClosedError` carrying the original cause. Closing a poisoned writer discards its buffered
 block. For `atomic=false` and caller-owned streams, no repair of partial output is promised.

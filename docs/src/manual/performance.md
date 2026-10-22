@@ -10,8 +10,7 @@
   in order encode monomorphized.
 * **Projection**: `select=` skips what you don't read; `validate=:fast` additionally jumps sized
   blocks (choose it only for trusted data).
-* **Parallelism needs headroom**: default limits leave none, so raise the ceiling
-  (`Limits(max_total_bytes=4 << 30)`) for `ntasks > 1` to engage, and give files multi-megabyte blocks
-  (`block_bytes=` on the writer) so per-block overheads amortise.
+* **Parallelism needs headroom** under `max_total_bytes` (ample at the default) and files with
+  multi-megabyte blocks (`block_bytes=` on the writer) so per-block overheads amortise.
 * **Column access beats row access** for bulk work: `Avro.Table` decodes straight into typed columns.
 * Typed decoding into concrete structs avoids the generic model's boxing for isbits fields.

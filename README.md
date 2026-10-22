@@ -59,8 +59,9 @@ value = Avro.decode(s, bytes)
   metadata); `Avro.Rows` streams `Avro.Row`s; `select=` is projection pushdown that skips unselected
   fields; typed decoding into your own structs via StructUtils.
 * **Parallel decoding**: `Avro.Table(src; ntasks=…)` decodes blocks in parallel when the memory
-  ceiling leaves room (raise `max_total_bytes`); results and errors match `ntasks=1`.
-* **Safety by default**: each operation's memory is capped (256 MiB by default), decompression work is
+  ceiling leaves room; results and errors match `ntasks=1`.
+* **Safety by default**: claimed lengths and counts are checked against the input before allocation,
+  each container block's decompressed size is capped, each operation's memory is capped (16 GiB), work is
   bounded, and input is validated strictly; a service can cap `Symbol` creation with
   `names=Avro.SymbolAdmission(...)`. Raise any limit with `Avro.Limits` for trusted bulk workloads.
 * **Interoperability**: files are round-tripped against the Java (avro-tools 1.12.2) and Python
