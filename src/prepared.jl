@@ -223,8 +223,9 @@ end
     Avro.DatumWriter(schema, T; limits=Limits())
 
 A prepared encoder with a reusable buffer (single-owner): `writer(x) -> Vector{UInt8}` returns a fresh
-owned buffer; `writer(io, x)` appends to `io`. The typed form fixes the datum type `T`; when `T` is a
-NamedTuple aligned with the record schema, encoding into a reused buffer does not allocate.
+owned buffer; `writer(io, x)` appends to `io` without creating a result vector for each call. The typed
+form fixes the datum type `T` and prepares an optimized path for supported NamedTuple fields aligned
+with the record schema. Reused buffers may still grow when a larger value is written.
 """
 function DatumWriter(schema::Schema; limits::Limits=Limits())
     plan = withbudget(limits; direction=:encode) do b
