@@ -18,7 +18,9 @@ call; use prepared objects for repeated work.
 dr = Avro.DatumReader(s)               # generic decoding
 drT = Avro.DatumReader(s, T)           # typed decoding into T
 dw = Avro.DatumWriter(s)               # accepts any encodable value
-dwT = Avro.DatumWriter(s, T)           # the typed kernel: zero allocations for aligned NamedTuples
+dwT = Avro.DatumWriter(s, T)           # fixes the input type and reuses its prepared plan
+bytes = dwT(value)                    # returns a new owned byte vector
+dwT(io, value)                       # appends to an existing output stream
 ```
 
 `DatumReader` objects are safe to share across tasks because each call owns its decoder state.

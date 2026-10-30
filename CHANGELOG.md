@@ -47,8 +47,8 @@ deferred.
   parameters).
 - Legacy support for files written by Avro.jl ≤ 1.1.2: `legacy=:avrojl1` and
   `decimal_byteorder=:little`.
-- Prepared codecs: `Avro.DatumReader(schema[, T])` and `Avro.DatumWriter(schema[, T])` — the typed
-  writer encodes aligned NamedTuples with zero allocations.
+- Prepared codecs: `Avro.DatumReader(schema[, T])` and `Avro.DatumWriter(schema[, T])` reuse plans
+  across calls; writers accept a reusable output buffer or return a fresh byte vector.
 
 ### Changed (breaking)
 

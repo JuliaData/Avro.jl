@@ -1,7 +1,9 @@
 # Benchmarks
 
 `AVRO_PERF=true` in the test suite runs the performance gates in `test/perf.jl`. Each number is the
-median of 5 cold processes; workloads use 1 M deterministic `{id, x, name, flag}` rows. The gates
+median of 5 fresh processes. Within each process, workload metrics use the best of 3 repetitions
+after one warm-up; load and time to first table measure cold startup directly. Workloads use 1 M
+deterministic `{id, x, name, flag}` rows. The gates
 are calibrated for an Apple M3 Max and compare against Avro.jl 1.1.2 measured there with Julia
 1.12.6 (2026-08-24): `writetable` 0.946 s, `readtable` plus materialisation 5.051 s.
 

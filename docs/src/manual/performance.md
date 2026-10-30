@@ -5,7 +5,7 @@
 ## Getting the numbers
 
 * **Prepared beats one-shot**: `DatumReader`/`DatumWriter` skip per-call plan construction. For repeated
-  writes, reuse a typed `DatumWriter(schema, T)` and an output `IO` or `Encoder`; calling `writer(row)`
+  writes, reuse a typed `DatumWriter(schema, T)` and an output `IO`; calling `writer(row)`
   returns a new owned byte vector each time.
 * **Writers fast-path aligned NamedTuples** automatically — rows whose fields match the record schema
   in order (up to 32 fields) encode monomorphized. Other column tables and strided vectors of concrete
