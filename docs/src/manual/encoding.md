@@ -62,6 +62,13 @@ p = dr(bytes)
 `DateTime` (an explicit range-checked conversion from the exact timestamp wrappers) and StructUtils
 customisations are supported. Conversion failures raise `Avro.ConversionError`.
 
+When the target has a field absent from the reader schema, its StructUtils default factory runs for
+**each decoded value**. This keeps mutable defaults independent and evaluates defaults such as
+`uuid4()` or `now()` per row. On StructUtils versions supporting dependent defaults, factories can
+use earlier fields in the target type's declaration order. These conversions use StructUtils in caller space; their user-defined
+allocations are outside Avro's decoding budget. Fields supplied by the schema and implicit
+`missing`/`nothing` defaults keep the direct typed path.
+
 ## Validation modes
 
 Every read path takes `validate=:strict` (the default: every value walked and validated, blocks

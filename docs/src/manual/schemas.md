@@ -21,7 +21,8 @@ Schema nodes are immutable; records, enums and fixed carry their full names
 
 Two repair options admit historically produced schemas: `allow_invalid_names=true` (invalid names are
 kept and the graph is marked repaired) and `allow_invalid_defaults=true`. Operations that depend on
-canonical form reject repaired schemas, and a `Writer` requires the matching option to write one.
+canonical form reject repaired names; invalid defaults do not affect canonical form. A `Writer`
+requires the matching repair option to write either kind of repaired schema.
 
 ## Constructing schemas programmatically
 

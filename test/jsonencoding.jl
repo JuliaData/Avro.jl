@@ -211,14 +211,52 @@
             @test tight.reserved == tight.ceiling - Avro.bytesbytes(payloadbytes)
         end
 
-        fixedschema = P("{\"type\":\"fixed\",\"name\":\"OwnedFixed\",\"size\":1}")
-        fixedbudget = Avro.Budget(Avro.Limits())
-        fixedparsed = parsedjson("\"x\"", fixedbudget)
-        fixedbefore = fixedbudget.reserved
-        fixedvalue = Avro.jsontovalue(fixedschema, fixedparsed,
-                                      Avro.JSONContext(fixedbudget, false, false), 1)
-        @test fixedvalue.bytes == UInt8['x']
-        @test fixedbudget.reserved - fixedbefore == Avro.fixedbytes(1)
+        for annotation in ("", ",\"logicalType\":\"future-type\"")
+            fixedschema = P("{\"type\":\"fixed\",\"name\":\"OwnedFixed\",\"size\":1" * annotation * "}")
+            fixedbudget = Avro.Budget(Avro.Limits())
+            fixedparsed = parsedjson("\"x\"", fixedbudget)
+            fixedbefore = fixedbudget.reserved
+            fixedvalue = Avro.jsontovalue(fixedschema, fixedparsed,
+                                          Avro.JSONContext(fixedbudget, false, false), 1)
+            @test fixedvalue.bytes == UInt8['x']
+            @test fixedbudget.reserved - fixedbefore == Avro.fixedbytes(1)
+
+            tight = Avro.Budget(Avro.Limits())
+            parsed = parsedjson("\"x\"", tight)
+            Avro.reserve!(tight, tight.ceiling - tight.reserved - Avro.fixedbytes(1) + 1)
+            @test_throws Avro.LimitError Avro.jsontovalue(
+                fixedschema, parsed, Avro.JSONContext(tight, false, false), 1)
+        end
+    end
+
+    @testset "string limits across JSON, binary and resolved defaults" begin
+        cases = (
+            ("\"string\"", "\"abc\"", 3),
+            ("\"string\"", "\"\\u00e9\"", 2),
+            ("{\"type\":\"string\",\"logicalType\":\"future-type\"}", "\"abc\"", 3),
+            ("{\"type\":\"string\",\"logicalType\":\"uuid\"}",
+             "\"123e4567-e89b-12d3-a456-426614174000\"", 36),
+            ("{\"type\":\"map\",\"values\":\"null\"}", "{\"abc\":null}", 3),
+            ("{\"type\":\"map\",\"values\":\"null\"}", "{\"\\u00e9\":null}", 2),
+        )
+        writer = P("{\"type\":\"record\",\"name\":\"BoundedDefault\",\"fields\":[]}")
+        for (schematext, text, nbytes) in cases
+            schema = P(schematext)
+            at = Avro.Limits(max_bytes=nbytes, max_datum_bytes=256)
+            over = Avro.Limits(max_bytes=nbytes - 1, max_datum_bytes=256)
+            value = Avro.fromjson(schema, text; limits=at)
+            bytes = Avro.encode(schema, value; limits=at)
+            @test isequal(Avro.decode(schema, bytes; limits=at), value)
+            @test_throws Avro.LimitError Avro.fromjson(schema, text; limits=over)
+            @test_throws Avro.LimitError Avro.decode(schema, bytes; limits=over)
+
+            reader = P("{\"type\":\"record\",\"name\":\"BoundedDefault\",\"fields\":[" *
+                       "{\"name\":\"value\",\"type\":" * schematext * ",\"default\":" * text * "}]}")
+            prepared = Avro.DatumReader(writer; reader_schema=reader, limits=at)
+            @test isequal(prepared(UInt8[]).value, value)
+            @test_throws Avro.LimitError Avro.DatumReader(
+                writer; reader_schema=reader, limits=over)(UInt8[])
+        end
     end
 
     @testset "pretty printing, limits, typed targets, fixtures" begin

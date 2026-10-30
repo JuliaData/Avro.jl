@@ -1,5 +1,5 @@
 module TypedTestTypes
-using StructUtils, Dates
+using StructUtils, Dates, UUIDs
 
 struct Plain
     a::Int
@@ -50,6 +50,27 @@ StructUtils.@kwarg struct WithDefault
     extra::String = "dflt"
     opt::Union{Missing,Int} = missing
 end
+StructUtils.@kwarg struct MutableDefault
+    a::Int64
+    extra::Vector{Int} = Int[]
+end
+StructUtils.@kwarg struct NestedMutableDefault
+    a::Int64
+    extra::NamedTuple{(:items,),Tuple{Vector{Int}}} = (items=Int[],)
+end
+const DEFAULT_FACTORY_CALLS = Ref(0)
+nextdefault() = (DEFAULT_FACTORY_CALLS[] += 1)
+StructUtils.@kwarg struct GeneratedDefault
+    a::Int64
+    sequence::Int64 = nextdefault()
+    id::UUID = uuid4()
+end
+struct DependentDefault
+    a::Int64
+    twice::Int64
+end
+StructUtils.fielddefaults(::StructUtils.StructStyle, ::Type{DependentDefault}, values) =
+    (twice=2 * values[1],)
 struct NoDefault
     a::Int
     extra::String
@@ -221,6 +242,13 @@ end
         # decoded scalars are not collections
         @test_throws Avro.ConversionError Avro.decode(P("\"string\""), Avro.encode(P("\"string\""), "abc"), Vector{UInt8})
         @test_throws Avro.ConversionError Avro.decode(P("\"long\""), Avro.encode(P("\"long\""), 5), Vector{Int})
+        nullschema = Avro.NullSchema()
+        for T in (Vector{Any}, Dict{String,Any}, NamedTuple{(),Tuple{}})
+            @test_throws Avro.ConversionError Avro.decode(nullschema, UInt8[], T)
+            @test_throws Avro.ConversionError Avro.fromjson(nullschema, "null", T)
+        end
+        @test Avro.decode(nullschema, UInt8[], Union{Missing,Vector{Any}}) === missing
+        @test Avro.decode(nullschema, UInt8[], Union{Nothing,Dict{String,Any}}) === nothing
         # a union branch's own Julia type wins; Float16 does not overflow silently
         il = P("""["int","long"]""")
         @test Avro.decode(il, Avro.encode(il, Avro.UnionValue(2, typemax(Int64))), Union{Int32,Int64}) === typemax(Int64)
@@ -307,6 +335,72 @@ end
         # timestamps out of the DateTime range
         far = Avro.encode(P("{\"type\":\"long\",\"logicalType\":\"timestamp-millis\"}"), Avro.Timestamp{Millisecond}(typemax(Int64)))
         @test_throws Avro.ConversionError Avro.decode(P("{\"type\":\"long\",\"logicalType\":\"timestamp-millis\"}"), far, DateTime)
+    end
+
+    @testset "mutable target defaults are fresh for each decoded value" begin
+        defaultschema = P("""{"type":"record","name":"D","fields":[{"name":"a","type":"long"}]}""")
+        promotedwriter = P("""{"type":"record","name":"D","fields":[{"name":"a","type":"int"}]}""")
+        for (T, contents) in ((TypedTestTypes.MutableDefault, x -> x.extra),
+                              (TypedTestTypes.NestedMutableDefault, x -> x.extra.items))
+            for source in (defaultschema, promotedwriter)
+                defaultbytes = Avro.encode(source, (a=1,))
+                defaultreader = source === defaultschema ? Avro.DatumReader(source, T) :
+                    Avro.DatumReader(source, T; reader_schema=defaultschema)
+                @test defaultreader.plan isa Avro.SemanticTarget
+                firstvalue, secondvalue = defaultreader(defaultbytes), defaultreader(defaultbytes)
+                @test contents(firstvalue) !== contents(secondvalue)
+                push!(contents(firstvalue), 99)
+                @test isempty(contents(secondvalue))
+                @test isempty(contents(defaultreader(defaultbytes)))
+                @test isempty(contents(Avro.decode(source, defaultbytes, T; reader_schema=defaultschema)))
+                @test isempty(contents(Avro.fromjson(source, "{\"a\":1}", T)))
+
+                defaultio = IOBuffer()
+                Avro.write(defaultio, [(a=1,), (a=2,), (a=3,)]; schema=source)
+                defaultrows = collect(Avro.Rows(take!(defaultio); T, reader_schema=defaultschema))
+                @test length(defaultrows) == 3
+                @test contents(defaultrows[1]) !== contents(defaultrows[2])
+                push!(contents(defaultrows[1]), 99)
+                @test isempty(contents(defaultrows[2])) && isempty(contents(defaultrows[3]))
+            end
+        end
+        # Implicit optional defaults retain the direct route, including resolution.
+        @test Avro.DatumReader(defaultschema, Optional).plan isa Avro.RecordTarget
+        @test Avro.DatumReader(promotedwriter, Optional; reader_schema=defaultschema).plan isa Avro.ResolvedRecordTarget
+        for source in (defaultschema, promotedwriter)
+            TypedTestTypes.DEFAULT_FACTORY_CALLS[] = 0
+            factoryreader = Avro.DatumReader(source, TypedTestTypes.GeneratedDefault; reader_schema=defaultschema)
+            @test TypedTestTypes.DEFAULT_FACTORY_CALLS[] == 0
+            factorybytes = Avro.encode(source, (a=3,))
+            firstvalue, secondvalue = factoryreader(factorybytes), factoryreader(factorybytes)
+            @test (firstvalue.sequence, secondvalue.sequence) == (1, 2)
+            @test firstvalue.id != secondvalue.id
+            @test TypedTestTypes.DEFAULT_FACTORY_CALLS[] == 2
+            oneshot = Avro.decode(source, factorybytes, TypedTestTypes.GeneratedDefault; reader_schema=defaultschema)
+            jsonvalue = Avro.fromjson(source, "{\"a\":3}", TypedTestTypes.GeneratedDefault)
+            @test (oneshot.sequence, jsonvalue.sequence) == (3, 4)
+            @test TypedTestTypes.DEFAULT_FACTORY_CALLS[] == 4
+            factoryio = IOBuffer()
+            Avro.write(factoryio, [(a=1,), (a=2,)]; schema=source)
+            factoryrows = Avro.Rows(take!(factoryio); T=TypedTestTypes.GeneratedDefault, reader_schema=defaultschema)
+            @test TypedTestTypes.DEFAULT_FACTORY_CALLS[] == 4
+            rowvalues = collect(factoryrows)
+            @test getfield.(rowvalues, :sequence) == [5, 6]
+            @test TypedTestTypes.DEFAULT_FACTORY_CALLS[] == 6
+            @test rowvalues[1].id != rowvalues[2].id
+            dependent = Avro.DatumReader(source, TypedTestTypes.DependentDefault; reader_schema=defaultschema)
+            @test dependent(factorybytes).twice == 6
+        end
+        fullschema = P("""{"type":"record","name":"Full","fields":[
+            {"name":"a","type":"long"},{"name":"sequence","type":"long"},
+            {"name":"id","type":{"type":"string","logicalType":"uuid"}}]}""")
+        TypedTestTypes.DEFAULT_FACTORY_CALLS[] = 0
+        fullreader = Avro.DatumReader(fullschema, TypedTestTypes.GeneratedDefault)
+        @test fullreader.plan isa Avro.RecordTarget
+        @test TypedTestTypes.DEFAULT_FACTORY_CALLS[] == 0
+        id = UUID("123e4567-e89b-12d3-a456-426614174000")
+        @test fullreader(Avro.encode(fullschema, (a=1, sequence=7, id=id))).sequence == 7
+        @test TypedTestTypes.DEFAULT_FACTORY_CALLS[] == 0
     end
 
     @testset "struct targets: fast route never calls a constructor" begin

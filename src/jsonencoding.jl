@@ -577,7 +577,7 @@ end
 function jsonkind(s::FixedSchema, j, ctx, depth)
     bytes = bytesfromjson(j, s.size, ctx)
     l = s.logical
-    if l !== nothing
+    if l isa Union{DecimalLogical,UUIDLogical,DurationLogical}
         try
             l isa DecimalLogical && return decimalfromvector(bytes, l, ctx)
             l isa UUIDLogical && return uuidfrombytes(bytes)
@@ -593,6 +593,7 @@ end
 
 function jsonkind(s::StringSchema, j, ctx, depth)
     j isa String || jsonerror(ctx, "expected a string, got ", describejson(j))
+    checkvaluebytes(ctx.budget, sizeof(j))
     isstrictutf8(j) ||
         jsonerror(ctx, "string is not valid UTF-8 (lone surrogate escape)")
     if s.logical isa UUIDLogical
@@ -602,7 +603,6 @@ function jsonkind(s::StringSchema, j, ctx, depth)
         return u
     end
     if ctx.copystrings
-        checkvaluebytes(ctx.budget, sizeof(j))
         return ownedstringcopy(j, ctx.budget)
     end
     return j                                           # transfer the parser-owned immutable string
@@ -642,10 +642,10 @@ function jsonkind(s::MapSchema, j, ctx, depth)
     vals = Vector{V}(undef, n)
     for i in 1:n
         k = ks[i]
+        checkvaluebytes(ctx.budget, sizeof(k))
         isstrictutf8(k) ||
             jsonerror(ctx, "map key is not valid UTF-8 (lone surrogate escape)")
         if ctx.copystrings
-            checkvaluebytes(ctx.budget, sizeof(k))
             keys[i] = ownedstringcopy(k, ctx.budget)
         else
             keys[i] = k

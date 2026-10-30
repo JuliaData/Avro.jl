@@ -1564,7 +1564,7 @@ function pushdatum!(w::Writer, datum)
     return pushprepareddatum!(w, datum)
 end
 
-"Push one row through the aligned fast path: a `NamedTuple` and its plan tuple, or a `CellRow` and its column cells."
+"Push one row through the aligned fast path: a `NamedTuple` and its plan tuple, or a `CellRow` and its field cells."
 function pushalignedrow!(w::Writer, datum, plans)
     nextrows = checked_add(w.budget.rows, 1)
     nextrows <= w.limits.max_rows ||
@@ -2527,8 +2527,8 @@ end
 """
 Push one partition. A column table whose columns match the record schema's fields in order (up to the
 aligned-row width) is pushed as typed `NamedTuple` rows, which take the writer's aligned fast path, as
-is a vector of one concrete `NamedTuple` type. Any other column table with a column for every field
-is pushed through per-column cells; other sources are pushed row by row.
+is an aligned vector of one concrete `NamedTuple` type. Other column tables and strided NamedTuple
+vectors with every field present use per-field cells; other sources are pushed row by row.
 """
 function pushpartition!(w::Writer, part, rows)
     rows isa AbstractVector && isconcretetype(eltype(rows)) && eltype(rows) <: NamedTuple &&
@@ -2566,7 +2566,8 @@ function pushcolumns!(w::Writer, cols::NamedTuple, ::Type{R}) where {R<:NamedTup
     for c in cols
         length(c) == n || throw(ArgumentError("table columns have different lengths"))
     end
-    return pushrowsof!(w, i -> R(map(c -> c[firstindex(c) + i - 1], values(cols))), R, n)
+    return pushrowsof!(w, i -> R(ntuple(j -> cols[j][firstindex(cols[j]) + i - 1],
+                                       Val(fieldcount(R)))), R, n)
 end
 
 """
@@ -2618,7 +2619,39 @@ function pushcellrows!(w::Writer, cells::Vector{WriteCell}, n::Int)
 end
 
 function pushnamedtuples!(w::Writer, rows::AbstractVector{R}) where {R<:NamedTuple}
+    isempty(rows) && return w
+    if !alignedcolumns(w.schema, fieldnames(R)) && pushrowcells!(w, rows)
+        return w
+    end
     return pushrowsof!(w, i -> @inbounds(rows[firstindex(rows) + i - 1]), R, length(rows))
+end
+
+"Use typed field views over the original rows without materializing columns or boxing whole rows."
+function pushrowcells!(w::Writer, rows::AbstractVector{R}) where {R<:NamedTuple}
+    # Custom vectors may compute or consume a row on access; only strided storage permits field views.
+    rows isa StridedVector{R} || return false
+    p = w.plan
+    (p isa WRecord && !isempty(p.fields) && !w.stagevalues) || return false
+    positions = recordfieldpositions(p, R, w.budget)
+    reserved = vectorbytes(Int, length(positions))
+    try
+        any(==(0), positions) && return false
+        charge = checked_add(vectorbytes(WriteCell, length(positions)), shellbytes(CellRow))
+        for (k, j) in enumerate(positions)
+            C = RowCell{typeof(p.fields[k]),fieldtype(R, j),typeof(rows)}
+            charge = checked_add(charge, boxbytes(C))
+        end
+        reserve!(w.budget, charge)
+        reserved += charge
+        cells = Vector{WriteCell}(undef, length(positions))
+        for (k, j) in enumerate(positions)
+            cells[k] = RowCell(p.fields[k], rows, j)
+        end
+        pushcellrows!(w, cells, length(rows))
+        return true
+    finally
+        release!(w.budget, reserved)
+    end
 end
 
 "Push `row(i)` for `i` in `1:n`; after the first row, aligned rows skip the dynamic plan lookup."

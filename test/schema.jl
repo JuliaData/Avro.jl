@@ -164,8 +164,30 @@
         @test_throws Avro.SchemaError P("""{"type":{"type":"string"}}""")
         @test_throws Avro.SchemaError P("""{"type":["null","int"]}""")
         @test_throws Avro.SchemaError P("""{"type":"union"}""")
-        @test_throws Avro.SchemaError P("""{"type":"E"}""")            # a named reference must be a string
-        @test_throws Avro.SchemaError P("""{"type":"record","name":"R","fields":[{"name":"e","type":{"type":"enum","name":"E","symbols":["A"]}},{"name":"f","type":{"type":"E"}}]}""")
+        @test_throws Avro.SchemaError P("""{"type":"E"}""")            # undefined named reference
+        for definition in (
+            """{"type":"enum","name":"E","symbols":["A"]}""",
+            """{"type":"fixed","name":"E","size":1}""",
+            """{"type":"record","name":"E","fields":[]}""",
+        )
+            s = P("""{"type":"record","name":"ns.R","fields":[
+                {"name":"e","type":$definition},
+                {"name":"f","type":{"type":"E","reference-only":true}},
+                {"name":"g","type":{"type":"ns.E"}}]}""")
+            @test s.fields[1].schema === s.fields[2].schema === s.fields[3].schema
+            @test !haskey(s.fields[1].schema.props, "reference-only")
+            normalized = Avro.json(s)
+            @test P(normalized) == s
+            @test Avro.canonical(P(normalized)) == Avro.canonical(s)
+        end
+        recursive = P(raw"""{"type":"record","name":"ns.Node","doc":"\u0064efinition","marker":"definition","fields":[
+            {"name":"next","type":["null",{"type":"Node","marker":"reference"}]}]}""")
+        @test recursive.fields[1].schema.branches[2] === recursive
+        @test recursive.props["marker"] == "definition"
+        @test occursin("\"doc\":\"\\u0064efinition\"", Avro.json(recursive))
+        @test P(Avro.json(recursive)) == recursive
+        @test Avro.decode(recursive, Avro.encode(recursive, (next=missing,))).next === missing
+        @test_throws Avro.SchemaError P("""{"type":"record","name":"R","fields":[{"name":"x","type":{"type":"Missing"}}]}""")
         @test_throws Avro.SchemaError P("""{"type":"bogus"}""")
         @test_throws Avro.SchemaError P("""5""")
         @test_throws Avro.SchemaError P("""{"name":"R"}""")

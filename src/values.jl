@@ -101,11 +101,19 @@ function Base.isless(a::LocalTimestamp, b::LocalTimestamp)
     return timestampnanoseconds(a) < timestampnanoseconds(b)
 end
 
-function Base.:(<)(a::Union{Timestamp,LocalTimestamp}, b::Union{Timestamp,LocalTimestamp})
+function Base.:(<)(a::Timestamp, b::Timestamp)
     return isless(a, b)
 end
 
-function Base.:(<=)(a::Union{Timestamp,LocalTimestamp}, b::Union{Timestamp,LocalTimestamp})
+function Base.:(<)(a::LocalTimestamp, b::LocalTimestamp)
+    return isless(a, b)
+end
+
+function Base.:(<=)(a::Timestamp, b::Timestamp)
+    return isless(a, b) || a == b
+end
+
+function Base.:(<=)(a::LocalTimestamp, b::LocalTimestamp)
     return isless(a, b) || a == b
 end
 

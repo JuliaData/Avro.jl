@@ -1690,10 +1690,10 @@ function encodealignedfast!(plans::Tuple, e::Encoder, x::NamedTuple)
     end
 end
 
-# ---- the column-cell path ------------------------------------------------------------------------------
+# ---- the field-cell path -------------------------------------------------------------------------------
 #
-# A column table the aligned path does not take (wider than its tuple limit, or columns in another order)
-# writes each row through one cell per schema field: the field's plan and its column. Each cell is one
+# Tables the aligned path does not take (wider than its tuple limit, or fields in another order)
+# write each row through one cell per schema field: the field's plan and its source. Each cell is one
 # dynamic call to the same per-plan estimate and encode methods the aligned path uses, so the arithmetic,
 # validation and bytes are identical, without building a boxed `Record` per row. Cells take the row as a
 # mutable cursor so a dynamic call boxes neither the row index nor a returned estimate.
@@ -1705,7 +1705,17 @@ struct ColumnCell{P<:WritePlan,C<:AbstractVector} <: WriteCell
     column::C
 end
 
-"The row a column-cell push is at, and the output estimate summed over its cells so far."
+struct RowCell{P<:WritePlan,T,R<:AbstractVector} <: WriteCell
+    plan::P
+    rows::R
+    field::Int
+end
+
+function RowCell(plan::P, rows::R, field::Int) where {P<:WritePlan,R<:AbstractVector}
+    return RowCell{P,fieldtype(eltype(R), field),R}(plan, rows, field)
+end
+
+"The current source row and the output estimate summed over its field cells so far."
 mutable struct CellRow
     i::Int
     retained::Int
@@ -1717,7 +1727,23 @@ function cellvalue(c::ColumnCell, row::CellRow)
     return c.column[firstindex(c.column) + row.i - 1]
 end
 
-function estimatecell!(c::ColumnCell, row::CellRow, budget::Budget,
+function cellvalue(c::RowCell{P,T}, row::CellRow) where {P,T}
+    value = c.rows[firstindex(c.rows) + row.i - 1]
+    return typedrowfield(value, c.field, T)
+end
+
+# Literal field positions let Julia read an inline heterogeneous row without boxing the row or scalar.
+# Specialization follows the caller's NamedTuple type and field types, never schema names or positions.
+@inline @generated function typedrowfield(row::R, field::Int, ::Type{T}) where {R<:NamedTuple,T}
+    body = :(throw(BoundsError(row, field)))
+    for i in reverse(1:fieldcount(R))
+        fieldtype(R, i) === T || continue
+        body = :(field == $i ? getfield(row, $i) : $body)
+    end
+    return body
+end
+
+function estimatecell!(c::Union{ColumnCell,RowCell}, row::CellRow, budget::Budget,
                        diagnostics::Union{Nothing,Encoder}=nothing)
     value = cellvalue(c, row)
     estimate = estimatevalue(c.plan, value, budget, diagnostics)
@@ -1728,12 +1754,12 @@ function estimatecell!(c::ColumnCell, row::CellRow, budget::Budget,
     return nothing
 end
 
-function encodecell!(c::ColumnCell, e::Encoder, row::CellRow)
+function encodecell!(c::Union{ColumnCell,RowCell}, e::Encoder, row::CellRow)
     encode(c.plan, e, cellvalue(c, row))
     return nothing
 end
 
-function encodecellchild!(c::ColumnCell, e::Encoder, row::CellRow, field::Field)
+function encodecellchild!(c::Union{ColumnCell,RowCell}, e::Encoder, row::CellRow, field::Field)
     return encodealignedchild(c.plan, e, cellvalue(c, row), field.schema, field.name)
 end
 

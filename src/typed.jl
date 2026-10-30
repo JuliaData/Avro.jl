@@ -413,9 +413,10 @@ function buildtyped(::Type{T}, s::Schema, p::ReadPlan, memo::TypedMemo) where {T
     end
     s isa UnionSchema && return builduniontarget(T, s, p::UnionPlan, memo)
     if T isa Union
-        _, inner = splitoptional(T)
+        nulltype, inner = splitoptional(T)
+        s isa NullSchema && nulltype !== Union{} && return buildtyped(nulltype, s, p, memo)
         inner === nothing && return chargedsemantic(T, s, p, memo)
-        return buildtyped(inner, s, p, memo)      # a non-union schema never produces the null member
+        return buildtyped(inner, s, p, memo)      # a non-null schema never produces the null member
     end
     s isa RecordSchema && return buildrecordtarget(T, s, p::RecordPlan, memo)
     s isa ArraySchema && return buildarraytarget(T, s, p::ArrayPlan, memo)
@@ -728,6 +729,16 @@ function resolvedfieldindex(index::FrozenDict{String,Int}, name::String, budget:
     return 0
 end
 
+# Default factories run per value in caller space, including defaults that depend on other fields.
+function customfielddefaults(@nospecialize(T::Type))
+    for signature in (Tuple{AvroStyle,Type{T}}, Tuple{AvroStyle,Type{T},Any})
+        for method in methods(StructUtils.fielddefaults, signature)
+            method.module in HOOK_MODULES || return true
+        end
+    end
+    return false
+end
+
 function buildrecordplan(::Type{T}, s::RecordSchema, p::RecordPlan, memo::TypedMemo) where {T}
     names = fieldnames(T)
     tags = StructUtils.fieldtags(AvroStyle(), T)
@@ -755,23 +766,15 @@ function buildrecordplan(::Type{T}, s::RecordSchema, p::RecordPlan, memo::TypedM
         plans[j] = tp
         map[k] = j
     end
+    if any(iszero, map) && customfielddefaults(T)
+        release!(memo.budget, scratch)
+        return nothing
+    end
     defaults = typedvector(Any, length(names), memo)
-    defs = StructUtils.fielddefaults(AvroStyle(), T)
-    defaultcharge = 0
     for k in eachindex(names)
         map[k] == 0 || continue
         ft = fieldtype(T, k)
-        if haskey(defs, names[k])
-            v = defs[names[k]]
-            if !(v isa ft)
-                release!(memo.budget, scratch + vectorbytes(Any, length(names)) + defaultcharge)   # `defaults` dies with the fallback
-                return nothing
-            end
-            bb = isbits(v) ? boxbytes(typeof(v)) : 0
-            bb > 0 && reserve!(memo.budget, bb)        # the retained Any-slot box, made at the assignment
-            defaults[k] = v
-            defaultcharge += bb
-        elseif Missing <: ft
+        if Missing <: ft
             defaults[k] = missing
         elseif Nothing <: ft
             defaults[k] = nothing
@@ -790,7 +793,7 @@ function buildrecordplan(::Type{T}, s::RecordSchema, p::RecordPlan, memo::TypedM
     reservenode!(memo, RecordTarget{T,typeof(ps),mp})
     out = RecordTarget{T,typeof(ps),mp}(s, ps, defaults, measuredshell(T, memo.budget))
     settlenode!(memo, RecordTarget{T,typeof(ps),mp})
-    ownfresh!(memo, vectorbytes(Any, length(names)) + defaultcharge)
+    ownfresh!(memo, vectorbytes(Any, length(names)))
     release!(memo.budget, psbox + mpbox + scratch)     # the tuple boxes and construction-only scratch die here
     return out
 end
@@ -799,7 +802,7 @@ end
 The direct typed route over resolving plans: promotions and enum remaps are leaves
 (their decode already yields the reader value); a two-branch-nullable reader union resolves through a
 wrapped or per-writer-branch target; resolved records decode writer-ordered steps straight into `T`'s
-fields with reader-only defaults materialised once at plan time. Returns `nothing` when ineligible.
+fields with reader-only defaults materialised afresh for each datum. Returns `nothing` when ineligible.
 """
 function buildresolvedtyped(::Type{T}, s::Schema, p::ReadPlan, memo::TypedMemo) where {T}
     p isa PromotePlan && return buildleaftarget(T, s, p, memo)
@@ -1035,19 +1038,12 @@ function resolvedreaderdefaults!(::Type{T}, defaults::Vector{Any}, covered::Vect
 end
 
 function resolvedstaticdefaults!(::Type{T}, defaults::Vector{Any}, covered::Vector{Bool}, names,
-                                 budget::Budget, retained::Base.RefValue{Int}) where {T}
-    defs = StructUtils.fielddefaults(AvroStyle(), T)
+                                 budget::Budget) where {T}
+    any(!, covered) && customfielddefaults(T) && return false
     for k in eachindex(names)
         covered[k] && continue
         ft = fieldtype(T, k)
-        if haskey(defs, names[k])
-            v = defs[names[k]]
-            v isa ft || return false
-            bb = isbits(v) ? boxbytes(typeof(v)) : 0
-            bb > 0 && reserve!(budget, bb)             # the retained Any-slot box, made at the assignment
-            defaults[k] = v
-            retained[] += bb
-        elseif Missing <: ft
+        if Missing <: ft
             defaults[k] = missing
         elseif Nothing <: ft
             defaults[k] = nothing
@@ -1073,14 +1069,13 @@ function buildresolvedrecordplan(::Type{T}, s::RecordSchema, p::ResolvedRecordPl
               vectorbytes(Bool, length(names))         # construction-only storage, released on every exit
     defaults = typedvector(Any, length(names), memo)
     covered = typedvector(Bool, length(names), memo)
-    defaultcharge = Ref(0)
     fill!(covered, false)
     for k in stepslot
         k == 0 || (covered[k] = true)
     end
     if !(resolvedreaderdefaults!(T, defaults, covered, slotfor, p, memo) &&
-         resolvedstaticdefaults!(T, defaults, covered, names, memo.budget, defaultcharge))
-        release!(memo.budget, scratch + vectorbytes(Any, length(names)) + defaultcharge[])   # `defaults` dies with the fallback
+         resolvedstaticdefaults!(T, defaults, covered, names, memo.budget))
+        release!(memo.budget, scratch + vectorbytes(Any, length(names)))   # `defaults` dies with the fallback
         return nothing
     end
     ps, psbox = chargedtuple(memo, plans)
@@ -1091,7 +1086,7 @@ function buildresolvedrecordplan(::Type{T}, s::RecordSchema, p::ResolvedRecordPl
     reservenode!(memo, ResolvedRecordTarget{T,typeof(ps),sm})
     out = ResolvedRecordTarget{T,typeof(ps),sm}(s, ps, defaults, measuredshell(T, memo.budget))
     settlenode!(memo, ResolvedRecordTarget{T,typeof(ps),sm})
-    ownfresh!(memo, vectorbytes(Any, length(names)) + defaultcharge[])
+    ownfresh!(memo, vectorbytes(Any, length(names)))
     release!(memo.budget, psbox + smbox + scratch)     # the tuple boxes and construction-only scratch die here
     return out
 end
@@ -1940,7 +1935,7 @@ end
 
 # StructUtils would treat a decoded scalar as a struct without fields and fill an array, dict or struct
 # target with nothing; refuse instead so the conversion fails.
-const SCALAR_VALUES = Union{Bool,Int32,Int64,Float32,Float64,String,Date,Time,UUID,
+const SCALAR_VALUES = Union{Missing,Nothing,Bool,Int32,Int64,Float32,Float64,String,Date,Time,UUID,
                             Timestamp,LocalTimestamp,Duration,DataDecimals.AbstractDecimal,WideDecimal}
 
 function StructUtils.applyeach(::AvroStyle, f, x::SCALAR_VALUES)

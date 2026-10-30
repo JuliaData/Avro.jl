@@ -551,7 +551,9 @@ end
 
 Parse an Avro schema from JSON text (a `String`, a byte vector, or an `IO` read incrementally under
 `max_schema_bytes`). Every schema rule is validated; violations raise `SchemaError` (with a
-JSON path) or `LimitError`. With `allow_invalid_names=true` invalid names are admitted (the graph is
+JSON path) or `LimitError`. Named references accept strings or `{"type":"Name"}` objects;
+attributes on reference objects are ignored, as in Apache Java. With `allow_invalid_names=true`
+invalid names are admitted (the graph is
 marked `repaired_names`); with `allow_invalid_defaults=true` invalid defaults are kept with
 `valid=false`.
 """
@@ -675,6 +677,9 @@ function parsenode(ctx::ParseContext, node, enclosing::String, buf)
             return parseunion(ctx, node, enclosing, buf)
         elseif node isa JSONObject
             schema = parseobjectschema(ctx, node, enclosing, buf)
+            # Reference attributes must not replace a recursive definition's source lexemes.
+            schema isa NamedSchema &&
+                !(node["type"] in ("record", "error", "enum", "fixed")) && return schema
             isfilled(schema.meta.lexemes) ||
                 fillonce!(schema.meta.lexemes,
                     capturelexemes(ctx, node, buf, schema))
@@ -811,7 +816,7 @@ end
 function parseobjectschema(ctx::ParseContext, obj::JSONObject, enclosing::String, buf)
     haskey(obj, "type") || schemaerror(ctx, "schema object without a \"type\" attribute")
     t = obj["type"]
-    t isa String || schemaerror(ctx, "a schema object's \"type\" must be a JSON string naming a primitive or one of record, error, enum, array, map, fixed", "type")
+    t isa String || schemaerror(ctx, "a schema object's \"type\" must be a JSON string naming a primitive, a named type, or one of record, error, enum, array, map, fixed", "type")
     if t in PRIMITIVE_NAMES
         p = collectprops(ctx, obj, ("type",))
         return primitive(ctx, t, p)
@@ -832,7 +837,7 @@ function parseobjectschema(ctx::ParseContext, obj::JSONObject, enclosing::String
     elseif t == "fixed"
         return parsefixed(ctx, obj, enclosing)
     else
-        schemaerror(ctx, "a schema object's \"type\" must name a primitive or one of record, error, enum, array, map, fixed (a named-type reference is a schema string, a union is an array); got \"$(escapename(t))\"", "type")
+        return parsereference(ctx, t, enclosing)
     end
 end
 
