@@ -41,11 +41,17 @@ struct WMap <: WritePlan
     values::WritePlan
     eltype::Type
 end
-struct WUnion <: WritePlan
+"`Q` is the concrete plan type of a nullable union's non-null branch (`Nothing` for other unions)."
+struct WUnion{Q} <: WritePlan
     schema::UnionSchema
     branches::Vector{WritePlan}
     nullable::Int
     reprtypes::Vector{Any}           # juliatype of each branch (for exact representation matching)
+end
+
+function WUnion(schema::UnionSchema, branches::Vector{WritePlan}, nullable::Int, reprtypes::Vector{Any})
+    Q = nullable == 0 ? Nothing : typeof(branches[3 - nullable])
+    return WUnion{Q}(schema, branches, nullable, reprtypes)
 end
 struct WRecord <: WritePlan
     schema::RecordSchema
@@ -1020,11 +1026,20 @@ function collectmapentries(pairs, budget::Budget)
 end
 
 # unions: branch recovery
-function encodevalue(p::WUnion, e::Encoder, x)
+function encodevalue(p::WUnion{Q}, e::Encoder, x) where {Q}
     i = selectbranch(p, x, e.budget)
     writelong!(e, Int64(i) - 1)
-    encodebranch(p.branches[i], e, x isa UnionValue ? x.value : x,
-                 p.schema.branches[i])
+    value = x isa UnionValue ? x.value : x
+    # A nullable union's value branch: the concrete plan, and a value narrowed out of its
+    # `Union{Missing,T}` field type, make the call static and unboxed.
+    if Q !== Nothing && i != p.nullable && !(value isa Union{Missing,Nothing})
+        previous = e.expected
+        e.expected = p.schema.branches[i]
+        encode(p.branches[i]::Q, e, value)   # `encode` attaches the live path before propagating EncodeError
+        e.expected = previous
+    else
+        encodebranch(p.branches[i], e, value, p.schema.branches[i])
+    end
     return nothing
 end
 

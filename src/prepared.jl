@@ -5,8 +5,8 @@
     Avro.DatumReader(writer_schema, T; kw...)
 
 A prepared decoder for datums written with `writer_schema`, optionally resolved against
-`reader_schema` and optionally producing the typed target `T`. Immutable after construction
-and safe to share across tasks (every call allocates its own decoder state and budget):
+`reader_schema` and optionally producing the typed target `T`. Configuration is fixed after
+construction and safe to share across tasks (each active call owns its decoder state and budget):
 `reader(bytes)`, `reader(bytes, pos) -> (value, nextpos)`, `reader(io)`.
 """
 mutable struct DatumReader{T,P}
@@ -69,7 +69,8 @@ end
     reader(io) -> value
 
 Decode one datum (the byte form rejects trailing bytes; the `IO` form reads at most
-`max_datum_bytes + 1` bytes and errors if bytes remain).
+`max_datum_bytes + 1` bytes and errors if bytes remain). Positions are one-based byte offsets
+from the beginning of the input, including when its array indices start elsewhere.
 """
 const EMPTY_BYTES = UInt8[]                            # shared, never written: decoders only read `buf`
 

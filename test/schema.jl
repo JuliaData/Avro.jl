@@ -501,6 +501,18 @@
         @test s != P("""{"type":"record","name":"N","fields":[{"name":"next","type":["null","N"]},{"name":"p","type":"int","k":[1,{"a":3}]}]}""")
         @test s != P("""{"type":"record","name":"N","fields":[{"name":"next","type":["null","N"]},{"name":"p","type":"int"}]}""")
         @test weather != s && hash(weather) != hash(s)
+        mutual = P("""{"type":"record","name":"A","fields":[{"name":"b","type":
+            {"type":"record","name":"B","fields":[{"name":"a","type":["null","A"]}]}}]}""")
+        child = mutual.fields[1].schema
+        childroot = P(Avro.json(child))
+        @test isequal(child, childroot) && hash(child) == hash(childroot)
+        @test Dict(child => :found)[childroot] === :found
+        @test length(Set([child, childroot])) == 1
+        # Anonymous subgraphs also have the same hash after becoming the traversal root.
+        union = child.fields[1].schema
+        unionroot = P(Avro.json(union))
+        @test isequal(union, unionroot) && hash(union) == hash(unionroot)
+        @test Dict(union => :found)[unionroot] === :found
         # props are unordered maps
         @test P("""{"type":"int","a":1,"b":2}""") == P("""{"type":"int","b":2,"a":1}""")
         @test P("""{"type":"int","a":1}""") != P("""{"type":"int","a":1.0}""")     # raw number tokens differ lexically

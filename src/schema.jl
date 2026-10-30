@@ -606,7 +606,7 @@ function sourcebytes(src::AbstractString, maxbytes::Int, budget::Budget, ::Type{
 end
 
 function sourcebytes(src::AbstractVector{UInt8}, maxbytes::Int, budget::Budget, ::Type{E}) where {E}
-    if src isa SubArray && parent(src) isa Vector{UInt8} && Base.iscontiguous(src)
+    if src isa SubArray && parent(src) isa Vector{UInt8} && Base.iscontiguous(src) && firstindex(src) == 1
         return src
     end
     n = length(src)
@@ -614,7 +614,7 @@ function sourcebytes(src::AbstractVector{UInt8}, maxbytes::Int, budget::Budget, 
     charge = bytesbytes(n)
     reserve!(budget, charge)
     out = Vector{UInt8}(undef, n)
-    copyto!(out, 1, src, 1, n)
+    copyto!(out, 1, src, firstindex(src), n)
     return out
 end
 
@@ -1567,6 +1567,13 @@ function schemahash(s::Schema, inprogress::BitVector)
     return UInt64(h)
 end
 
+# A named edge hashes its identity, not the point where a cycle happened to be encountered.
+# Still visit the child to cache every node's own structural hash.
+function schemaedgehash(s::Schema, inprogress::BitVector)
+    h = schemahash(s, inprogress)
+    return s isa NamedSchema ? hash(s.name, hash(kind(s), UInt(0x5ecc1e))) : h
+end
+
 function propshash(p::Props, h::UInt)
     return hash(p.vals, hash(p.keys, h))
 end
@@ -1588,17 +1595,17 @@ function structuralhash(s::PrimitiveSchema, inprogress)
 end
 
 function structuralhash(s::ArraySchema, inprogress)
-    return propshash(s.props, hash(schemahash(s.items, inprogress), hash(:array, UInt(0xa7))))
+    return propshash(s.props, hash(schemaedgehash(s.items, inprogress), hash(:array, UInt(0xa7))))
 end
 
 function structuralhash(s::MapSchema, inprogress)
-    return propshash(s.props, hash(schemahash(s.values, inprogress), hash(:map, UInt(0xa7))))
+    return propshash(s.props, hash(schemaedgehash(s.values, inprogress), hash(:map, UInt(0xa7))))
 end
 
 function structuralhash(s::UnionSchema, inprogress)
     h = hash(:union, UInt(0xa7))
     for b in s.branches
-        h = hash(schemahash(b, inprogress), h)
+        h = hash(schemaedgehash(b, inprogress), h)
     end
     return h
 end
@@ -1628,7 +1635,7 @@ function structuralhash(s::RecordSchema, inprogress)
     h = hash(s.aliases.data, hash(s.doc, h))
     for f in s.fields
         h = hash(f.name, h)
-        h = hash(schemahash(f.schema, inprogress), h)
+        h = hash(schemaedgehash(f.schema, inprogress), h)
         h = defaulthash(f.default, h)
         h = hash(f.order, hash(f.aliases.data, h))
         h = propshash(f.props, hash(f.doc, h))

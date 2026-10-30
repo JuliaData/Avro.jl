@@ -20,6 +20,10 @@ import DataAPI
         @test collect(ts.types) == [Int64, String, Union{Missing,Float64}, Avro.EnumValue]
         @test Tables.getcolumn(t, 1) == 1:250 && Tables.getcolumn(t, :a) isa Vector{Int64}
         @test Tables.getcolumn(t, :b) == ["r$i" for i in 1:250]
+        @test t.a === t[:a] === t[1] === Tables.getcolumn(t, :a)
+        @test propertynames(t) == Tables.columnnames(t)
+        @test_throws ArgumentError t[:unknown]
+        @test_throws BoundsError t[0]
         @test isequal(Tables.getcolumn(t, :c), [i % 3 == 0 ? missing : i / 2 for i in 1:250])
         @test Tables.getcolumn(t, :c) isa Vector{Union{Missing,Float64}}
         @test Tables.getcolumn(t, :e) isa Vector{Avro.EnumValue} && String(Tables.getcolumn(t, :e)[1]) == "X"
@@ -41,6 +45,44 @@ import DataAPI
         close(w)
         seekstart(arrio)
         @test_throws ArgumentError Avro.Table(arrio)
+    end
+    @testset "column access does not shadow table metadata accessors" begin
+        columns = (schema=[1], writerschema=[2], metadata=[3], columns=[4], names=[5], nrows=[6])
+        collision = Avro.Table(Avro.tobuffer(columns))
+        for name in keys(columns)
+            @test getproperty(collision, name) == columns[name]
+            @test collision[name] === getproperty(collision, name)
+        end
+        @test length(collision) == 1
+        @test Avro.schema(collision) isa Avro.RecordSchema
+        @test Avro.writerschema(collision) isa Avro.RecordSchema
+        @test Avro.metadata(collision) isa AbstractDict
+        @test Tables.columntable(collision) == columns
+        @test Tables.columntable(Avro.Table(Avro.tobuffer(collision))) == columns
+    end
+    @testset "partition output limits match column materialization" begin
+        data = take!(Avro.tobuffer([(x=Int64(1),)]))
+        exact = Avro.Limits(max_block_output_bytes=8)
+        for validate in (:strict, :fast)
+            expected = Tables.columntable(Avro.Table(data; limits=exact, validate))
+            Avro.Rows(data; limits=exact, validate) do stream
+                @test Tables.columntable(only(Tables.partitions(stream))) == expected
+            end
+        end
+        many = take!(Avro.tobuffer([(x=repeat("a", 64),) for _ in 1:1_000]))
+        bounded = Avro.Limits(max_block_output_bytes=1024)
+        Avro.Rows(many; limits=bounded) do stream
+            failure = try
+                first(Tables.partitions(stream))
+            catch err
+                err
+            end
+            @test failure isa Avro.LimitError
+            if failure isa Avro.LimitError
+                @test failure.limit === :max_block_output_bytes
+                @test 1024 < failure.observed < 2048
+            end
+        end
     end
     @testset "Table == columntable(Rows); the three Rows modes" begin
         t = Avro.Table(buf())
@@ -397,7 +439,23 @@ import DataAPI
         @test Base.IteratorSize(typeof(rl)) === Base.HasLength()
         @test length(rl) == 250
         @test count(Returns(true), rl) == 250                        # the pre-scan count matches iteration
+        @test length(rl) == 0
+        @test isempty(collect(rl))
         close(rl)
+        partial = Avro.Rows(bytes)
+        @test first(iterate(partial)).a == 1
+        @test length(partial) == 249
+        @test [row.a for row in collect(partial)] == collect(2:250)
+        @test length(partial) == 0
+        close(partial)
+        partitioned = Avro.Rows(bytes)
+        firstpart, _ = iterate(Tables.partitions(partitioned))
+        @test length(partitioned) == 250 - length(firstpart)
+        rest = Tables.columns(partitioned)
+        @test length(rest) == 250 - length(firstpart)
+        @test length(partitioned) == 0
+        @test isempty(collect(partitioned))
+        close(partitioned)
         p = joinpath(mktempdir(), "rows.avro")
         write(p, bytes)
         rs = Avro.Rows(open(p))                                      # a streamed source stays SizeUnknown

@@ -153,13 +153,14 @@
     end
     @testset "unions: policies, directions, unresolvable branches" begin
         wi = P("\"int\"")
-        @test rt(wi, P("[\"long\",\"int\"]"), Int32(5)) == Avro.UnionValue(2, Int32(5))                       # the writer's own type first
+        @test rt(wi, P("[\"long\",\"int\"]"), Int32(5)) == Avro.UnionValue(1, Int64(5))                       # first matching reader branch
         @test rt(wi, P("[\"long\",\"int\"]"), Int32(5); union_resolution=:java) == Avro.UnionValue(2, Int32(5))
-        @test rt(wi, P("[\"double\",\"int\"]"), Int32(5)) == Avro.UnionValue(2, Int32(5))
+        @test rt(wi, P("[\"double\",\"int\"]"), Int32(5)) == Avro.UnionValue(1, 5.0)
         @test rt(wi, P("[\"double\",\"int\"]"), Int32(5); union_resolution=:java) == Avro.UnionValue(2, Int32(5))
         @test rt(wi, P("[\"string\",\"double\",\"long\"]"), Int32(5)) == Avro.UnionValue(2, 5.0)             # else the first promotion
         big = typemax(Int64) - 1                                                                               # not exact in a double
-        @test rt(P("\"long\""), P("[\"double\",\"long\"]"), big) == Avro.UnionValue(2, big)
+        @test rt(P("\"long\""), P("[\"double\",\"long\"]"), big) == Avro.UnionValue(1, Float64(big))
+        @test rt(P("\"long\""), P("[\"double\",\"long\"]"), big; union_resolution=:java) == Avro.UnionValue(2, big)
         @test rt(wi, P("[\"null\",\"long\"]"), Int32(5)) === Int64(5)                                          # nullable readers stay bare
         @test_throws Avro.ResolutionError Avro.resolve(wi, P("[\"string\",\"boolean\"]"))
         wu = P("[\"int\",\"string\"]")
@@ -189,46 +190,43 @@
         aliasrecordreader = P("[{\"type\":\"record\",\"name\":\"x.Foo\",\"fields\":[{\"name\":\"a\",\"type\":\"long\"}]},{\"type\":\"record\",\"name\":\"r.Bar\",\"aliases\":[\"w.Foo\"],\"fields\":[{\"name\":\"a\",\"type\":\"int\"}]}]")
         specrecord = rt(aliasrecordwriter, aliasrecordreader, (a=Int32(7),))
         javarecord = rt(aliasrecordwriter, aliasrecordreader, (a=Int32(7),); union_resolution=:java)
-        @test specrecord.index == 2 && specrecord.value["a"] === Int32(7)       # a reader alias beats an unqualified name
+        @test specrecord.index == 1 && specrecord.value["a"] === Int64(7)       # the earlier unqualified name matches
         @test javarecord.index == 2 && javarecord.value["a"] === Int32(7)
 
         aliasenumwriter = P("{\"type\":\"enum\",\"name\":\"w.Kind\",\"symbols\":[\"A\"]}")
         aliasenumreader = P("[{\"type\":\"enum\",\"name\":\"x.Kind\",\"symbols\":[\"A\"]},{\"type\":\"enum\",\"name\":\"r.Other\",\"aliases\":[\"w.Kind\"],\"symbols\":[\"A\"]}]")
         enumvalue = Avro.EnumValue(aliasenumwriter, 1)
-        @test rt(aliasenumwriter, aliasenumreader, enumvalue).index == 2
+        @test rt(aliasenumwriter, aliasenumreader, enumvalue).index == 1
         @test rt(aliasenumwriter, aliasenumreader, enumvalue; union_resolution=:java).index == 2
 
         aliasfixedwriter = P("{\"type\":\"fixed\",\"name\":\"w.Blob\",\"size\":2}")
         aliasfixedreader = P("[{\"type\":\"fixed\",\"name\":\"x.Blob\",\"size\":2},{\"type\":\"fixed\",\"name\":\"r.OtherBlob\",\"aliases\":[\"w.Blob\"],\"size\":2}]")
         fixedvalue = Avro.Fixed(aliasfixedwriter, UInt8[1, 2])
-        @test rt(aliasfixedwriter, aliasfixedreader, fixedvalue).index == 2
+        @test rt(aliasfixedwriter, aliasfixedreader, fixedvalue).index == 1
         @test rt(aliasfixedwriter, aliasfixedreader, fixedvalue; union_resolution=:java).index == 2
 
-        # :spec takes the branch with the writer's fullname over an earlier one sharing its unqualified name,
-        # and refuses to guess between unqualified-name matches
+        # :spec takes the first matching unqualified name; :java prefers an exact fullname.
         event(ns, t="int") = """{"type":"record","name":"Event","namespace":"$ns","fields":[{"name":"x","type":"$t"}]}"""
         eventreader = P("[" * event("com.a", "long") * "," * event("com.b") * "]")
         exactevent = rt(P(event("com.b")), eventreader, (x=Int32(7),))
-        @test exactevent.index == 2 && exactevent.value["x"] === Int32(7)
-        @test Avro.fullname(Avro.schema(exactevent.value)) == "com.b.Event"
+        @test exactevent.index == 1 && exactevent.value["x"] === Int64(7)
+        javaevent = rt(P(event("com.b")), eventreader, (x=Int32(7),); union_resolution=:java)
+        @test javaevent.index == 2 && javaevent.value["x"] === Int32(7)
+        @test Avro.fullname(Avro.schema(exactevent.value)) == "com.a.Event"
         color(ns) = """{"type":"enum","name":"Color","namespace":"$ns","symbols":["R","G"]}"""
         colorwriter = P(color("com.b"))
         colorvalue = rt(colorwriter, P("[" * color("com.a") * "," * color("com.b") * "]"),
                         Avro.EnumValue(colorwriter, 2))
-        @test colorvalue.index == 2 && String(colorvalue.value) == "G"
-        ambiguous = try
-            Avro.resolve(P(event("com.c")), eventreader)
-            nothing
-        catch err
-            err
-        end
-        @test ambiguous isa Avro.ResolutionError && occursin("more than one reader union branch", ambiguous.msg)
+        @test colorvalue.index == 1 && String(colorvalue.value) == "G"
+        firstevent = rt(P(event("com.c")), eventreader, (x=Int32(7),))
+        @test firstevent.index == 1 && firstevent.value["x"] === Int64(7)
         @test rt(P(event("com.c")), P("[\"null\"," * event("com.a", "long") * "]"), (x=Int32(3),))["x"] === Int64(3)
         unionwriter = P("[\"null\"," * event("com.c") * "]")
         nullablereader = P("[\"null\"," * event("com.a", "long") * "," * event("com.b") * "]")
-        @test Avro.resolve(unionwriter, nullablereader) isa Avro.ResolvedSchema   # an ambiguous branch fails only when used
+        @test Avro.resolve(unionwriter, nullablereader) isa Avro.ResolvedSchema
         @test isequal(rt(unionwriter, nullablereader, missing), Avro.UnionValue(1, missing))
-        @test_throws Avro.ResolutionError rt(unionwriter, nullablereader, (x=Int32(1),))
+        value = rt(unionwriter, nullablereader, (x=Int32(1),))
+        @test value.index == 2 && value.value["x"] === Int64(1)
 
         softrecordwriter = P("""{"type":"record","name":"w.W","fields":[{"name":"x","type":"int"}]}""")
         softrecordreader = P("""[
@@ -275,6 +273,32 @@
                             union_resolution=:java)
         @test immediatevalue.index == 2
         @test immediatevalue.value["x"] == UInt8[0x6f, 0x6b]
+    end
+    @testset "first union matches across prepared, typed and container readers" begin
+        writer = P("\"int\"")
+        reader = P("[\"long\",\"int\"]")
+        bytes = Avro.encode(writer, Int32(7))
+        for validate in (:strict, :fast)
+            @test Avro.DatumReader(writer; reader_schema=reader, validate)(bytes) == Avro.UnionValue(1, Int64(7))
+            @test Avro.decode(writer, bytes, Union{Int32,Int64}; reader_schema=reader, validate) === Int64(7)
+            @test Avro.decode(writer, bytes, Union{Int32,Int64}; reader_schema=reader, validate,
+                              union_resolution=:java) === Int32(7)
+        end
+        recordwriter = P("""{"type":"record","name":"R","fields":[{"name":"n","type":"int"}]}""")
+        recordreader = P("""{"type":"record","name":"R","fields":[{"name":"n","type":["long","int"]}]}""")
+        buffer = IOBuffer()
+        Avro.write(buffer, [(n=Int32(7),)]; schema=recordwriter)
+        data = take!(buffer)
+        @test only(Avro.Rows(data; reader_schema=recordreader)).n == Avro.UnionValue(1, Int64(7))
+        @test only(Tables.getcolumn(Avro.Table(data; reader_schema=recordreader), :n)) == Avro.UnionValue(1, Int64(7))
+
+        # Once a named branch matches, failure while resolving its fields does not try a later branch.
+        namedwriter = P("""{"type":"record","name":"w.R","fields":[{"name":"n","type":"int"}]}""")
+        namedreader = P("""[
+            {"type":"record","name":"a.R","fields":[{"name":"n","type":"boolean"}]},
+            {"type":"record","name":"w.R","fields":[{"name":"n","type":"int"}]}]""")
+        @test_throws Avro.ResolutionError Avro.resolve(namedwriter, namedreader)
+        @test rt(namedwriter, namedreader, (n=Int32(7),); union_resolution=:java).index == 2
     end
     @testset "a failed branch inside a recursive record keeps the record's cached plan" begin
         w = P("""{"type":"record","name":"R","fields":[{"name":"a","type":["null",

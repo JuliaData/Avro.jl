@@ -766,6 +766,12 @@ function outputtype(p::WUnion, x)
     return outputtype(p.branches[i], x isa UnionValue ? x.value : x)
 end
 
+function outputtype(p::WUnion{Q}, x) where {Q<:WritePlan}
+    i = x isa UnionValue ? x.index : ((x === missing || x === nothing) ? p.nullable : 3 - p.nullable)
+    inner = x isa UnionValue ? x.value : x
+    return i == p.nullable ? outputtype(p.branches[i]::WNull, inner) : outputtype(p.branches[i]::Q, inner)
+end
+
 function estimatedbox(p::WritePlan, x)
     T = outputtype(p, x)
     T === Missing && return 0
@@ -979,6 +985,18 @@ function estimatevalue(p::WritePlan, x, budget::Budget,
         return estimaterecordvalue(p, x, budget, diagnostics)
     end
     return OutputEstimate(0, 0, 1)
+end
+
+"A nullable union's estimate (the union arithmetic above) through its non-null branch's concrete plan."
+function estimatevalue(p::WUnion{Q}, x, budget::Budget,
+                       diagnostics::Union{Nothing,Encoder}=nothing)::OutputEstimate where {Q<:WritePlan}
+    i = selectbranch(p, x, budget)
+    i == p.nullable && return OutputEstimate(0, 0, checkedvalueadd(budget, 1, 1))
+    inner = x isa UnionValue ? x.value : x
+    estimate = estimatewithschema(diagnostics, p.schema.branches[i]) do
+        estimatevalue(p.branches[i]::Q, inner, budget, diagnostics)
+    end
+    return OutputEstimate(estimate.retained, estimate.peakextra, checkedvalueadd(budget, 1, estimate.values))
 end
 
 function estimaterootvalue(p::WritePlan, x, budget::Budget,
@@ -1410,9 +1428,12 @@ end
 function publishmode(path::String)
     isfile(path) && return filemode(path) & 0o777
     Sys.iswindows() && return 0o666
-    mask = ccall(:umask, Cuint, (Cuint,), 0o022) & 0o777           # the umask is read by setting it
-    ccall(:umask, Cuint, (Cuint,), mask)
-    return 0o666 & ~mask
+    # Let file creation apply the umask without changing process-wide permissions while other tasks run.
+    return mktempdir(dirname(path)) do dir
+        open(joinpath(dir, "mode"), "w") do io
+            return filemode(stat(io)) & 0o777
+        end
+    end
 end
 
 "The writer's destination: `(sink, temppath, ownsink)` — a temp file first when writing atomically."
@@ -2402,10 +2423,11 @@ function syncfile(io::IO)
     flush(io)
     io isa IOStream || return nothing
     @static if Sys.iswindows()
-        ccall(:_commit, Cint, (Cint,), fd(io))
+        result = ccall(:_commit, Cint, (Cint,), fd(io))
     else
-        ccall(:fsync, Cint, (Cint,), fd(io))
+        result = ccall(:fsync, Cint, (Cint,), fd(io))
     end
+    Base.systemerror("syncing Avro output", result != 0)
     return nothing
 end
 
@@ -2544,7 +2566,7 @@ function pushcolumns!(w::Writer, cols::NamedTuple, ::Type{R}) where {R<:NamedTup
     for c in cols
         length(c) == n || throw(ArgumentError("table columns have different lengths"))
     end
-    return pushrowsof!(w, i -> R(map(c -> c[i], values(cols))), R, n)
+    return pushrowsof!(w, i -> R(map(c -> c[firstindex(c) + i - 1], values(cols))), R, n)
 end
 
 """

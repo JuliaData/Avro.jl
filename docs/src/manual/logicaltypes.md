@@ -18,6 +18,31 @@ Timestamps never silently become `DateTime` — the exact wrappers preserve the 
 typed target of `DateTime` performs the same explicit conversion; a typed `Avro.Timestamp{P}` target
 of another unit converts exactly or raises `Avro.ConversionError`.
 
+Timestamps support sorting, comparisons and dictionary keys across all three precisions without
+rounding. For example, `Avro.Timestamp{Millisecond}(1) == Avro.Timestamp{Microsecond}(1000)`.
+The same applies to local timestamps. Global and local timestamps are distinct: they compare unequal
+and cannot be ordered against each other because a local timestamp does not identify a global instant.
+
+## Arrow integration
+
+Loading Arrow.jl activates an optional extension for `Avro.Timestamp` and `Avro.LocalTimestamp`:
+
+```julia
+using Avro, Arrow
+Arrow.write("events.arrow", Avro.Table("events.avro"))
+```
+
+These columns use native Arrow timestamps in their original millisecond, microsecond or nanosecond
+unit. Global instants carry the UTC timezone; local timestamps have no timezone. Julia extension
+metadata restores the exact Avro wrapper when both packages are loaded, including nullable columns
+and the full `Int64` tick range. Other Arrow implementations see ordinary timestamp columns.
+`Arrow.Table(path; convert=false)` exposes the native Arrow storage types.
+
+This extension covers timestamps. Other Avro-specific values, such as records, enums, fixed bytes,
+general unions and durations, do not have a guaranteed Arrow round trip. Convert them explicitly to
+the representation required by the destination; Tables.jl compatibility alone does not preserve
+every Avro logical type.
+
 Deviations from other implementations, in favour of the specification, are recorded in
 [Limits and security](limits-and-security.md): decimal precision is validated on decode as well as
 encode, and time values are never silently truncated on encode.

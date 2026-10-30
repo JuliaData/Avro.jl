@@ -1350,7 +1350,7 @@ function positionalsource(source::AbstractVector{UInt8}, position::Int,
     1 <= position <= length(source) + 1 ||
         throw(ArgumentError("position $position out of range"))
     if source isa Vector{UInt8} ||
-       (source isa SubArray && parent(source) isa Vector{UInt8} && Base.iscontiguous(source))
+       (source isa SubArray && parent(source) isa Vector{UInt8} && Base.iscontiguous(source) && firstindex(source) == 1)
         return PositionalDatumSource(source, position, 0, length(source))
     end
     remaining = length(source) - position + 1
@@ -1359,7 +1359,7 @@ function positionalsource(source::AbstractVector{UInt8}, position::Int,
     charge = bytesbytes(count)
     reserve!(budget, charge)
     buffer = Vector{UInt8}(undef, count)
-    copyto!(buffer, 1, source, position, count)
+    copyto!(buffer, 1, source, firstindex(source) + position - 1, count)
     return PositionalDatumSource(buffer, 1, position - 1, length(source))
 end
 

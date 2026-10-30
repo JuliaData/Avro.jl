@@ -231,6 +231,29 @@ end
         @test Avro.decode(r, Avro.encode(r, (a=1, b="q")), Dict{String,Any}) == Dict{String,Any}("a" => 1, "b" => "q")
     end
 
+    @testset "logical scalars never become collections of their implementation fields" begin
+        cases = (
+            (Avro.IntSchema(; logical=Avro.DateLogical()), Date(2026, 1, 2)),
+            (Avro.IntSchema(; logical=Avro.TimeMillis()), Time(1, 2, 3)),
+            (Avro.LongSchema(; logical=Avro.TimestampMicros()), Avro.Timestamp{Microsecond}(1)),
+            (Avro.LongSchema(; logical=Avro.LocalTimestampMicros()), Avro.LocalTimestamp{Microsecond}(1)),
+            (Avro.StringSchema(; logical=Avro.UUIDLogical()), UUID("123e4567-e89b-12d3-a456-426614174000")),
+            (Avro.FixedSchema("Duration", 12; logical=Avro.DurationLogical()), Avro.Duration(1, 2, 3)),
+            (Avro.BytesSchema(; logical=Avro.DecimalLogical(9, 2)), Avro.Decimal(123, 2)),
+            (Avro.BytesSchema(; logical=Avro.DecimalLogical(40, 2)), Avro.WideDecimal(big(123), 2)),
+        )
+        for (schema, value) in cases
+            logicalbytes = Avro.encode(schema, value)
+            for T in (Vector{Any}, Dict{String,Any}, NamedTuple{(),Tuple{}})
+                @test_throws Avro.ConversionError Avro.decode(schema, logicalbytes, T)
+                @test_throws Avro.ConversionError Avro.fromjson(schema, Avro.tojson(schema, value), T)
+            end
+            array = Avro.ArraySchema(schema)
+            @test_throws Avro.ConversionError Avro.decode(array, Avro.encode(array, [value]), Vector{Vector{Any}})
+            @test Avro.decode(schema, logicalbytes, typeof(value)) == value
+        end
+    end
+
     @testset "NamedTuple targets and leaf conversions" begin
         NT = NamedTuple{(:a, :b, :c, :d, :e, :f, :g, :t, :ch, :fl),Tuple{Int,String,Union{Missing,Int},Vector{Float64},Dict{String,Int},Symbol,NTuple{2,UInt8},DateTime,Char,Float64}}
         @test plan(NT) isa Avro.SemanticTarget       # the Dict field converts after generic ownership transfer

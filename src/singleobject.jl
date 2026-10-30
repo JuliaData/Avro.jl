@@ -6,11 +6,11 @@ const SINGLE_OBJECT_MARKER = (0xC3, 0x01)
 """
     Avro.SchemaStore
 
-The interface of a schema store used by `Avro.decodesingle`: `Avro.lookup(store, fingerprint::UInt64;
-limits) -> Schema`, `Avro.lookup(store, fingerprint, budget::Avro.Budget) -> Schema`, and
-`Avro.register!(store, schema; limits) -> UInt64`. The shared-budget lookup must charge the supplied
-budget and throw `Avro.UnknownSchemaError` for an unknown fingerprint. A custom store owns its own
-table budget and ambiguity policy; the built-in `Avro.SchemaCache` is bounded and rejects any second
+The interface of a schema store used by `Avro.decodesingle`: implement
+`Avro.lookup(store, fingerprint::UInt64; limits=Avro.Limits()) -> Schema` and throw
+`Avro.UnknownSchemaError` for an unknown fingerprint. Writable stores may also implement
+`Avro.register!(store, schema; limits) -> UInt64`. A custom store owns its lookup resources,
+cache bounds and ambiguity policy; the built-in `Avro.SchemaCache` is bounded and rejects any second
 schema under an existing fingerprint that is not structurally equal to the stored one. Fingerprints
 are identifiers, not authentication.
 """
@@ -273,22 +273,6 @@ end
 The schema registered under `fingerprint` (`Avro.UnknownSchemaError` otherwise).
 """
 function lookup(c::SchemaCache, fp::UInt64; limits::Limits=Limits())
-    return withbudget(limits) do budget                # the binary search is charged work
-        return lookup(c, fp, budget)
-    end
-end
-
-"""
-    Avro.lookup(store, fingerprint, budget::Avro.Budget) -> Schema
-
-The shared-budget route `decodesingle` uses. Custom stores must implement it so lookup work is charged
-to the caller's operation budget instead of opening a second budget.
-"""
-function lookup(::SchemaStore, ::UInt64, ::Budget)
-    throw(ArgumentError("a custom Avro.SchemaStore used by decodesingle must implement Avro.lookup(store, fingerprint, budget)"))
-end
-
-function lookup(c::SchemaCache, fp::UInt64, budget::Budget)
     return lock(c.lock) do
         n = length(c.fingerprints)
         i = cacheindex(c.fingerprints, fp)
@@ -352,16 +336,17 @@ function decodesingleoperation(src::AbstractVector{UInt8}, store::SchemaStore, b
     T === nothing || T isa Type || throw(ArgumentError("T must be a type or nothing"))
     n = length(src)
     n >= 10 || throw(DataError("single-object message shorter than the 10-byte header", n + 1))
+    n - 10 <= limits.max_datum_bytes || throw(LimitError(:max_datum_bytes, n - 10, limits.max_datum_bytes, :max_datum_bytes, :decode))
+    src = sourcebytes(src, n, budget, DataError)
     (src[1] == SINGLE_OBJECT_MARKER[1] && src[2] == SINGLE_OBJECT_MARKER[2]) || throw(DataError("missing single-object marker C3 01", 1))
     fp = UInt64(0)
     for i in 0:7
         fp |= UInt64(src[3 + i]) << (8 * i)
     end
-    n - 10 <= limits.max_datum_bytes || throw(LimitError(:max_datum_bytes, n - 10, limits.max_datum_bytes, :max_datum_bytes, :decode))
     local tplan, adm, d, span
     beginworkdefer!(budget)
     try
-        writer = lookup(store, fp, budget)             # the shared-budget route; SchemaCache charges this budget
+        writer = lookup(store, fp; limits=limits)
         writer isa Schema || throw(ArgumentError("the schema store returned $(typeof(writer)), not an Avro.Schema"))
         w = BoundedWriter(budget, limits.max_schema_bytes; credit=false)
         seen = schemaseen(writer, budget)

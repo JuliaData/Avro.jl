@@ -387,7 +387,14 @@ function Base.get(m::Map, k::Symbol, default)
     return m.vals[i]
 end
 
-# Equality and hashing follow the sorted key order (insertion order is not part of the value).
+# Symbol indexing is a convenience; dictionary equality compares the actual string keys.
+function Base.in(pair::Pair, m::Map, valcmp=(==))
+    pair.first isa AbstractString || return false
+    index = keyposition(m, pair.first)
+    return index != 0 && valcmp(m.vals[index], pair.second)
+end
+
+# Compare maps in sorted key order; AbstractDict supplies the compatible, order-independent hash.
 function Base.:(==)(a::Map, b::Map)
     length(a.perm) == length(b.perm) || return false
     result = true
@@ -408,14 +415,6 @@ function Base.isequal(a::Map, b::Map)
         (a.keys[ia] == b.keys[ib] && isequal(a.vals[ia], b.vals[ib])) || return false
     end
     return true
-end
-
-function Base.hash(a::Map, h::UInt)
-    h = hash(:AvroMap, h)
-    for i in a.perm
-        h = hash(a.vals[i], hash(a.keys[i], h))
-    end
-    return h
 end
 
 function Base.show(io::IO, m::Map{V}) where {V}

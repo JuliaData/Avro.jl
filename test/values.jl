@@ -18,6 +18,33 @@
     @test sprint(show, ts) == "Avro.Timestamp{Millisecond}(0)"
     @test sprint(show, Avro.LocalTimestamp{Nanosecond}(5)) == "Avro.LocalTimestamp{Nanosecond}(5)"
 
+    @testset "timestamp ordering and hashing across units" begin
+        for T in (Avro.Timestamp, Avro.LocalTimestamp)
+            millis = T{Millisecond}(-1)
+            micros = T{Microsecond}(-1000)
+            nanos = T{Nanosecond}(-1_000_000)
+            @test millis == micros == nanos
+            @test isequal(millis, micros) && isequal(micros, nanos)
+            @test hash(millis) == hash(micros) == hash(nanos)
+            @test length(Set([millis, micros, nanos])) == 1
+            @test Dict(millis => "before epoch")[nanos] == "before epoch"
+            @test millis <= micros && !(millis < micros)
+            @test millis < T{Nanosecond}(-999_999) < T{Microsecond}(0)
+            values = [T{Millisecond}(typemax(Int64)), T{Nanosecond}(typemax(Int64)),
+                      T{Nanosecond}(typemin(Int64)), T{Millisecond}(typemin(Int64))]
+            @test sort(values) == reverse(values)
+            @test sort([T{Microsecond}(1), T{Microsecond}(-1), T{Microsecond}(0)]) ==
+                  [T{Microsecond}(-1), T{Microsecond}(0), T{Microsecond}(1)]
+        end
+        instant = Avro.Timestamp{Microsecond}(1)
+        localtime = Avro.LocalTimestamp{Microsecond}(1)
+        @test instant != localtime && !isequal(instant, localtime)
+        @test length(Set([instant, localtime])) == 2
+        @test_throws MethodError isless(instant, localtime)
+        @test_throws MethodError instant < localtime
+        @test_throws MethodError instant <= localtime
+    end
+
     d = Avro.Duration(UInt32(1), UInt32(2), UInt32(3))
     @test d.months == 1 && d.days == 2 && d.millis == 3
 

@@ -84,16 +84,12 @@
     @testset "custom stores" begin
         struct DictStore <: Avro.SchemaStore
             d::Dict{UInt64,Avro.Schema}
-            seen::Base.RefValue{Union{Nothing,Avro.Budget}}
+            seen::Base.RefValue{Union{Nothing,Avro.Limits}}
         end
 
         function Avro.lookup(s::DictStore, fp::UInt64; limits=Avro.Limits())
+            s.seen[] = limits
             return haskey(s.d, fp) ? s.d[fp] : throw(Avro.UnknownSchemaError(fp))
-        end
-
-        function Avro.lookup(s::DictStore, fp::UInt64, budget::Avro.Budget)
-            s.seen[] = budget
-            return Avro.lookup(s, fp; limits=budget.limits)
         end
 
         function Avro.register!(s::DictStore, schema::Avro.Schema;
@@ -103,27 +99,30 @@
             return fp
         end
 
-        ds = DictStore(Dict{UInt64,Avro.Schema}(), Ref{Union{Nothing,Avro.Budget}}(nothing))
+        ds = DictStore(Dict{UInt64,Avro.Schema}(), Ref{Union{Nothing,Avro.Limits}}(nothing))
         Avro.register!(ds, ws)
-        @test Avro.decodesingle(wbin, ds) == w1
-        @test ds.seen[] isa Avro.Budget
+        limits = Avro.Limits(max_datum_bytes=1024)
+        @test Avro.decodesingle(wbin, ds; limits=limits) == w1
+        @test ds.seen[] === limits
         # a store returning a schema under the wrong fingerprint is rejected
-        liar = DictStore(Dict(Avro.fingerprint(ws) => P("\"int\"")), Ref{Union{Nothing,Avro.Budget}}(nothing))
+        liar = DictStore(Dict(Avro.fingerprint(ws) => P("\"int\"")), Ref{Union{Nothing,Avro.Limits}}(nothing))
         @test_throws Avro.DataError Avro.decodesingle(wbin, liar)
-        e = try Avro.decodesingle(wbin, DictStore(Dict{UInt64,Avro.Schema}(), Ref{Union{Nothing,Avro.Budget}}(nothing))); nothing catch x; x end
+        e = try Avro.decodesingle(wbin, DictStore(Dict{UInt64,Avro.Schema}(), Ref{Union{Nothing,Avro.Limits}}(nothing))); nothing catch x; x end
         @test e isa Avro.UnknownSchemaError && e.fingerprint == Avro.fingerprint(ws)
         @test occursin("fingerprint", sprint(showerror, e))
 
-        struct LegacyStore <: Avro.SchemaStore
+        struct ReadOnlyStore <: Avro.SchemaStore
             d::Dict{UInt64,Avro.Schema}
         end
 
-        function Avro.lookup(s::LegacyStore, fp::UInt64; limits=Avro.Limits())
+        function Avro.lookup(s::ReadOnlyStore, fp::UInt64; limits=Avro.Limits())
             return haskey(s.d, fp) ? s.d[fp] : throw(Avro.UnknownSchemaError(fp))
         end
 
-        legacy = LegacyStore(Dict(Avro.fingerprint(ws) => ws))
-        @test_throws ArgumentError Avro.decodesingle(wbin, legacy)              # no nested operation budget fallback
+        readonly = ReadOnlyStore(Dict(Avro.fingerprint(ws) => ws))
+        @test Avro.decodesingle(wbin, readonly) == w1
+        @test Avro.decodesingle(IOBuffer(wbin), readonly) == w1
+        @test_throws Avro.UnknownSchemaError Avro.decodesingle(wbin, ReadOnlyStore(Dict{UInt64,Avro.Schema}()))
     end
 
     @testset "one operation budget; transactional exact-capacity cache" begin

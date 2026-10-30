@@ -57,7 +57,8 @@ value = Avro.decode(s, bytes)
   atomic file replacement on write; `Avro.inspect` for diagnosing files.
 * **Tables.jl**: `Avro.Table` is a column table (with `Tables.partitions` per block and DataAPI
   metadata); `Avro.Rows` streams `Avro.Row`s; `select=` is projection pushdown that skips unselected
-  fields; typed decoding into your own structs via StructUtils.
+  fields; typed decoding into your own structs via StructUtils. Access columns as `table.name` or
+  `table[:name]`. Loading Arrow.jl preserves exact Avro timestamps as native Arrow timestamp columns.
 * **Parallel decoding**: `Avro.Table(src; ntasks=…)` decodes blocks in parallel when the memory
   ceiling leaves room; results and errors match `ntasks=1`.
 * **Safety by default**: claimed lengths and counts are checked against the input before allocation,

@@ -14,6 +14,10 @@ deferred.
 
 ### Added
 
+- Direct column access on `Avro.Table` through `table.name`, `table[:name]`, and `table[index]`.
+- Optional Arrow.jl integration that preserves exact global and local timestamp units and values,
+  including nullable columns, without converting through millisecond `DateTime` values.
+
 - Schema resolution (`Avro.resolve`; `reader_schema=` on `Avro.decode`, `Avro.DatumReader`,
   `Avro.decodesingle`, `Avro.Table`, and `Avro.Rows`) with both union-resolution policies (`:spec`,
   `:java`), aliases, promotions and defaults.

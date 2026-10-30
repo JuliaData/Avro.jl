@@ -5,6 +5,14 @@ mutable struct FailIO <: IO
     written::Int
 end
 
+struct OffsetTableColumn{T} <: AbstractVector{T}
+    data::Vector{T}
+end
+
+Base.size(column::OffsetTableColumn) = size(column.data)
+Base.axes(column::OffsetTableColumn) = (0:length(column.data)-1,)
+Base.getindex(column::OffsetTableColumn, i::Int) = column.data[i + 1]
+
 function FailIO(n::Int)
     return FailIO(IOBuffer(), n, 0)
 end
@@ -633,6 +641,9 @@ end
         @test [v.x for v in readall(IOBuffer(take!(pb)))] == collect(1:10)
         @test_throws ArgumentError Avro.tobuffer(Tables.partitioner([(a=[1],), (a=[2], b=[3])]))
         @test length(Avro.Table(Avro.tobuffer(Tables.partitioner([(a=[1],), (a=[2],)])))) == 2
+        offsetcolumns = (x=OffsetTableColumn(Int64[1, 2, 3]), y=OffsetTableColumn(["a", "b", "c"]))
+        @test Tables.columntable(Avro.Table(Avro.tobuffer(offsetcolumns))) ==
+              (x=Int64[1, 2, 3], y=["a", "b", "c"])
         if !Sys.iswindows()
             dir = mktempdir()
             plain = joinpath(dir, "plain.avro")
@@ -643,6 +654,7 @@ end
             chmod(fresh, 0o640)
             Avro.write(fresh, rows)                       # replacing keeps the existing mode
             @test filemode(fresh) & 0o777 == 0o640
+            @test sort(readdir(dir)) == ["fresh.avro", "plain.avro"]
         end
     end
     @testset "sources: path, mmap=false stream, IO, bytes" begin
@@ -1267,6 +1279,21 @@ end
         push!(w5, (x=Int64(4),))
         close(w5)
         @test [v.x for v in readall(dest2)] == [4]
+        if Sys.isunix()
+            pipe = Pipe()
+            Base.link_pipe!(pipe)
+            sink = Base.fdio(reinterpret(Cint, Base._fd(pipe.in)), false)
+            try
+                syncwriter = Avro.Writer(sink, s; fsync=true)
+                push!(syncwriter, (x=Int64(1),))
+                @test_throws SystemError close(syncwriter)
+                @test isopen(sink)                       # caller-owned streams remain open after failure
+                @test_throws Avro.WriterClosedError push!(syncwriter, (x=Int64(2),))
+            finally
+                close(sink)
+                close(pipe)
+            end
+        end
         # reserved metadata and option validation
         @test_throws ArgumentError Avro.Writer(IOBuffer(), s; metadata=Dict("avro.codec" => UInt8[]))
         @test_throws Avro.EncodeError Avro.Writer(w -> push!(w, (Int64(1),)), IOBuffer(), s)

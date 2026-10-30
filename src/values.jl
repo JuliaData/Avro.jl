@@ -1,5 +1,5 @@
 # Value types that do not reference schemas. `Record`, `EnumValue`, `Fixed`, `UnionValue` and
-# `Avro.Map` live in `schema.jl`/`map.jl` because they carry schema identity or frozen storage.
+# `Avro.Map` live in `generic.jl` because they carry schema identity or frozen storage.
 
 using Dates: Dates, Millisecond, Microsecond, Nanosecond, DateTime, Date, Time
 
@@ -34,7 +34,7 @@ end
 
 An exact global instant: `ticks` units of `P` (`Millisecond`, `Microsecond` or `Nanosecond`) since the
 Unix epoch. `DateTime(x)` is an explicit, range-checked conversion (`ConversionError`) that floors
-sub-millisecond units.
+sub-millisecond units. Equality, ordering and hashing compare exact instants across these units.
 """
 struct Timestamp{P<:Dates.TimePeriod}
     ticks::Int64
@@ -43,7 +43,9 @@ end
 """
     Avro.LocalTimestamp{P}(ticks::Int64)
 
-An exact local (zone-less) timestamp: `ticks` units of `P` since 1970-01-01T00:00:00 local time.
+An exact local (zone-less) timestamp: `ticks` units of `P` (`Millisecond`, `Microsecond` or
+`Nanosecond`) since 1970-01-01T00:00:00 local time. Equality, ordering and hashing compare exact
+local times across these units. Local timestamps are distinct from global `Timestamp` instants.
 """
 struct LocalTimestamp{P<:Dates.TimePeriod}
     ticks::Int64
@@ -72,6 +74,47 @@ end
 
 function tickscale(::Type{Nanosecond})
     return 1_000_000
+end
+
+# Int128 holds the full Int64 millisecond range in nanoseconds without rounding or overflow.
+function timestampnanoseconds(x::Union{Timestamp{P},LocalTimestamp{P}}) where {P}
+    return Int128(x.ticks) * (1_000_000 ÷ tickscale(P))
+end
+
+function Base.:(==)(a::Timestamp, b::Timestamp)
+    return timestampnanoseconds(a) == timestampnanoseconds(b)
+end
+
+function Base.:(==)(a::LocalTimestamp, b::LocalTimestamp)
+    return timestampnanoseconds(a) == timestampnanoseconds(b)
+end
+
+function Base.isequal(a::Union{Timestamp,LocalTimestamp}, b::Union{Timestamp,LocalTimestamp})
+    return a == b
+end
+
+function Base.isless(a::Timestamp, b::Timestamp)
+    return timestampnanoseconds(a) < timestampnanoseconds(b)
+end
+
+function Base.isless(a::LocalTimestamp, b::LocalTimestamp)
+    return timestampnanoseconds(a) < timestampnanoseconds(b)
+end
+
+function Base.:(<)(a::Union{Timestamp,LocalTimestamp}, b::Union{Timestamp,LocalTimestamp})
+    return isless(a, b)
+end
+
+function Base.:(<=)(a::Union{Timestamp,LocalTimestamp}, b::Union{Timestamp,LocalTimestamp})
+    return isless(a, b) || a == b
+end
+
+function Base.hash(x::Timestamp, h::UInt)
+    return hash(timestampnanoseconds(x), hash(:AvroTimestamp, h))
+end
+
+function Base.hash(x::LocalTimestamp, h::UInt)
+    return hash(timestampnanoseconds(x), hash(:AvroLocalTimestamp, h))
 end
 
 """

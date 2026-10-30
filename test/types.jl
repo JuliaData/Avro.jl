@@ -232,6 +232,15 @@ end
     @test Dict(m) == Dict("a" => 1, "b" => 3, "c" => 4)
     @test m == Avro.Map([("b", 3), ("a", 1), ("c", 4)]) && hash(m) == hash(Avro.Map([("b", 3), ("a", 1), ("c", 4)]))
     @test m == Avro.Map([("a", 1), ("b", 3), ("c", 4)]) && hash(m) == hash(Avro.Map([("a", 1), ("b", 3), ("c", 4)]))   # equality ignores insertion order (AbstractDict semantics)
+    ordinary = Dict("a" => 1, "b" => 3, "c" => 4)
+    @test isequal(m, ordinary) && isequal(ordinary, m)
+    @test hash(m) == hash(ordinary)
+    @test Dict{Any,Int}(m => 7)[ordinary] == 7
+    @test length(Set{Any}([m, ordinary])) == 1
+    symbolic = Dict(:a => 1, :b => 3, :c => 4)
+    @test !isequal(m, symbolic) && !isequal(symbolic, m)
+    @test m != symbolic && symbolic != m
+    @test !((1 => 2) in m) && !((:a => 1) in m) && (("a" => 1) in m)
     @test m != Avro.Map([("a", 1), ("b", 3)]) && m != Avro.Map([("a", 1), ("b", 3), ("c", 5)])
     @test Avro.Map{Int}([(:x, 1)])["x"] == 1 && Avro.Map{Int}() isa Avro.Map{Int} && isempty(Avro.Map{Int}())
     @test_throws ArgumentError Avro.Map([(1, 2)])

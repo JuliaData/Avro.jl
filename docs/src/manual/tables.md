@@ -10,10 +10,13 @@ files cannot force compilation.
 
 ```julia
 t = Avro.Table("data.avro")
+ids = t.id                                    # also t[:id], or t[1] for the first column
 df = DataFrame(t)                              # or any Tables.jl sink
 ```
 
 `Avro.schema(t)` is the effective (reader) schema, `Avro.writerschema(t)` the file's writer schema.
+Column names take precedence in property access, including fields named `schema` or `metadata`;
+use `Avro.schema(t)` and `Avro.metadata(t)` to inspect file information.
 
 ## `Avro.Rows`
 
@@ -27,6 +30,8 @@ df = DataFrame(t)                              # or any Tables.jl sink
 
 `close(rows)` releases the source (do-block form available); `Tables.partitions(rows)` yields one
 `Avro.Table` per block, so `Avro.write(dst, Avro.Rows(src))` re-encodes with bounded memory.
+Rows are consumed once. For bytes and memory-mapped files, `length(rows)` reports the number still
+available; it decreases as rows or partitions are consumed. Streamed sources have no known length.
 
 ## Projection pushdown
 

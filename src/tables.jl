@@ -190,6 +190,7 @@ end
 
 Materialise a container file with a record root as a Tables.jl column table (plain `Vector` columns,
 a stored `Tables.Schema` without eltype parameters, `Tables.partitions` per block, DataAPI metadata).
+Access columns with `table.name`, `table[:name]`, or `table[index]`; `length(table)` is the row count.
 `select=` is projection pushdown: unselected fields are skipped under the active validation mode and
 the result's derived schema keeps the selected fields in the selected order.
 """
@@ -362,6 +363,18 @@ function Tables.getcolumn(t::Table, nm::Symbol)
     i = findfirst(==(nm), getfield(t, :names))
     i === nothing && throw(ArgumentError("no column $nm"))
     return getfield(t, :columns)[i]
+end
+
+Base.getindex(t::Table, column::Union{Int,Symbol}) = Tables.getcolumn(t, column)
+
+function Base.getproperty(t::Table, name::Symbol)
+    i = findfirst(==(name), getfield(t, :names))
+    return i === nothing ? getfield(t, name) : Tables.getcolumn(t, i)
+end
+
+function Base.propertynames(t::Table, private::Bool=false)
+    columns = getfield(t, :names)
+    return private ? unique(vcat(columns, collect(fieldnames(Table)))) : copy(columns)
 end
 
 function Tables.partitions(t::Table)
@@ -557,7 +570,8 @@ Stream a container file's datums. **Generic record mode** (record root, no `T`):
 yielding `Avro.Row`, with lazily interned column names and per-block `Tables.partitions`. **Typed mode**
 (`T`): a plain iterator of `T` (no Tables interface). **Non-record mode**: a plain iterator of the generic
 values. `select=` applies to the generic record mode only. `close(rows)` is idempotent; the do-block
-form closes on exit.
+form closes on exit. Byte and memory-mapped sources report the number of remaining rows with `length`;
+streamed sources have no known length. All modes are single-pass iterators.
 """
 mutable struct Rows{L}                     # L::Bool — a byte-source pre-scan supplied an exact length
     const reader::Reader
@@ -569,7 +583,7 @@ mutable struct Rows{L}                     # L::Bool — a byte-source pre-scan 
     const adm::Union{Nothing,SymbolAdmission}
     const select::Union{Nothing,Projection}
     const resolved::Bool                     # the plan can add zero-input reader defaults
-    const nrows::Int                       # exact datum count when L (0 otherwise)
+    nrows::Int                             # remaining datum count when L (0 otherwise)
     symbols::Union{Nothing,Vector{Symbol}} # lazy
     tablesschema::Union{Nothing,Tables.Schema{nothing,nothing}} # lazy
     bytes::Vector{UInt8}
@@ -725,6 +739,13 @@ function Base.length(rows::Rows{true})
     return getfield(rows, :nrows)
 end
 
+function consumedrows!(rows::Rows{true}, count::Int)
+    rows.nrows -= count
+    return nothing
+end
+
+consumedrows!(::Rows{false}, ::Int) = nothing
+
 function Base.IteratorEltype(::Type{<:Rows})
     return Base.EltypeUnknown()
 end
@@ -785,6 +806,7 @@ function Base.iterate(rows::Rows, ::Nothing=nothing)
         rows.blockwork = nothing
         releaseblock!(rows, b)
     end
+    consumedrows!(rows, 1)
     return (v, nothing)
 end
 
@@ -904,34 +926,21 @@ function Base.iterate(it::RowsPartitions, ::Nothing=nothing)
     baseline = b.reserved
     try
         reserve!(b, bytesbytes(length(bytes)))
-        before = b.reserved
         d = setblockscope!(Decoder(bytes, b; validate=r.validate), blockwork)
         plan = rows.plan
         cols = columnbuilders(plan, rows.select, count, b)
-        for _ in 1:count
-            datumspan!(r.span, d, d.pos, d.budget.values,
-                       d.budget.input_bytes)
-            span = decoderspan(d)
-            planneddatumspan!(plan, d, span; resolved=rows.resolved,
-                              projection=rows.select)
-            span = decoderspan(d)
-            datumwork = begindatum!(d, span)
-            try
-                countvalues!(b)
-                decoderow!(cols, d, plan)
-            catch
-                abortdatum!(d, datumwork)
-                rethrow()
-            end
-            finishdatum!(d, datumwork)
+        out = rows.outschema::RecordSchema
+        slotrow = sum(field -> slotbytes(juliatype(field.schema)), out.fields; init=0)
+        cells = plan isa RecordPlan ? fuseskips(cols, b) : cols
+        try
+            decodeblockrows!(r.span, d, plan, cells, count, b, rows.select, rows.resolved,
+                             b.reserved, slotrow, r.limits.max_block_output_bytes)
+        finally
+            releasefused!(cells, cols, b)
         end
         d.pos == length(bytes) + 1 || throw(DataError("block datums did not consume the block exactly", d.pos))
         finishblockwork!(b, blockwork)
-        blockout = max(b.reserved - before, 0)
-        blockout <= r.limits.max_block_output_bytes ||
-            throw(LimitError(:max_block_output_bytes, blockout, r.limits.max_block_output_bytes, :max_block_output_bytes, :decode))
         release!(b, bytesbytes(length(bytes)))
-        out = rows.outschema::RecordSchema
         sel = rows.select === nothing ? eachindex(out.fields) : rows.select.indices
         finals = exactvector(AbstractVector, length(out.fields), b)
         for (position, i) in enumerate(sel)
@@ -945,6 +954,7 @@ function Base.iterate(it::RowsPartitions, ::Nothing=nothing)
         reserve!(b, shellbytes(Table))
         t = Table(out, r.schema, outnames, tableschema, finals, count, ranges,
                   r.metadata, r.codecname, r.sync)
+        consumedrows!(rows, count)
         return (t, nothing)
     finally
         release!(b, max(b.reserved - baseline, 0))       # completed output transfers at return; partial output dies here
@@ -982,6 +992,7 @@ function Tables.columns(rows::Rows)
         t = Table(out, writerschema(rows), outnames, tableschema, finals, nrows,
                   ranges, metadata(rows), codec(rows), sync(rows))
         release!(b, vectorbytes(Int, length(counts)))
+        consumedrows!(rows, nrows)
         return t
     finally
         release!(b, max(b.reserved - baseline, 0))       # completed output transfers at return; partial output dies here

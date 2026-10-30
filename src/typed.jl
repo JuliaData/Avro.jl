@@ -1940,7 +1940,8 @@ end
 
 # StructUtils would treat a decoded scalar as a struct without fields and fill an array, dict or struct
 # target with nothing; refuse instead so the conversion fails.
-const SCALAR_VALUES = Union{Bool,Int32,Int64,Float32,Float64,String}
+const SCALAR_VALUES = Union{Bool,Int32,Int64,Float32,Float64,String,Date,Time,UUID,
+                            Timestamp,LocalTimestamp,Duration,DataDecimals.AbstractDecimal,WideDecimal}
 
 function StructUtils.applyeach(::AvroStyle, f, x::SCALAR_VALUES)
     throw(ArgumentError("a decoded $(typeof(x)) is not a collection"))

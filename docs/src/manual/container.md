@@ -19,7 +19,9 @@ symbolic links, when it opens. Changing the working directory later does not red
 `atomic=true`, a failure leaves the target unchanged. With
 `atomic=false`, the destination is opened in place, so a failure can leave it truncated or containing
 complete blocks plus a partial final block. `fsync=true` syncs the file before rename, but does not sync
-the directory that contains it.
+the directory that contains it. A failed file sync raises an error and prevents atomic publication.
+Atomic writes preserve an existing file's permissions; new files use the process's normal creation
+permissions without changing the process-wide umask.
 
 [`Avro.Writer`](@ref) is the streaming form:
 

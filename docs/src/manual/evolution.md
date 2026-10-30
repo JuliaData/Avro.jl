@@ -17,16 +17,17 @@ t = Avro.Table("people.avro"; reader_schema=reader)
 
 The full "Schema Resolution" rules are implemented:
 
-* records match by fullname, then reader aliases; fields by name, then field aliases; missing reader
+* records match by fullname, reader aliases, or unqualified name; fields by name and field aliases; missing reader
   fields take their defaults; writer-only fields are skipped.
 * promotions: `int → long → float → double`, `string ↔ bytes`.
 * enums remap by symbol; unknown writer symbols fall to the reader's `default` symbol.
-* unions resolve per branch. `union_resolution=:spec` (default) takes the reader branch of the
-  writer's own type (the same primitive, or a named type with the writer's fullname or a reader alias of
-  it), else the only branch sharing a named writer type's unqualified name, else the first branch the
-  writer promotes to: `long` data read with `["double","long"]` stays `long`. When several branches share
-  the unqualified name and none has the fullname, resolution raises `Avro.ResolutionError` instead of
-  guessing. `:java` reproduces Java's choice, which also matches records structurally.
+* unions resolve per branch. `union_resolution=:spec` (default) chooses the **first matching reader
+  branch**, including promotions, in schema order. Thus `long` data read with `["double","long"]`
+  becomes `Float64`, which can lose integer precision. Named types match by fullname, reader alias,
+  or unqualified name; the first match wins even if a later branch has the exact fullname.
+  `union_resolution=:java` reproduces Java's choice: it prefers the writer's exact primitive type or
+  fullname (including aliases), then considers structural record matches and promotions. Use this
+  policy when interoperating with Java's union choices or to prefer an exact integer branch.
 * the decoded representation follows the **reader** schema (a resolved value looks as if it had been
   written under the reader schema).
 

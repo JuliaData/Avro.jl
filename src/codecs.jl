@@ -2,7 +2,7 @@
 # exactly one meaning — the cap on the complete decoder memory requirement of one codec member as the
 # codec library reports it — enforced on every member read and on every frame written. Multi-member
 # payloads (zstandard frames incl. skippable ones; xz/bzip2 streams via the extensions) are decoded to
-# exact exhaustion; deflate rejects bytes after its final block; snappy carries the big-endian CRC32 of
+# exact exhaustion; deflate tolerates bytes after its final block; snappy carries the big-endian CRC32 of
 # the uncompressed data.
 
 import CodecZlib
