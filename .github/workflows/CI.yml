@@ -75,7 +75,7 @@ jobs:
           coverage: false
   quality:
     if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
-    name: Aqua + JET + Arrow 2 smoke
+    name: Aqua + JET + cross-package smoke
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -163,23 +163,3 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           DOCUMENTER_KEY: ${{ secrets.DOCUMENTER_KEY }}
-  trim:
-    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
-    name: juliac --trim smoke (informational)
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-      - uses: julia-actions/setup-julia@v2
-        with:
-          version: '1'
-      - uses: julia-actions/julia-buildpkg@v1
-      - name: Trim-compile the reader program
-        run: julia test/trim/compile.jl
-  arrow3:
-    name: Arrow 3 candidate smoke (informational)
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    if: false   # enabled when an Arrow 3 release candidate is registered
-    steps:
-      - uses: actions/checkout@v4
