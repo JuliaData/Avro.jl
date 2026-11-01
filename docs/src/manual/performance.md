@@ -5,16 +5,20 @@
 ## Getting the numbers
 
 * **Prepared beats one-shot**: `DatumReader`/`DatumWriter` skip per-call plan construction. For repeated
-  writes, reuse a typed `DatumWriter(schema, T)` and an output `IO`; calling `writer(row)`
-  returns a new owned byte vector each time.
-* **Writers fast-path aligned NamedTuples** automatically — rows whose fields match the record schema
-  in order (up to 32 fields) encode monomorphized. Other column tables and strided vectors of concrete
-  `NamedTuple` rows use typed field cells when every schema field is present. Wide and reordered rows
-  reuse the same encoding and limit checks without building a generic record for each row. Custom
-  and lazy row vectors retain row-by-row access.
-* **Projection**: `select=` skips what you don't read; `validate=:fast` additionally jumps sized
-  blocks (choose it only for trusted data).
-* **Parallelism needs headroom** under `max_total_bytes` (ample at the default) and files with
-  multi-megabyte blocks (`block_bytes=` on the writer) so per-block overheads amortise.
+  writes, reuse a typed `DatumWriter(schema, T)` and an output `IO`; calling `writer(row)` returns a new
+  owned byte vector each time, `writer(io, row)` appends without allocating one.
+* **Writers fast-path aligned rows** automatically: NamedTuples and structs whose fields match the record
+  schema in order (up to 32 fields) encode monomorphized. Other column tables and strided vectors of concrete
+  `NamedTuple` rows write through typed field cells; wide and reordered rows never build a generic
+  record per row.
+* **Message streams**: a `SingleObjectReader` looks up and verifies each schema fingerprint once, where
+  `decodesingle` repeats that work per message.
+* **Projection**: `select=` skips what you don't read, jumping sized array and map blocks by their
+  recorded size.
+* **Parallelism** wants files with multi-megabyte blocks (`block_bytes=` on the writer) so per-block
+  overheads amortise; `Avro.Table(src; ntasks=…)` then decodes blocks straight into preallocated
+  columns.
 * **Column access beats row access** for bulk work: `Avro.Table` decodes straight into typed columns.
 * Typed decoding into concrete structs avoids the generic model's boxing for isbits fields.
+* **`juliac --trim=safe`** builds are not supported: readers and writers dispatch on schema-driven plans
+  at run time, which a trimmed executable cannot resolve.

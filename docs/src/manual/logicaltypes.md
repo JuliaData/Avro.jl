@@ -8,40 +8,41 @@ types fall back to their underlying type and are preserved when re-encoding. The
 |---|---|---|
 | `date` | `Dates.Date` | any `Int32` day count |
 | `time-millis` / `time-micros` | `Dates.Time` | decode range-checked to one day; encode rejects sub-precision values — align with [`Avro.truncate`](@ref)/[`Avro.round`](@ref) |
-| `timestamp-*` | [`Avro.Timestamp`](@ref)`{Millisecond\|Microsecond\|Nanosecond}` | exact `Int64` ticks since the Unix epoch; `DateTime(x)` is an explicit, range-checked conversion (`Avro.ConversionError` on overflow; floor for sub-ms) |
-| `local-timestamp-*` | [`Avro.LocalTimestamp`](@ref)`{...}` | same conversion rules |
+| `timestamp-millis` / `-micros` / `-nanos` | [`Avro.Timestamp`](@ref)`{P}` = `Durations.ZonedTimestamp{P,:UTC}` | an instant on the global timeline: exact `Int64` ticks since the Unix epoch, displayed in UTC |
+| `local-timestamp-*` | [`Avro.LocalTimestamp`](@ref)`{P}` = `Durations.Timestamp{P}` | a wall-clock date-time without a zone (`Dates.Timestamp` on Julia ≥ 1.14) |
 | `decimal` (bytes/fixed) | [`Avro.Decimal`](@ref) (`Int128`, precision ≤ 38) or [`Avro.WideDecimal`](@ref) (`BigInt`) | big-endian two's complement; both encode and decode validate digits ≤ precision |
 | `uuid` (string / fixed-16) | `UUIDs.UUID` | strings must be RFC-4122 `8-4-4-4-12` hex |
-| `duration` | [`Avro.Duration`](@ref) | `months`/`days`/`millis` as `UInt32` |
+| `duration` | [`Avro.Duration`](@ref) | `months`/`days`/`millis` as `UInt32`; converts to and from `Durations.Duration` |
 
-Timestamps never silently become `DateTime` — the exact wrappers preserve the full `Int64` range. A
-typed target of `DateTime` performs the same explicit conversion; a typed `Avro.Timestamp{P}` target
+Timestamps are `Dates.AbstractDateTime`s from [Durations.jl](https://github.com/quinnj/Durations.jl):
+they support the `Dates` accessors, period arithmetic, comparison and sorting across precisions, and
+dictionary keys, and they never silently lose sub-millisecond precision. `DateTime(x)` converts
+explicitly (flooring to milliseconds); `Avro.LocalTimestamp{P}(x, UTC)` (that is,
+`Durations.Timestamp{P}(x, UTC)`) gives the UTC wall-clock time of a global instant. Global and local
+timestamps are distinct types and compare unequal: a local timestamp does not identify an instant.
+
+Encoding accepts, for a `timestamp-*` field, any `Durations.ZonedTimestamp` whose UTC instant is
+exactly representable in the field's unit, a `DateTime` (read as UTC), and, with TimeZones.jl loaded, a
+`ZonedDateTime`; for a `local-timestamp-*` field, any `Durations.Timestamp` exactly representable in the
+field's unit and a `DateTime`. A typed target of `DateTime` performs the same explicit conversion; a target
 of another unit converts exactly or raises `Avro.ConversionError`.
-
-Timestamps support sorting, comparisons and dictionary keys across all three precisions without
-rounding. For example, `Avro.Timestamp{Millisecond}(1) == Avro.Timestamp{Microsecond}(1000)`.
-The same applies to local timestamps. Global and local timestamps are distinct: they compare unequal
-and cannot be ordered against each other because a local timestamp does not identify a global instant.
 
 ## Arrow integration
 
-Loading Arrow.jl activates an optional extension for `Avro.Timestamp` and `Avro.LocalTimestamp`:
+Durations.jl's own Arrow extension writes these timestamps as native Arrow timestamp columns in their
+original unit: global instants with the `UTC` time zone, local timestamps without one. Other Arrow
+implementations see ordinary timestamp columns; Julia readers with Durations loaded get the same types
+back:
 
 ```julia
 using Avro, Arrow
 Arrow.write("events.arrow", Avro.Table("events.avro"))
 ```
 
-These columns use native Arrow timestamps in their original millisecond, microsecond or nanosecond
-unit. Global instants carry the UTC timezone; local timestamps have no timezone. Julia extension
-metadata restores the exact Avro wrapper when both packages are loaded, including nullable columns
-and the full `Int64` tick range. Other Arrow implementations see ordinary timestamp columns.
-`Arrow.Table(path; convert=false)` exposes the native Arrow storage types.
-
-This extension covers timestamps. Other Avro-specific values, such as records, enums, fixed bytes,
-general unions and durations, do not have a guaranteed Arrow round trip. Convert them explicitly to
-the representation required by the destination; Tables.jl compatibility alone does not preserve
-every Avro logical type.
+Nested records become Arrow struct columns, enums become strings and fixed values become byte lists, and
+they all read back as those plain Arrow types. Decimals and durations become struct columns of their fields,
+and a UUID nested in a record becomes its text. Arrow.jl cannot store a [`Avro.WideDecimal`](@ref), which holds
+a `BigInt`, or a top-level column of maps whose values are not leaves, so convert those first.
 
 Deviations from other implementations, in favour of the specification, are recorded in
 [Limits and security](limits-and-security.md): decimal precision is validated on decode as well as

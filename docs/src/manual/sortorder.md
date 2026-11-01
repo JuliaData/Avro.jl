@@ -18,5 +18,4 @@ Rules of note, matching the specification and validated against the Java impleme
 * maps are unordered: comparing them is an error unless the field's `order` is `ignore`.
 * union values compare by branch index first, then by value within the branch.
 
-Comparing two encoded datums reads each byte at most once; the work rule of the
-[limits model](limits-and-security.md) bounds the values counted.
+Comparing two encoded datums reads each byte at most once.

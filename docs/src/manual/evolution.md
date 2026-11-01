@@ -34,5 +34,4 @@ The full "Schema Resolution" rules are implemented:
 A writer union branch that no reader branch accepts raises `Avro.ResolutionError` when a datum uses
 it, not when the schemas are resolved, matching Java.
 
-Resolution work is bounded by `max_resolution_work` (see [Limits](limits-and-security.md)); results
-are memoised per `(writer, reader)` pair within an operation.
+Resolutions are memoised per `(writer, reader)` pair within an operation.

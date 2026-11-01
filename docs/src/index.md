@@ -2,7 +2,7 @@
 
 A pure-Julia implementation of the [Apache Avro](https://avro.apache.org/docs/current/specification/)
 data format: schemas, binary and JSON encodings, schema resolution, sort order, single-object encoding,
-and object container files — with a Tables.jl interface, parallel decoding, and fixed, portable
+and object container files — with a Tables.jl interface, parallel decoding, and input-proportional
 resource limits so untrusted files fail predictably instead of exhausting memory.
 
 The package implements the Avro *data format*; Avro RPC is out of scope.

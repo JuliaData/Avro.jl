@@ -2,28 +2,44 @@
 
 ## Writing
 
-[`Avro.write`](@ref) writes any Tables.jl source (row or column access) to a container file:
+[`Avro.write`](@ref) writes any Tables.jl source (row or column access) or any collection of datums, such
+as a vector of structs, to a container file:
 
 ```julia
 Avro.write("data.avro", table; codec=:zstandard, level=7, metadata=Dict("origin" => b"etl-v2"))
+Avro.write("people.avro", [Person(1, "alice"), Person(2, "bob")])
+Avro.write("ids.avro", (i^2 for i in 1:100))   # a generator is collected first
 buf = Avro.tobuffer(table)                     # an IOBuffer instead of a file
 ```
 
 The schema comes from `schema=`, else from the retained schema of an Avro source (an `Avro.Table` or
-`Avro.Rows`), else from the source's `Tables.schema`. Sources without one need an
-explicit `schema=`. `Tables.partitions` become block boundaries.
+`Avro.Rows`), else from the source's column types, or from the element type of a collection of datums.
+`Tables.partitions` become block boundaries. A table column the schema has no field for is an `ArgumentError`.
+`metadata` maps strings to strings or byte vectors; rewriting an Avro source keeps its user metadata unless you
+pass your own.
 
 Writing to a path is **atomic by default**: output goes to a temporary file that is renamed over the
 target only on a successful `close`. The writer resolves the path's parent directory, including parent
 symbolic links, when it opens. Changing the working directory later does not redirect the output. With
-`atomic=true`, a failure leaves the target unchanged. With
-`atomic=false`, the destination is opened in place, so a failure can leave it truncated or containing
-complete blocks plus a partial final block. `fsync=true` syncs the file before rename, but does not sync
-the directory that contains it. A failed file sync raises an error and prevents atomic publication.
-Atomic writes preserve an existing file's permissions; new files use the process's normal creation
-permissions without changing the process-wide umask.
+`atomic=true`, a failure leaves the target unchanged. With `atomic=false`, the destination is opened in
+place, so a failure can leave it truncated or containing complete blocks plus a partial final block.
+`fsync=true` syncs the file before rename, but does not sync the directory that contains it. A failed
+file sync raises an error and prevents atomic publication. Atomic writes preserve an existing file's
+permissions; new files use the process's normal creation permissions without changing the process-wide
+umask.
 
-[`Avro.Writer`](@ref) is the streaming form:
+`append=true` adds blocks to an existing file in place, like Java's `DataFileWriter.appendTo`:
+
+```julia
+Avro.write("events.avro", new_events; append=true)
+```
+
+The file's schema, codec, metadata and sync marker stay in force, and a missing or empty file is created
+as usual. An explicit `schema=` must equal the file's schema, and `codec=` must match. Appending checks that the file
+ends at a block boundary, so a torn file is reported before anything is added. A failed write removes the blocks it
+added, but a process crash can still leave a torn last block. Only one writer may append at a time.
+
+[`Avro.Writer`](@ref) is the streaming form, and it takes `append=true` too:
 
 ```julia
 w = Avro.Writer("data.avro", s; codec=:deflate, block_bytes=256 * 1024)
@@ -33,12 +49,12 @@ end
 close(w)
 ```
 
-A `Writer` enforces every per-schema, per-block and per-datum limit a reader enforces, so **everything
-a successfully closed writer emits is accepted by `Reader` and `Rows` under identical limits**, and by
-`Avro.Table` when the table fits `max_total_bytes` (see [Limits and security](limits-and-security.md)). The first failure poisons the
-writer, including a rejected datum or limit failure from `push!`; further use throws
-`Avro.WriterClosedError` carrying the original cause. Closing a poisoned writer discards its buffered
-block. For `atomic=false` and caller-owned streams, no repair of partial output is promised.
+A `Writer` enforces the reader's limits as it writes, so **everything a successfully closed writer emits
+is accepted by `Reader`, `Rows` and `Table` under identical limits** (see
+[Limits and security](limits-and-security.md)). The first failure poisons the writer, including a
+rejected datum or limit failure from `push!`; further use throws `Avro.WriterClosedError` carrying the original cause.
+Closing a poisoned writer discards its buffered block. For `atomic=false` and caller-owned streams, no
+repair of partial output is promised.
 
 ## Reading
 
@@ -47,7 +63,7 @@ Three consumers, all schema-carrying and all bounded by the limits:
 * [`Avro.Table`](@ref) — materialise as a column table ([Tables.jl integration](tables.md)).
 * [`Avro.Rows`](@ref) — stream datums with per-block memory.
 * [`Avro.Reader`](@ref) — the low-level form: [`Avro.eachdatum`](@ref) iterates values of any root
-  schema, [`Avro.eachblock`](@ref) yields `(count, bytes)` per block.
+  schema, [`Avro.eachblock`](@ref) yields `(count, bytes)` per decompressed block.
 
 ```julia
 Avro.Reader("data.avro") do r
@@ -66,21 +82,17 @@ path-owned handles until `close` (do-block forms close on exit); caller-owned `I
 
 `null`, `deflate`, `snappy` and `zstandard` are built in; `bzip2` and `xz` activate as package
 extensions when `CodecBzip2`/`CodecXz` are loaded. [`Avro.codecs`](@ref) lists what is available.
-Decoders enforce `max_codec_memory` against each frame's declared requirement (a zstandard file
-written with a huge window fails fast, with the limit to raise); writers verify every frame they emit
-against the same cap, so a written file is always decodable under the same limits.
+Decompression stops as soon as a block's output passes `max_bytes`.
 
 ## Inspection and 1.x files
 
-[`Avro.inspect`](@ref) reports header and framing issues, including a container's codec, schema, and
+[`Avro.inspect`](@ref) reports header and framing issues together with a container's codec, schema and
 block structure. It walks each datum without materialising values and diagnoses payload count
 mismatches and Avro.jl 1.x null-codec padding. It cannot infer decimal byte order.
-Files written by Avro.jl ≤ 1.1.2 have known defects; read them with
-`legacy=:avrojl1` (padded null-codec blocks, the `zstd` codec name, unnamed fixed schemas) and
-`decimal_byteorder=:little` (native-endian fixed-16 decimals), and rewrite once:
+Files written by Avro.jl ≤ 1.1.2 have known defects (padded null-codec blocks, the `zstd` codec
+name, unnamed fixed schemas, native-endian fixed-16 decimals); read them with `legacy=:avrojl1`, which
+tolerates all four, and rewrite once:
 
 ```julia
-Avro.write("clean.avro",
-           Avro.Rows("old.avro"; legacy=:avrojl1, decimal_byteorder=:little);
-           codec=:zstandard)
+Avro.write("clean.avro", Avro.Rows("old.avro"; legacy=:avrojl1); codec=:zstandard)
 ```

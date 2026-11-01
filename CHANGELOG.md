@@ -6,17 +6,13 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [2.0.0] - Unreleased
 
-Avro.jl 2.0 is a ground-up rewrite of the Avro data-format implementation, with fixed, portable
-resource limits, strict validation by default, parallel container decoding, and oracle-tested
-interoperability. It is SemVer-breaking; deprecation shims cover the main 1.x entry points for one
-major cycle. The Avro 1.12 `big-decimal` logical type is preserved as an unknown annotation and is
-deferred.
+Avro.jl 2.0 is a ground-up rewrite of the Avro data-format implementation: reusable schema and
+encoding plans, a Tables.jl interface with projection and parallel decoding, strict validation,
+input-proportional resource limits, and oracle-tested interoperability. It is SemVer-breaking;
+deprecation shims cover the main 1.x entry points for one major cycle. The Avro 1.12 `big-decimal`
+logical type is preserved as an unknown annotation and is deferred.
 
 ### Added
-
-- Direct column access on `Avro.Table` through `table.name`, `table[:name]`, and `table[index]`.
-- Optional Arrow.jl integration that preserves exact global and local timestamp units and values,
-  including nullable columns, without converting through millisecond `DateTime` values.
 
 - Schema resolution (`Avro.resolve`; `reader_schema=` on `Avro.decode`, `Avro.DatumReader`,
   `Avro.decodesingle`, `Avro.Table`, and `Avro.Rows`) with both union-resolution policies (`:spec`,
@@ -27,43 +23,56 @@ deferred.
 - Single-object encoding (`Avro.encodesingle`/`Avro.decodesingle`) with `Avro.SchemaStore` and
   `Avro.SchemaCache`.
 - The JSON encoding (`Avro.tojson`/`Avro.fromjson`).
-- `Avro.Rows`: bounded-memory streaming (generic `Avro.Row`s, typed `T`, or plain values), with
-  `Tables.partitions`.
+- `Avro.Table`: a column table with DataAPI metadata, direct column access through `table.name`,
+  `table[:name]` and `table[index]`, and a stored `Tables.Schema` (names and eltypes never become type
+  parameters); `Tables.rowtable` builds typed rows from it on request.
+- `Avro.Rows`: bounded-memory streaming of `Avro.Record`s (Tables.jl rows), typed values `T`, or plain
+  values, with per-block `Tables.partitions`.
+- `Avro.write` takes generators and vectors of structs or plain values as well as Tables.jl sources;
+  `append=true` adds to an existing file; a rewrite keeps the source's user metadata; `metadata=` values
+  may be strings; a table column the schema lacks is an error rather than a silent drop.
+- `Avro.SingleObjectReader` and `Avro.SingleObjectWriter`: prepared single-object codecs for message streams.
+- `references=` on `Avro.parseschema`, for named types shared across schema files.
+- With Arrow.jl loaded, nested `Avro.Record` columns write as Arrow struct columns; with TimeZones.jl loaded,
+  `ZonedDateTime` reads and writes as an instant.
 - Projection pushdown: `select=` on `Avro.Table` and `Avro.Rows` skips unselected fields and derives
   an effective schema that `Avro.write` round-trips.
-- Parallel container decoding: `Avro.Table(src; ntasks=…)` — identical results, acceptance and errors
-  at every `ntasks`; parallelism only uses headroom under the memory ceiling.
-- Fixed, validated resource limits (`Avro.Limits`) with one 16 GiB per-operation default ceiling, a
-  decompression work rule, per-block caps, and an opt-in `Symbol`-admission table
-  (`Avro.SymbolAdmission`, `names=` everywhere `Symbol`s are produced).
-- Validation modes: `validate=:strict` (default) and `:fast`.
-- Writer safety: atomic file replacement, failure poisoning, and the reader's per-schema, per-block
-  and per-datum limits enforced at write time, so every successfully written file streams through
-  `Reader` and `Rows` under identical limits.
+- Parallel container decoding: `Avro.Table(src; ntasks=…)` decodes blocks straight into preallocated
+  columns; results, acceptance and errors are identical at every `ntasks`.
+- Resource limits (`Avro.Limits`): nesting depth, the largest materialised buffer, and the number of
+  values a block or datum may decode per input byte; every claimed length and count is checked against
+  the remaining input before allocation.
+- Writer safety: atomic file replacement, failure poisoning, and the reader's limits enforced at write
+  time, so every successfully written file is readable under identical limits.
 - Codecs: `zstandard`, `snappy`, `deflate`, `null` built in; `bzip2` and `xz` via package extensions
-  (`using CodecBzip2` / `using CodecXz`); per-frame decoder-memory verification on write.
-- `Avro.inspect`: bounded container header and framing diagnostics (codec, schema, block structure).
-- DataAPI metadata on `Avro.Table`; stored `Tables.Schema` (names and eltypes never become type
-  parameters).
-- Legacy support for files written by Avro.jl ≤ 1.1.2: `legacy=:avrojl1` and
-  `decimal_byteorder=:little`.
+  (`using CodecBzip2` / `using CodecXz`).
+- `Avro.inspect`: container header and framing diagnostics (codec, schema, block structure, legacy
+  defects).
+- Legacy support for files written by Avro.jl ≤ 1.1.2: `legacy=:avrojl1` (padded null-codec blocks,
+  the `zstd` codec name, unnamed fixed schemas, native-endian fixed-16 decimals).
 - Prepared codecs: `Avro.DatumReader(schema[, T])` and `Avro.DatumWriter(schema[, T])` reuse plans
-  across calls; writers accept a reusable output buffer or return a fresh byte vector.
+  across calls; writers return a fresh byte vector or append to an `IO`.
+- Exact timestamps: `timestamp-*` values are `Durations.ZonedTimestamp{P,:UTC}` and `local-timestamp-*`
+  values are `Durations.Timestamp{P}` (the `Dates.Timestamp` of Julia 1.14), so microsecond and
+  nanosecond precision survives decoding and Arrow.jl writes them as native timestamp columns.
 
 ### Changed (breaking)
 
 - Customisation moved from StructTypes to StructUtils; `JSON3`/`SentinelArrays` dependencies dropped.
-- Generic decoding returns the closed value model: enums as `Avro.EnumValue`, fixed as `Avro.Fixed`,
-  nested records as `Avro.Record`, non-nullable unions as `Avro.UnionValue` (1-based positions;
-  `Avro.ordinal` is the wire index); timestamps as exact `Avro.Timestamp`/`Avro.LocalTimestamp`
-  wrappers (`DateTime(x)` is an explicit, range-checked conversion); `Avro.Duration` fields are
-  `UInt32`; decimals are `Avro.Decimal`/`Avro.WideDecimal` with runtime scale, big-endian per the
-  specification.
+- Generic decoding returns the closed value model: enums as `Avro.EnumValue` (a string), fixed as
+  `Avro.Fixed` (a byte vector), nested records as `Avro.Record`, maps as `Dict{String,V}`, `["null", T]` unions as
+  `Union{Missing,T}`, other unions as the bare value of the written branch (`Avro.UnionValue` only
+  forces a branch when encoding); decimals are `Avro.Decimal`/`Avro.WideDecimal` with runtime scale,
+  big-endian per the specification; `Avro.Duration` fields are `UInt32`.
 - `Avro.readtable` → `Avro.Table` (columns, not lazy records); `Avro.writetable` → `Avro.write`;
   `compress=:zstd` → `codec=:zstandard` (the shims map these); `Avro.write(io, x)` with a non-table
   `x` is no longer the datum writer (use `Avro.encode`).
-- Container reading validates strictly by default; schema-less Tables sources require `schema=`;
-  invalid Julia-derived names are errors instead of being silently emitted.
+- Container reading validates every value; invalid Julia-derived names are errors instead of being silently
+  emitted.
+- Problems with a file's content raise `Avro.AvroError` subclasses throughout: asking `Avro.Table` for a
+  non-record root or `select=` for a field the file lacks is an `Avro.SchemaError`, and a value a typed
+  target cannot hold is an `Avro.ConversionError`. Typed decoding builds structs through their positional
+  constructors, and encoding refuses integers a `float` or `double` cannot hold exactly.
 - `Avro.Record{names,T,N}`, `Avro.Enum{names}` and `Avro.Array` are removed.
 
 ### Deprecated
@@ -73,7 +82,7 @@ deferred.
 
 ### Fixed
 
-- 1.x data defects are readable (`legacy=:avrojl1`, `decimal_byteorder=:little`): padded null-codec
-  blocks, the `zstd` codec name, native-endian fixed-16 decimals, unnamed fixed schemas. `Avro.inspect`
-  reports header-visible and framing issues, walks datum structure, and diagnoses legacy null-codec
-  padding; it does not infer decimal byte order.
+- 1.x data defects are readable with `legacy=:avrojl1`: padded null-codec blocks, the `zstd` codec
+  name, native-endian fixed-16 decimals, unnamed fixed schemas. `Avro.inspect` reports header-visible
+  and framing issues, walks datum structure, and diagnoses legacy null-codec padding; it does not
+  infer decimal byte order.

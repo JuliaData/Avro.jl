@@ -16,8 +16,19 @@ s = Avro.parseschema("""
 """)
 ```
 
-Schema nodes are immutable; records, enums and fixed carry their full names
+Schema nodes are treated as immutable once built; records, enums and fixed carry their full names
 ([`Avro.fullname`](@ref)) and compare by structure. [`Avro.json`](@ref) prints a schema back to JSON.
+
+`references=` lists schemas that the parsed schema may name without defining them, as when each type lives
+in its own `.avsc` file or a registry reports references. Each entry is JSON text or an `Avro.Schema`, and may
+name the entries before it:
+
+```julia
+address = read("Address.avsc", String)
+person = Avro.parseschema(read("Person.avsc", String); references=[address])
+```
+
+The result holds only the types reachable from the parsed schema.
 
 Two repair options admit historically produced schemas: `allow_invalid_names=true` (invalid names are
 kept and the graph is marked repaired) and `allow_invalid_defaults=true`. Operations that depend on

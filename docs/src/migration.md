@@ -22,25 +22,29 @@ Avro.jl 2.0 is a rewrite; this page maps 1.x usage to its 2.0 form. `Avro.readta
 | `Avro.read(buf, T)` | `Avro.DatumReader(Avro.schema(T), T)(buf)` or `Avro.decode(s, buf)` |
 | `Avro.schematype(T)` | `Avro.schema(T)` |
 
-`Avro.write(dst, x)` writes a container file from a Tables.jl source.
+`Avro.write(dst, x)` writes a container file from a Tables.jl source or a collection of datums, such as a
+vector of structs.
 
 ## Value model changes
 
-* Enums decode as `Avro.EnumValue` (was `Avro.Enum{names}`), fixed as `Avro.Fixed`, nested records as
-  `Avro.Record` (was `Avro.Record{names,T,N}`), non-nullable unions as `Avro.UnionValue`. Positions
-  are 1-based; `Avro.ordinal` is the wire index.
-* Timestamps decode as exact `Avro.Timestamp{P}`/`Avro.LocalTimestamp{P}` wrappers; `DateTime(x)` is
-  an explicit, range-checked conversion (or decode typed with a `DateTime` field).
-* `Avro.Decimal` is an alias for `DataDecimals.DecimalValue{Int128}`. It carries its scale at runtime and reads big-endian per the specification (1.x wrote
-  native-endian; see below). `Avro.Duration` fields are `UInt32`.
+* Enums decode as `Avro.EnumValue`, a string (was `Avro.Enum{names}`), fixed as `Avro.Fixed`, a byte vector, nested records as
+  `Avro.Record` (was `Avro.Record{names,T,N}`; now a `Tables.AbstractRow`), maps as `Dict{String,V}`.
+  Values of unions other than `["null", T]` decode to the bare value of the branch that was written.
+  Positions are 1-based; `Avro.ordinal` is the wire index.
+* Timestamps decode as exact Durations.jl values: `Avro.Timestamp{P}` (`Durations.ZonedTimestamp{P,:UTC}`)
+  for `timestamp-*` and `Avro.LocalTimestamp{P}` (`Durations.Timestamp{P}`) for `local-timestamp-*`;
+  `DateTime(x)` is an explicit, range-checked conversion (or decode typed with a `DateTime` field).
+* `Avro.Decimal` is an alias for `DataDecimals.DecimalValue{Int128}`. It carries its scale at runtime
+  and reads big-endian per the specification (1.x wrote native-endian; see below). `Avro.Duration`
+  fields are `UInt32`.
 * Customisation moved from StructTypes to StructUtils (field tags: `&(avro=(name="…", default=…),)`).
 
 ## Behaviour changes
 
-* Container reading validates strictly by default (`validate=:fast` opts out of the walk).
-* Tables sources without a `Tables.schema` need an explicit `schema=`.
+* Every value is validated as it is decoded; unselected fields are skipped by their recorded size.
+* Tables sources without a `Tables.schema` derive their schema from the values they hold.
 * Julia-derived names that are invalid Avro names are errors (1.x silently emitted them).
-* Every operation runs under fixed resource limits; see
+* Every operation runs under a few input-proportional resource limits; see
   [Limits and security](manual/limits-and-security.md).
 
 ## Files written by Avro.jl ≤ 1.1.2
@@ -48,19 +52,17 @@ Avro.jl 2.0 is a rewrite; this page maps 1.x usage to its 2.0 form. `Avro.readta
 1.x wrote files with defects the strict reader rejects: null-codec blocks padded with garbage bytes,
 the non-standard codec name `zstd`, unnamed fixed schemas, and `decimal` values written
 **native-endian** as fixed-16. `Avro.inspect(file)` reports header and framing issues, including the
-codec name. It walks datum structure and diagnoses null-codec padding, but it cannot infer decimal
-byte order. Read
-with:
+codec name, and diagnoses null-codec padding; it cannot infer decimal byte order. Read such files with `legacy=:avrojl1`, which tolerates
+all four defects:
 
 ```julia
-t = Avro.Table("old.avro"; legacy=:avrojl1, decimal_byteorder=:little)  # byteorder only if decimals
+t = Avro.Table("old.avro"; legacy=:avrojl1)
 ```
 
 and rewrite once to clean 2.0 output:
 
 ```julia
-Avro.write("clean.avro", Avro.Rows("old.avro"; legacy=:avrojl1, decimal_byteorder=:little);
-           codec=:zstandard)
+Avro.write("clean.avro", Avro.Rows("old.avro"; legacy=:avrojl1); codec=:zstandard)
 ```
 
 ## Shared values
