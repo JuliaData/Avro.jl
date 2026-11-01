@@ -11,16 +11,6 @@ struct ArrayLengthMismatch
     actual::Int
 end
 
-struct ReservedReadProbe <: Avro.ReadPlan
-    seen::Base.RefValue{Int}
-end
-
-struct ChangingWriteProbe <: Avro.WritePlan end
-
-struct ReservedWriteProbe <: Avro.WritePlan
-    seen::Base.RefValue{Int}
-end
-
 function Base.IteratorSize(::Type{ArrayLengthMismatch})
     return Base.HasLength()
 end
@@ -34,59 +24,27 @@ function Base.iterate(x::ArrayLengthMismatch, state::Int=1)
     return (Int64(state), state + 1)
 end
 
-function Avro.decodevalue(probe::ReservedReadProbe, decoder::Avro.Decoder)
-    probe.seen[] = decoder.budget.reserved
-    return missing
-end
-
-function Avro.stagewritervalue(::ChangingWriteProbe, value, state::Avro.WriterStageState,
-                               ::Int)
-    Avro.countstaged!(state)
-    return (value, true)
-end
-
-function Avro.stagewritervalue(probe::ReservedWriteProbe, value,
-                               state::Avro.WriterStageState, ::Int)
-    Avro.countstaged!(state)
-    probe.seen[] = state.budget.reserved
-    return (value, false)
-end
-
 @enum BranchShade branchred branchgreen
 
 function StructUtils.fieldtags(::Avro.AvroStyle, ::Type{ThrowingWriteFields})
     return error("field tag failure")
 end
 
-function fieldpositionalloc(plan, ::Type{T}, iterations) where {T}
-    total = 0
-    for _ in 1:iterations, i in eachindex(plan.fields)
-        total += Avro.fieldposition(plan, T, i)
-    end
-    return total
-end
-
-function symbollookupalloc(map, record, row, iterations)
+function symbollookupalloc(record, iterations)
     total = Int32(0)
     for _ in 1:iterations
-        total += map[:a]
-        total += get(map, :a, Int32(0))
         total += record[:a]::Int32
+        total += record.a::Int32
         total += get(record, :a, Int32(0))::Int32
-        total += Tables.getcolumn(row, :a)::Int32
-        haskey(map, :a) && haskey(record, :a) || error("missing symbol key")
+        total += Tables.getcolumn(record, :a)::Int32
+        haskey(record, :a) || error("missing symbol key")
     end
     return total
 end
 
-function symbollookupbytes(map::M, record::R, row::W) where {M,R,W}
-    symbollookupalloc(map, record, row, 1)
-    return @allocated symbollookupalloc(map, record, row, 1_000)
-end
-
-function fieldpositionbytes(plan::P, ::Type{T}) where {P,T}
-    fieldpositionalloc(plan, T, 1)
-    return @allocated fieldpositionalloc(plan, T, 1_000)
+function symbollookupbytes(record::R) where {R}
+    symbollookupalloc(record, 1)
+    return @allocated symbollookupalloc(record, 1_000)
 end
 
 @testset "Binary core" begin
@@ -164,20 +122,6 @@ end
         @test_throws Avro.EncodeError enc(f, UInt8[1])
         @test_throws Avro.EncodeError enc(f, "ab")
         @test_throws Avro.DataError dec(f, UInt8[1])
-        fixedschema = P(f)
-        fixedat = Avro.Limits(max_bytes=2, max_datum_bytes=2)
-        fixedover = Avro.Limits(max_bytes=1, max_datum_bytes=2)
-        @test Avro.encode(fixedschema, UInt8[1, 2]; limits=fixedat) == UInt8[1, 2]
-        @test Avro.decode(fixedschema, UInt8[1, 2]; limits=fixedat) ==
-              Avro.Fixed(fixedschema, UInt8[1, 2])
-        @test_throws Avro.LimitError Avro.encode(fixedschema, UInt8[1, 2]; limits=fixedover)
-        @test_throws Avro.LimitError Avro.decode(fixedschema, UInt8[1, 2]; limits=fixedover)
-        @test_throws Avro.LimitError Avro.Fixed(fixedschema, UInt8[1, 2]; limits=fixedover)
-        @test_throws Avro.LimitError Avro.DatumWriter(fixedschema; limits=fixedover)(UInt8[1, 2])
-        skipbudget = Avro.Budget(fixedover)
-        skipdecoder = Avro.Decoder(UInt8[1, 2], skipbudget)
-        @test_throws Avro.LimitError Avro.skip(Avro.readplan(fixedschema; budget=skipbudget),
-                                               skipdecoder)
         g = Avro.FixedSchema("G", 2)
         @test_throws Avro.EncodeError enc(f, Avro.Fixed(g, UInt8[1, 2]))      # identity mismatch
         mutable_fixed = Avro.Fixed(P(f), UInt8[1, 2])
@@ -195,14 +139,11 @@ end
         catch err
             err
         end
-        hugeenumfailure()
-        GC.gc()
         hugeenumerror = hugeenumfailure()
         @test hugeenumerror isa Avro.EncodeError
         @test hugeenumerror.path == "\$"
         @test hugeenumerror.schema === enumschema
         @test sizeof(hugeenumerror.msg) < 256
-        @test @allocated(hugeenumfailure()) < 512 * 1024
         hugeinteger = big(10)^100_000
         for integerschema in (Avro.IntSchema(), Avro.LongSchema())
             integererror = try
@@ -230,11 +171,10 @@ end
         @test hex(enc(u, Avro.UnionValue(5, 1))) == "08000000000000f03f"
         @test hex(enc(u, Avro.Record(P(u).branches[3], []))) == "04"
         @test hex(enc(u, Avro.Fixed(P(u).branches[4], UInt8[7]))) == "0607"
-        raised = Avro.Limits(max_name_bytes=2048)
-        longfixed = Avro.FixedSchema("A"^1025, 1; limits=raised)
-        longunion = Avro.UnionSchema([longfixed, Avro.StringSchema()]; limits=raised)
-        longvalue = Avro.Fixed(longfixed, UInt8[1]; limits=raised)
-        @test Avro.encode(longunion, longvalue; limits=raised) == UInt8[0, 1]
+        longfixed = Avro.FixedSchema("A"^1025, 1)
+        longunion = Avro.UnionSchema([longfixed, Avro.StringSchema()])
+        longvalue = Avro.Fixed(longfixed, UInt8[1])
+        @test Avro.encode(longunion, longvalue) == UInt8[0, 1]
         @test_throws Avro.EncodeError enc(u, Avro.UnionValue(6, 1))
         @test_throws Avro.EncodeError enc(u, Avro.Fixed(Avro.FixedSchema("F", 2), UInt8[1, 2]))   # same name, different size
         recordbranch = Avro.UnionSchema([Avro.RecordSchema("KindIdentity"), Avro.StringSchema()])
@@ -246,29 +186,22 @@ end
         fixedbranch = Avro.UnionSchema([Avro.FixedSchema("KindIdentityFixed", 1),
                                         Avro.StringSchema()])
         wrongfixedrecord = Avro.Record(Avro.RecordSchema("KindIdentityFixed"), [])
-        for (schema, value) in ((recordbranch, wrongenum), (enumbranch, wrongrecord),
-                                (fixedbranch, wrongfixedrecord))
+        @test Avro.encode(recordbranch, wrongenum)[1] == 0x02                  # an enum value is also a string
+        for (schema, value) in ((enumbranch, wrongrecord), (fixedbranch, wrongfixedrecord))
             @test_throws Avro.EncodeError Avro.encode(schema, value)
             @test_throws Avro.EncodeError Avro.tojson(schema, value)
         end
         @test_throws Avro.EncodeError enc(u, missing)
         @test_throws Avro.EncodeError enc("[]", 1)
         @test_throws Avro.DataError dec("[]", UInt8[0x00])
-        v = dec(u, hex2bytes("020278"))
-        @test v == Avro.UnionValue(2, "x") && Avro.ordinal(v) == 1
+        @test dec(u, hex2bytes("020278")) == "x"                  # union values decode to the bare branch value
+        @test dec(u, hex2bytes("0002")) === Int32(1) && dec(u, hex2bytes("04")) == Avro.Record(P(u).branches[3], [])
+        @test Avro.ordinal(Avro.UnionValue(2, "x")) == 1
         @test dec("[\"null\",\"int\"]", hex2bytes("0236")) == 27 && dec("[\"null\",\"int\"]", hex2bytes("00")) === missing
-        @test isequal(dec("[\"null\"]", hex2bytes("00")), Avro.UnionValue(1, missing))
+        @test dec("[\"null\"]", hex2bytes("00")) === missing
         @test_throws Avro.DataError dec("[\"null\",\"int\"]", hex2bytes("04"))
         @test hex(enc("[\"null\",\"int\"]", nothing)) == "00" && hex(enc("[\"null\",\"int\"]", Avro.UnionValue(2, 3))) == "0206"
-        countedunion = P("[\"int\",\"string\"]")
-        unionvalue = Avro.UnionValue(1, Int32(0))
-        @test Avro.encode(countedunion, unionvalue; limits=Avro.Limits(max_total_values=2)) == UInt8[0x00, 0x00]
-        @test_throws Avro.LimitError Avro.encode(countedunion, unionvalue; limits=Avro.Limits(max_total_values=1))
-        @test Avro.decode(countedunion, UInt8[0x00, 0x00]; limits=Avro.Limits(max_total_values=2)) == unionvalue
-        @test_throws Avro.LimitError Avro.decode(countedunion, UInt8[0x00, 0x00]; limits=Avro.Limits(max_total_values=1))
-        countednullable = P("[\"null\",\"int\"]")
-        @test Avro.decode(countednullable, UInt8[0x00]; limits=Avro.Limits(max_total_values=2)) === missing
-        @test_throws Avro.LimitError Avro.decode(countednullable, UInt8[0x00]; limits=Avro.Limits(max_total_values=1))
+        @test Avro.encode(P("[\"int\",\"string\"]"), Avro.UnionValue(1, Int32(0))) == UInt8[0x00, 0x00]
         enumunion = "[{\"type\":\"enum\",\"name\":\"BranchRed\",\"symbols\":[\"branchred\"]},{\"type\":\"enum\",\"name\":\"BranchGreen\",\"symbols\":[\"branchgreen\"]}]"
         @test hex(enc(enumunion, branchred)) == "0000"
         @test hex(enc(enumunion, branchgreen)) == "0200"
@@ -279,18 +212,18 @@ end
                    {"type":"record","name":"B","fields":[{"name":"x","type":"long"},{"name":"y","type":"string"}]}]""")
         for v in ((x=1, y="kept"), Dict("x" => 1, "y" => "kept"))
             d = Avro.decode(u, Avro.encode(u, v))
-            @test d.index == 2 && d.value.y == "kept"
+            @test Avro.fullname(Avro.schema(d)) == "B" && d.y == "kept"
         end
-        @test Avro.decode(u, Avro.encode(u, (x=1,))).index == 1
+        @test Avro.fullname(Avro.schema(Avro.decode(u, Avro.encode(u, (x=1,))))) == "A"
         lacks = P("""[{"type":"record","name":"A","fields":[{"name":"z","type":"long"}]},
                        {"type":"record","name":"B","fields":[{"name":"x","type":"long"}]}]""")
-        @test Avro.decode(lacks, Avro.encode(lacks, (x=1,))).index == 2
+        @test Avro.fullname(Avro.schema(Avro.decode(lacks, Avro.encode(lacks, (x=1,))))) == "B"
         @test_throws Avro.EncodeError Avro.encode(P("""{"type":"array","items":"int"}"""), 5)
         @test_throws Avro.EncodeError Avro.encode(P("""["null",{"type":"array","items":"int"}]"""), 5)
         @test_throws Avro.EncodeError Avro.encode(P("""{"type":"array","items":"string"}"""), 'x')
         scalar = P("""[{"type":"array","items":"long"},"double"]""")
-        @test Avro.decode(scalar, Avro.encode(scalar, 5)) == Avro.UnionValue(2, 5.0)
-        @test Avro.decode(scalar, Avro.encode(scalar, [5])) == Avro.UnionValue(1, [5])
+        @test Avro.decode(scalar, Avro.encode(scalar, 5)) === 5.0
+        @test Avro.decode(scalar, Avro.encode(scalar, [5])) == [5]
     end
 
     @testset "arrays and maps: blocks, sized blocks, cross-form fixtures" begin
@@ -312,18 +245,18 @@ end
         @test_throws Avro.EncodeError enc(arr, Dict("a" => 1))
         @test dec(arr, enc(arr, 1:3)) == [1, 2, 3]
         arrayunion = "[\"int\",{\"type\":\"array\",\"items\":\"long\"}]"
-        @test dec(arrayunion, enc(arrayunion, (i for i in 1:3))) == Avro.UnionValue(2, Int64[1, 2, 3])
+        @test dec(arrayunion, enc(arrayunion, (i for i in 1:3))) == Int64[1, 2, 3]
         nested = "{\"type\":\"array\",\"items\":{\"type\":\"array\",\"items\":\"int\"}}"
         @test dec(nested, enc(nested, [[1], Int32[]])) == Any[Int32[1], Int32[]] && typeof(dec(nested, enc(nested, [[1]]))) === Vector{Any}
         opt = "{\"type\":\"array\",\"items\":[\"null\",\"int\"]}"
         @test isequal(dec(opt, enc(opt, [1, missing, 2])), [1, missing, 2]) && typeof(dec(opt, enc(opt, [1]))) === Vector{Union{Missing,Int32}}
         mp = "{\"type\":\"map\",\"values\":\"int\"}"
         m = dec(mp, enc(mp, Dict("b" => 1, "a" => 2)))
-        @test m isa Avro.Map{Int32} && Dict(m) == Dict("a" => 2, "b" => 1)
-        @test dec(mp, enc(mp, (x=1, y=2))) == Avro.Map{Int32}([("x", 1), ("y", 2)])
-        @test dec(mp, enc(mp, Avro.Map([("k", 5)])))["k"] == 5
-        @test dec(mp, hex2bytes("00")) isa Avro.Map{Int32} && isempty(dec(mp, hex2bytes("00")))
-        @test dec(mp, hex2bytes("0202610202026104" * "00")) == Avro.Map{Int32}([("a", 2)])   # duplicate key across blocks: last wins
+        @test m isa Dict{String,Int32} && m == Dict("a" => 2, "b" => 1)
+        @test dec(mp, enc(mp, (x=1, y=2))) == Dict{String,Int32}("x" => 1, "y" => 2)
+        @test dec(mp, enc(mp, Dict(:k => 5)))["k"] == 5
+        @test dec(mp, hex2bytes("00")) isa Dict{String,Int32} && isempty(dec(mp, hex2bytes("00")))
+        @test dec(mp, hex2bytes("0202610202026104" * "00")) == Dict{String,Int32}("a" => 2)   # duplicate key across blocks: last wins
         @test_throws Avro.DataError dec(mp, hex2bytes("02" * "02ff" * "02" * "00"))    # invalid UTF-8 key
         @test_throws Avro.EncodeError enc(mp, Dict(1 => 2))
         @test_throws Avro.EncodeError enc(mp, [1, 2])
@@ -332,15 +265,10 @@ end
         impossiblebytes = UInt8[0x02, 0x00]
         @test_throws Avro.DataError Avro.decode(impossiblemap, impossiblebytes)
         impossibleplan = Avro.readplan(impossiblemap)
-        for operation in (Avro.skip, Avro.structuralskip)
-            budget = Avro.Budget(Avro.Limits())
-            Avro.addinput!(budget, length(impossiblebytes))
-            decoder = Avro.Decoder(impossiblebytes, budget)
-            @test_throws Avro.DataError operation(impossibleplan, decoder)
-        end
+        @test_throws Avro.DataError Avro.skip(impossibleplan, Avro.Decoder(impossiblebytes))
         # Java BlockingBinaryEncoder fixtures (sized blocks at every level) decode like the positive form
         arrmap = P(read(joinpath(FIXTURES, "generated", "blocking", "arrmap.avsc"), String))
-        expected = [Avro.Map{Int64}([("a", 1), ("b", 2)]), Avro.Map{Int64}(), Avro.Map{Int64}([("c", 3)])]
+        expected = [Dict{String,Int64}("a" => 1, "b" => 2), Dict{String,Int64}(), Dict{String,Int64}("c" => 3)]
         for bs in (32, 64, 1024)
             @test Avro.decode(arrmap, read(joinpath(FIXTURES, "generated", "blocking", "arrmap-$bs.bin"))) == expected
         end
@@ -360,10 +288,10 @@ end
         @test hex(enc(r, (a=1, b="z"))) == "02027a" && hex(enc(r, Dict("a" => 1, "b" => "z"))) == "02027a" && hex(enc(r, Dict(:a => 1, :b => "z"))) == "02027a"
         @test hex(enc(r, Avro.Record(rs, [1, "z"]))) == "02027a"
         short_record = Avro.Record(rs, [1, "z"])
-        empty!(short_record.values)
+        empty!(getfield(short_record, :values))
         @test_throws Avro.EncodeError enc(r, short_record)
         long_record = Avro.Record(rs, [1, "z"])
-        push!(long_record.values, 3)
+        push!(getfield(long_record, :values), 3)
         @test_throws Avro.EncodeError enc(r, long_record)
         @test_throws Avro.EncodeError enc(r, (a=1,))                 # defaults never make a field optional when encoding
         @test_throws Avro.EncodeError enc(r, Dict("a" => 1))
@@ -376,9 +304,9 @@ end
         @test hex(enc(r, Avro.Record(other, ["z", 1]))) == "02027a"  # reordered record of the same name: by field name
         rec = dec(r, hex2bytes("02027a"))
         @test rec.a == 1 && rec.b == "z" && rec == Avro.Record(rs, [1, "z"])
-        symbolmap = Avro.Map([("a", Int32(2))])
-        symbolrow = Avro.Row(rec)
-        @test symbollookupbytes(symbolmap, rec, symbolrow) == 0
+        @test rec isa Tables.AbstractRow && Tables.columnnames(rec) == [:a, :b] && Avro.schema(rec) == rs
+        @test rec[1] == 1 && rec[:b] == "z" && rec["b"] == "z" && collect(rec) == Any[Int32(1), "z"]
+        @test symbollookupbytes(rec) == 0
         @test_throws Avro.DataError dec(r, hex2bytes("02"))
         @test dec(r, enc(r, first(Tables.rows((a=[1], b=["q"]))))).b == "q"   # Tables.AbstractRow source
         empty = "{\"type\":\"record\",\"name\":\"E\",\"fields\":[]}"
@@ -387,29 +315,8 @@ end
         lls = P(ll)
         v = Avro.Record(lls, [1, Avro.Record(lls, [2, missing])])
         @test hex(enc(ll, v)) == "02020400" && isequal(dec(ll, hex2bytes("02020400")), v) && ismissing(dec(ll, hex2bytes("02020400")) == v)
-        struct LL; value::Int64; next::Union{Missing,LL}; end
-        @test hex(enc(ll, LL(1, LL(2, missing)))) == "02020400"
-
-        nullrecord = P("{\"type\":\"record\",\"name\":\"PendingRead\",\"fields\":[{\"name\":\"a\",\"type\":\"null\"}]}")
-        baseplan = Avro.readplan(nullrecord)
-        readreserved = Ref(-1)
-        probeplan = Avro.RecordPlan(nullrecord, Avro.ReadPlan[ReservedReadProbe(readreserved)],
-                                    baseplan.boxes)
-        readbudget = Avro.Budget(Avro.Limits())
-        decoded = Avro.decode(probeplan, Avro.Decoder(UInt8[], readbudget))
-        @test readreserved[] == Avro.recordbytes(1)        # the whole record is reserved before its fields decode
-        @test isequal(decoded, Avro.Record(nullrecord, [missing]))
-
-        writerecord = P("{\"type\":\"record\",\"name\":\"PendingWrite\",\"fields\":[{\"name\":\"a\",\"type\":\"null\"},{\"name\":\"b\",\"type\":\"null\"}]}")
-        writereserved = Ref(-1)
-        writeplan = Avro.WRecord(writerecord,
-                                 Avro.WritePlan[ChangingWriteProbe(), ReservedWriteProbe(writereserved)])
-        writebudget = Avro.Budget(Avro.Limits())
-        staged, changed = Avro.stagewriterrecord(writeplan, (a=missing, b=missing),
-                                                  Avro.WriterStageState(writebudget, 0), 0)
-        @test changed
-        @test writereserved[] == Avro.recordbytes(2) + Avro.boxbytes(Missing)   # the staged record and field a, before field b stages
-        @test isequal(staged, Avro.Record(writerecord, [missing, missing]))
+        struct LongListNode; value::Int64; next::Union{Missing,LongListNode}; end
+        @test hex(enc(ll, LongListNode(1, LongListNode(2, missing)))) == "02020400"
     end
 
     @testset "logical types" begin
@@ -432,13 +339,14 @@ end
         @test dec(tu, enc(tu, Time(23, 59, 59, 999, 999))) == Time(23, 59, 59, 999, 999)
         @test_throws Avro.EncodeError enc(tu, Time(0, 0, 0, 0, 0, 1))
         @test_throws Avro.DataError dec(tu, enc("\"long\"", 86_400_000_000))
-        for (lt, T) in (("timestamp-millis", Avro.Timestamp{Millisecond}), ("timestamp-micros", Avro.Timestamp{Microsecond}), ("timestamp-nanos", Avro.Timestamp{Nanosecond}),
-                        ("local-timestamp-millis", Avro.LocalTimestamp{Millisecond}), ("local-timestamp-micros", Avro.LocalTimestamp{Microsecond}), ("local-timestamp-nanos", Avro.LocalTimestamp{Nanosecond}))
+        for (lt, make, P_) in (("timestamp-millis", Avro.timestamp, Millisecond), ("timestamp-micros", Avro.timestamp, Microsecond), ("timestamp-nanos", Avro.timestamp, Nanosecond),
+                               ("local-timestamp-millis", Avro.localtimestamp, Millisecond), ("local-timestamp-micros", Avro.localtimestamp, Microsecond), ("local-timestamp-nanos", Avro.localtimestamp, Nanosecond))
+            T(x) = make(P_, x)
             s = "{\"type\":\"long\",\"logicalType\":\"$lt\"}"
             @test dec(s, enc(s, T(-5))) == T(-5) && dec(s, enc(s, T(typemax(Int64)))) == T(typemax(Int64))
             @test dec(s, enc(s, DateTime(2016, 3, 17, 13, 13, 10, 123))) == T(DateTime(2016, 3, 17, 13, 13, 10, 123))
         end
-        @test_throws Avro.EncodeError enc("{\"type\":\"long\",\"logicalType\":\"timestamp-millis\"}", Avro.Timestamp{Microsecond}(1))
+        @test_throws Avro.EncodeError enc("{\"type\":\"long\",\"logicalType\":\"timestamp-millis\"}", Avro.timestamp(Microsecond, 1))
         # Java TimeConversions vectors (text → ticks); sub-millisecond digits only survive in micros/nanos
         for line in eachline(joinpath(FIXTURES, "generated", "timevectors.tsv"))
             lt, text, val = split(line, '\t')
@@ -457,8 +365,8 @@ end
             ticks = parse(Int64, val)
             v = dec(s, enc("\"long\"", ticks))
             @test DateTime(v) == dt
-            @test v.ticks == ticks
-            length(frac) <= 3 && @test dec(s, enc(s, dt)).ticks == ticks
+            @test Dates.value(v) == ticks
+            length(frac) <= 3 && @test Dates.value(dec(s, enc(s, dt))) == ticks
         end
         # decimal
         db = "{\"type\":\"bytes\",\"logicalType\":\"decimal\",\"precision\":5,\"scale\":2}"
@@ -489,26 +397,16 @@ end
         hugeuuidbytes = 1_000_000
         hugeuuid = vcat(Avro.encode(Avro.LongSchema(), Int64(hugeuuidbytes)),
                         fill(UInt8('x'), hugeuuidbytes))
-        uuidlimits = Avro.Limits(max_bytes=hugeuuidbytes,
-                                 max_datum_bytes=hugeuuidbytes + 10)
-        uuidfailure = () -> try
-            Avro.decode(uuidschema, hugeuuid; limits=uuidlimits)
+        uuiderror = try
+            Avro.decode(uuidschema, hugeuuid)
             nothing
         catch err
             err
         end
-        uuidfailure()
-        GC.gc()
-        uuidallocation = @allocated uuidfailure()
-        uuiderror = uuidfailure()
         @test uuiderror isa Avro.DataError
         @test sizeof(uuiderror.msg) < 128
-        @test uuidallocation < 512 * 1024
-        skipuuidbudget = Avro.Budget(uuidlimits)
-        skipuuidplan = Avro.readplan(uuidschema; budget=skipuuidbudget)
-        skipuuiddecoder = Avro.Decoder(hugeuuid, skipuuidbudget)
         skipuuiderror = try
-            Avro.skip(skipuuidplan, skipuuiddecoder)
+            Avro.skip(Avro.readplan(uuidschema), Avro.Decoder(hugeuuid))
             nothing
         catch err
             err
@@ -525,8 +423,7 @@ end
         @test dec(dur, enc(dur, x)) == x && hex(enc(dur, x)) == "0100000002000000ffffffff"
         @test_throws Avro.EncodeError enc(dur, UInt8[1])
 
-        budget = Avro.Budget(Avro.Limits())
-        encoder = Avro.Encoder(budget; capacity=128)
+        encoder = Avro.Encoder(; capacity=128)
         Avro.writeuuidstring!(encoder, id)
         Avro.reset!(encoder)
         @test @allocated(Avro.writeuuidstring!(encoder, id)) == 0
@@ -544,62 +441,52 @@ end
         @test_throws ArgumentError Avro.decode(s, bytes, 5)
         @test Avro.decode(s, IOBuffer(enc("\"long\"", 9))) == 9
         @test_throws Avro.DataError Avro.decode(s, IOBuffer(bytes))
-        @test_throws Avro.LimitError Avro.decode(s, IOBuffer(zeros(UInt8, 20)); limits=Avro.Limits(max_datum_bytes=10, max_bytes=10))
+        streamerror = try
+            Avro.decode(s, IOBuffer(zeros(UInt8, 20)); limits=Avro.Limits(max_bytes=10))
+            nothing
+        catch err
+            err
+        end
+        @test streamerror isa Avro.LimitError && streamerror.limit == :max_bytes && streamerror.value == 10
         @test Avro.decode(s, view(vcat(UInt8[0xff], enc("\"long\"", 4)), 2:2)) == 4
         reader = Avro.DatumReader(s)
         @test reader(enc("\"long\"", 5)) == 5 && reader(IOBuffer(enc("\"long\"", 6))) == 6 && reader(bytes, 2) == (2, 3)
         writer = Avro.DatumWriter(s)
-        @test writer.encoder === nothing
-        @test writer(7) == enc("\"long\"", 7)
-        preparedencoder = writer.encoder
-        preparedbuffer = preparedencoder.buf
+        first7 = writer(7)
+        @test first7 == enc("\"long\"", 7)
         @test writer(9) == enc("\"long\"", 9)
-        @test writer.encoder === preparedencoder
-        @test writer.encoder.buf === preparedbuffer
+        @test first7 == enc("\"long\"", 7)                    # each call returns its own vector
         io = IOBuffer(); writer(io, 8); @test take!(io) == enc("\"long\"", 8)
-        @test writer.encoder === preparedencoder
         record = P("{\"type\":\"record\",\"name\":\"PreparedRecord\",\"fields\":[{\"name\":\"a\",\"type\":\"long\"}]}")
         typedwriter = Avro.DatumWriter(record, @NamedTuple{a::Int64})
         @test typedwriter((a=Int64(1),)) == UInt8[0x02]
         boundedrecord = P("{\"type\":\"record\",\"name\":\"BoundedPreparedRecord\",\"fields\":[{\"name\":\"x\",\"type\":\"string\"}]}")
         boundedbytes = Avro.encode(boundedrecord, (x="abcdefghij",))
-        boundedlimits = Avro.Limits(max_datum_bytes=4, max_bytes=64)
-        boundedoverlap = UInt8[0x14, 0x61, 0x62, 0x63]
+        boundedoverlap = UInt8[0x14, 0x61, 0x62, 0x63]               # claims 10 string bytes, 3 remain
+        streamlimits = Avro.Limits(max_bytes=4)
         for boundedreader in (
-            Avro.DatumReader(boundedrecord; limits=boundedlimits),
-            Avro.DatumReader(boundedrecord, @NamedTuple{x::String}; limits=boundedlimits),
+            Avro.DatumReader(boundedrecord; limits=streamlimits),
+            Avro.DatumReader(boundedrecord, @NamedTuple{x::String}; limits=streamlimits),
         )
-            for input in (boundedbytes, boundedoverlap, view(boundedoverlap, :))
-                boundederror = try
-                    input === boundedbytes ? boundedreader(input, 1) : boundedreader(input)
-                    nothing
-                catch err
-                    err
-                end
-                @test boundederror isa Avro.LimitError
-                @test boundederror.limit == boundederror.keyword == :max_datum_bytes
+            @test boundedreader(boundedbytes, 1)[1].x == "abcdefghij"   # max_bytes bounds stream reads only
+            @test_throws Avro.DataError boundedreader(boundedoverlap)
+            @test_throws Avro.DataError boundedreader(view(boundedoverlap, :))
+            streamerror = try
+                boundedreader(IOBuffer(boundedbytes))
+                nothing
+            catch err
+                err
             end
+            @test streamerror isa Avro.LimitError && streamerror.limit == :max_bytes
         end
-        @test_throws Avro.DataError Avro.DatumReader(boundedrecord;
-            limits=Avro.Limits(max_datum_bytes=64, max_bytes=64))(boundedoverlap)
-        zerodepth = Avro.Limits(max_depth=0)
-        @test_throws Avro.LimitError Avro.DatumWriter(record; limits=zerodepth)((a=Int64(1),))
-        @test_throws Avro.LimitError Avro.DatumWriter(record, @NamedTuple{a::Int64};
-                                                       limits=zerodepth)((a=Int64(1),))
         reorderedrecord = P("{\"type\":\"record\",\"name\":\"ReorderedPreparedRecord\",\"fields\":[{\"name\":\"a\",\"type\":\"long\"},{\"name\":\"b\",\"type\":\"long\"}]}")
         reorderedwriter = Avro.DatumWriter(reorderedrecord, @NamedTuple{a::Int64,b::Int64})
         @test_throws Avro.EncodeError reorderedwriter((b=Int64(1), a=Int64(2)))
         @test Avro.decode(reorderedrecord, Avro.DatumWriter(reorderedrecord)((b=Int64(1), a=Int64(2)))) ==
               Avro.Record(reorderedrecord, Any[Int64(2), Int64(1)])
-        typedencoder = typedwriter.encoder
-        firstbudget = typedencoder.budget
         @test typedwriter((a=Int64(2),)) == UInt8[0x04]
-        @test typedwriter.encoder === typedencoder
-        @test typedencoder.budget === firstbudget
-        @test typedencoder.pos == typedencoder.depth == typedencoder.credited == 0
         @test_throws Avro.EncodeError typedwriter((a="bad",))
-        @test typedencoder.pos == typedencoder.depth == typedencoder.credited == 0
-        @test typedwriter((a=Int64(3),)) == UInt8[0x06]
+        @test typedwriter((a=Int64(3),)) == UInt8[0x06]                 # a failed call leaves the writer usable
         reusableplan = Avro.DatumWriter(record)
         @test reusableplan(StableWriteFields(4)) == UInt8[0x08]
         @test_throws ErrorException reusableplan(ThrowingWriteFields(5))
@@ -608,35 +495,15 @@ end
             {"name":"a","type":{"type":"fixed","name":"CachedFixed","size":1}}]}""")
         cachewriter = Avro.DatumWriter(cachedrecord)
         @test cachewriter((a=UInt8[1],)) == UInt8[1]
-        @test cachewriter.fastbytes == sizeof(cachewriter.fastplans) > 0
-        cachedbytes = cachewriter.fastbytes
         @test cachewriter((a=UInt8[2],)) == UInt8[2]
-        @test cachewriter.callbudget.peak >=
-              Avro.encoderstorage(cachewriter.encoder) + cachedbytes
-        @test fieldpositionbytes(reorderedwriter.plan,
-            @NamedTuple{a::Int64,b::Int64}) == 0
 
-        outputwriter = Avro.DatumWriter(P("\"bytes\""))
-        output = outputwriter(fill(UInt8(1), 1_000))
-        outputencoder = outputwriter.encoder
-        @test outputencoder.budget.peak >= Avro.bytesbytes(length(outputencoder.buf)) +
-                                           Avro.bytesbytes(length(output))
-
-        mib = 1 << 20
-        tightlimits = Avro.Limits(max_total_bytes=80 * mib, max_block_bytes=mib,
-            max_block_output_bytes=mib, max_codec_memory=16 * mib,
-            max_bytes=40 * mib, max_datum_bytes=41 * mib)
-        tightwriter = Avro.DatumWriter(P("\"bytes\""); limits=tightlimits)
-        @test_throws Avro.LimitError tightwriter(fill(UInt8(1), 40 * mib))
-        @test tightwriter(UInt8[1]) == UInt8[0x02, 0x01]
         @test Avro.encode!(IOBuffer(), s, 1) === nothing
         @test Avro.encode((a=1,)) == enc("{\"type\":\"record\",\"name\":\"Record\",\"fields\":[{\"name\":\"a\",\"type\":\"long\"}]}", (a=1,))
         @test Avro.encode(Int32(3)) == UInt8[0x06] && Avro.encode("x") == UInt8[0x02, 0x78]
-        @test_throws ArgumentError Avro.DatumReader(s; validate=:loose)
         @test_throws ArgumentError Avro.DatumReader(s; reader_schema=s, union_resolution=:odd)
         # limits
-        @test_throws Avro.LimitError Avro.decode(P("\"bytes\""), enc("\"bytes\"", zeros(UInt8, 100)); limits=Avro.Limits(max_bytes=50, max_datum_bytes=50))
-        @test_throws Avro.LimitError Avro.encode(P("\"bytes\""), zeros(UInt8, 100); limits=Avro.Limits(max_bytes=50, max_datum_bytes=50))
+        @test_throws Avro.LimitError Avro.decode(P("\"bytes\""), IOBuffer(enc("\"bytes\"", zeros(UInt8, 100))); limits=Avro.Limits(max_bytes=50))
+        @test Avro.decode(P("\"bytes\""), enc("\"bytes\"", zeros(UInt8, 100)); limits=Avro.Limits(max_bytes=50)) == zeros(UInt8, 100)
         nestedpathschema = P("""{"type":"record","name":"PathRecord","fields":[
             {"name":"xs","type":{"type":"array","items":{"type":"map","values":"int"}}}]}""")
         nestedbad = (xs=Any[Dict("key" => "bad")],)
@@ -665,80 +532,31 @@ end
             return value
         end
 
-        deeplimits = Avro.Limits(max_depth=64)
-        prepareddeep = Avro.DatumWriter(deepowner; limits=deeplimits)
-        for append in (e -> Avro.encode!(e, deepowner, deepownervalue(20);
-                                         limits=deeplimits),
+        prepareddeep = Avro.DatumWriter(deepowner)
+        for append in (e -> Avro.encode!(e, deepowner, deepownervalue(20)),
                        e -> prepareddeep(e, deepownervalue(20)))
-            owner = Avro.Budget(deeplimits; direction=:encode)
-            external = Avro.Encoder(owner)
+            external = Avro.Encoder()
             append(external)
-            @test length(external.path.data) > 16
-            @test owner.reserved == Avro.encoderstorage(external)
+            @test take!(external) == Avro.encode(deepowner, deepownervalue(20))
         end
-        for appendfailure in (e -> Avro.encode!(e, deepowner,
-                                                deepownervalue(20; bad=true);
-                                                limits=deeplimits),
-                              e -> prepareddeep(e,
-                                                deepownervalue(20; bad=true)))
-            owner = Avro.Budget(deeplimits; direction=:encode)
-            external = Avro.Encoder(owner)
+        for appendfailure in (e -> Avro.encode!(e, deepowner, deepownervalue(20; bad=true)),
+                              e -> prepareddeep(e, deepownervalue(20; bad=true)))
             err = try
-                appendfailure(external)
+                appendfailure(Avro.Encoder())
                 nothing
             catch caught
                 caught
             end
             @test err isa Avro.EncodeError
-            @test length(external.path.data) > 16
-            @test owner.reserved == Avro.encoderstorage(external)
         end
 
         arr = P("{\"type\":\"array\",\"items\":\"null\"}")
-        @test_throws Avro.LimitError Avro.decode(arr, hex2bytes("ffffffffff0f00"); limits=Avro.Limits(max_block_count=100))   # 2^31 nulls declared
-        blocklimits = Avro.Limits(max_block_count=2, max_total_values=100, work_allowance=100)
-        @test_throws Avro.LimitError Avro.encode(arr, fill(missing, 3); limits=blocklimits)
-        @test_throws Avro.LimitError Avro.encode(P("{\"type\":\"map\",\"values\":\"null\"}"), Dict("a" => missing, "b" => missing, "c" => missing); limits=blocklimits)
-        e = try Avro.decode(arr, hex2bytes("ffffffffff0f00")); nothing catch err; err end
-        @test e isa Avro.LimitError && e.limit in (:max_block_count, :max_values_per_byte, :max_total_values)
+        e = try Avro.decode(arr, hex2bytes("ffffffffff0f00")); nothing catch err; err end   # 2^38 nulls declared in a sized block of 0 bytes
+        @test e isa Avro.LimitError && e.limit == :max_values_per_byte
         densearray = vcat(enc("\"long\"", 1 << 20), UInt8[0])
-        @test_throws Avro.LimitError Avro.decode(arr, densearray; limits=Avro.Limits(work_allowance=0))   # work rule
-        denseunion = P("{\"type\":\"array\",\"items\":[\"null\",\"int\"]}")
-        densecount = 100_000
-        densebytes = Avro.encode(denseunion, fill(missing, densecount))
-        denselimits = Avro.Limits(max_values_per_byte=1, work_allowance=0,
-                                  max_total_values=10_000_000,
-                                  max_datum_bytes=length(densebytes),
-                                  max_block_count=densecount)
-        @test_throws Avro.LimitError Avro.decode(denseunion, densebytes;
-                                                 limits=denselimits)
-        densebytes[end - 1] = 0x04                     # invalid branch at the hostile tail
-        denseerr = try
-            Avro.decode(denseunion, densebytes; limits=denselimits)
-            nothing
-        catch caught
-            caught
-        end
-        @test denseerr isa Avro.LimitError
-        @test denseerr.limit === :max_values_per_byte  # impossible work stops before the tail
-        hugecount = vcat(Avro.encode(Avro.LongSchema(), typemax(Int64)), UInt8[0])
-        hugelimits = Avro.Limits(max_block_count=typemax(Int),
-                                 max_total_values=typemax(Int),
-                                 max_values_per_byte=typemax(Int))
-        hugeerr = try
-            Avro.decode(arr, hugecount; limits=hugelimits)
-            nothing
-        catch caught
-            caught
-        end
-        @test hugeerr isa Avro.LimitError
-        @test hugeerr.limit === :max_total_values
-        @test hugeerr.observed === typemax(Int)
-        @test_throws Avro.LimitError Avro.encode(arr, Vector{Missing}(undef, 1 << 20); limits=Avro.Limits(max_total_values=1000))
+        @test_throws Avro.LimitError Avro.decode(arr, densearray; limits=Avro.Limits(value_allowance=0))
         bigarr = Avro.parseschema("{\"type\":\"array\",\"items\":\"boolean\"}")
-        @test length(Avro.encode(bigarr, fill(true, 200_000))) > 200_000       # produced bytes feed the encode work rule (> work_allowance values)
-        nullarr = Avro.parseschema("{\"type\":\"array\",\"items\":\"null\"}")
-        @test_throws Avro.LimitError Avro.encode(nullarr, Vector{Missing}(undef, 1 << 21))                    # a million nulls produce no bytes: the work rule trips
+        @test length(Avro.encode(bigarr, fill(true, 200_000))) > 200_000
         deep = P("{\"type\":\"record\",\"name\":\"D\",\"fields\":[{\"name\":\"n\",\"type\":[\"null\",\"D\"]}]}")
         function nest(k)
             v = Avro.Record(deep, [missing])
@@ -747,8 +565,7 @@ end
             end
             return v
         end
-        @test isequal(Avro.decode(deep, Avro.encode(deep, nest(10); limits=Avro.Limits(max_depth=12)); limits=Avro.Limits(max_depth=12)), nest(10))
-        @test_throws Avro.LimitError Avro.encode(deep, nest(20); limits=Avro.Limits(max_depth=12))
+        @test isequal(Avro.decode(deep, Avro.encode(deep, nest(10)); limits=Avro.Limits(max_depth=12)), nest(10))
         @test_throws Avro.LimitError Avro.decode(deep, Avro.encode(deep, nest(20)); limits=Avro.Limits(max_depth=12))
         @test_throws Avro.LimitError Avro.decode(deep, vcat(fill(UInt8(0x02), 2000), UInt8(0x00)))   # 2000 levels > max_depth
         # a prepared reader is shareable across tasks
@@ -758,51 +575,8 @@ end
         @test [fetch(t) for t in tasks] == ["t$i" for i in 1:8]
     end
 
-    @testset "span-plan accounting and exact ceiling" begin
-        fields = join(("{\"name\":\"f$i\",\"type\":[\"null\",{\"type\":\"fixed\",\"name\":\"SpanFixed$i\",\"size\":$i}]}" for i in 1:100), ",")
-        schema = P("{\"type\":\"record\",\"name\":\"SpanCeiling\",\"fields\":[$fields]}")
-
-        function retainedspanbytes(plan)
-            T = typeof(plan)
-            bytes = isbitstype(T) ? Avro.boxbytes(T) : 16 + sizeof(T)
-            if plan isa Avro.UnionSpan
-                bytes += Avro.vectorbytes(Avro.SpanPlan, length(plan.branches))
-                for branch in plan.branches
-                    bytes += retainedspanbytes(branch)
-                end
-            elseif plan isa Avro.RecordSpan
-                bytes += Avro.vectorbytes(Avro.SpanPlan, length(plan.fields))
-                bytes += Avro.vectorbytes(Avro.SpanStep, length(plan.steps))
-                for field in plan.fields
-                    bytes += retainedspanbytes(field)
-                end
-            end
-            return bytes
-        end
-
-        generous = Avro.ledgerbudget(1 << 30)
-        plan = Avro.spanplan(schema; budget=generous)
-        expected = retainedspanbytes(plan)
-        @test generous.reserved == expected
-        @test generous.peak > generous.reserved
-        exactpeak = generous.peak
-
-        insufficient = Avro.ledgerbudget(exactpeak - 1)
-        @test_throws Avro.LimitError Avro.spanplan(schema; budget=insufficient)
-        @test insufficient.reserved == 0
-
-        exact = Avro.ledgerbudget(exactpeak)
-        exactplan = Avro.spanplan(schema; budget=exact)
-        @test retainedspanbytes(exactplan) == exact.reserved == expected
-        @test exact.peak == exactpeak
-    end
-
-    @testset "unions whose branches share a value count are static" begin
-        span(schema) = Avro.spanplan(schema; budget=Avro.ledgerbudget(1 << 30))
+    @testset "nullable-union rows: round trip and malformed blocks" begin
         nullable = P("{\"type\":\"record\",\"name\":\"StaticUnions\",\"fields\":[{\"name\":\"a\",\"type\":[\"null\",\"long\"]},{\"name\":\"s\",\"type\":[\"string\",\"null\"]}]}")
-        @test Avro.spanvalues(span(nullable)) == 5     # the record plus two values per union: no span pass
-        @test Avro.spanvalues(span(P("[\"null\",{\"type\":\"record\",\"name\":\"Two\",\"fields\":[{\"name\":\"x\",\"type\":\"long\"}]}]"))) == -1
-        @test Avro.spanvalues(span(P("{\"type\":\"record\",\"name\":\"Rec\",\"fields\":[{\"name\":\"n\",\"type\":[\"null\",\"Rec\"]}]}"))) == -1
         rows = [(a=isodd(i) ? missing : Int64(i), s=i % 3 == 0 ? missing : "v$i") for i in 1:100]
         buf = take!(Avro.tobuffer(rows; schema=nullable))
         @test isequal(Tables.columntable(Avro.Table(buf; ntasks=1)), Tables.columntable(rows))
@@ -818,7 +592,7 @@ end
         @test_throws Avro.DataError Avro.DatumReader(nullable)(UInt8[0x02, 0x06])     # truncated long
     end
 
-    @testset "validation modes: strict walks skipped regions, fast jumps sized blocks" begin
+    @testset "sized blocks: decoding validates every item, skipping jumps the block" begin
         s = P("{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"a\",\"type\":{\"type\":\"array\",\"items\":\"boolean\"}},{\"name\":\"b\",\"type\":\"int\"}]}")
         good = Avro.encode(s, (a=[true, false], b=1))
         @test Avro.decode(s, good).b == 1
@@ -826,151 +600,57 @@ end
         bad = vcat(hex2bytes("0304" * "0102" * "00"), enc("\"int\"", 1))
         @test_throws Avro.DataError Avro.decode(s, bad)
 
-        fasttagwriter = P("""{"type":"record","name":"FastTag","fields":[
+        # a field the reader drops is skipped: its sized block is jumped without reading the items
+        tagwriter = P("""{"type":"record","name":"FastTag","fields":[
             {"name":"good","type":"long"},
             {"name":"arr","type":{"type":"array","items":["null","int"]}}]}""")
-        fasttagreader = P("""{"type":"record","name":"FastTag","fields":[
+        tagreader = P("""{"type":"record","name":"FastTag","fields":[
             {"name":"good","type":"long"}]}""")
         badtag = UInt8[0x02, 0x01, 0x02, 0x04, 0x00]
-        @test_throws Avro.DataError Avro.decode(fasttagwriter, badtag;
-                                                reader_schema=fasttagreader)
-        @test Avro.decode(fasttagwriter, badtag; reader_schema=fasttagreader,
-                          validate=:fast).good == 1
-        @test Avro.DatumReader(fasttagwriter; reader_schema=fasttagreader,
-                               validate=:fast)(badtag).good == 1
+        @test_throws Avro.DataError Avro.decode(tagwriter, badtag)
+        @test Avro.decode(tagwriter, badtag; reader_schema=tagreader).good == 1
+        @test Avro.DatumReader(tagwriter; reader_schema=tagreader)(badtag).good == 1
 
-        fastenumwriter = P("""{"type":"record","name":"FastEnumTag","fields":[
+        enumwriter = P("""{"type":"record","name":"FastEnumTag","fields":[
             {"name":"good","type":"long"},
             {"name":"arr","type":{"type":"array","items":
                 {"type":"enum","name":"FastE","symbols":["A"]}}}]}""")
-        fastenumreader = P("""{"type":"record","name":"FastEnumTag","fields":[
+        enumreader = P("""{"type":"record","name":"FastEnumTag","fields":[
             {"name":"good","type":"long"}]}""")
         badenum = UInt8[0x02, 0x01, 0x02, 0x02, 0x00]
-        @test_throws Avro.DataError Avro.decode(fastenumwriter, badenum;
-                                                reader_schema=fastenumreader)
-        @test Avro.decode(fastenumwriter, badenum; reader_schema=fastenumreader,
-                          validate=:fast).good == 1
+        @test_throws Avro.DataError Avro.decode(enumwriter, badenum)
+        @test Avro.decode(enumwriter, badenum; reader_schema=enumreader).good == 1
 
-        fastmapwriter = P("""{"type":"record","name":"FastMap","fields":[
+        mapwriter = P("""{"type":"record","name":"FastMap","fields":[
             {"name":"good","type":"long"},
             {"name":"m","type":{"type":"map","values":"boolean"}}]}""")
-        fastmapreader = P("""{"type":"record","name":"FastMap","fields":[
+        mapreader = P("""{"type":"record","name":"FastMap","fields":[
             {"name":"good","type":"long"}]}""")
         badmap = UInt8[0x02, 0x01, 0x06, 0x02, 0x6b, 0x02, 0x00]
-        @test_throws Avro.DataError Avro.decode(fastmapwriter, badmap;
-                                                reader_schema=fastmapreader)
-        @test Avro.decode(fastmapwriter, badmap; reader_schema=fastmapreader,
-                          validate=:fast).good == 1
+        @test_throws Avro.DataError Avro.decode(mapwriter, badmap)
+        @test Avro.decode(mapwriter, badmap; reader_schema=mapreader).good == 1
 
-        byteswriter = P("""{"type":"record","name":"FastBytes","fields":[
-            {"name":"good","type":"long"},
-            {"name":"xs","type":{"type":"array","items":"bytes"}}]}""")
-        bytesreader = P("""{"type":"record","name":"FastBytes","fields":[
-            {"name":"good","type":"long"}]}""")
-        sizedbytes = UInt8[0x02, 0x01, 0x06, 0x04, 0xaa, 0xbb, 0x00]
-        byteslimit = Avro.Limits(max_bytes=1,
-                                 max_datum_bytes=length(sizedbytes))
-        for mode in (:strict, :fast)
-            err = try
-                Avro.decode(byteswriter, sizedbytes; reader_schema=bytesreader,
-                            validate=mode, limits=byteslimit)
-                nothing
-            catch caught
-                caught
-            end
-            @test err isa Avro.LimitError
-            @test err.limit == :max_bytes
-        end
-
-        unionfixedwriter = P("""{"type":"record","name":"FastUnionFixed","fields":[
-            {"name":"good","type":"long"},
-            {"name":"xs","type":{"type":"array","items":["null",
-                {"type":"fixed","name":"FastUnionF","size":2}]}}]}""")
-        unionfixedreader = P("""{"type":"record","name":"FastUnionFixed","fields":[
-            {"name":"good","type":"long"}]}""")
-        sizedunionfixed = UInt8[0x02, 0x01, 0x06, 0x02, 0xaa, 0xbb, 0x00]
-        unionfixedlimit = Avro.Limits(max_bytes=1,
-                                      max_datum_bytes=length(sizedunionfixed))
-        for mode in (:strict, :fast)
-            err = try
-                Avro.decode(unionfixedwriter, sizedunionfixed;
-                            reader_schema=unionfixedreader, validate=mode,
-                            limits=unionfixedlimit)
-                nothing
-            catch caught
-                caught
-            end
-            @test err isa Avro.LimitError
-            @test err.limit == :max_bytes
-        end
-
-        fixedwriter = P("""{"type":"record","name":"FastFixed","fields":[
-            {"name":"xs","type":{"type":"array","items":{"type":"fixed","name":"FastF","size":2}}},
-            {"name":"x","type":"int"}]}""")
-        fixedreader = P("""{"type":"record","name":"FastFixed","fields":[
-            {"name":"x","type":"int"}]}""")
-        sizedfixed = UInt8[0x01, 0x04, 0x01, 0x02, 0x00, 0x06]
-        fixedlimit = Avro.Limits(max_bytes=1, max_datum_bytes=length(sizedfixed))
-        for mode in (:strict, :fast)
-            err = try
-                Avro.decode(fixedwriter, sizedfixed; reader_schema=fixedreader,
-                            validate=mode, limits=fixedlimit)
-                nothing
-            catch caught
-                caught
-            end
-            @test err isa Avro.LimitError
-            @test err.limit == :max_bytes
-        end
-
-        impossiblefixed = Avro.ArraySchema(Avro.FixedSchema("ImpossibleFastF",
-                                                            typemax(Int)))
-        overflowerror = try
-            Avro.decode(impossiblefixed, UInt8[0x02, 0x00])
-            nothing
-        catch caught
-            caught
-        end
-        @test overflowerror isa Avro.LimitError
-        @test overflowerror.limit == :max_bytes
-
+        impossiblefixed = Avro.ArraySchema(Avro.FixedSchema("ImpossibleFastF", typemax(Int)))
+        @test_throws Avro.DataError Avro.decode(impossiblefixed, UInt8[0x02, 0x00])
         saturatedrecord = P("""{"type":"record","name":"SaturatedFixedRecord","fields":[
             {"name":"a","type":{"type":"fixed","name":"SaturatedA","size":9223372036854775806}},
             {"name":"b","type":{"type":"fixed","name":"SaturatedB","size":2}}]}""")
-        saturatederror = try
-            Avro.decode(saturatedrecord, UInt8[0x00];
-                        limits=Avro.Limits(max_bytes=typemax(Int)))
-            nothing
-        catch caught
-            caught
-        end
-        @test saturatederror isa Avro.LimitError
-        @test saturatederror.limit == :max_datum_bytes
+        @test_throws Avro.DataError Avro.decode(saturatedrecord, UInt8[0x00])
 
-        # skip() directly:
+        # skip() directly: the sized block is jumped, so the bad boolean is not seen
         plan = Avro.readplan(s)
-        for mode in (:strict, :fast)
-            b = Avro.Budget(Avro.Limits())
-            Avro.addinput!(b, length(bad))
-            d = Avro.Decoder(bad, b; validate=mode)
-            if mode === :strict
-                @test_throws Avro.DataError Avro.skip(plan.fields[1], d)
-            else
-                Avro.skip(plan.fields[1], d)           # jumped by size: the bad boolean is not seen
-                @test Avro.decode(plan.fields[2], d) == 1
-            end
-        end
+        d = Avro.Decoder(bad)
+        Avro.skip(plan.fields[1], d)
+        @test Avro.decode(plan.fields[2], d) == 1
         # skipped strings are length-validated but not UTF-8-validated (documented exception)
         bs = P("{\"type\":\"array\",\"items\":\"string\"}")
         badstr = hex2bytes("02" * "02ff" * "00")
-        b = Avro.Budget(Avro.Limits()); Avro.addinput!(b, 4)
-        d = Avro.Decoder(badstr, b)
+        d = Avro.Decoder(badstr)
         @test Avro.skip(Avro.readplan(bs), d) === nothing && d.pos == length(badstr) + 1
         @test_throws Avro.DataError Avro.decode(bs, badstr)
         # skipped logical values are domain-checked like decoded ones (fuzz findings): uuid text, time ranges, decimals
         function skipverdict(s, bytes)
-            b = Avro.Budget(Avro.Limits()); Avro.addinput!(b, length(bytes))
-            d = Avro.Decoder(bytes, b)
+            d = Avro.Decoder(bytes)
             try
                 Avro.skip(Avro.readplan(s), d)
                 return d.pos == length(bytes) + 1 ? :ok : :trailing
@@ -1039,7 +719,7 @@ end
             s isa Avro.NullSchema && return missing
             s isa Avro.BooleanSchema && return rand(rng, Bool)
             s isa Avro.IntSchema && return s.logical isa Avro.DateLogical ? Date(1970, 1, 1) + Day(rand(rng, Int32)) : rand(rng, Int32)
-            s isa Avro.LongSchema && return s.logical isa Avro.TimestampMicros ? Avro.Timestamp{Microsecond}(rand(rng, Int64)) : rand(rng, Int64)
+            s isa Avro.LongSchema && return s.logical isa Avro.TimestampMicros ? Avro.timestamp(Microsecond, rand(rng, Int64)) : rand(rng, Int64)
             s isa Avro.FloatSchema && return rand(rng, Bool) ? rand(rng, Float32) : reinterpret(Float32, rand(rng, UInt32))
             s isa Avro.DoubleSchema && return rand(rng, Bool) ? rand(rng, Float64) : reinterpret(Float64, rand(rng, UInt64))
             s isa Avro.BytesSchema && return s.logical isa Avro.DecimalLogical ? Avro.Decimal(Int128(rand(rng, -999999999:999999999)), 3) : rand(rng, UInt8, rand(rng, 0:8))
@@ -1047,22 +727,22 @@ end
             s isa Avro.FixedSchema && return Avro.Fixed(s, rand(rng, UInt8, s.size))
             s isa Avro.EnumSchema && return Avro.EnumValue(s, rand(rng, 1:3))
             s isa Avro.ArraySchema && return [genvalue(s.items) for _ in 1:rand(rng, 0:3)]
-            s isa Avro.MapSchema && return Avro.Map([("k$i", genvalue(s.values)) for i in 1:rand(rng, 0:3)])
+            s isa Avro.MapSchema && return Dict{String,Any}("k$i" => genvalue(s.values) for i in 1:rand(rng, 0:3))
             s isa Avro.UnionSchema && return rand(rng, Bool) ? missing : genvalue(s.branches[2])
             return Avro.Record(s, Any[genvalue(f.schema) for f in s.fields])
         end
 
-        function bitequal(a, b)
-            return isequal(a, b) && (!(a isa AbstractFloat) ||
-                reinterpret(UInt64, Float64(a)) == reinterpret(UInt64, Float64(b)) || a isa Float32)
-        end
+        # map entries have no defined order, so a decoded map may re-encode its entries in another order
+        hasmap(s) = s isa Avro.MapSchema || (s isa Avro.ArraySchema && hasmap(s.items)) ||
+                    (s isa Avro.UnionSchema && any(hasmap, s.branches)) ||
+                    (s isa Avro.RecordSchema && any(f -> hasmap(f.schema), s.fields))
         for trial in 1:150
             s = P(genschema(0))
             v = genvalue(s)
             bytes = Avro.encode(s, v)
             w = Avro.decode(s, bytes)
             @test isequal(w, v) || (v isa AbstractVector && isequal(collect(Any, w), collect(Any, v)))
-            @test Avro.encode(s, w) == bytes
+            @test hasmap(s) ? isequal(Avro.decode(s, Avro.encode(s, w)), w) : Avro.encode(s, w) == bytes
             # prepared == one-shot
             @test isequal(Avro.DatumReader(s)(bytes), w) && Avro.DatumWriter(s)(v) == bytes
         end

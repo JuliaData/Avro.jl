@@ -40,8 +40,7 @@
         @test err isa Avro.EncodeError
         @test err.path == "\$.xs[1]"
         @test err.schema === s.fields[1].schema.items.branches[2]
-        @test writer.encoder.expected === nothing
-        @test writer.encoder.path.len == 0
+        @test failure(() -> writer((xs=Any["bad"],))).path == "\$.xs[0]"      # no stale path from the last failure
         @test isequal(Avro.decode(s, writer((xs=Any[missing, Int32(1234)],))).xs,
                       Union{Missing,Int32}[missing, 1234])
 
@@ -54,25 +53,22 @@
         @test Avro.decode(nullable_record, writer((value=Int32(1234),))).value == 1234
     end
 
-    @testset "value and depth limits" begin
+    @testset "depth limit; a prepared writer recovers" begin
         s = P("[\"null\",\"long\"]")
         for x in (missing, Int64(1234))
-            @test isequal(Avro.decode(s, Avro.encode(s, x; limits=Avro.Limits(max_total_values=2))), x)
-            err = failure(() -> Avro.encode(s, x; limits=Avro.Limits(max_total_values=1)))
-            @test err isa Avro.LimitError && err.limit === :max_total_values
+            @test isequal(Avro.decode(s, Avro.encode(s, x)), x)
         end
         s = P("""{"type":"record","name":"NullableDepth","fields":[
             {"name":"next","type":["null","NullableDepth"]}]}""")
-        writer = Avro.DatumWriter(s; limits=Avro.Limits(max_depth=1))
+        writer = Avro.DatumWriter(s)
         @test isequal(Avro.decode(s, writer((next=missing,))).next, missing)
-        err = failure(() -> writer((next=(next=missing,),)))
-        @test err isa Avro.LimitError && err.limit === :max_depth && err.observed == 2
+        deep = Avro.Record(s, Any[missing])
+        for _ in 1:1100
+            deep = Avro.Record(s, Any[deep])
+        end
+        err = failure(() -> writer(deep))
+        @test err isa Avro.LimitError && err.limit === :max_depth && err.value == 1024
         @test isequal(Avro.decode(s, writer((next=missing,))).next, missing)
-
-        bytes = P("[\"null\",\"bytes\"]")
-        writer = Avro.DatumWriter(bytes; limits=Avro.Limits(max_bytes=2, max_datum_bytes=32))
-        @test_throws Avro.LimitError writer(UInt8[1, 2, 3])
-        @test Avro.decode(bytes, writer(UInt8[1, 2])) == UInt8[1, 2]
     end
 
     @testset "table allocations stay independent of nullable row count" begin

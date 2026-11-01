@@ -4,10 +4,11 @@ import Arrow
     for (period, unit) in ((Millisecond, Arrow.Meta.TimeUnit.MILLISECOND),
                            (Microsecond, Arrow.Meta.TimeUnit.MICROSECOND),
                            (Nanosecond, Arrow.Meta.TimeUnit.NANOSECOND))
-        for (wrapper, zone) in ((Avro.Timestamp, :UTC), (Avro.LocalTimestamp, nothing))
-            T = wrapper{period}
+        for (make, zone) in ((Avro.timestamp, :UTC), (Avro.localtimestamp, nothing))
             ticks = Int64[typemin(Int64), -1, 0, 1, typemax(Int64)]
-            for values in (T.(ticks), Union{Missing,T}[missing; T.(ticks)])
+            stamps = [make(period, t) for t in ticks]
+            T = eltype(stamps)
+            for values in (stamps, Union{Missing,T}[missing; stamps])
                 table = Avro.Table(Avro.tobuffer((time=values,)))
                 io = IOBuffer()
                 Arrow.write(io, table)

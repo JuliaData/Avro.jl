@@ -1,8 +1,8 @@
 # The projection equivalence matrix: names, order, eltypes, Tables.schema, row
 # count and values of `Table(src; select=cols)` equal `columntable(Table(src))[cols]` over the fixture
 # battery — multi-block files, empty records, select=(), nested and nullable fields, directly and
-# mutually recursive roots — in both validation modes and for ntasks ∈ {1, 2, 8}; malformed data inside
-# projected-away fields follows each mode's documented policy; projected tables round-trip their schema.
+# mutually recursive roots — for ntasks ∈ {1, 2, 8}; malformed data inside projected-away fields
+# follows the documented skip policy; projected tables round-trip their schema.
 
 import Logging
 
@@ -23,8 +23,6 @@ import Logging
     push!(fixtures, ("mutually recursive root",
         "{\"type\":\"record\",\"name\":\"A0\",\"fields\":[{\"name\":\"v\",\"type\":\"long\"},{\"name\":\"b\",\"type\":[\"null\",{\"type\":\"record\",\"name\":\"B0\",\"fields\":[{\"name\":\"w\",\"type\":\"string\"},{\"name\":\"a\",\"type\":[\"null\",\"A0\"]}]}]}]}",
         [(v=Int64(i), b=i % 3 == 0 ? missing : (w="w$i", a=missing)) for i in 1:400]))
-    raised = Avro.Limits(max_total_bytes=2 << 30, max_block_bytes=16 << 20, max_block_output_bytes=256 << 20,
-                         max_codec_memory=32 << 20, max_bytes=64 << 20, max_datum_bytes=64 << 20)
     function selections(names)
         sels = Vector{Symbol}[]
         push!(sels, Symbol[])                                 # select=()
@@ -41,52 +39,47 @@ import Logging
     recursivefield = Dict("directly recursive root" => :next, "mutually recursive root" => :b)
     for (label, json, rows) in fixtures
         s = P(json)
-        bytes = take!(Avro.tobuffer(rows; schema=s, block_bytes=512, limits=raised))
+        bytes = take!(Avro.tobuffer(rows; schema=s, block_bytes=512))
         @testset "$label" begin
-            for val in (:strict, :fast)
-                full = Avro.Table(IOBuffer(bytes); validate=val, limits=raised)
-                fullct = Tables.columntable(full)
-                fullsch = Tables.schema(full)
-                for sel in selections(Tables.columnnames(full)), nt in (1, 2, 8)
-                    if get(recursivefield, label, nothing) in sel && length(sel) < length(fullsch.names)
-                        @test_throws ArgumentError Avro.Table(IOBuffer(bytes); select=Tuple(sel), validate=val,
-                                                              ntasks=nt, limits=raised)
-                        @test_throws ArgumentError Avro.Rows(IOBuffer(bytes); select=Tuple(sel), validate=val,
-                                                             limits=raised)
-                        continue
-                    end
-                    pt = Avro.Table(IOBuffer(bytes); select=Tuple(sel), validate=val, ntasks=nt, limits=raised)
-                    @test Tables.columnnames(pt) == sel
-                    @test length(pt) == length(full)
-                    psch = Tables.schema(pt)
-                    @test collect(psch.names) == sel
-                    for (k, nm) in enumerate(sel)
-                        col = Tables.getcolumn(pt, k)
-                        want = fullct[nm]
-                        @test isequal(col, want) && typeof(col) == typeof(want)
-                        @test psch.types[k] == fullsch.types[findfirst(==(nm), collect(fullsch.names))]
-                    end
-                    ps = Avro.schema(pt)
-                    @test [f.name for f in ps.fields] == [String(nm) for nm in sel]
+            full = Avro.Table(IOBuffer(bytes))
+            fullct = Tables.columntable(full)
+            fullsch = Tables.schema(full)
+            for sel in selections(Tables.columnnames(full)), nt in (1, 2, 8)
+                if get(recursivefield, label, nothing) in sel && length(sel) < length(fullsch.names)
+                    @test_throws ArgumentError Avro.Table(IOBuffer(bytes); select=Tuple(sel), ntasks=nt)
+                    @test_throws ArgumentError Avro.Rows(IOBuffer(bytes); select=Tuple(sel))
+                    continue
                 end
-                # writing a projection round-trips its derived schema and values
-                names = collect(Tables.columnnames(full))
-                sel = isempty(names) ? Symbol[] : [names[1]]
-                pt = Avro.Table(IOBuffer(bytes); select=Tuple(sel), validate=val, limits=raised)
-                io = IOBuffer()
-                Avro.write(io, pt; limits=raised)
-                seekstart(io)
-                t2 = Avro.Table(io; limits=raised)
-                @test Avro.json(Avro.schema(t2)) == Avro.json(Avro.schema(pt))
-                @test length(t2) == length(pt)
-                @test isequal(Tables.columntable(t2), Tables.columntable(pt))
+                pt = Avro.Table(IOBuffer(bytes); select=Tuple(sel), ntasks=nt)
+                @test Tables.columnnames(pt) == sel
+                @test length(pt) == length(full)
+                psch = Tables.schema(pt)
+                @test collect(psch.names) == sel
+                for (k, nm) in enumerate(sel)
+                    col = Tables.getcolumn(pt, k)
+                    want = fullct[nm]
+                    @test isequal(col, want) && typeof(col) == typeof(want)
+                    @test psch.types[k] == fullsch.types[findfirst(==(nm), collect(fullsch.names))]
+                end
+                ps = Avro.schema(pt)
+                @test [f.name for f in ps.fields] == [String(nm) for nm in sel]
             end
+            # writing a projection round-trips its derived schema and values
+            names = collect(Tables.columnnames(full))
+            sel = isempty(names) ? Symbol[] : [names[1]]
+            pt = Avro.Table(IOBuffer(bytes); select=Tuple(sel))
+            io = IOBuffer()
+            Avro.write(io, pt)
+            seekstart(io)
+            t2 = Avro.Table(io)
+            @test Avro.json(Avro.schema(t2)) == Avro.json(Avro.schema(pt))
+            @test length(t2) == length(pt)
+            @test isequal(Tables.columntable(t2), Tables.columntable(pt))
         end
     end
-    @testset "malformed data inside projected-away fields (each mode's documented policy)" begin
+    @testset "malformed data inside projected-away fields (the documented skip policy)" begin
         # a crafted container: {good: long, arr: array<boolean>} where arr uses the sized-block form
-        # holding invalid boolean bytes — strict walks skipped fields (rejects), fast jumps the sized
-        # block by its byte size (tolerates)
+        # holding invalid boolean bytes: a projected-away sized block is jumped by its byte size
         s2 = P("{\"type\":\"record\",\"name\":\"M\",\"fields\":[{\"name\":\"good\",\"type\":\"long\"},{\"name\":\"arr\",\"type\":{\"type\":\"array\",\"items\":\"boolean\"}}]}")
         sync = collect(UInt8(1):UInt8(16))
         base = IOBuffer()
@@ -100,18 +93,15 @@ import Logging
         headerend = e1.offset - Avro.varintlength(1) - Avro.varintlength(e1.size) - 1
         payload = UInt8[0x02, 0x03, 0x04, 0x02, 0x02, 0x00]     # good=1; arr sized block(count=-2, 2 bytes): two invalid bools; end
         crafted = vcat(orig[1:headerend], UInt8[0x02], UInt8[UInt8(2 * length(payload))], payload, sync)
-        pt = Avro.Table(IOBuffer(crafted); select=(:good,), validate=:fast)
+        pt = Avro.Table(IOBuffer(crafted); select=(:good,))
         @test Tables.getcolumn(pt, :good) == [1]
-        @test_throws Avro.DataError Avro.Table(IOBuffer(crafted); select=(:good,), validate=:strict)
-        @test_throws Avro.DataError Avro.Table(IOBuffer(crafted); select=(:arr,), validate=:fast)   # selected data is always validated
-        rs = Avro.Rows(IOBuffer(crafted); select=(:good,), validate=:fast)
+        @test_throws Avro.DataError Avro.Table(IOBuffer(crafted); select=(:arr,))   # selected data is always validated
+        @test_throws Avro.DataError Avro.Table(IOBuffer(crafted))
+        rs = Avro.Rows(IOBuffer(crafted); select=(:good,))
         @test [row.good for row in rs] == [1]
         close(rs)
-        rst = Avro.Rows(IOBuffer(crafted); select=(:good,), validate=:strict)
-        @test_throws Avro.DataError collect(rst)
-        close(rst)
-        # an invalid skipped value outside a sized block is rejected in both modes (bools are
-        # domain-checked when skipped; only sized-block jumps and skipped-string UTF-8 are relaxed)
+        # an invalid skipped value outside a sized block is rejected (bools are domain-checked when
+        # skipped; only sized-block jumps and skipped-string UTF-8 are relaxed)
         s3 = P("{\"type\":\"record\",\"name\":\"M2\",\"fields\":[{\"name\":\"good\",\"type\":\"long\"},{\"name\":\"b\",\"type\":\"boolean\"}]}")
         rows3 = [(good=Int64(i), b=iseven(i)) for i in 1:10]
         bytes3 = take!(Avro.tobuffer(rows3; schema=s3, block_bytes=64))
@@ -120,8 +110,7 @@ import Logging
         close(r3)
         bad3 = copy(bytes3)
         bad3[f1.offset + 1] = 0x02                              # row 1's boolean byte
-        @test_throws Avro.DataError Avro.Table(IOBuffer(bad3); select=(:good,), validate=:strict)
-        @test_throws Avro.DataError Avro.Table(IOBuffer(bad3); select=(:good,), validate=:fast)
+        @test_throws Avro.DataError Avro.Table(IOBuffer(bad3); select=(:good,))
         s3fused = P("""{"type":"record","name":"M2Fused","fields":[
             {"name":"good","type":"long"},{"name":"b1","type":"boolean"},
             {"name":"b2","type":"boolean"}]}""")
@@ -132,10 +121,8 @@ import Logging
         close(fusedreader)
         fusedbad = copy(fusedbytes)
         fusedbad[fusedblock.offset + 1] = 0x02
-        for mode in (:strict, :fast)
-            @test_throws Avro.DataError Avro.Table(IOBuffer(fusedbad);
-                                                   select=(:good,), validate=mode)
-        end
+        @test_throws Avro.DataError Avro.Table(IOBuffer(fusedbad); select=(:good,))
+        # a dropped field's sized block is jumped unread, whatever its items hold
         countedwriter = P("""{"type":"record","name":"CountedFastSkip","fields":[
             {"name":"drop","type":{"type":"array","items":{"type":"record","name":"CountedFastItem","fields":[
                 {"name":"e","type":{"type":"enum","name":"CountedFastEnum","symbols":["a"]}}]}}},
@@ -145,41 +132,25 @@ import Logging
         countedprefix = UInt8[0xc7, 0x01, 0xc8, 0x01]   # sized array: count=-100, size=100
         countedvalid = vcat(countedprefix, fill(UInt8(0x00), 100), UInt8[0x00, 0x02])
         countedinvalid = vcat(countedprefix, fill(UInt8(0x02), 100), UInt8[0x00, 0x02])
-        countedlimits = Avro.Limits(max_total_values=10)
         CountedTarget = @NamedTuple{keep::Int32}
-        for target in (nothing, CountedTarget)
-            decodecounted = target === nothing ?
-                bytes -> Avro.decode(countedwriter, bytes;
-                                     reader_schema=countedreader, validate=:fast,
-                                     limits=countedlimits) :
-                bytes -> Avro.decode(countedwriter, bytes, target;
-                                     reader_schema=countedreader, validate=:fast,
-                                     limits=countedlimits)
-            @test_throws Avro.LimitError decodecounted(countedvalid)
-            @test_throws Avro.DataError decodecounted(countedinvalid)
+        for bytes in (countedvalid, countedinvalid)
+            @test Avro.decode(countedwriter, bytes; reader_schema=countedreader).keep === Int32(1)
+            @test Avro.decode(countedwriter, bytes, CountedTarget; reader_schema=countedreader) == (keep=Int32(1),)
         end
+        @test_throws Avro.DataError Avro.decode(countedwriter, countedinvalid)
         fixedrun = P("""{"type":"record","name":"FastFixedRun","fields":[
             {"name":"id","type":"long"},{"name":"a","type":"float"},
             {"name":"b","type":"float"}]}""")
         fixedrunbytes = take!(Avro.tobuffer([(id=Int64(1), a=1.0f0, b=2.0f0)];
                                              schema=fixedrun))
-        fixedrunlimits = Avro.Limits(max_bytes=4, max_datum_bytes=1 << 20)
-        for mode in (:strict, :fast)
-            table = Avro.Table(fixedrunbytes; select=(:id,), validate=mode,
-                               limits=fixedrunlimits, ntasks=1)
-            @test Tables.getcolumn(table, :id) == [1]
-        end
+        @test Tables.getcolumn(Avro.Table(fixedrunbytes; select=(:id,), ntasks=1), :id) == [1]
         dynamicrun = P("""{"type":"record","name":"FastDynamicRun","fields":[
             {"name":"id","type":"long"},{"name":"s","type":"string"},
             {"name":"d","type":"double"},{"name":"f","type":"float"}]}""")
         dynamicrunbytes = take!(Avro.tobuffer([(id=Int64(1), s="", d=2.0, f=3.0f0)];
                                                schema=dynamicrun))
-        for mode in (:strict, :fast)
-            table = Avro.Table(dynamicrunbytes; select=(:id,), validate=mode,
-                               limits=fixedrunlimits, ntasks=1)
-            @test Tables.getcolumn(table, :id) == [1]
-        end
-        # invalid UTF-8 inside a skipped string is tolerated in both modes; selecting it rejects
+        @test Tables.getcolumn(Avro.Table(dynamicrunbytes; select=(:id,), ntasks=1), :id) == [1]
+        # invalid UTF-8 inside a skipped string is tolerated; selecting it rejects
         s4 = P("{\"type\":\"record\",\"name\":\"M3\",\"fields\":[{\"name\":\"good\",\"type\":\"long\"},{\"name\":\"s\",\"type\":\"string\"}]}")
         bytes4 = take!(Avro.tobuffer([(good=Int64(7), s="AB")]; schema=s4))
         r4 = Avro.Reader(IOBuffer(bytes4))
@@ -188,10 +159,8 @@ import Logging
         bad4 = copy(bytes4)
         @test bad4[g1.offset + 2] == UInt8('A')
         bad4[g1.offset + 2] = 0xff                              # invalid UTF-8, length intact
-        for val in (:strict, :fast)
-            @test Tables.getcolumn(Avro.Table(IOBuffer(bad4); select=(:good,), validate=val), :good) == [7]
-            @test_throws Avro.DataError Avro.Table(IOBuffer(bad4); select=(:s,), validate=val)
-        end
+        @test Tables.getcolumn(Avro.Table(IOBuffer(bad4); select=(:good,)), :good) == [7]
+        @test_throws Avro.DataError Avro.Table(IOBuffer(bad4); select=(:s,))
 
         @testset "resolved skips enforce reader-side validation" begin
             cases = [
@@ -255,9 +224,6 @@ import Logging
         rootsdir = joinpath(gen, "roots")
         legacydir = joinpath(gen, "legacy1x")
         highwindowdir = joinpath(gen, "highwindow")
-        raised = Avro.Limits(max_total_bytes=2 << 30, max_block_bytes=16 << 20, max_block_output_bytes=256 << 20,
-                             max_codec_memory=32 << 20, max_bytes=64 << 20, max_datum_bytes=64 << 20)
-
         function avrofiles(root)
             files = String[]
             for (dir, _, names) in walkdir(root)
@@ -284,7 +250,7 @@ import Logging
         end
 
         function readoptions(data)
-            startswith(data, legacydir) && return (; legacy=:avrojl1, decimal_byteorder=:little)
+            startswith(data, legacydir) && return (; legacy=:avrojl1)
             return (;)
         end
 
@@ -335,7 +301,7 @@ import Logging
         end
         for data in rootfiles
             @test any(stem -> startswith(basename(data), stem * "-"), rootstems)
-            r = Avro.Reader(data; limits=raised)
+            r = Avro.Reader(data)
             try
                 @test !(Avro.writerschema(r) isa Avro.RecordSchema)
             finally
@@ -346,46 +312,43 @@ import Logging
         for data in recordfiles
             opts = readoptions(data)
             @testset "$(relpath(data, fixtureroot))" begin
-                for val in (:strict, :fast)
-                    full = quietly(data) do
-                        return Avro.Table(data; validate=val, ntasks=1, limits=raised, opts...)
+                full = quietly(data) do
+                    return Avro.Table(data; ntasks=1, opts...)
+                end
+                names = collect(Tables.columnnames(full))
+                fullct = Tables.columntable(full)
+                fullsch = Tables.schema(full)
+                for sel in corpusselections(names)
+                    expectedtypes = Type[fullsch.types[findfirst(==(nm), collect(fullsch.names))] for nm in sel]
+                    rowresult = quietly(data) do
+                        rl = Avro.Rows(data; select=Tuple(sel), opts...)
+                        try
+                            return (Tables.schema(rl), collect(rl))
+                        finally
+                            close(rl)
+                        end
                     end
-                    names = collect(Tables.columnnames(full))
-                    fullct = Tables.columntable(full)
-                    fullsch = Tables.schema(full)
-                    for sel in corpusselections(names)
-                        expectedtypes = Type[fullsch.types[findfirst(==(nm), collect(fullsch.names))] for nm in sel]
-                        rowresult = quietly(data) do
-                            rl = Avro.Rows(data; select=Tuple(sel), validate=val, limits=raised, opts...)
-                            try
-                                return (Tables.schema(rl), collect(rl))
-                            finally
-                                close(rl)
-                            end
+                    rowschema, rows = rowresult
+                    @test collect(rowschema.names) == sel
+                    @test collect(rowschema.types) == expectedtypes
+                    @test length(rows) == length(full)
+                    for (k, nm) in enumerate(sel)
+                        @test isequal([Tables.getcolumn(r, k) for r in rows], collect(fullct[nm]))
+                    end
+                    for nt in (1, 2, 8)
+                        pt = quietly(data) do
+                            return Avro.Table(data; select=Tuple(sel), ntasks=nt, opts...)
                         end
-                        rowschema, rows = rowresult
-                        @test collect(rowschema.names) == sel
-                        @test collect(rowschema.types) == expectedtypes
-                        @test length(rows) == length(full)
+                        @test collect(Tables.columnnames(pt)) == sel
+                        @test length(pt) == length(full)
+                        psch = Tables.schema(pt)
+                        @test collect(psch.names) == sel
+                        @test collect(psch.types) == expectedtypes
+                        @test isequal(Tables.columntable(pt), fullct[Tuple(sel)])
                         for (k, nm) in enumerate(sel)
-                            @test isequal([Tables.getcolumn(r, k) for r in rows], collect(fullct[nm]))
-                        end
-                        for nt in (1, 2, 8)
-                            pt = quietly(data) do
-                                return Avro.Table(data; select=Tuple(sel), validate=val, ntasks=nt,
-                                                  limits=raised, opts...)
-                            end
-                            @test collect(Tables.columnnames(pt)) == sel
-                            @test length(pt) == length(full)
-                            psch = Tables.schema(pt)
-                            @test collect(psch.names) == sel
-                            @test collect(psch.types) == expectedtypes
-                            @test isequal(Tables.columntable(pt), fullct[Tuple(sel)])
-                            for (k, nm) in enumerate(sel)
-                                got = Tables.getcolumn(pt, k)
-                                want = fullct[nm]
-                                @test isequal(got, want) && typeof(got) == typeof(want)
-                            end
+                            got = Tables.getcolumn(pt, k)
+                            want = fullct[nm]
+                            @test isequal(got, want) && typeof(got) == typeof(want)
                         end
                     end
                 end
@@ -393,40 +356,38 @@ import Logging
                 # One projection from every readable record fixture must remain writable. This also
                 # covers the authoritative row count of empty records and `select=()`.
                 full = quietly(data) do
-                    return Avro.Table(data; validate=:strict, ntasks=1, limits=raised, opts...)
+                    return Avro.Table(data; ntasks=1, opts...)
                 end
                 names = collect(Tables.columnnames(full))
                 sel = isempty(names) ? Symbol[] : [names[end]]
                 projected = quietly(data) do
-                    return Avro.Table(data; select=Tuple(sel), validate=:strict, ntasks=1,
-                                      limits=raised, opts...)
+                    return Avro.Table(data; select=Tuple(sel), ntasks=1, opts...)
                 end
                 io = IOBuffer()
-                Avro.write(io, projected; limits=raised)
+                Avro.write(io, projected)
                 seekstart(io)
-                roundtrip = Avro.Table(io; limits=raised)
+                roundtrip = Avro.Table(io)
                 @test Avro.json(Avro.schema(roundtrip)) == Avro.json(Avro.schema(projected))
                 @test length(roundtrip) == length(projected)
                 @test isequal(Tables.columntable(roundtrip), Tables.columntable(projected))
             end
         end
 
-        # The plan deliberately excludes these two files from decode-under-defaults. They still
-        # receive the full projection verdict surface under the gate's 32 MiB codec-memory limit.
+        # The plan deliberately excludes these two files from decode-under-defaults: a 1 GiB decoder
+        # window is refused, under every projection.
         for data in overlimit
-            r = Avro.Reader(data; limits=raised)
+            r = Avro.Reader(data)
             s = Avro.writerschema(r)
             close(r)
             @test s isa Avro.RecordSchema
             names = Symbol[Symbol(f.name) for f in s.fields]
-            for sel in corpusselections(names), val in (:strict, :fast)
+            for sel in corpusselections(names)
                 for nt in (1, 2, 8)
-                    @test_throws Avro.CodecError Avro.Table(data; select=Tuple(sel), validate=val,
-                                                            ntasks=nt, limits=raised)
+                    @test_throws Union{Avro.CodecError,Avro.LimitError} Avro.Table(data; select=Tuple(sel), ntasks=nt)
                 end
-                rl = Avro.Rows(data; select=Tuple(sel), validate=val, limits=raised)
+                rl = Avro.Rows(data; select=Tuple(sel))
                 try
-                    @test_throws Avro.CodecError collect(rl)
+                    @test_throws Union{Avro.CodecError,Avro.LimitError} collect(rl)
                 finally
                     close(rl)
                 end

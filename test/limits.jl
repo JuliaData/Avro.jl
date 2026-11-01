@@ -1,117 +1,188 @@
 @testset "Limits" begin
-    l = Avro.Limits()
-    @test l.max_total_bytes == 16 << 30
-    @test l.max_total_values == l.max_rows == l.max_blocks == typemax(Int)
-    @test l.max_block_bytes == 16 << 20
-    @test l.max_codec_memory == 32 << 20
-    @test l.max_values_per_byte == 16
-    @test l.work_allowance == 65_536
-    @test l.max_inflight_blocks == 0
-    @test Avro.Limits(max_total_bytes=1 << 30).max_total_bytes == 1 << 30
-    @test_throws ArgumentError Avro.Limits(bogus=1)
-    @test_throws ArgumentError Avro.Limits(max_depth=-1)
-    @test sprint(show, MIME("text/plain"), l) isa String
-
-    @testset "constructor relations at equality and one byte beyond" begin
-        # max_codec_memory ≥ 16 MiB
-        @test Avro.Limits(max_codec_memory=16 << 20).max_codec_memory == 16 << 20
-        @test_throws ArgumentError Avro.Limits(max_codec_memory=(16 << 20) - 1)
-        # max_datum_bytes ≤ max_bytes + 1 MiB
-        @test Avro.Limits(max_datum_bytes=(64 << 20) + (1 << 20)).max_datum_bytes == (64 << 20) + (1 << 20)
-        @test_throws ArgumentError Avro.Limits(max_datum_bytes=(64 << 20) + (1 << 20) + 1)
-        ceiling = 256 << 20                            # the relations below scale with max_total_bytes
-        # max_block_bytes ≤ ceiling ÷ 4
-        @test Avro.Limits(max_total_bytes=ceiling, max_block_bytes=64 << 20).max_block_bytes == 64 << 20
-        @test_throws ArgumentError Avro.Limits(max_total_bytes=ceiling, max_block_bytes=(64 << 20) + 1)
-        # max_codec_memory + 4 MiB ≤ ceiling ÷ 4
-        @test Avro.Limits(max_total_bytes=ceiling, max_codec_memory=60 << 20).max_codec_memory == 60 << 20
-        @test_throws ArgumentError Avro.Limits(max_total_bytes=ceiling, max_codec_memory=(60 << 20) + 1)
-        # max_block_output_bytes ≤ ceiling ÷ 2
-        @test Avro.Limits(max_total_bytes=ceiling, max_block_output_bytes=128 << 20).max_block_output_bytes == 128 << 20
-        @test_throws ArgumentError Avro.Limits(max_total_bytes=ceiling, max_block_output_bytes=(128 << 20) + 1)
-        # max_metadata_bytes + max_schema_bytes ≤ ceiling ÷ 2
-        @test Avro.Limits(max_total_bytes=ceiling, max_metadata_bytes=112 << 20).max_metadata_bytes == 112 << 20
-        @test_throws ArgumentError Avro.Limits(max_total_bytes=ceiling, max_metadata_bytes=(112 << 20) + 1)
-        # the first unit of progress fits under the default ceiling, and must fit any ceiling
-        @test Avro.first_unit_bytes(l) <= l.max_total_bytes
-        lowceiling = 4 * ((32 << 20) + (4 << 20))   # the smallest ceiling the codec relation admits
-        @test Avro.first_unit_bytes(Avro.Limits(max_total_bytes=lowceiling)) <= lowceiling
-        @test_throws ArgumentError Avro.Limits(max_total_bytes=lowceiling, max_bytes=100 << 20,
-                                               max_datum_bytes=101 << 20)
-    end
-
-    @testset "the ceiling is max_total_bytes, independent of host memory" begin
-        @test Avro.Budget(l).ceiling == l.max_total_bytes
-        @test Avro.Budget(Avro.Limits(max_total_bytes=1 << 40)).ceiling == 1 << 40
-        @test !isdefined(Avro, :available_memory) && !isdefined(Avro, :GUARD)
-    end
-
-    @testset "Budget: reservations and release" begin
-        b = Avro.Budget(l)
-        Avro.reserve!(b, 1000 + (1 << 20))
-        @test b.reserved == 1000 + (1 << 20) && b.peak == b.reserved
-        Avro.release!(b, 400)
-        @test b.reserved == 600 + (1 << 20) && b.peak == 1000 + (1 << 20)
-        @test_throws ArgumentError Avro.release!(b, 601 + (1 << 20))               # an over-release is a mismatch, no clamp
-        @test b.reserved == 600 + (1 << 20)
-        @test_throws ArgumentError Avro.reserve!(b, -1)
-        @test_throws ArgumentError Avro.release!(b, -1)
-        Avro.release!(b, 600 + (1 << 20))
-        @test b.reserved == 0
-        checkpoint = Avro.budgetcheckpoint(b)
-        Avro.reserve!(b, 10)
-        Avro.reserve!(b, 20)
-        Avro.rollbackreservations!(b, checkpoint)
-        @test b.reserved == 0
-        @test_throws Avro.LimitError Avro.reserve!(b, b.ceiling + 1)
-        Avro.reserve!(b, b.ceiling)   # exactly the ceiling is admitted
-        @test_throws Avro.LimitError Avro.reserve!(b, 1)
-        r = Avro.withbudget(l) do bb
-            Avro.reserve!(bb, 10)
-            42
+    P = Avro.parseschema
+    @testset "keywords, defaults, validation and show" begin
+        l = Avro.Limits()
+        @test l === Avro.Limits()
+        @test fieldnames(Avro.Limits) == (:max_depth, :max_bytes, :max_values_per_byte, :value_allowance)
+        @test (l.max_depth, l.max_bytes, l.max_values_per_byte, l.value_allowance) == (1024, 256 << 20, 16, 65_536)
+        custom = Avro.Limits(max_depth=8)
+        @test custom.max_depth == 8 && custom.max_bytes == l.max_bytes && custom.value_allowance == l.value_allowance
+        @test Avro.Limits(max_bytes=0, value_allowance=0).max_bytes == 0
+        @test Avro.Limits(max_bytes=typemax(Int)).max_bytes == typemax(Int)
+        @test Avro.Limits(max_depth=1024) == l
+        for bad in ((bogus=1,), (max_depth=-1,), (max_depth=0,), (max_values_per_byte=0,),
+                    (max_bytes=-1,), (value_allowance=-1,), (max_bytes=1.5,), (max_bytes=true,),
+                    (max_bytes=big(typemax(Int)) + 1,))
+            @test_throws ArgumentError Avro.Limits(; bad...)
         end
-        @test r == 42
-        @test_throws ErrorException Avro.withbudget(l) do bb
-            Avro.reserve!(bb, 10)
-            error("boom")
-        end
+        @test sprint(show, l) == "Avro.Limits()"
+        @test sprint(show, MIME("text/plain"), l) == "Avro.Limits()"
+        @test sprint(show, Avro.Limits(max_depth=8, value_allowance=0)) == "Avro.Limits(max_depth=8, value_allowance=0)"
     end
 
-    @testset "BuildBuf accounts for its mutable shell" begin
-        b = Avro.Budget(l)
-        bb = Avro.BuildBuf{Int}(b, 4)
-        @test b.reserved == Avro.vectorbytes(Int, 4) + Avro.shellbytes(typeof(bb))
-        push!(bb, b, 1)
-        data = Avro.finishbuild!(bb, b)
-        @test data == [1]
-        @test b.reserved == Avro.vectorbytes(Int, 1)
-        data = nothing
-        Avro.release!(b, Avro.vectorbytes(Int, 1))
-        @test b.reserved == 0
+    @testset "LimitError names the limit and the keyword that raises it" begin
+        e = Avro.LimitError(:max_depth, 1025, 1024)
+        @test fieldnames(Avro.LimitError) == (:limit, :observed, :value)
+        @test (e.limit, e.observed, e.value) == (:max_depth, 1025, 1024)
+        @test sprint(showerror, e) == "LimitError: max_depth exceeded: observed 1025, limit 1024; raise `Avro.Limits(max_depth=...)`"
     end
 
-    @testset "live Writer header copies stay reserved" begin
-        meta = Dict("user.blob" => rand(UInt8, 2 << 20))
-        s = Avro.parseschema("{\"type\":\"record\",\"name\":\"RP\",\"fields\":[{\"name\":\"a\",\"type\":\"long\"}]}")
-        io = IOBuffer()
-        w = Avro.Writer(io, s; metadata=meta)
-        try
-            # the retained header copies (schema json, codec, metadata) stay reserved while the writer lives
-            @test w.budget.reserved >= Avro.bytesbytes(2 << 20)
-        finally
-            close(w)
+    @testset "max_depth: nested data and schema JSON" begin
+        node = P("""{"type":"record","name":"Node","fields":[{"name":"next","type":["null","Node"]}]}""")
+        chain(depth) = vcat(fill(0x02, depth - 1), 0x00)            # `depth` nested records
+        @test Avro.decode(node, chain(8); limits=Avro.Limits(max_depth=8)) isa Avro.Record
+        err = try
+            Avro.decode(node, chain(9); limits=Avro.Limits(max_depth=8))
+            nothing
+        catch caught
+            caught
         end
-        # decode-side: a completed datum decode keeps its live output reserved
-        db = Avro.Budget(Avro.Limits())
-        bytes = Avro.encode(s, (a=Int64(1),))
-        d = Avro.Decoder(bytes, db)
-        v = Avro.decode(Avro.readplan(s), d)
-        @test v.a == 1
-        @test db.reserved > 0
+        @test err isa Avro.LimitError && err.limit === :max_depth && err.observed == 9 && err.value == 8
+        @test_throws Avro.LimitError Avro.decode(node, chain(2000))                     # the default of 1024
+        deepvalue = Avro.Record(node, Any[missing])
+        for _ in 1:1100
+            deepvalue = Avro.Record(node, Any[deepvalue])
+        end
+        @test_throws Avro.LimitError Avro.encode(node, deepvalue)
+        nestedjson(depth) = "{\"type\":\"array\",\"items\":"^depth * "\"int\"" * "}"^depth
+        @test P(nestedjson(7); limits=Avro.Limits(max_depth=8)) isa Avro.ArraySchema
+        jsonerr = try
+            P(nestedjson(20); limits=Avro.Limits(max_depth=8))
+            nothing
+        catch caught
+            caught
+        end
+        @test jsonerr isa Avro.LimitError && jsonerr.limit === :max_depth && jsonerr.value == 8
+        @test_throws Avro.LimitError P(nestedjson(2000))
+        @test_throws Avro.LimitError Avro.fromjson(node, "{\"next\":{\"Node\":"^20 * "null" * "}}"^20;
+                                                   limits=Avro.Limits(max_depth=8))
+    end
+
+    @testset "max_bytes: container blocks, schema documents, stream datums" begin
+        # a decompressed container block
+        compressible = IOBuffer()
+        Avro.Writer(w -> push!(w, "x"^100_000), compressible, Avro.StringSchema(); codec=:deflate)
+        blockfile = take!(compressible)
+        @test only(Avro.Reader(r -> collect(Avro.eachdatum(r)), blockfile)) == "x"^100_000
+        blockerr = try
+            Avro.Reader(r -> collect(Avro.eachdatum(r)), blockfile; limits=Avro.Limits(max_bytes=64 << 10))
+            nothing
+        catch caught
+            caught
+        end
+        @test blockerr isa Avro.LimitError && blockerr.limit === :max_bytes && blockerr.value == 64 << 10
+        # a schema document, from text and from a stream
+        doc = "{\"type\":\"record\",\"name\":\"R\",\"fields\":[" * join(("{\"name\":\"f$i\",\"type\":\"int\"}" for i in 1:100), ",") * "]}"
+        @test P(doc; limits=Avro.Limits(max_bytes=sizeof(doc))) isa Avro.RecordSchema
+        @test P(IOBuffer(doc); limits=Avro.Limits(max_bytes=sizeof(doc))) isa Avro.RecordSchema
+        docerr = try
+            P(doc; limits=Avro.Limits(max_bytes=sizeof(doc) - 1))
+            nothing
+        catch caught
+            caught
+        end
+        @test docerr isa Avro.LimitError && docerr.limit === :max_bytes && docerr.value == sizeof(doc) - 1
+        @test_throws Avro.LimitError P(IOBuffer(doc); limits=Avro.Limits(max_bytes=sizeof(doc) - 1))
+        # a container header's schema metadata
+        @test_throws Avro.LimitError Avro.Reader(take!(Avro.tobuffer([(a=1,)])); limits=Avro.Limits(max_bytes=16))
+        # one datum read from a stream
+        datum = Avro.encode(Avro.StringSchema(), "x"^100)              # 102 bytes: a 2-byte length varint
+        @test Avro.decode(Avro.StringSchema(), IOBuffer(datum); limits=Avro.Limits(max_bytes=102)) == "x"^100
+        streamerr = try
+            Avro.decode(Avro.StringSchema(), IOBuffer(datum); limits=Avro.Limits(max_bytes=101))
+            nothing
+        catch caught
+            caught
+        end
+        @test streamerr isa Avro.LimitError && streamerr.limit === :max_bytes && streamerr.value == 101
+        @test Avro.decode(Avro.StringSchema(), datum; limits=Avro.Limits(max_bytes=100)) == "x"^100   # bytes in memory are not read from a stream
+    end
+
+    @testset "value density: per standalone datum and per container block" begin
+        nulls = Avro.ArraySchema(Avro.NullSchema())
+        million = vcat(Avro.encode(Avro.LongSchema(), 1_000_000), UInt8[0x00])     # a million nulls in four bytes
+        @test length(million) == 4
+        err = try
+            Avro.decode(nulls, million)
+            nothing
+        catch caught
+            caught
+        end
+        @test err isa Avro.LimitError && err.limit === :max_values_per_byte
+        @test err.value == 16 * length(million) + 65_536 && err.observed > err.value
+        @test occursin("raise `Avro.Limits(max_values_per_byte=...)`", sprint(showerror, err))
+        for raised in (Avro.Limits(value_allowance=1_000_001), Avro.Limits(max_values_per_byte=1_000_000))
+            v = Avro.decode(nulls, million; limits=raised)
+            @test length(v) == 1_000_000 && all(ismissing, v)
+        end
+        exact = 1_000_001 - 16 * length(million)                            # the array value and its nulls
+        @test length(Avro.decode(nulls, million; limits=Avro.Limits(value_allowance=exact))) == 1_000_000
+        @test_throws Avro.LimitError Avro.decode(nulls, million; limits=Avro.Limits(value_allowance=exact - 1))
+        @test_throws Avro.LimitError Avro.DatumReader(nulls)(million)
+        @test length(Avro.DatumReader(nulls; limits=Avro.Limits(value_allowance=exact))(million)) == 1_000_000
+        # encoding is not capped; the cap applies where untrusted bytes are read
+        encoded = Avro.encode(nulls, fill(missing, 1_000_000))
+        @test_throws Avro.LimitError Avro.decode(nulls, encoded)
+        @test length(Avro.decode(nulls, encoded; limits=Avro.Limits(value_allowance=2_000_000))) == 1_000_000
+        # each standalone datum has its own allowance
+        sixty = vcat(Avro.encode(Avro.LongSchema(), 60_000), UInt8[0x00])
+        @test all(length(Avro.decode(nulls, sixty)) == 60_000 for _ in 1:3)
+        threeinone = vcat(sixty, sixty, sixty)
+        pos = 1
+        for _ in 1:3
+            value, pos = Avro.decode(nulls, threeinone, pos)
+            @test length(value) == 60_000
+        end
+        @test pos == length(threeinone) + 1
+        # each container block has its own allowance: the writer splits zero-byte datums at the cap
+        n = 200_000
+        nullio = IOBuffer()
+        nullwriter = Avro.Writer(nullio, Avro.NullSchema())
+        for _ in 1:n
+            push!(nullwriter, missing)
+        end
+        close(nullwriter)
+        nullfile = take!(nullio)
+        @test Avro.Reader(r -> length(collect(Avro.eachblock(r))), nullfile) >= cld(n, 65_536)
+        @test Avro.Reader(r -> count(Returns(true), Avro.eachdatum(r)), nullfile) == n
+        rows = Avro.Rows(nullfile)
+        @test count(Returns(true), rows) == n
+        close(rows)
+        # one block of those datums, written under a raised allowance, is over the default cap
+        raised = Avro.Limits(value_allowance=1_000_000)
+        bigio = IOBuffer()
+        bigwriter = Avro.Writer(bigio, Avro.NullSchema(); limits=raised)
+        for _ in 1:n
+            push!(bigwriter, missing)
+        end
+        close(bigwriter)
+        bigfile = take!(bigio)
+        @test Avro.Reader(r -> length(collect(Avro.eachblock(r))), bigfile) == 1
+        blockerr = try
+            Avro.Reader(r -> count(Returns(true), Avro.eachdatum(r)), bigfile)
+            nothing
+        catch caught
+            caught
+        end
+        @test blockerr isa Avro.LimitError && blockerr.limit === :max_values_per_byte && blockerr.value == 65_536
+        @test Avro.Reader(r -> count(Returns(true), Avro.eachdatum(r)), bigfile; limits=raised) == n
+    end
+
+    @testset "claimed lengths are checked against the remaining bytes before allocation" begin
+        longs = P("{\"type\":\"array\",\"items\":\"long\"}")
+        @test_throws Avro.DataError Avro.decode(Avro.StringSchema(), UInt8[0x04, 0x61])   # 2 bytes claimed, 1 remains
+        @test_throws Avro.DataError Avro.decode(longs, hex2bytes("d00f00"))              # 1000 longs claimed, 1 byte remains
+        @test_throws Avro.DataError Avro.decode(longs, hex2bytes("0306"))                # a sized block beyond the data
+        huge = vcat(Avro.encode(Avro.LongSchema(), typemax(Int64)), UInt8[0x00])
+        for schema in (Avro.StringSchema(), Avro.BytesSchema(), longs, P("{\"type\":\"map\",\"values\":\"long\"}"))
+            @test_throws Avro.DataError Avro.decode(schema, huge)
+            @test @allocated(try Avro.decode(schema, huge) catch end) < 1 << 20
+        end
+        @test_throws Avro.DataError Avro.decode(Avro.FixedSchema("Huge", typemax(Int) - 1), UInt8[0x00])
     end
 
     @testset "a prepared reader recovers after a failed call" begin
-        schema = Avro.parseschema("""{"type":"record","name":"Guarded","fields":[{"name":"payload","type":"bytes"},{"name":"valid","type":"boolean"}]}""")
+        schema = P("""{"type":"record","name":"Guarded","fields":[{"name":"payload","type":"bytes"},{"name":"valid","type":"boolean"}]}""")
         good = Avro.encode(schema, (payload=zeros(UInt8, 1 << 20), valid=true))
         bad = copy(good)
         bad[end] = 0x02
@@ -120,86 +191,13 @@
         @test reader(good).valid === true
     end
 
-    @testset "guarded IO source normalization" begin
-        input = fill(UInt8(' '), 64 << 10)
-        budget = Avro.Budget(l)
-        bytes = Avro.sourcebytes(IOBuffer(input), length(input), budget, Avro.SchemaError)
-        @test bytes == input
-        @test budget.peak >= 2 * Avro.bytesbytes(length(input))
-
-        datum_budget = Avro.Budget(l)
-        err = try
-            Avro.sourcebytes(IOBuffer(UInt8[0x01, 0x02]), 1, datum_budget, Avro.DataError)
-            nothing
-        catch e
-            e
-        end
-        @test err isa Avro.LimitError && err.limit == :max_datum_bytes && err.keyword == :max_datum_bytes
-    end
-
-    @testset "Budget: work and count rules" begin
-        b = Avro.Budget(l)
-        Avro.addinput!(b, 10)
-        # values ≤ 16 × 10 + 65_536
-        Avro.countvalues!(b, 16 * 10 + 65_536)
-        @test_throws Avro.LimitError Avro.countvalues!(b, 1)
-        b2 = Avro.Budget(Avro.Limits(work_allowance=0))
-        Avro.addinput!(b2, 1)
-        Avro.countvalues!(b2, 16)
-        e = try Avro.countvalues!(b2, 1); nothing catch err; err end
-        @test e isa Avro.LimitError && e.limit == :max_values_per_byte && e.observed == 17 && e.value == 16
-        b4 = Avro.Budget(Avro.Limits(max_total_values=5, work_allowance=1 << 20))
-        Avro.countvalues!(b4, 5)
-        @test_throws Avro.LimitError Avro.countvalues!(b4, 1)
-        b5 = Avro.Budget(Avro.Limits(max_rows=2, max_blocks=1, max_resolution_work=3))
-        Avro.addrows!(b5, 2); @test_throws Avro.LimitError Avro.addrows!(b5, 1)
-        Avro.addblocks!(b5); @test_throws Avro.LimitError Avro.addblocks!(b5)
-        Avro.addresolution!(b5, 3); @test_throws Avro.LimitError Avro.addresolution!(b5)
-        @test Avro.checkdepth(b5, l.max_depth) === nothing
-        @test_throws Avro.LimitError Avro.checkdepth(b5, l.max_depth + 1)
-        # codec members count as values
-        b6 = Avro.Budget(Avro.Limits(work_allowance=0))
-        Avro.addinput!(b6, 1)
-        Avro.addmembers!(b6, 16)
-        @test_throws Avro.LimitError Avro.addmembers!(b6, 1)
-        @test_throws ArgumentError Avro.Budget(l; direction=:sideways)
-        e2 = try
-            Avro.reserve!(Avro.Budget(l; direction=:encode), typemax(Int))
-        catch err
-            err
-        end
-        @test e2 isa Avro.LimitError && e2.direction == :encode
-        @test occursin("encoding", sprint(showerror, e2))
-
-        allowance = 17
-        exactinput = (typemax(Int) - allowance) ÷ 2
-        @test Avro.muladdcap(2, exactinput, allowance) == 2 * exactinput + allowance
-        @test Avro.muladdcap(2, exactinput + 1, allowance) == typemax(Int)
-        @test Avro.muladdcap(typemax(Int), 1, 0) == typemax(Int)
-        @test Avro.muladdcap(typemax(Int), 2, typemax(Int)) == typemax(Int)
-        @test Avro.satadd(typemax(Int), 1) == typemax(Int)
-        raisedlimits = Avro.Limits(max_bytes=typemax(Int),
-                                   max_datum_bytes=typemax(Int),
-                                   max_total_bytes=typemax(Int))
-        @test raisedlimits.max_bytes == typemax(Int)
-        @test Avro.first_unit_bytes(raisedlimits) == typemax(Int)
-        @test Avro.Budget(raisedlimits).ceiling == typemax(Int)
-        @test_throws ArgumentError Avro.Limits(max_bytes=big(typemax(Int)) + 1)
-        @test issorted(Avro.muladdcap(typemax(Int), input, 1)
-                       for input in (0, 1, 2, typemax(Int)))
-        saturated = Avro.Limits(max_values_per_byte=typemax(Int))
-        saturatedbudget = Avro.Budget(saturated)
-        Avro.addinput!(saturatedbudget, 2)
-        Avro.countvalues!(saturatedbudget, 4)
-        @test saturatedbudget.workcap == saturated.max_total_values
-        @test Avro.checkoperationwork!(saturatedbudget) == 0
-
+    @testset "saturated limits do not overflow" begin
+        saturated = Avro.Limits(max_bytes=typemax(Int), max_values_per_byte=typemax(Int), value_allowance=typemax(Int))
         ints = Avro.IntSchema()
-        encoded = Avro.encode(ints, Int32(7); limits=saturated)
-        @test Avro.decode(ints, encoded; limits=saturated) == Int32(7)
+        @test Avro.decode(ints, Avro.encode(ints, Int32(7)); limits=saturated) == Int32(7)
         @test Avro.fromjson(ints, "7"; limits=saturated) == Int32(7)
-        @test Avro.parseschema("{\"type\":\"record\",\"name\":\"Saturated\",\"fields\":[{\"name\":\"x\",\"type\":\"int\"}]}";
-                               limits=saturated) isa Avro.RecordSchema
+        @test P("{\"type\":\"record\",\"name\":\"Saturated\",\"fields\":[{\"name\":\"x\",\"type\":\"int\"}]}";
+                limits=saturated) isa Avro.RecordSchema
         saturatedio = IOBuffer()
         saturatedwriter = Avro.Writer(saturatedio, ints; limits=saturated)
         push!(saturatedwriter, Int32(7))

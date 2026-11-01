@@ -1,407 +1,196 @@
-# Prepared codecs and one-shot conveniences.
+# Prepared datum codecs and the one-shot conveniences built on them.
 
 """
-    Avro.DatumReader(writer_schema; reader_schema=nothing, union_resolution=:spec, limits=Limits(), validate=:strict, names=nothing)
+    Avro.DatumReader(writer_schema; reader_schema=nothing, union_resolution=:spec, limits=Limits())
     Avro.DatumReader(writer_schema, T; kw...)
 
 A prepared decoder for datums written with `writer_schema`, optionally resolved against
 `reader_schema` and optionally producing the typed target `T`. Configuration is fixed after
-construction and safe to share across tasks (each active call owns its decoder state and budget):
-`reader(bytes)`, `reader(bytes, pos) -> (value, nextpos)`, `reader(io)`.
+construction and safe to share across tasks.
+
+* `reader(bytes) -> value` decodes exactly one datum; trailing bytes are a `DataError`.
+* `reader(bytes, pos) -> (value, nextpos)` decodes the datum that starts at byte `pos`.
+* `reader(io) -> value` reads the rest of `io` (at most `limits.max_bytes`) as exactly one datum.
+
+Positions are one-based byte offsets from the start of the input, including when its array indices
+start elsewhere.
 """
 mutable struct DatumReader{T,P}
     const writer::Schema
     const reader::Schema
-    const plan::P               # the concrete plan type: prepared calls devirtualize end to end
-    const span::SpanPlan         # exact writer-datum boundary/value plan (allocation-free per call)
+    const plan::P                                         # concrete, so prepared calls dispatch statically
     const limits::Limits
-    const validate::Symbol
-    const names::Union{Nothing,SymbolAdmission}
-    const resolved::Bool       # reader defaults need a plan-aware zero-input-value pre-scan
-    const staticvalues::Int    # exact writer value count, or -1 when a structural scan is required
-    @atomic scratch::Any        # one pooled per-call Decoder (its budget inside), shared lock-free
+    @atomic scratch::Union{Nothing,Decoder{Vector{UInt8}}}   # one pooled decoder, taken and returned lock-free
 end
 
-"Internal marker for generic decoding; unlike `Nothing`, it can never be a caller's typed target."
-struct GenericDatumTarget end
-
-function datumreaderplan(writer::Schema, reader_schema::Union{Nothing,Schema}, union_resolution::Symbol,
-                         limits::Limits, budget::Budget)
-    return reader_schema === nothing ? readplan(writer; budget=budget) :
-           resolvingplan(writer, reader_schema; union_resolution=union_resolution,
-                         limits=limits, budget=budget)
+function Base.show(io::IO, r::DatumReader{T}) where {T}
+    return print(io, "Avro.DatumReader(", schemalabel(r.writer), T === Any ? "" : ", $T", ")")
+end
+function datumreaderplan(writer::Schema, reader::Union{Nothing,Schema}, union_resolution::Symbol)
+    reader === nothing && return readplan(writer)
+    return resolvingplan(writer, reader; union_resolution=union_resolution)
 end
 
-function DatumReader(writer::Schema; reader_schema::Union{Nothing,Schema}=nothing, union_resolution::Symbol=:spec,
-                     limits::Limits=Limits(), validate::Symbol=:strict, names=nothing)
-    validate in (:strict, :fast) || throw(ArgumentError("validate must be :strict or :fast"))
-    effective = reader_schema === nothing ? writer : reader_schema
-    plan, span = withbudget(limits) do budget
-        return (datumreaderplan(writer, reader_schema, union_resolution, limits, budget),
-                spanplan(writer; budget=budget))
-    end
-    resolved = reader_schema !== nothing
-    staticvalues = resolved ? -1 : staticdatumvalues(span, limits)
-    return DatumReader{GenericDatumTarget,typeof(plan)}(writer, effective, plan, span, limits,
-                                                        validate, admission(names), resolved,
-                                                        staticvalues, nothing)
+function DatumReader(writer::Schema; kw...)
+    return DatumReader(writer, Any; kw...)
 end
 
 function DatumReader(writer::Schema, ::Type{T}; reader_schema::Union{Nothing,Schema}=nothing,
-                     union_resolution::Symbol=:spec, limits::Limits=Limits(), validate::Symbol=:strict,
-                     names=nothing) where {T}
-    validate in (:strict, :fast) || throw(ArgumentError("validate must be :strict or :fast"))
-    effective = reader_schema === nothing ? writer : reader_schema
-    plan, span = withbudget(limits) do budget
-        generic = datumreaderplan(writer, reader_schema, union_resolution, limits, budget)
-        return (typedplan(T, effective, generic, limits; budget=budget),
-                spanplan(writer; budget=budget))
+                     union_resolution::Symbol=:spec, limits::Limits=Limits()) where {T}
+    reader = something(reader_schema, writer)
+    plan = typedplan(T, reader, datumreaderplan(writer, reader_schema, union_resolution))
+    return DatumReader{T,typeof(plan)}(writer, reader, plan, limits, nothing)
+end
+
+const EMPTY_BYTES = UInt8[]   # shared and never written: what an idle decoder holds instead of a caller's bytes
+
+function (r::DatumReader)(bytes::AbstractVector{UInt8})
+    v, next = decodeat(r, bytes, 1)
+    next == length(bytes) + 1 || throw(DataError("trailing bytes after the datum", next))
+    return finishtyped(r.plan, v)
+end
+
+function (r::DatumReader)(bytes::AbstractVector{UInt8}, pos::Integer)
+    v, next = decodeat(r, bytes, Int(pos))
+    return (finishtyped(r.plan, v), next)
+end
+
+function (r::DatumReader)(io::IO)
+    return r(sourcebytes(io, r.limits.max_bytes))
+end
+
+# The datum at `pos` and the position after it. A `Vector` reuses the pooled decoder; a failed call drops
+# the decoder instead of returning it.
+function decodeat(r::DatumReader, bytes::Vector{UInt8}, pos::Int)
+    d = @atomicswap r.scratch = nothing
+    if d === nothing
+        d = Decoder(bytes, r.limits; pos=pos)
+    else
+        reset!(d, bytes, pos, length(bytes))
     end
-    resolved = reader_schema !== nothing
-    staticvalues = resolved ? -1 : staticdatumvalues(span, limits)
-    return DatumReader{T,typeof(plan)}(writer, effective, plan, span, limits, validate,
-                                      admission(names), resolved, staticvalues, nothing)
+    v = decoderoot(r.plan, d)
+    next = d.pos
+    d.buf = EMPTY_BYTES
+    @atomic r.scratch = d
+    return (v, next)
+end
+
+function decodeat(r::DatumReader, bytes::AbstractVector{UInt8}, pos::Int)
+    d = Decoder(onebased(bytes), r.limits; pos=pos)
+    return (decoderoot(r.plan, d), d.pos)
 end
 
 """
-    reader(bytes) -> value
-    reader(bytes, pos) -> (value, nextpos)
-    reader(io) -> value
+    Avro.decode(writer_schema, src; reader_schema=nothing, union_resolution=:spec, limits=Limits())
+    Avro.decode(writer_schema, src, T; kw...)
+    Avro.decode(writer_schema, bytes, pos::Integer; kw...) -> (value, nextpos)
 
-Decode one datum (the byte form rejects trailing bytes; the `IO` form reads at most
-`max_datum_bytes + 1` bytes and errors if bytes remain). Positions are one-based byte offsets
-from the beginning of the input, including when its array indices start elsewhere.
+One-shot decoding of one datum from bytes (trailing bytes rejected), from `bytes` at `pos`, or from an
+`IO`; `T` selects a typed target. Use a `DatumReader` for repeated work.
 """
-const EMPTY_BYTES = UInt8[]                            # shared, never written: decoders only read `buf`
-
-@inline function (r::DatumReader{T,P})(bytes::AbstractVector{UInt8}) where {T,P}
-    bytes isa Vector{UInt8} && length(bytes) <= r.limits.max_datum_bytes &&
-        return first(pooledcall(r, bytes, 1, true))
-    return first(slowcall(r, bytes, 1, true))
+function decode(writer::Schema, src::Union{AbstractVector{UInt8},IO}; kw...)
+    return DatumReader(writer; kw...)(src)
 end
 
-@inline function (r::DatumReader{T,P})(bytes::AbstractVector{UInt8}, pos::Integer) where {T,P}
-    bytes isa Vector{UInt8} && return pooledcall(r, bytes, Int(pos), false)
-    return slowcall(r, bytes, Int(pos), false)
+function decode(writer::Schema, src::Union{AbstractVector{UInt8},IO}, ::Type{T}; kw...) where {T}
+    return DatumReader(writer, T; kw...)(src)
 end
 
-"The pooled per-call path: ≤ 1 payload allocation per decode (its own scope, so nothing boxes)."
-@inline function pooledcall(r::DatumReader{T,P}, bytes::Vector{UInt8}, pos::Int,
-                            whole::Bool) where {T,P}
-    sc = @atomicswap(r.scratch = nothing)
-    d = sc isa Decoder{Vector{UInt8}} ? sc : Decoder(UInt8[], Budget(r.limits); validate=r.validate)
-    recycle = false
-    local v, next
-    try
-        resetbudget!(d.budget)
-        d.buf = bytes
-        d.pos = pos
-        d.stop = length(bytes)
-        d.depth = 0
-        1 <= pos <= length(bytes) + 1 || throw(ArgumentError("position $pos out of range"))
-        if r.staticvalues >= 0
-            work = beginstaticdatum!(d, r.staticvalues)
-            try
-                v = decodetyped(T, r.plan, d, r.names)
-                next = d.pos
-                whole && next != length(bytes) + 1 &&
-                    throw(DataError("trailing bytes after the datum", next))
-                finishstaticdatum!(d, work; credit=true)
-            catch
-                abortdatum!(d, work)
-                rethrow()
-            end
-        else
-            datumspan!(r.span, d, pos, d.budget.values,
-                       rawspaninputmax(d.budget, bytes, pos, r.limits))
-            span = decoderspan(d)
-            whole && span.next != length(bytes) + 1 &&
-                throw(DataError("trailing bytes after the datum", span.next))
-            d.stop = span.next - 1
-            addinput!(d.budget, span.bytes)
-            planneddatumspan!(r.plan, d, span; resolved=r.resolved)
-            span = decoderspan(d)
-            work = begindatum!(d, span)
-            v = decodetyped(T, r.plan, d, r.names)
-            finishdatum!(d, work)
-            next = d.pos
-        end
-        recycle = true
-    finally
-        d.buf = EMPTY_BYTES                            # never pin the caller's bytes from the pool
-        recycle && @atomicswap(r.scratch = d)          # a failed call drops its scratch instead
-    end
-    return (finishtyped(r.plan, v, r.names), next)
+function decode(writer::Schema, bytes::AbstractVector{UInt8}, pos::Integer; kw...)
+    return DatumReader(writer; kw...)(bytes, pos)
 end
 
-function slowcall(r::DatumReader{T,P}, bytes::AbstractVector{UInt8}, pos::Int,
-                  whole::Bool) where {T,P}
-    v, next = withbudget(r.limits) do budget
-        source = positionalsource(bytes, pos, r.limits, budget)
-        d = Decoder(source.buffer, budget; pos=source.start,
-                    validate=r.validate)
-        datumspan!(r.span, d, source.start, budget.values,
-                   rawspaninputmax(budget, source.buffer,
-                                   source.start, r.limits))
-        span = decoderspan(d)
-        nextpos = originalnext(source, span.next)
-        whole && nextpos != source.sourceend + 1 &&
-            throw(DataError("trailing bytes after the datum", nextpos))
-        addinput!(budget, span.bytes)
-        d.stop = span.next - 1
-        planneddatumspan!(r.plan, d, span; resolved=r.resolved)
-        span = decoderspan(d)
-        work = begindatum!(d, span)
-        value = try
-            decodetyped(T, r.plan, d, r.names)
-        catch
-            abortdatum!(d, work)
-            rethrow()
-        end
-        finishdatum!(d, work)
-        return (value, nextpos)
-    end
-    return (finishtyped(r.plan, v, r.names), next)     # semantic conversion runs in caller space
+function decode(writer::Schema, bytes::AbstractVector{UInt8}, pos::Integer, ::Type{T}; kw...) where {T}
+    return DatumReader(writer, T; kw...)(bytes, pos)
 end
 
-function (r::DatumReader{T,P})(io::IO) where {T,P}
-    v = withbudget(r.limits) do budget
-        buf = sourcebytes(io, r.limits.max_datum_bytes, budget, DataError)
-        length(buf) <= r.limits.max_datum_bytes || throw(LimitError(:max_datum_bytes, length(buf), r.limits.max_datum_bytes, :max_datum_bytes, :decode))
-        d = Decoder(buf, budget; validate=r.validate)
-        datumspan!(r.span, d, 1, budget.values,
-                   rawspaninputmax(budget, buf, 1, r.limits))
-        span = decoderspan(d)
-        span.next == length(buf) + 1 || throw(DataError("trailing bytes after the datum", span.next))
-        addinput!(budget, span.bytes)
-        d.stop = span.next - 1
-        planneddatumspan!(r.plan, d, span; resolved=r.resolved)
-        span = decoderspan(d)
-        work = begindatum!(d, span)
-        value = try
-            decodetyped(T, r.plan, d, r.names)
-        catch
-            abortdatum!(d, work)
-            rethrow()
-        end
-        finishdatum!(d, work)
-        return value
-    end
-    return finishtyped(r.plan, v, r.names)
-end
-
-function decodetyped(::Type{GenericDatumTarget}, plan::ReadPlan, d::Decoder, names)
-    return decode(plan, d)
-end
-
-function decodetyped(::Type{T}, plan::SemanticTarget{T}, d::Decoder, names) where {T}
-    return decode(plan.plan, d)
-end
-
-function decodetyped(::Type{T}, plan::TypedPlan, d::Decoder, names) where {T}
-    return decodetyped(plan, d, names)
-end
-
-# The type parameter of a DatumWriter built without a fixed datum type.
+# The datum type parameter of a `DatumWriter` built without one.
 struct UnfixedDatumWriter end
-
-mutable struct DatumWriter{P<:WritePlan,T,FP}
-    const schema::Schema
-    const plan::P               # concrete plan type
-    const limits::Limits
-    const callbudget::Budget      # reset for each call; writer is single-owner
-    encoder::Union{Nothing,Encoder}
-    fasttype::Any               # single-entry aligned-NamedTuple cache (single-owner like `encoder`)
-    fastplans::Any
-    fastbytes::Int              # marginal tuple storage retained by the current untyped cache entry
-    const fixedplans::FP        # the typed form's aligned tuple, concrete (`nothing` when untyped)
-    const fixedbytes::Int       # marginal tuple storage retained by the typed writer
-end
 
 """
     Avro.DatumWriter(schema; limits=Limits())
     Avro.DatumWriter(schema, T; limits=Limits())
 
-A prepared encoder with a reusable buffer (single-owner): `writer(x) -> Vector{UInt8}` returns a fresh
-owned buffer; `writer(io, x)` appends to `io` without creating a result vector for each call. The typed
-form fixes the datum type `T` and prepares an optimized path for supported NamedTuple fields aligned
-with the record schema. Reused buffers may still grow when a larger value is written.
+A prepared encoder that retains its plan and a reusable buffer, so it is single-owner:
+`writer(x) -> Vector{UInt8}` returns a fresh owned buffer; `writer(io, x)` writes to `io` without
+creating a result vector per call; `writer(e::Avro.Encoder, x)` appends to a caller's encoder. The typed
+form fixes the datum type `T`, which is the fastest path when `T` is a NamedTuple or struct whose fields
+align with the record schema. Reused buffers may still grow when a larger value is written.
 """
+mutable struct DatumWriter{P<:WritePlan,T,FP}
+    const schema::Schema
+    const plan::P
+    const encoder::Encoder
+    const fixedplans::FP          # the typed form's aligned plans (`nothing` when untyped or not aligned)
+end
+
+function Base.show(io::IO, w::DatumWriter{P,T}) where {P,T}
+    return print(io, "Avro.DatumWriter(", schemalabel(w.schema), T === UnfixedDatumWriter ? "" : ", $T", ")")
+end
+
 function DatumWriter(schema::Schema; limits::Limits=Limits())
-    plan = withbudget(limits; direction=:encode) do b
-        writeplan(schema; budget=b)
-    end
-    return DatumWriter{typeof(plan),UnfixedDatumWriter,Nothing}(
-        schema, plan, limits, Budget(limits; direction=:encode), nothing, nothing, nothing,
-        0, nothing, 0)
+    plan = writeplan(schema)
+    return DatumWriter{typeof(plan),UnfixedDatumWriter,Nothing}(schema, plan, Encoder(limits), nothing)
 end
 
 function DatumWriter(schema::Schema, ::Type{T}; limits::Limits=Limits()) where {T}
-    plan, fp = withbudget(limits; direction=:encode) do b
-        p = writeplan(schema; budget=b)
-        return (p, alignedplans(p, T, b))
-    end
-    return DatumWriter{typeof(plan),T,typeof(fp)}(
-        schema, plan, limits, Budget(limits; direction=:encode), nothing, nothing, nothing,
-        0, fp, fp === nothing ? 0 : sizeof(fp))
-end
-
-function fastdatumplans(w::DatumWriter, @nospecialize(x), budget::Budget)
-    x isa NamedTuple || return nothing
-    w.fasttype === typeof(x) && return w.fastplans
-    fp = alignedplans(w.plan, typeof(x), budget)
-    oldbytes = w.fastbytes
-    w.fasttype = typeof(x)
-    w.fastplans = fp
-    w.fastbytes = fp === nothing ? 0 : sizeof(fp)
-    release!(budget, oldbytes)                       # the replaced tuple is unreachable after publication
-    return fp
-end
-
-"Reset the writer's retained encoder and charge its existing buffer to the new operation."
-function preparedencoder!(w::DatumWriter, budget::Budget)
-    reserve!(budget, checked_add(w.fastbytes, w.fixedbytes))
-    e = w.encoder
-    if e === nothing
-        e = Encoder(budget)
-        w.encoder = e
-        return e
-    end
-    reserve!(budget, encoderstorage(e))
-    e.budget = budget
-    e.owner = budget
-    return reset!(e)
-end
-
-"Copy the encoded prefix into caller-owned storage under a reservation for the overlap peak."
-function takeowned!(e::Encoder)
-    charge = bytesbytes(e.pos)
-    checkpoint = budgetcheckpoint(e.budget)
-    try
-        reserve!(e.budget, charge)
-        out = take!(e)
-        release!(e.budget, charge)                    # caller ownership starts at the return boundary
-        return out
-    catch
-        rollbackreservations!(e.budget, checkpoint)
-        rethrow()
-    end
+    plan = writeplan(schema)
+    fixed = alignedplans(plan, T)
+    return DatumWriter{typeof(plan),T,typeof(fixed)}(schema, plan, Encoder(limits), fixed)
 end
 
 function (w::DatumWriter)(x)
-    budget = resetbudget!(w.callbudget)
-    e = preparedencoder!(w, budget)
+    e = w.encoder
     try
         writeprepared!(w, e, x)
-        return takeowned!(e)
     catch
         reset!(e)
         rethrow()
     end
+    return take!(e)
 end
 
 function (w::DatumWriter)(io::IO, x)
-    budget = resetbudget!(w.callbudget)
-    e = preparedencoder!(w, budget)
+    e = w.encoder
     try
         writeprepared!(w, e, x)
-        buf = e.buf
-        GC.@preserve buf Base.unsafe_write(io, pointer(buf), UInt(e.pos))
-        return nothing
+        Base.write(io, view(e.buf, 1:e.pos))
     finally
         reset!(e)
-    end
-end
-
-function (w::DatumWriter{P,T,FP})(e::Encoder, x) where {P,T,FP}
-    e.budget === e.owner || throw(ArgumentError("an Encoder cannot run nested prepared-writer calls"))
-    budget = resetbudget!(w.callbudget)
-    original = e.budget
-    start = e.pos
-    olddepth = e.depth
-    oldcredited = e.credited
-    reserve!(budget, checked_add(w.fastbytes, w.fixedbytes))
-    reserve!(budget, encoderstorage(e))
-    e.budget = budget
-    e.credited = start
-    e.depth = 0
-    try
-        writeprepared!(w, e, x)
-        return nothing
-    catch
-        e.pos = start
-        rethrow()
-    finally
-        release!(budget, encoderstorage(e))
-        e.budget = original
-        e.depth = olddepth
-        e.credited = oldcredited
-    end
-end
-
-function writeprepared!(w::DatumWriter{P,T,FP}, e::Encoder, x) where {P,T,FP}
-    T === UnfixedDatumWriter || typeof(x) === T ||
-        throw(EncodeError(typediagnostic(
-            e.budget, "prepared writer expects a datum of exact type ", T),
-            "\$", w.schema))
-    if FP !== Nothing
-        encodealigned!(w.fixedplans, e, x, w.schema::RecordSchema) # fully concrete: the zero-allocation kernel
-    else
-        fp = fastdatumplans(w, x, e.budget)
-        fp === nothing ? encodedatum!(w.plan, e, x, w.schema) :
-                         encodealigned!(fp, e, x, w.schema::RecordSchema)
     end
     return nothing
 end
 
-function withencoderroot!(f::F, e::Encoder, schema::Schema) where {F}
-    previous = e.expected
-    emptyencodepath!(e)
-    e.expected = schema
+function (w::DatumWriter)(e::Encoder, x)
+    return appenddatum!(() -> writeprepared!(w, e, x), e)
+end
+
+function writeprepared!(w::DatumWriter{P,T,FP}, e::Encoder, x) where {P,T,FP}
+    T === UnfixedDatumWriter || typeof(x) === T ||
+        throw(EncodeError(string("prepared writer expects a datum of exact type ", T), "\$", w.schema))
+    FP === Nothing && return encodedatum!(w.plan, e, x, w.schema)
     try
-        return f()
+        encodealignedfast!(w.fixedplans, e, x)
     catch err
-        if err isa EncodeError && isempty(err.path)
-            throw(EncodeError(err.msg, formatencodepath(e), e.expected))
-        end
+        err isa EncodeError && replayaligned!(w.plan, Encoder(e.limits), x, w.schema::RecordSchema)
         rethrow()
-    finally
-        e.expected = previous
-        emptyencodepath!(e)
     end
+    return nothing
 end
 
-function encodedatum!(plan::WritePlan, e::Encoder, x, schema::Schema)
-    return withencoderroot!(e, schema) do
-        encodedwork!(e) do
-            encode(plan, e, x)
-        end
-    end
-end
-
-"Encode one root datum with density deferred until its exact output span is known."
-function encodedwork!(f::F, e::Encoder) where {F}
-    budget = e.budget
-    e.credited < e.pos && creditoutput!(e)              # settle any earlier caller-owned prefix
-    start = e.pos
-    values0 = budget.values
-    beginworkdefer!(budget)
-    complete = false
+# Encode one datum onto a caller's encoder from depth zero; a failure truncates what it wrote.
+function appenddatum!(f::F, e::Encoder) where {F}
+    start, depth, values = e.pos, e.depth, e.values
+    e.depth = 0
     try
         f()
-        bytes = e.pos - start
-        bytes <= budget.limits.max_datum_bytes ||
-            throw(LimitError(:max_datum_bytes, bytes, budget.limits.max_datum_bytes,
-                             :max_datum_bytes, :encode))
-        creditoutput!(e)
-        complete = true
+    catch
+        e.pos = start
+        e.values = values
+        rethrow()
     finally
-        endworkdefer!(budget)
+        e.depth = depth
     end
-    complete || return nothing
-    values = budget.values - values0
-    checkworkscope!(budget, values, e.pos - start)
-    budget.workdeferred == 0 && checkoperationwork!(budget)
     return nothing
 end
 
@@ -409,146 +198,33 @@ end
     Avro.encode(schema, x; limits=Limits()) -> Vector{UInt8}
     Avro.encode(x; limits=Limits()) -> Vector{UInt8}          # conventional schema `Avro.schema(x)`
 
-One-shot encoding (builds a writer per call; use `DatumWriter` for repeated use).
+One-shot encoding (builds a plan per call; use `DatumWriter` for repeated use).
 """
 function encode(schema::Schema, x; limits::Limits=Limits())
-    return withbudget(limits; direction=:encode) do budget
-        return encodewithbudget(schema, x, budget)
-    end
+    e = Encoder(limits)
+    encodedatum!(writeplan(schema), e, x, schema)
+    return take!(e)
 end
 
 function encode(x; limits::Limits=Limits())
-    return withbudget(limits; direction=:encode) do budget
-        s = withconstructionbudget(budget) do _
-            schema(x; limits=limits)
-        end
-        return encodewithbudget(s, x, budget)
-    end
-end
-
-function encodewithbudget(schema::Schema, x, budget::Budget)
-    plan = writeplan(schema; budget=budget)
-    encoder = Encoder(budget)
-    encodedatum!(plan, encoder, x, schema)
-    return takeowned!(encoder)
+    return encode(schema(x), x; limits=limits)
 end
 
 """
-    Avro.encode!(enc_or_io, schema, x; limits=Limits())
+    Avro.encode!(io::IO, schema, x; limits=Limits())
+    Avro.encode!(e::Avro.Encoder, schema, x)
 
-One-shot encoding that appends one datum to the caller's encoder or stream. Use `DatumWriter` for
-repeated work.
+One-shot encoding that appends one datum to the caller's stream or encoder; a failed append leaves the
+encoder's bytes as they were. Use `DatumWriter` for repeated work.
 """
 function encode!(io::IO, schema::Schema, x; limits::Limits=Limits())
-    return withbudget(limits; direction=:encode) do budget
-        plan = writeplan(schema; budget=budget)
-        encoder = Encoder(budget)
-        encodedatum!(plan, encoder, x, schema)
-        buf = encoder.buf
-        GC.@preserve buf Base.unsafe_write(io, pointer(buf), UInt(encoder.pos))
-        return nothing
-    end
+    e = Encoder(limits)
+    encodedatum!(writeplan(schema), e, x, schema)
+    Base.write(io, view(e.buf, 1:e.pos))
+    return nothing
 end
 
-function encode!(e::Encoder, schema::Schema, x; limits::Limits=Limits())
-    e.budget === e.owner || throw(ArgumentError("an Encoder cannot run nested one-shot writes"))
-    return withbudget(limits; direction=:encode) do budget
-        original = e.budget
-        start = e.pos
-        depth = e.depth
-        credited = e.credited
-        reserve!(budget, encoderstorage(e))
-        e.budget = budget
-        e.depth = 0
-        e.credited = start
-        try
-            plan = writeplan(schema; budget=budget)
-            encodedatum!(plan, e, x, schema)
-            return nothing
-        catch
-            e.pos = start
-            rethrow()
-        finally
-            release!(budget, encoderstorage(e))
-            e.budget = original
-            e.depth = depth
-            e.credited = credited
-        end
-    end
-end
-
-"""
-    Avro.decode(writer_schema, src; reader_schema=nothing, union_resolution=:spec, limits=Limits(), validate=:strict, names=…)
-    Avro.decode(writer_schema, src, T; kw...)
-    Avro.decode(writer_schema, bytes, pos::Integer; kw...) -> (value, nextpos)
-
-One-shot decoding of one datum from bytes (trailing bytes rejected), from `bytes` at `pos`, or from an
-`IO`.
-"""
-function decode(writer::Schema, src::AbstractVector{UInt8}; kw...)
-    return decodedatum(writer, src, 1, GenericDatumTarget, true; kw...)
-end
-
-function decode(writer::Schema, src::IO; kw...)
-    return decodedatum(writer, src, 1, GenericDatumTarget, true; kw...)
-end
-
-function decode(writer::Schema, src::AbstractVector{UInt8}, pos::Integer; kw...)
-    return decodedatum(writer, src, Int(pos), GenericDatumTarget, false; kw...)
-end
-
-function decode(writer::Schema, src::AbstractVector{UInt8}, ::Type{T}; kw...) where {T}
-    return decodedatum(writer, src, 1, T, true; kw...)
-end
-
-function decode(writer::Schema, src::IO, ::Type{T}; kw...) where {T}
-    return decodedatum(writer, src, 1, T, true; kw...)
-end
-
-function decode(writer::Schema, src::AbstractVector{UInt8}, pos::Integer, ::Type{T}; kw...) where {T}
-    return decodedatum(writer, src, Int(pos), T, false; kw...)
-end
-
-function decodedatum(writer::Schema, src, pos::Int, ::Type{T}, whole::Bool;
-                      reader_schema::Union{Nothing,Schema}=nothing, union_resolution::Symbol=:spec,
-                      limits::Limits=Limits(), validate::Symbol=:strict, names=nothing) where {T}
-    validate in (:strict, :fast) || throw(ArgumentError("validate must be :strict or :fast"))
-    admitted = admission(names)
-    plan, value, next = withbudget(limits) do budget
-        generic = datumreaderplan(writer, reader_schema, union_resolution, limits, budget)
-        effective = reader_schema === nothing ? writer : reader_schema
-        prepared = T === GenericDatumTarget ? generic : typedplan(T, effective, generic, limits; budget=budget)
-        spans = spanplan(writer; budget=budget)
-        source = if src isa IO
-            buffer = sourcebytes(src, limits.max_datum_bytes, budget, DataError)
-            PositionalDatumSource(buffer, 1, 0, length(buffer))
-        else
-            positionalsource(src, pos, limits, budget)
-        end
-        decoder = Decoder(source.buffer, budget; pos=source.start,
-                          validate=validate)
-        datumspan!(spans, decoder, source.start, budget.values,
-                   rawspaninputmax(budget, source.buffer,
-                                   source.start, limits))
-        span = decoderspan(decoder)
-        nextpos = originalnext(source, span.next)
-        whole && nextpos != source.sourceend + 1 &&
-            throw(DataError("trailing bytes after the datum", nextpos))
-        addinput!(budget, span.bytes)
-        decoder.stop = span.next - 1
-        planneddatumspan!(prepared, decoder, span;
-                          resolved=reader_schema !== nothing)
-        span = decoderspan(decoder)
-        work = begindatum!(decoder, span)
-        decoded = try
-            decodetyped(T, prepared, decoder, admitted)
-        catch
-            abortdatum!(decoder, work)
-            rethrow()
-        end
-        finishdatum!(decoder, work)
-        return (prepared, decoded, nextpos)
-    end
-    finished = finishtyped(plan, value, admitted)
-    return whole ? finished : (finished, next)
+function encode!(e::Encoder, schema::Schema, x)
+    plan = writeplan(schema)
+    return appenddatum!(() -> encodedatum!(plan, e, x, schema), e)
 end

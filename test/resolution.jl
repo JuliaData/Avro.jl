@@ -7,53 +7,26 @@
         w = P("\"int\"")
         rs = Avro.resolve(w, P("\"long\""))
         @test rs isa Avro.ResolvedSchema && rs.union_resolution === :spec && rs.plan isa Avro.PromotePlan
-        promote_budget = Avro.Budget(Avro.Limits())
-        @test Avro.resolve(w, P("\"long\""); budget=promote_budget).plan isa Avro.PromotePlan
-        @test promote_budget.reserved == 64
-
-        array_budget = Avro.Budget(Avro.Limits())
         array_writer = P("{\"type\":\"array\",\"items\":\"int\"}")
         array_reader = P("{\"type\":\"array\",\"items\":\"long\"}")
-        @test Avro.resolve(array_writer, array_reader; budget=array_budget).plan isa Avro.ArrayPlan
-        @test array_budget.reserved == 128
+        @test Avro.resolve(array_writer, array_reader).plan isa Avro.ArrayPlan
 
         union_writer = P("[{\"type\":\"record\",\"name\":\"BranchRecord\",\"fields\":[{\"name\":\"a\",\"type\":\"int\"}]}]")
         late_reader = P("{\"type\":\"record\",\"name\":\"BranchRecord\",\"fields\":[{\"name\":\"a\",\"type\":\"long\"},{\"name\":\"z\",\"type\":\"int\"}]}")
         early_reader = P("{\"type\":\"record\",\"name\":\"OtherRecord\",\"fields\":[{\"name\":\"a\",\"type\":\"long\"},{\"name\":\"z\",\"type\":\"int\"}]}")
-        branchcharges = Int[]
         for branchreader in (late_reader, early_reader)
-            branchbudget = Avro.Budget(Avro.Limits())
-            branchplan = Avro.resolve(union_writer, branchreader; budget=branchbudget).plan
-            @test branchplan.branches[1] isa Avro.UnresolvableBranch
-            failedbranch = branchplan.branches[1]
-            diagnostics = Avro.stringbytes(sizeof(failedbranch.msg)) +
-                          Avro.stringbytes(sizeof(failedbranch.writerpath)) +
-                          Avro.stringbytes(sizeof(failedbranch.readerpath))
-            push!(branchcharges, branchbudget.reserved - diagnostics)
+            @test Avro.resolve(union_writer, branchreader).plan.branches[1] isa Avro.UnresolvableBranch
         end
-        @test branchcharges[1] == branchcharges[2]
 
-        diagnosticcharges = Int[]
-        enumdiagnosticcharges = Int[]
         for n in (1, 1_000)
             field = "x"^n
             diagnosticwriter = P("[{\"type\":\"record\",\"name\":\"DiagnosticRecord\",\"fields\":[{\"name\":\"$field\",\"type\":\"string\"}]},\"null\"]")
             diagnosticreader = P("{\"type\":\"record\",\"name\":\"DiagnosticRecord\",\"fields\":[{\"name\":\"$field\",\"type\":\"long\"}]}")
-            diagnosticbudget = Avro.Budget(Avro.Limits())
-            diagnosticplan = Avro.resolve(diagnosticwriter, diagnosticreader;
-                budget=diagnosticbudget).plan
-            @test diagnosticplan.branches[1] isa Avro.UnresolvableBranch
-            push!(diagnosticcharges, diagnosticbudget.reserved)
-
+            @test Avro.resolve(diagnosticwriter, diagnosticreader).plan.branches[1] isa Avro.UnresolvableBranch
             enumwriter = P("{\"type\":\"record\",\"name\":\"EnumDiagnosticRecord\",\"fields\":[{\"name\":\"$field\",\"type\":{\"type\":\"enum\",\"name\":\"DiagnosticEnum\",\"symbols\":[\"A\",\"B\"]}}]}")
             enumreader = P("{\"type\":\"record\",\"name\":\"EnumDiagnosticRecord\",\"fields\":[{\"name\":\"$field\",\"type\":{\"type\":\"enum\",\"name\":\"DiagnosticEnum\",\"symbols\":[\"B\",\"A\"]}}]}")
-            enumbudget = Avro.Budget(Avro.Limits())
-            enumplan = Avro.resolve(enumwriter, enumreader; budget=enumbudget).plan
-            @test enumplan.steps[1].second isa Avro.EnumRemapPlan
-            push!(enumdiagnosticcharges, enumbudget.reserved)
+            @test Avro.resolve(enumwriter, enumreader).plan.steps[1].second isa Avro.EnumRemapPlan
         end
-        @test diagnosticcharges[2] - diagnosticcharges[1] >= 2 * 999
-        @test enumdiagnosticcharges[2] - enumdiagnosticcharges[1] >= 2 * 999
 
         @test_throws ArgumentError Avro.resolve(w, w; union_resolution=:odd)
         @test Avro.resolvingplan(w, w) isa Avro.IntPlan                        # writer == reader: the plain reader plan
@@ -67,11 +40,7 @@
             @test v === expect || v == expect
             @test typeof(v) === typeof(expect)
         end
-        primitive_limits = Avro.Limits(max_bytes=0, max_datum_bytes=1 << 20)
-        for mode in (:strict, :fast)
-            @test rt(Avro.FloatSchema(), Avro.DoubleSchema(), 1.5f0;
-                     validate=mode, limits=primitive_limits) === 1.5
-        end
+        @test rt(Avro.FloatSchema(), Avro.DoubleSchema(), 1.5f0) === 1.5
         for (wk, rk) in (("\"long\"", "\"int\""), ("\"double\"", "\"float\""), ("\"double\"", "\"long\""), ("\"string\"", "\"int\""), ("\"boolean\"", "\"int\""), ("\"null\"", "\"boolean\""))
             @test_throws Avro.ResolutionError Avro.resolve(P(wk), P(rk))
         end
@@ -79,13 +48,13 @@
     end
     @testset "logical pairings: the reader's interpretation wins over the raw value" begin
         @test rt(P("{\"type\":\"int\",\"logicalType\":\"date\"}"), P("\"int\""), Date(1970, 1, 3)) === Int32(2)
-        @test rt(P("\"long\""), P("{\"type\":\"long\",\"logicalType\":\"timestamp-millis\"}"), Int64(1500)) === Avro.Timestamp{Millisecond}(1500)
-        @test rt(P("{\"type\":\"long\",\"logicalType\":\"timestamp-millis\"}"), P("{\"type\":\"long\",\"logicalType\":\"timestamp-micros\"}"), Avro.Timestamp{Millisecond}(7)) ===
-              Avro.Timestamp{Microsecond}(7)                                   # no unit conversion (documented hazard)
-        @test rt(P("{\"type\":\"long\",\"logicalType\":\"timestamp-micros\"}"), P("{\"type\":\"long\",\"logicalType\":\"local-timestamp-micros\"}"), Avro.Timestamp{Microsecond}(9)) ===
-              Avro.LocalTimestamp{Microsecond}(9)                              # global → local reinterprets
+        @test rt(P("\"long\""), P("{\"type\":\"long\",\"logicalType\":\"timestamp-millis\"}"), Int64(1500)) === Avro.timestamp(Millisecond, 1500)
+        @test rt(P("{\"type\":\"long\",\"logicalType\":\"timestamp-millis\"}"), P("{\"type\":\"long\",\"logicalType\":\"timestamp-micros\"}"), Avro.timestamp(Millisecond, 7)) ===
+              Avro.timestamp(Microsecond, 7)                                   # no unit conversion (documented hazard)
+        @test rt(P("{\"type\":\"long\",\"logicalType\":\"timestamp-micros\"}"), P("{\"type\":\"long\",\"logicalType\":\"local-timestamp-micros\"}"), Avro.timestamp(Microsecond, 9)) ===
+              Avro.localtimestamp(Microsecond, 9)                              # global → local reinterprets
         @test rt(P("{\"type\":\"int\",\"logicalType\":\"date\"}"), P("{\"type\":\"int\",\"logicalType\":\"time-millis\"}"), Date(1970, 1, 2)) === Time(0, 0, 0, 1)
-        @test rt(P("\"int\""), P("{\"type\":\"long\",\"logicalType\":\"timestamp-micros\"}"), Int32(4)) === Avro.Timestamp{Microsecond}(4)
+        @test rt(P("\"int\""), P("{\"type\":\"long\",\"logicalType\":\"timestamp-micros\"}"), Int32(4)) === Avro.timestamp(Microsecond, 4)
         db = P("{\"type\":\"bytes\",\"logicalType\":\"decimal\",\"precision\":9,\"scale\":2}")
         @test rt(db, P("\"bytes\""), Avro.Decimal(150, 2)) == UInt8[0x00, 0x96]
         @test rt(P("\"bytes\""), db, UInt8[0x00, 0x96]) == Avro.Decimal(150, 2)
@@ -101,14 +70,14 @@
         w = P("{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"a\",\"type\":\"int\"},{\"name\":\"b\",\"type\":\"string\"}]}")
         r = P("{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"b\",\"type\":\"string\"},{\"name\":\"a\",\"type\":\"long\"},{\"name\":\"c\",\"type\":{\"type\":\"array\",\"items\":\"int\"},\"default\":[1,2]}]}")
         v = rt(w, r, (a=7, b="x"))
-        @test keys(v) == ["b", "a", "c"] && v.a === Int64(7) && v.b == "x" && v.c == Int32[1, 2]
+        @test keys(v) == [:b, :a, :c] && v.a === Int64(7) && v.b == "x" && v.c == Int32[1, 2]
         v2 = rt(w, r, (a=8, b="y"))
         push!(getfield(v, :values)[3], Int32(9))
         @test v2.c == Int32[1, 2]                                              # defaults are fresh per record
         rnodefault = P("{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"z\",\"type\":\"int\"}]}")
         @test_throws Avro.ResolutionError Avro.resolve(w, rnodefault)
-        # writer-only fields are skipped in both validation modes
-        @test rt(w, P("{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"b\",\"type\":\"string\"}]}"), (a=1, b="q"); validate=:fast).b == "q"
+        # writer-only fields are skipped
+        @test rt(w, P("{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"b\",\"type\":\"string\"}]}"), (a=1, b="q")).b == "q"
         # a reader field alias matches the writer field (an alias colliding with another reader field name
         # is already a SchemaError at parse time, so the consumed-name corner cannot arise)
         @test_throws Avro.SchemaError P("{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"renamed\",\"type\":\"int\",\"aliases\":[\"a\"]},{\"name\":\"a\",\"type\":\"int\",\"default\":42}]}")
@@ -153,14 +122,15 @@
     end
     @testset "unions: policies, directions, unresolvable branches" begin
         wi = P("\"int\"")
-        @test rt(wi, P("[\"long\",\"int\"]"), Int32(5)) == Avro.UnionValue(1, Int64(5))                       # first matching reader branch
-        @test rt(wi, P("[\"long\",\"int\"]"), Int32(5); union_resolution=:java) == Avro.UnionValue(2, Int32(5))
-        @test rt(wi, P("[\"double\",\"int\"]"), Int32(5)) == Avro.UnionValue(1, 5.0)
-        @test rt(wi, P("[\"double\",\"int\"]"), Int32(5); union_resolution=:java) == Avro.UnionValue(2, Int32(5))
-        @test rt(wi, P("[\"string\",\"double\",\"long\"]"), Int32(5)) == Avro.UnionValue(2, 5.0)             # else the first promotion
+        # union values decode to the bare value of the reader branch, so its Julia type shows the branch
+        @test rt(wi, P("[\"long\",\"int\"]"), Int32(5)) === Int64(5)                                          # first matching reader branch
+        @test rt(wi, P("[\"long\",\"int\"]"), Int32(5); union_resolution=:java) === Int32(5)
+        @test rt(wi, P("[\"double\",\"int\"]"), Int32(5)) === 5.0
+        @test rt(wi, P("[\"double\",\"int\"]"), Int32(5); union_resolution=:java) === Int32(5)
+        @test rt(wi, P("[\"string\",\"double\",\"long\"]"), Int32(5)) === 5.0                                 # else the first promotion
         big = typemax(Int64) - 1                                                                               # not exact in a double
-        @test rt(P("\"long\""), P("[\"double\",\"long\"]"), big) == Avro.UnionValue(1, Float64(big))
-        @test rt(P("\"long\""), P("[\"double\",\"long\"]"), big; union_resolution=:java) == Avro.UnionValue(2, big)
+        @test rt(P("\"long\""), P("[\"double\",\"long\"]"), big) === Float64(big)
+        @test rt(P("\"long\""), P("[\"double\",\"long\"]"), big; union_resolution=:java) === big
         @test rt(wi, P("[\"null\",\"long\"]"), Int32(5)) === Int64(5)                                          # nullable readers stay bare
         @test_throws Avro.ResolutionError Avro.resolve(wi, P("[\"string\",\"boolean\"]"))
         wu = P("[\"int\",\"string\"]")
@@ -169,8 +139,8 @@
         wn = P("[\"null\",\"int\"]")
         @test rt(wn, P("\"int\""), Int32(3)) === Int32(3)
         @test_throws Avro.ResolutionError rt(wn, P("\"int\""), missing)
-        @test rt(wu, P("[\"string\",\"long\"]"), Avro.UnionValue(1, Int32(9))) == Avro.UnionValue(2, Int64(9))
-        @test rt(wu, P("[\"string\",\"long\"]"), Avro.UnionValue(2, "x")) == Avro.UnionValue(1, "x")
+        @test rt(wu, P("[\"string\",\"long\"]"), Avro.UnionValue(1, Int32(9))) === Int64(9)
+        @test rt(wu, P("[\"string\",\"long\"]"), Avro.UnionValue(2, "x")) == "x"
         @test rt(P("[\"null\",\"string\"]"), P("[\"string\",\"null\"]"), missing) === missing
         @test rt(P("[\"null\",\"string\"]"), P("[\"string\",\"null\"]"), "q") == "q"
         @test_throws Avro.ResolutionError rt(P("[\"int\",\"boolean\"]"), P("\"long\""), Avro.UnionValue(2, true))
@@ -179,54 +149,50 @@
         decimalwriter = P("{\"type\":\"fixed\",\"name\":\"a.F\",\"size\":4,\"logicalType\":\"decimal\",\"precision\":8,\"scale\":2}")
         decimalreader = P("[{\"type\":\"fixed\",\"name\":\"b.F\",\"size\":4,\"logicalType\":\"decimal\",\"precision\":9,\"scale\":2},{\"type\":\"fixed\",\"name\":\"a.F\",\"size\":4,\"logicalType\":\"decimal\",\"precision\":8,\"scale\":2}]")
         decimalvalue = Avro.Decimal(1, 2)
-        resolveddecimal = rt(decimalwriter, decimalreader, decimalvalue)
-        @test resolveddecimal isa Avro.UnionValue && resolveddecimal.index == 2
+        @test rt(decimalwriter, decimalreader, decimalvalue) == decimalvalue
         uniondecimalwriter = P("[{\"type\":\"fixed\",\"name\":\"a.F\",\"size\":4,\"logicalType\":\"decimal\",\"precision\":8,\"scale\":2},\"null\"]")
-        resolveduniondecimal = rt(uniondecimalwriter, decimalreader,
-            Avro.UnionValue(1, decimalvalue))
-        @test resolveduniondecimal isa Avro.UnionValue && resolveduniondecimal.index == 2
+        @test rt(uniondecimalwriter, decimalreader, Avro.UnionValue(1, decimalvalue)) == decimalvalue
 
         aliasrecordwriter = P("{\"type\":\"record\",\"name\":\"w.Foo\",\"fields\":[{\"name\":\"a\",\"type\":\"int\"}]}")
         aliasrecordreader = P("[{\"type\":\"record\",\"name\":\"x.Foo\",\"fields\":[{\"name\":\"a\",\"type\":\"long\"}]},{\"type\":\"record\",\"name\":\"r.Bar\",\"aliases\":[\"w.Foo\"],\"fields\":[{\"name\":\"a\",\"type\":\"int\"}]}]")
         specrecord = rt(aliasrecordwriter, aliasrecordreader, (a=Int32(7),))
         javarecord = rt(aliasrecordwriter, aliasrecordreader, (a=Int32(7),); union_resolution=:java)
-        @test specrecord.index == 1 && specrecord.value["a"] === Int64(7)       # the earlier unqualified name matches
-        @test javarecord.index == 2 && javarecord.value["a"] === Int32(7)
+        @test Avro.fullname(Avro.schema(specrecord)) == "x.Foo" && specrecord["a"] === Int64(7)     # the earlier unqualified name matches
+        @test Avro.fullname(Avro.schema(javarecord)) == "r.Bar" && javarecord["a"] === Int32(7)
 
         aliasenumwriter = P("{\"type\":\"enum\",\"name\":\"w.Kind\",\"symbols\":[\"A\"]}")
         aliasenumreader = P("[{\"type\":\"enum\",\"name\":\"x.Kind\",\"symbols\":[\"A\"]},{\"type\":\"enum\",\"name\":\"r.Other\",\"aliases\":[\"w.Kind\"],\"symbols\":[\"A\"]}]")
         enumvalue = Avro.EnumValue(aliasenumwriter, 1)
-        @test rt(aliasenumwriter, aliasenumreader, enumvalue).index == 1
-        @test rt(aliasenumwriter, aliasenumreader, enumvalue; union_resolution=:java).index == 2
+        @test Avro.fullname(rt(aliasenumwriter, aliasenumreader, enumvalue).schema) == "x.Kind"
+        @test Avro.fullname(rt(aliasenumwriter, aliasenumreader, enumvalue; union_resolution=:java).schema) == "r.Other"
 
         aliasfixedwriter = P("{\"type\":\"fixed\",\"name\":\"w.Blob\",\"size\":2}")
         aliasfixedreader = P("[{\"type\":\"fixed\",\"name\":\"x.Blob\",\"size\":2},{\"type\":\"fixed\",\"name\":\"r.OtherBlob\",\"aliases\":[\"w.Blob\"],\"size\":2}]")
         fixedvalue = Avro.Fixed(aliasfixedwriter, UInt8[1, 2])
-        @test rt(aliasfixedwriter, aliasfixedreader, fixedvalue).index == 1
-        @test rt(aliasfixedwriter, aliasfixedreader, fixedvalue; union_resolution=:java).index == 2
+        @test Avro.fullname(rt(aliasfixedwriter, aliasfixedreader, fixedvalue).schema) == "x.Blob"
+        @test Avro.fullname(rt(aliasfixedwriter, aliasfixedreader, fixedvalue; union_resolution=:java).schema) == "r.OtherBlob"
 
         # :spec takes the first matching unqualified name; :java prefers an exact fullname.
         event(ns, t="int") = """{"type":"record","name":"Event","namespace":"$ns","fields":[{"name":"x","type":"$t"}]}"""
         eventreader = P("[" * event("com.a", "long") * "," * event("com.b") * "]")
         exactevent = rt(P(event("com.b")), eventreader, (x=Int32(7),))
-        @test exactevent.index == 1 && exactevent.value["x"] === Int64(7)
+        @test Avro.fullname(Avro.schema(exactevent)) == "com.a.Event" && exactevent["x"] === Int64(7)
         javaevent = rt(P(event("com.b")), eventreader, (x=Int32(7),); union_resolution=:java)
-        @test javaevent.index == 2 && javaevent.value["x"] === Int32(7)
-        @test Avro.fullname(Avro.schema(exactevent.value)) == "com.a.Event"
+        @test Avro.fullname(Avro.schema(javaevent)) == "com.b.Event" && javaevent["x"] === Int32(7)
         color(ns) = """{"type":"enum","name":"Color","namespace":"$ns","symbols":["R","G"]}"""
         colorwriter = P(color("com.b"))
         colorvalue = rt(colorwriter, P("[" * color("com.a") * "," * color("com.b") * "]"),
                         Avro.EnumValue(colorwriter, 2))
-        @test colorvalue.index == 1 && String(colorvalue.value) == "G"
+        @test Avro.fullname(colorvalue.schema) == "com.a.Color" && String(colorvalue) == "G"
         firstevent = rt(P(event("com.c")), eventreader, (x=Int32(7),))
-        @test firstevent.index == 1 && firstevent.value["x"] === Int64(7)
+        @test Avro.fullname(Avro.schema(firstevent)) == "com.a.Event" && firstevent["x"] === Int64(7)
         @test rt(P(event("com.c")), P("[\"null\"," * event("com.a", "long") * "]"), (x=Int32(3),))["x"] === Int64(3)
         unionwriter = P("[\"null\"," * event("com.c") * "]")
         nullablereader = P("[\"null\"," * event("com.a", "long") * "," * event("com.b") * "]")
         @test Avro.resolve(unionwriter, nullablereader) isa Avro.ResolvedSchema
-        @test isequal(rt(unionwriter, nullablereader, missing), Avro.UnionValue(1, missing))
+        @test rt(unionwriter, nullablereader, missing) === missing
         value = rt(unionwriter, nullablereader, (x=Int32(1),))
-        @test value.index == 2 && value.value["x"] === Int64(1)
+        @test Avro.fullname(Avro.schema(value)) == "com.a.Event" && value["x"] === Int64(1)
 
         softrecordwriter = P("""{"type":"record","name":"w.W","fields":[{"name":"x","type":"int"}]}""")
         softrecordreader = P("""[
@@ -235,9 +201,9 @@
         ]""")
         softrecord = rt(softrecordwriter, softrecordreader, (x=Int32(7),);
                         union_resolution=:java)
-        @test softrecord isa Avro.UnionValue
-        @test softrecord.index == 1
-        @test softrecord.value["x"] === Int32(7)
+        @test softrecord isa Avro.Record
+        @test Avro.fullname(Avro.schema(softrecord)) == "a.A"
+        @test softrecord["x"] === Int32(7)
         nestedsoftwriter = P("""{"type":"record","name":"w.W","fields":[
             {"name":"m","type":{"type":"record","name":"w.WM","fields":[
                 {"name":"leaf","type":{"type":"record","name":"w.WL","fields":[
@@ -262,8 +228,8 @@
             {"type":"record","name":"b.Target","fields":[{"name":"x","type":"long"}]}]""")
         shortnamevalue = rt(shortnamewriter, shortnamereader, (x=Int32(9),);
                             union_resolution=:java)
-        @test shortnamevalue.index == 2
-        @test shortnamevalue.value["x"] === Int64(9)
+        @test Avro.fullname(Avro.schema(shortnamevalue)) == "b.Target"
+        @test shortnamevalue["x"] === Int64(9)
         immediatewriter = P("""{"type":"record","name":"w.Immediate","fields":[
             {"name":"x","type":"string"}]}""")
         immediatereader = P("""[
@@ -271,26 +237,27 @@
             {"type":"record","name":"b.Good","fields":[{"name":"x","type":"bytes"}]}]""")
         immediatevalue = rt(immediatewriter, immediatereader, (x="ok",);
                             union_resolution=:java)
-        @test immediatevalue.index == 2
-        @test immediatevalue.value["x"] == UInt8[0x6f, 0x6b]
+        @test Avro.fullname(Avro.schema(immediatevalue)) == "b.Good"
+        @test immediatevalue["x"] == UInt8[0x6f, 0x6b]
     end
     @testset "first union matches across prepared, typed and container readers" begin
         writer = P("\"int\"")
         reader = P("[\"long\",\"int\"]")
         bytes = Avro.encode(writer, Int32(7))
-        for validate in (:strict, :fast)
-            @test Avro.DatumReader(writer; reader_schema=reader, validate)(bytes) == Avro.UnionValue(1, Int64(7))
-            @test Avro.decode(writer, bytes, Union{Int32,Int64}; reader_schema=reader, validate) === Int64(7)
-            @test Avro.decode(writer, bytes, Union{Int32,Int64}; reader_schema=reader, validate,
-                              union_resolution=:java) === Int32(7)
-        end
+        @test Avro.DatumReader(writer; reader_schema=reader)(bytes) === Int64(7)
+        @test Avro.decode(writer, bytes, Union{Int32,Int64}; reader_schema=reader) === Int64(7)
+        @test Avro.decode(writer, bytes, Union{Int32,Int64}; reader_schema=reader,
+                          union_resolution=:java) === Int32(7)
         recordwriter = P("""{"type":"record","name":"R","fields":[{"name":"n","type":"int"}]}""")
         recordreader = P("""{"type":"record","name":"R","fields":[{"name":"n","type":["long","int"]}]}""")
         buffer = IOBuffer()
         Avro.write(buffer, [(n=Int32(7),)]; schema=recordwriter)
         data = take!(buffer)
-        @test only(Avro.Rows(data; reader_schema=recordreader)).n == Avro.UnionValue(1, Int64(7))
-        @test only(Tables.getcolumn(Avro.Table(data; reader_schema=recordreader), :n)) == Avro.UnionValue(1, Int64(7))
+        @test only(Avro.Rows(data; reader_schema=recordreader)).n === Int64(7)
+        resolvedtable = Avro.Table(data; reader_schema=recordreader)
+        resolvedcolumn = Tables.getcolumn(resolvedtable, :n)
+        @test resolvedcolumn isa Vector{Any} && only(resolvedcolumn) === Int64(7)
+        @test collect(Tables.schema(resolvedtable).types) == [Any]       # a non-nullable union column holds bare values
 
         # Once a named branch matches, failure while resolving its fields does not try a later branch.
         namedwriter = P("""{"type":"record","name":"w.R","fields":[{"name":"n","type":"int"}]}""")
@@ -298,7 +265,7 @@
             {"type":"record","name":"a.R","fields":[{"name":"n","type":"boolean"}]},
             {"type":"record","name":"w.R","fields":[{"name":"n","type":"int"}]}]""")
         @test_throws Avro.ResolutionError Avro.resolve(namedwriter, namedreader)
-        @test rt(namedwriter, namedreader, (n=Int32(7),); union_resolution=:java).index == 2
+        @test Avro.fullname(Avro.schema(rt(namedwriter, namedreader, (n=Int32(7),); union_resolution=:java))) == "w.R"
     end
     @testset "a failed branch inside a recursive record keeps the record's cached plan" begin
         w = P("""{"type":"record","name":"R","fields":[{"name":"a","type":["null",
@@ -306,7 +273,8 @@
         r = P("""{"type":"record","name":"R","fields":[{"name":"a","type":["null",
             {"type":"record","name":"X","fields":[{"name":"v","type":"int"}]},"R"]}]}""")
         @test Avro.resolve(w, r) isa Avro.ResolvedSchema
-        @test rt(w, r, (a=Avro.UnionValue(3, (a=Avro.UnionValue(1, missing),)),)).a.index == 3
+        recursive = rt(w, r, (a=Avro.UnionValue(3, (a=Avro.UnionValue(1, missing),)),)).a
+        @test Avro.fullname(Avro.schema(recursive)) == "R" && recursive.a === missing
         @test_throws Avro.ResolutionError rt(w, r, (a=Avro.UnionValue(2, (v="s",)),))
     end
 
@@ -318,12 +286,7 @@
         @test rt(w, r, Dict("f$i" => Int32(i) for i in 1:3000)).f3000 === Int64(3000)
     end
 
-    @testset "work limit, repair, equality shortcut" begin
-        function wide(pfx, n)
-            return P("[" * join(["{\"type\":\"record\",\"name\":\"$(pfx)$i\",\"fields\":[]}" for i in 1:n], ",") * "]")
-        end
-        w, r = wide("W", 100), wide("R", 100)
-        @test_throws Avro.LimitError Avro.resolve(w, r; limits=Avro.Limits(max_resolution_work=2000))
+    @testset "repair, equality shortcut" begin
         wb = P("{\"type\":\"record\",\"name\":\"B\",\"fields\":[{\"name\":\"bad-name\",\"type\":\"int\"}]}"; allow_invalid_names=true)
         rb = P("{\"type\":\"record\",\"name\":\"B\",\"fields\":[{\"name\":\"good\",\"type\":\"int\",\"aliases\":[\"bad-name\"]}]}"; allow_invalid_names=true)
         bytes = Avro.encode(wb, (var"bad-name"=Int32(3),))
@@ -336,182 +299,60 @@
         bytes = Avro.encode(ev, v)
         @test isequal(Avro.decode(ev, bytes; reader_schema=ev), Avro.decode(ev, bytes))   # reader == writer equals the plain decode
     end
-    @testset "reader defaults are admitted before zero-input materialisation" begin
+    @testset "reader defaults: materialised per record, uncounted against the file's limits" begin
         nestedwriter = P("""{"type":"record","name":"W","fields":[]}""")
         nestedreader = P("""{"type":"record","name":"W","fields":[
             {"name":"outer","type":{"type":"record","name":"DefaultOuter","fields":[
                 {"name":"u","type":["null","int"],"default":7}]},"default":{}}]}""")
         nesteddefault = Avro.resolve(nestedwriter, nestedreader).plan.defaults[1].second
-        @test nesteddefault.values == 3
-        @test nesteddefault.branches == [2]
-        directlimits = Avro.Limits(max_total_values=3, work_allowance=3)
-        directbudget = Avro.Budget(directlimits)
-        directvalue = Avro.jsonvalue(nesteddefault, directbudget)
-        @test directvalue.u === Int32(7)
-        @test directbudget.values == 3
-        nestedlimits = Avro.Limits(max_total_values=4)
+        @test Avro.freshvalue(nesteddefault.value).u === Int32(7)
         nestedtarget = @NamedTuple{outer::@NamedTuple{u::Union{Missing,Int32}}}
         nestedcontainer = take!(Avro.tobuffer([NamedTuple()]; schema=nestedwriter))
-        for mode in (:strict, :fast)
-            nestedvalue = Avro.decode(nestedwriter, UInt8[]; reader_schema=nestedreader,
-                                      limits=nestedlimits, validate=mode)
-            @test nestedvalue.outer.u === Int32(7)
-            nestedprepared = Avro.DatumReader(nestedwriter; reader_schema=nestedreader,
-                                              limits=nestedlimits, validate=mode)
-            @test nestedprepared(UInt8[]).outer.u === Int32(7)
-            nestedtyped = Avro.DatumReader(nestedwriter, nestedtarget;
-                                           reader_schema=nestedreader,
-                                           limits=nestedlimits, validate=mode)
-            @test nestedtyped(UInt8[]) == (outer=(u=Int32(7),),)
-            @test Avro.decode(nestedwriter, UInt8[], nestedtarget;
-                              reader_schema=nestedreader, limits=nestedlimits,
-                              validate=mode) == (outer=(u=Int32(7),),)
-            nestedtable = Avro.Table(nestedcontainer; reader_schema=nestedreader,
-                                     select=(:outer,), validate=mode, ntasks=1)
-            @test Tables.getcolumn(nestedtable, :outer)[1].u === Int32(7)
-        end
+        @test Avro.decode(nestedwriter, UInt8[]; reader_schema=nestedreader).outer.u === Int32(7)
+        @test Avro.DatumReader(nestedwriter; reader_schema=nestedreader)(UInt8[]).outer.u === Int32(7)
+        @test Avro.DatumReader(nestedwriter, nestedtarget; reader_schema=nestedreader)(UInt8[]) == (outer=(u=Int32(7),),)
+        @test Avro.decode(nestedwriter, UInt8[], nestedtarget; reader_schema=nestedreader) == (outer=(u=Int32(7),),)
+        nestedtable = Avro.Table(nestedcontainer; reader_schema=nestedreader, select=(:outer,), ntasks=1)
+        @test Tables.getcolumn(nestedtable, :outer)[1].u === Int32(7)
 
-        depthwriter = P("""{"type":"record","name":"DepthRow","fields":[]}""")
-        depthreader = P("""{"type":"record","name":"DepthRow","fields":[
-            {"name":"child","type":{"type":"record","name":"DepthChild",
-             "fields":[]},"default":{}}]}""")
-        depthbytes = Avro.encode(depthwriter, NamedTuple())
-        depthlimits = Avro.Limits(max_depth=1)
-        DepthChild = @NamedTuple{}
-        DepthRow = @NamedTuple{child::DepthChild}
-        function defaulterror(f)
-            err = try
-                f()
-                nothing
-            catch caught
-                caught
-            end
-            @test err isa Avro.LimitError
-            if err isa Avro.LimitError
-                @test err.limit === :max_depth
-                @test err.observed == 2
-                @test err.value == 1
-            end
-            return err
-        end
-        depthcontainer = take!(Avro.tobuffer([NamedTuple()]; schema=depthwriter,
-                                              codec=:null))
-        for mode in (:strict, :fast)
-            defaulterror(() -> Avro.decode(
-                depthwriter, depthbytes; reader_schema=depthreader,
-                limits=depthlimits, validate=mode))
-            defaulterror(() -> Avro.DatumReader(
-                depthwriter; reader_schema=depthreader,
-                limits=depthlimits, validate=mode)(depthbytes))
-            defaulterror(() -> Avro.decode(
-                depthwriter, depthbytes, DepthRow; reader_schema=depthreader,
-                limits=depthlimits, validate=mode))
-            defaulterror(() -> Avro.DatumReader(
-                depthwriter, DepthRow; reader_schema=depthreader,
-                limits=depthlimits, validate=mode)(depthbytes))
-            defaulterror(() -> collect(Avro.Rows(
-                depthcontainer; reader_schema=depthreader,
-                limits=depthlimits, validate=mode)))
-            defaulterror(() -> collect(Avro.Rows(
-                depthcontainer; T=DepthRow, reader_schema=depthreader,
-                limits=depthlimits, validate=mode)))
-            defaulterror(() -> Avro.Table(
-                depthcontainer; reader_schema=depthreader,
-                limits=depthlimits, validate=mode, ntasks=1))
-        end
-        @test Avro.decode(depthwriter, depthbytes;
-                          reader_schema=depthreader,
-                          limits=Avro.Limits(max_depth=2)).child ==
-              Avro.Record(depthreader.fields[1].schema, Any[])
-        nestederror = try
-            Avro.decode(nestedwriter, UInt8[]; reader_schema=nestedreader,
-                        limits=Avro.Limits(max_total_values=3))
-            nothing
-        catch caught
-            caught
-        end
-        @test nestederror isa Avro.LimitError
-        @test nestederror.limit === :max_total_values
-        @test nestederror.observed == 4
-        @test nestederror.value == 3
         ownedreader = P("""{"type":"record","name":"W","fields":[
             {"name":"scalar","type":"string","default":"scalar-default"},
             {"name":"nested","type":{"type":"array","items":"string"},
              "default":["nested-default"]},
             {"name":"map","type":{"type":"map","values":"string"},
              "default":{"map-key":"map-value"}}]}""")
-        ownedplan = Avro.resolve(nestedwriter, ownedreader).plan
-        mapdefault = ownedplan.defaults[3].second
-        mapbudget = Avro.Budget(Avro.Limits())
-        directmap = Avro.jsonvalue(mapdefault, mapbudget)
-        @test mapbudget.reserved == Avro.storagebytes(directmap)
-        frozenmap = mapdefault.json
-        frozenkey = first(frozenmap.order)
-        outputkey = first(keys(directmap))
-        GC.@preserve frozenkey outputkey begin
-            @test pointer(frozenkey) != pointer(outputkey)
-        end
-        frozenvalue = frozenmap.members[frozenkey]
-        outputvalue = directmap["map-key"]
-        GC.@preserve frozenvalue outputvalue begin
-            @test pointer(frozenvalue) != pointer(outputvalue)
-        end
-
-        function distinctstringstorage(first::String, second::String)
-            GC.@preserve first second begin
-                return pointer(first) != pointer(second)
-            end
-        end
-        function checkowneddefaults(left, right)
+        # every record gets its own mutable default containers
+        function checkfreshdefaults(left, right)
             @test left.scalar == right.scalar == "scalar-default"
             @test left.nested == right.nested == ["nested-default"]
-            @test left.map == right.map == Avro.Map([("map-key", "map-value")])
-            @test distinctstringstorage(left.scalar, right.scalar)
-            @test distinctstringstorage(left.nested[1], right.nested[1])
-            @test distinctstringstorage(first(keys(left.map)), first(keys(right.map)))
-            @test distinctstringstorage(left.map["map-key"], right.map["map-key"])
+            @test left.map == right.map == Dict("map-key" => "map-value")
+            @test left.nested !== right.nested
+            @test left.map !== right.map
             return nothing
         end
         ownedprepared = Avro.DatumReader(nestedwriter; reader_schema=ownedreader)
-        checkowneddefaults(ownedprepared(UInt8[]), ownedprepared(UInt8[]))
-        checkowneddefaults(
+        checkfreshdefaults(ownedprepared(UInt8[]), ownedprepared(UInt8[]))
+        checkfreshdefaults(
             Avro.decode(nestedwriter, UInt8[]; reader_schema=ownedreader),
             Avro.decode(nestedwriter, UInt8[]; reader_schema=ownedreader))
         OwnedDefaults = @NamedTuple{
-            scalar::String, nested::Vector{String}, map::Avro.Map{String}}
+            scalar::String, nested::Vector{String}, map::Dict{String,String}}
         ownedtyped = Avro.DatumReader(nestedwriter, OwnedDefaults;
                                       reader_schema=ownedreader)
-        checkowneddefaults(ownedtyped(UInt8[]), ownedtyped(UInt8[]))
+        checkfreshdefaults(ownedtyped(UInt8[]), ownedtyped(UInt8[]))
         ownedcontainer = take!(Avro.tobuffer([NamedTuple(), NamedTuple()];
                                              schema=nestedwriter, codec=:null))
         Avro.Rows(ownedcontainer; reader_schema=ownedreader) do rows
             values = collect(rows)
             @test length(values) == 2
-            checkowneddefaults(values[1], values[2])
+            checkfreshdefaults(values[1], values[2])
         end
 
         largedefault = repeat("x", 100_000)
-        largeschemalimits = Avro.Limits(max_bytes=1_000_000,
-                                        max_datum_bytes=1_000_000,
-                                        max_schema_bytes=200_000)
         largereader = P("{\"type\":\"record\",\"name\":\"W\",\"fields\":[{\"name\":\"s\",\"type\":\"string\",\"default\":\"" *
-                        largedefault * "\"}]}", limits=largeschemalimits)
-        smalllimits = Avro.Limits(max_bytes=1024, max_datum_bytes=1024,
-                                  max_block_bytes=1024,
-                                  max_block_output_bytes=1024,
-                                  max_metadata_bytes=0, max_schema_bytes=0)
-        largeprepared = Avro.DatumReader(nestedwriter;
-                                         reader_schema=largereader,
-                                         limits=smalllimits)
-        largeerror = try
-            largeprepared(UInt8[])
-            nothing
-        catch caught
-            caught
-        end
-        @test largeerror isa Avro.LimitError
-        @test largeerror.limit === :max_bytes
-        @test largeerror.observed == sizeof(largedefault)
+                        largedefault * "\"}]}")
+        @test Avro.DatumReader(nestedwriter; reader_schema=largereader,
+                               limits=Avro.Limits(max_bytes=1024))(UInt8[]).s == largedefault   # max_bytes bounds buffers, not values
         compoundreader = P("""{"type":"record","name":"W","fields":[
             {"name":"array_default","type":{"type":"array","items":["null","int"]},
              "default":[7]},
@@ -522,14 +363,6 @@
             {"name":"omitted_default","type":{"type":"record","name":"OmittedDefault",
              "fields":[{"name":"u","type":["null","int"],"default":7}]},
              "default":{}}]}""")
-        compoundplan = Avro.resolve(nestedwriter, compoundreader).plan
-        @test [dp.values for (_, dp) in compoundplan.defaults] == fill(3, 4)
-        @test [dp.branches for (_, dp) in compoundplan.defaults] == fill([2], 4)
-        for (_, dp) in compoundplan.defaults
-            budget = Avro.Budget(Avro.Limits(max_total_values=3))
-            Avro.jsonvalue(dp, budget)
-            @test budget.values == 3
-        end
         compoundtarget = @NamedTuple{
             array_default::Vector{Union{Missing,Int32}},
             map_default::Dict{String,Union{Missing,Int32}},
@@ -543,49 +376,10 @@
             @test value.omitted_default.u === Int32(7)
             return nothing
         end
-        compoundlimits = Avro.Limits(max_total_values=13)
-        for mode in (:strict, :fast)
-            checkcompound(Avro.decode(nestedwriter, UInt8[];
-                                      reader_schema=compoundreader,
-                                      limits=compoundlimits, validate=mode))
-            preparedgeneric = Avro.DatumReader(nestedwriter;
-                                               reader_schema=compoundreader,
-                                               limits=compoundlimits, validate=mode)
-            checkcompound(preparedgeneric(UInt8[]))
-            checkcompound(Avro.decode(nestedwriter, UInt8[], compoundtarget;
-                                      reader_schema=compoundreader,
-                                      limits=compoundlimits, validate=mode))
-            preparedtyped = Avro.DatumReader(nestedwriter, compoundtarget;
-                                             reader_schema=compoundreader,
-                                             limits=compoundlimits, validate=mode)
-            checkcompound(preparedtyped(UInt8[]))
-        end
-        function totalvalueerror(f)
-            err = try
-                f()
-                nothing
-            catch caught
-                caught
-            end
-            @test err isa Avro.LimitError
-            @test err.limit === :max_total_values
-            @test err.observed == 13
-            @test err.value == 12
-            return err
-        end
-        shortlimits = Avro.Limits(max_total_values=12)
-        totalvalueerror(() -> Avro.decode(nestedwriter, UInt8[];
-                                         reader_schema=compoundreader,
-                                         limits=shortlimits))
-        totalvalueerror(() -> Avro.decode(nestedwriter, UInt8[], compoundtarget;
-                                         reader_schema=compoundreader,
-                                         limits=shortlimits))
-        totalvalueerror(() -> Avro.DatumReader(
-            nestedwriter; reader_schema=compoundreader,
-            limits=shortlimits)(UInt8[]))
-        totalvalueerror(() -> Avro.DatumReader(
-            nestedwriter, compoundtarget; reader_schema=compoundreader,
-            limits=shortlimits)(UInt8[]))
+        checkcompound(Avro.decode(nestedwriter, UInt8[]; reader_schema=compoundreader))
+        checkcompound(Avro.DatumReader(nestedwriter; reader_schema=compoundreader)(UInt8[]))
+        checkcompound(Avro.decode(nestedwriter, UInt8[], compoundtarget; reader_schema=compoundreader))
+        checkcompound(Avro.DatumReader(nestedwriter, compoundtarget; reader_schema=compoundreader)(UInt8[]))
         compoundio = IOBuffer()
         compoundwriter = Avro.Writer(compoundio, nestedwriter)
         for _ in 1:4
@@ -594,32 +388,27 @@
         end
         close(compoundwriter)
         compoundcontainer = take!(compoundio)
-        for mode in (:strict, :fast)
-            Avro.Rows(compoundcontainer; reader_schema=compoundreader,
-                      validate=mode) do rows
-                values = collect(rows)
-                @test length(values) == 4
-                foreach(checkcompound, values)
-            end
-            Avro.Rows(compoundcontainer; reader_schema=compoundreader,
-                      select=(:array_default,), validate=mode) do rows
-                values = collect(rows)
-                @test length(values) == 4
-                @test all(value -> value.array_default ==
-                          Union{Missing,Int32}[Int32(7)], values)
-            end
-            compoundtable = Avro.Table(compoundcontainer;
-                                       reader_schema=compoundreader,
-                                       validate=mode, ntasks=1)
-            @test length(compoundtable) == 4
-            checkcompound(first(Tables.rows(compoundtable)))
-            if Threads.nthreads() > 1
-                paralleltable = Avro.Table(compoundcontainer;
-                                           reader_schema=compoundreader,
-                                           validate=mode, ntasks=2)
-                @test length(paralleltable) == 4
-                checkcompound(first(Tables.rows(paralleltable)))
-            end
+        Avro.Rows(compoundcontainer; reader_schema=compoundreader) do rows
+            values = collect(rows)
+            @test length(values) == 4
+            foreach(checkcompound, values)
+        end
+        Avro.Rows(compoundcontainer; reader_schema=compoundreader,
+                  select=(:array_default,)) do rows
+            values = collect(rows)
+            @test length(values) == 4
+            @test all(value -> value.array_default ==
+                      Union{Missing,Int32}[Int32(7)], values)
+        end
+        compoundtable = Avro.Table(compoundcontainer;
+                                   reader_schema=compoundreader, ntasks=1)
+        @test length(compoundtable) == 4
+        checkcompound(first(Tables.rows(compoundtable)))
+        if Threads.nthreads() > 1
+            paralleltable = Avro.Table(compoundcontainer;
+                                       reader_schema=compoundreader, ntasks=2)
+            @test length(paralleltable) == 4
+            checkcompound(first(Tables.rows(paralleltable)))
         end
         writer = P("""{"type":"record","name":"W","fields":[
             {"name":"payload","type":"bytes"}]}""")
@@ -627,65 +416,27 @@
         reader = P("""{"type":"record","name":"W","fields":[
             {"name":"added","type":{"type":"array","items":"null"},
              "default":[$defaults]}]}""")
-        datumlimits = Avro.Limits(max_values_per_byte=16, work_allowance=100)
-        containerlimits = Avro.Limits(max_values_per_byte=16, work_allowance=10)
+        datumlimits = Avro.Limits(max_values_per_byte=16, value_allowance=100)
+        containerlimits = Avro.Limits(max_values_per_byte=16, value_allowance=10)
         datum = Avro.encode(writer, (payload=UInt8[],))
-        function workerror(f, expectedlimit)
-            err = try
-                f()
-                nothing
-            catch e
-                e
-            end
-            @test err isa Avro.LimitError
-            @test err.limit === :max_values_per_byte
-            @test err.observed == 1003
-            @test err.value == expectedlimit
-            return err
-        end
-        workerror(() -> Avro.decode(writer, datum; reader_schema=reader,
-                                    limits=datumlimits), 116)
-        prepared = Avro.DatumReader(writer; reader_schema=reader,
-                                    limits=datumlimits)
-        workerror(() -> prepared(datum), 116)
-        store = Avro.SchemaCache()
-        Avro.register!(store, writer)
-        message = Avro.encodesingle(writer, (payload=UInt8[],))
-        workerror(() -> Avro.decodesingle(message, store; reader_schema=reader,
-                                          limits=datumlimits), 116)
-
+        # the defaults come from the caller's schema, so a thousand of them per row fit tight limits
+        @test length(Avro.decode(writer, datum; reader_schema=reader, limits=datumlimits).added) == 1000
+        @test length(Avro.DatumReader(writer; reader_schema=reader, limits=datumlimits)(datum).added) == 1000
         io = IOBuffer()
-        containerwriter = Avro.Writer(io, writer; block_bytes=1 << 20)
+        containerwriter = Avro.Writer(io, writer)
         push!(containerwriter, (payload=UInt8[],))
-        push!(containerwriter, (payload=zeros(UInt8, 10_000),))
         close(containerwriter)
         container = take!(io)
-        workerror(() -> iterate(Avro.Rows(container; reader_schema=reader,
-                                          limits=containerlimits)), 26)
-        workerror(() -> iterate(Tables.partitions(Avro.Rows(
-            container; reader_schema=reader, limits=containerlimits))), 26)
-        workerror(() -> Tables.columns(Avro.Rows(
-            container; reader_schema=reader, limits=containerlimits)), 26)
+        @test length(first(Avro.Rows(container; reader_schema=reader, limits=containerlimits)).added) == 1000
+        @test length(Avro.Table(container; reader_schema=reader, limits=containerlimits).added[1]) == 1000
         typed = NamedTuple{(:added,),Tuple{Vector{Missing}}}
-        workerror(() -> iterate(Avro.Rows(
-            container; T=typed, reader_schema=reader,
-            limits=containerlimits)), 26)
-        workerror(() -> Avro.Table(container; reader_schema=reader,
-                                  limits=containerlimits, ntasks=1), 26)
-        workerror(() -> Avro.Table(IOBuffer(container); reader_schema=reader,
-                                  limits=containerlimits, ntasks=1), 26)
-        if Threads.nthreads() > 1
-            workerror(() -> Avro.Table(container; reader_schema=reader,
-                                      limits=containerlimits, ntasks=2), 26)
-        end
-        selected = Avro.Rows(container; reader_schema=reader, select=(:added,),
-                             limits=containerlimits)
-        workerror(() -> iterate(selected), 26)
-        unselected = Avro.Rows(container; reader_schema=reader, select=Symbol[],
-                               limits=containerlimits)
-        @test count(Returns(true), unselected) == 2
-        @test length(Avro.Table(container; reader_schema=reader, select=Symbol[],
-                                limits=containerlimits, ntasks=1)) == 2
+        @test length(first(Avro.Rows(container; T=typed, reader_schema=reader, limits=containerlimits)).added) == 1000
+        # many added fields over small rows, under the default limits
+        small = P("""{"type":"record","name":"S","fields":[{"name":"a","type":"boolean"}]}""")
+        added = join(("{\"name\":\"f$i\",\"type\":\"long\",\"default\":$i}" for i in 1:40), ",")
+        grown = P("""{"type":"record","name":"S","fields":[{"name":"a","type":"boolean"},$added]}""")
+        smallrows = take!(Avro.tobuffer([(a=true,) for _ in 1:200_000]; schema=small))
+        @test Avro.Table(smallrows; reader_schema=grown).f40 == fill(40, 200_000)
 
         hugewriter = P("""{"type":"array","items":{"type":"record",
             "name":"HugeDefault","fields":[]}}""")
@@ -694,19 +445,14 @@
             {"name":"d","type":"null","default":null}]}}""")
         hugebytes = vcat(Avro.encode(Avro.LongSchema(), typemax(Int64) - 1),
                          UInt8[0])
-        hugelimits = Avro.Limits(max_block_count=typemax(Int),
-                                 max_total_values=typemax(Int),
-                                 max_values_per_byte=typemax(Int))
         hugeerr = try
-            Avro.decode(hugewriter, hugebytes; reader_schema=hugereader,
-                        limits=hugelimits)
+            Avro.decode(hugewriter, hugebytes; reader_schema=hugereader)
             nothing
         catch caught
             caught
         end
         @test hugeerr isa Avro.LimitError
-        @test hugeerr.limit === :max_total_values
-        @test hugeerr.observed === typemax(Int) # the first default fails before the huge loop
+        @test hugeerr.limit === :max_values_per_byte          # empty records with defaults stop at the cap
     end
     @testset "Java oracle: the everything evolution fixtures" begin
         ev = P(read(joinpath(FIXTURES, "generated", "schemas", "everything.avsc"), String))

@@ -13,14 +13,13 @@ using Dates
 using UUIDs
 using Random: RandomDevice, rand
 using Tables: Tables
+using Base.Checked: checked_add, checked_mul
 import MD5
 import SHA
 import JSON
 
 include("errors.jl")
-include("frozen.jl")
 include("limits.jl")
-include("admission.jl")
 include("values.jl")
 include("names.jl")
 include("jsonreader.jl")
@@ -28,12 +27,10 @@ include("logical.jl")
 include("schema.jl")
 include("canonical.jl")
 include("generic.jl")
-include("storage.jl")
 include("types.jl")
 include("decoder.jl")
 include("encoder.jl")
 include("plan_read.jl")
-include("span.jl")
 include("plan_write.jl")
 include("columns.jl")
 include("resolution.jl")
@@ -54,25 +51,21 @@ if VERSION >= v"1.11.0-DEV.469"
         :AvroError, :DecodeError, :SchemaError, :EncodeError, :ResolutionError, :LimitError, :CodecError,
         :UnsupportedCodecError, :ConversionError, :UnknownSchemaError, :AmbiguousSchemaError,
         :WriterClosedError, :DataError,
-        :Limits, :SymbolAdmission,
-        :Decimal, :WideDecimal, :Timestamp, :LocalTimestamp, :Duration, :truncate, :round,
+        :Limits,
+        :Decimal, :WideDecimal, :Timestamp, :LocalTimestamp, :timestamp, :localtimestamp, :Duration, :truncate, :round,
         :Schema, :parseschema, :json, :canonical, :fingerprint, :parsingequivalent, :fullname, :nodefault,
         :NullSchema, :BooleanSchema, :IntSchema, :LongSchema, :FloatSchema, :DoubleSchema, :BytesSchema, :StringSchema,
         :ArraySchema, :MapSchema, :UnionSchema, :RecordSchema, :EnumSchema, :FixedSchema, :Field,
         :DecimalLogical, :UUIDLogical, :DateLogical, :TimeMillis, :TimeMicros, :TimestampMillis, :TimestampMicros,
-        :TimestampNanos, :LocalTimestampMillis, :LocalTimestampMicros, :LocalTimestampNanos, :DurationLogical, :UnknownLogical, :Map, :Record, :EnumValue, :Fixed, :UnionValue, :ordinal, :juliatype, :valuetypes, :minsize, :schema, :avroname, :avrosymbol, :AvroStyle,
+        :TimestampNanos, :LocalTimestampMillis, :LocalTimestampMicros, :LocalTimestampNanos, :DurationLogical, :UnknownLogical,
+        :Record, :EnumValue, :Fixed, :UnionValue, :ordinal, :juliatype, :valuetypes, :minsize, :schema, :avroname, :avrosymbol, :AvroStyle,
         :DatumReader, :DatumWriter, :encode, :encode!, :decode, :tojson, :fromjson,
-        :SchemaStore, :SchemaCache, :register!, :lookup, :encodesingle, :decodesingle,
+        :SchemaStore, :SchemaCache, :register!, :lookup, :encodesingle, :decodesingle, :SingleObjectReader, :SingleObjectWriter,
         :resolve, :ResolvedSchema, :compare, :comparebytes,
         :Reader, :Writer, :write, :tobuffer, :codecs, :inspect, :InspectReport,
         :metadata, :codec, :sync, :writerschema, :eachblock, :eachdatum,
-        :Table, :Rows, :Row, :record,
+        :Table, :Rows,
         :read, :readtable, :writetable))
-end
-
-function __init__()
-    STORAGE[] = measurestorage()
-    return nothing
 end
 
 "`JSON.json` prints an `Avro.Schema` as its schema JSON (parsing is Avro-owned)."

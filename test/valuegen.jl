@@ -1,5 +1,5 @@
-# Deterministic generators over the closed value set E shared by the compile-cost gate, the
-# storage oracle and other property tests.
+# Deterministic generators over the closed generic value set, shared by the compile-cost gate and other
+# property tests.
 
 "A schema whose generic representation is the value type `T`, or `nothing` when Avro cannot express it."
 function schemafor(::Type{T}) where {T}
@@ -19,24 +19,23 @@ function schemafor(::Type{T}) where {T}
         Avro.LocalTimestamp{Nanosecond} => "{\"type\":\"long\",\"logicalType\":\"local-timestamp-nanos\"}",
         Avro.Duration => "{\"type\":\"fixed\",\"name\":\"Du\",\"size\":12,\"logicalType\":\"duration\"}",
         Avro.Record => "{\"type\":\"record\",\"name\":\"Rec\",\"fields\":[{\"name\":\"f\",\"type\":\"int\"}]}",
-        Avro.UnionValue => "[\"int\",\"string\"]")
+        Any => "[\"int\",\"string\"]")                                       # bare branch values
     haskey(leaves, T) && return leaves[T]
     if T isa Union && Missing <: T
         inner = Base.nonmissingtype(T)
-        inner === Avro.UnionValue && return nothing                          # unions cannot nest
         s = schemafor(inner)
         s === nothing && return nothing
         return "[\"null\",$s]"
     end
     T === Vector{Any} && return "{\"type\":\"array\",\"items\":{\"type\":\"array\",\"items\":\"int\"}}"
-    T === Avro.Map{Any} && return "{\"type\":\"map\",\"values\":{\"type\":\"map\",\"values\":\"int\"}}"
+    T === Dict{String,Any} && return "{\"type\":\"map\",\"values\":{\"type\":\"map\",\"values\":\"int\"}}"
     if T <: Vector
         s = schemafor(eltype(T))
         s === nothing && return nothing
         return "{\"type\":\"array\",\"items\":$s}"
     end
-    if T <: Avro.Map
-        s = schemafor(eltype(T).parameters[2])
+    if T <: Dict{String}
+        s = schemafor(valtype(T))
         s === nothing && return nothing
         return "{\"type\":\"map\",\"values\":$s}"
     end
@@ -54,7 +53,8 @@ function samplevalue(s::Avro.Schema, rng, pick::Int=-1)
         l = s.logical
         l isa Avro.TimeMicros && return Time(2)
         l === nothing && return Int64(2)
-        return Avro.juliatype(s)(5)
+        T = Avro.juliatype(s)
+        return (T <: Avro.Timestamp ? Avro.timestamp : Avro.localtimestamp)(T.parameters[1], 5)
     end
     s isa Avro.FloatSchema && return 1.0f0
     s isa Avro.DoubleSchema && return 1.0
@@ -66,7 +66,7 @@ function samplevalue(s::Avro.Schema, rng, pick::Int=-1)
     end
     s isa Avro.EnumSchema && return Avro.EnumValue(s, 1)
     s isa Avro.ArraySchema && return Any[samplevalue(s.items, rng, p) for p in picks(pick)]
-    s isa Avro.MapSchema && return Avro.Map([(k, samplevalue(s.values, rng, p)) for (k, p) in zip(("k", "j"), picks(pick))])
+    s isa Avro.MapSchema && return Dict{String,Any}(k => samplevalue(s.values, rng, p) for (k, p) in zip(("k", "j"), picks(pick)))
     if s isa Avro.UnionSchema
         n = length(s.branches)
         nb = Avro.nullablebranch(s)

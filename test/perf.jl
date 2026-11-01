@@ -40,7 +40,7 @@
     ratio8 = nothing
     if Sys.CPU_THREADS >= 8
         ratio8 = only(coldmetric("table8"; threads=8))
-        @test ratio8 >= 3                                           # 8 tasks vs 1, 4 GiB limits on both
+        @test ratio8 >= 3                                           # 8 tasks vs 1 under the default limits
     end
     overheads = Dict{String,Float64}()
     for codec in ("zstandard", "deflate", "snappy")
@@ -49,15 +49,13 @@
         @test o <= 1.3                                              # ≤ 1.3 × (null table + isolated transcode)
     end
     projratio = only(coldmetric("projection"))
-    @test projratio >= 2                                            # select=(:id,) under :fast
+    @test projratio >= 2                                            # select=(:id,) vs the full table
     decallocs, dns, ea, ens, onedec, oneenc, parseus, parseallocs = coldmetric("kernels")
     @test decallocs <= 1                                            # prepared typed decode: the string only
     @test dns <= 150
     @test ea == 0                                                   # prepared typed encode: zero allocations
     @test parseus <= 100
-    # A regression bound on parser allocations (2,254 measured on the reference host); far fewer would
-    # need an arena-style parser.
-    @test parseallocs <= 2300
+    @test parseallocs <= 1400                                       # 1,196 measured on the reference host
     tload = only(coldmetric("load"))
     @test tload <= 0.5
     tttft = only(coldmetric("ttft"))

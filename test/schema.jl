@@ -88,28 +88,6 @@
             end
         end
         @test_throws ArgumentError Avro.fingerprint(weather; algorithm=:sha1)
-
-        @testset "fingerprint workspace is reserved before hashing" begin
-            for algorithm in (:md5, :sha256)
-                ample = Avro.Budget(Avro.Limits())
-                digest = Avro.hashfingerprint(UInt8[0x01], algorithm, ample)
-                @test ample.reserved == Base.summarysize(digest)
-                peak = ample.peak
-
-                tight = Avro.Budget(Avro.Limits())
-                err = try
-                    Avro.reserve!(tight, tight.ceiling - peak + 1)
-                    Avro.hashfingerprint(UInt8[0x01], algorithm, tight)
-                    nothing
-                catch e
-                    e
-                end
-                @test err isa Avro.LimitError
-                @test err.limit === :max_total_bytes
-                @test err.observed == tight.ceiling + 1
-                @test err.value == tight.ceiling
-            end
-        end
     end
 
     @testset "printing round trips every fixture schema structurally" begin
@@ -147,9 +125,7 @@
         rec = P("""{"type":"record","name":"LongList","fields":[{"name":"value","type":"long"},{"name":"next","type":["null","LongList"]}]}""")
         @test rec.fields[2].schema.branches[2] === rec
         @test rec == P(Avro.json(rec))
-        equalbudget = Avro.Budget(Avro.Limits())
-        @test Avro.budgetedschemaequal(rec, P(Avro.json(rec)), equalbudget)
-        @test equalbudget.reserved == 0              # equality memo is operation scratch
+        @test Avro.schemaequal(rec, P(Avro.json(rec)))
         @test Avro.canonical(rec) == "{\"name\":\"LongList\",\"type\":\"record\",\"fields\":[{\"name\":\"value\",\"type\":\"long\"},{\"name\":\"next\",\"type\":[\"null\",\"LongList\"]}]}"
         # a bare reference may name a null-namespace type from inside a namespace
         s2 = P("""{"type":"record","name":"R","fields":[{"name":"e","type":{"type":"fixed","name":"F","size":1}},{"name":"n","type":{"type":"record","name":"ns.Inner","fields":[{"name":"f","type":"F"}]}}]}""")
@@ -184,7 +160,7 @@
             {"name":"next","type":["null",{"type":"Node","marker":"reference"}]}]}""")
         @test recursive.fields[1].schema.branches[2] === recursive
         @test recursive.props["marker"] == "definition"
-        @test occursin("\"doc\":\"\\u0064efinition\"", Avro.json(recursive))
+        @test occursin("\"doc\":\"definition\"", Avro.json(recursive))
         @test P(Avro.json(recursive)) == recursive
         @test Avro.decode(recursive, Avro.encode(recursive, (next=missing,))).next === missing
         @test_throws Avro.SchemaError P("""{"type":"record","name":"R","fields":[{"name":"x","type":{"type":"Missing"}}]}""")
@@ -237,12 +213,8 @@
         # an invalid name ending in a multi-byte character is reported with the escaped text (fuzz finding: byte-indexed slicing)
         e = try; Avro.parseschema("{\"type\":\"enum\",\"name\":\"r\",\"symbols\":[\"\u0380\",\"\"]}"); nothing; catch err; err; end
         @test e isa Avro.SchemaError && occursin("invalid enum symbol \"\u0380\"", sprint(showerror, e))
-        @test Avro.escapename("a\u0380") == "a\u0380" && Avro.escapename("") == "" && Avro.escapename("x\"y") == "x\\\"y" && Avro.escapename("t\tb") == "t\\tb"
-        hugediagnosticname = "!"^1_000_000
-        Avro.escapename(hugediagnosticname)
-        GC.gc()
-        @test sizeof(Avro.escapename(hugediagnosticname)) < 256
-        @test @allocated(Avro.escapename(hugediagnosticname)) < 128 * 1024
+        @test Avro.quoted("a\u0380") == "\"a\u0380\"" && Avro.quoted("") == "\"\"" && Avro.quoted("x\"y") == "\"x\\\"y\"" && Avro.quoted("t\tb") == "\"t\\tb\""
+        @test sizeof(Avro.quoted("!"^1_000_000)) < 256                      # diagnostics quote a bounded prefix
         @test_throws Avro.SchemaError P("""{"type":"record","name":"9R","fields":[]}""")
         @test_throws Avro.SchemaError P("""{"type":"record","name":"a-b","fields":[]}""")
         @test_throws Avro.SchemaError P("""{"type":"record","name":"int","fields":[]}""")            # reserved in the null namespace
@@ -384,6 +356,8 @@
             "x", Avro.StringSchema(; logical=Avro.UUIDLogical()); default="bad")
         @test_throws ArgumentError Avro.Field(
             "x", Avro.BytesSchema(; logical=Avro.DecimalLogical(2)); default="d")
+        @test_throws ArgumentError Avro.Field("x", Avro.IntSchema(); default=1im)   # no JSON form
+        @test_throws ArgumentError Avro.IntSchema(; props=(a=1im,))
         @test_throws Avro.SchemaError P("""{"type":"record","name":"R","fields":[{"name":"a","type":"null","default":1}]}""")
         @test P("""{"type":"record","name":"R","fields":[{"name":"a","type":"null","default":null}]}""").fields[1].default.valid
         # invalid defaults are kept verbatim under allow_invalid_defaults
@@ -447,17 +421,13 @@
     end
 
     @testset "limits" begin
-        @test_throws Avro.LimitError P("""{"type":"record","name":"R","fields":[]}"""; limits=Avro.Limits(max_schema_bytes=10))
-        @test_throws Avro.LimitError P("""{"type":"array","items":{"type":"array","items":{"type":"array","items":"int"}}}"""; limits=Avro.Limits(max_schema_depth=2))
-        @test_throws Avro.LimitError P("""{"type":"record","name":"R","fields":[{"name":"a","type":"int"},{"name":"b","type":"int"}]}"""; limits=Avro.Limits(max_fields=1))
-        @test_throws Avro.LimitError P("""["null","int","string"]"""; limits=Avro.Limits(max_union_branches=2))
-        @test_throws Avro.LimitError P("""{"type":"enum","name":"E","symbols":["A","B"]}"""; limits=Avro.Limits(max_enum_symbols=1))
-        @test_throws Avro.LimitError P("""{"type":"record","name":"Rrrrrrrrrr","fields":[]}"""; limits=Avro.Limits(max_name_bytes=5))
-        @test_throws Avro.LimitError P("""{"type":"record","name":"R","fields":[{"name":"a","type":{"type":"fixed","name":"F","size":1}}]}"""; limits=Avro.Limits(max_named_types=1))
-        @test_throws Avro.LimitError P("""{"type":"record","name":"R","fields":[{"name":"a","type":"int"},{"name":"b","type":"int"},{"name":"c","type":"int"}]}"""; limits=Avro.Limits(max_schema_nodes=3))
+        # a schema document is bounded by max_bytes (its size) and max_depth (its nesting)
+        @test_throws Avro.LimitError P("""{"type":"record","name":"R","fields":[]}"""; limits=Avro.Limits(max_bytes=10))
+        @test_throws Avro.LimitError P("""{"type":"array","items":{"type":"array","items":{"type":"array","items":"int"}}}"""; limits=Avro.Limits(max_depth=2))
+        @test P("""{"type":"array","items":{"type":"array","items":{"type":"array","items":"int"}}}"""; limits=Avro.Limits(max_depth=8)) isa Avro.ArraySchema
         # IO sources are read incrementally under the limit
         @test P(IOBuffer("\"int\"")) isa Avro.IntSchema
-        @test_throws Avro.LimitError P(IOBuffer("\"string\""); limits=Avro.Limits(max_schema_bytes=5))
+        @test_throws Avro.LimitError P(IOBuffer("\"string\""); limits=Avro.Limits(max_bytes=5))
         @test P(Vector{UInt8}(codeunits("\"long\""))) isa Avro.LongSchema
         @test P(view(Vector{UInt8}(codeunits("xx\"long\"")), 3:8)) isa Avro.LongSchema
         @test P(SubString("\"float\" ", 1, 7)) isa Avro.FloatSchema
@@ -468,13 +438,13 @@
         names = ["x$i" for i in 5000:-1:1]
         rec = P("{\"type\":\"record\",\"name\":\"W\",\"fields\":[" *
                 join(("{\"name\":\"$n\",\"type\":\"long\"}" for n in names), ",") * "]}")
-        @test length(rec.fields) == 5000 && rec.fieldindex["x1"] == 5000 && rec.fieldindex["x5000"] == 1
+        @test length(rec.fields) == 5000 && rec.fieldindex[:x1] == 5000 && rec.fieldindex[:x5000] == 1
         @test P("{\"type\":\"enum\",\"name\":\"E\",\"symbols\":[" *
                 join(("\"S$i\"" for i in 1000:-1:1), ",") * "]}").symbolindex["S1"] == 1000
         @test length(P("[" * join(("{\"type\":\"record\",\"name\":\"U$i\",\"fields\":[]}" for i in 100:-1:1), ",") * "]").branches) == 100
-        @test Avro.RecordSchema("C"; fields=[Avro.Field(n, Avro.LongSchema()) for n in names]).fieldindex["x1"] == 5000
+        @test Avro.RecordSchema("C"; fields=[Avro.Field(n, Avro.LongSchema()) for n in names]).fieldindex[:x1] == 5000
         @test Avro.EnumSchema("E", ["S$i" for i in 1000:-1:1]).symbolindex["S1"] == 1000
-        @test Avro.schema(Tables.Schema(Symbol.(names), fill(Int64, 5000))).fieldindex["x1"] == 5000
+        @test Avro.schema(Tables.Schema(Symbol.(names), fill(Int64, 5000))).fieldindex[:x1] == 5000
         # duplicates are still reported at their second occurrence
         dup(json) = try P(json); "" catch e; sprint(showerror, e) end
         @test occursin("duplicate field name \"b\" (at \$.fields[2].name)",
@@ -511,12 +481,9 @@
         @test t < 60                                   # quadratic insertion would take hours
     end
 
-    @testset "immutability, identity, equality and hashing on cycles" begin
+    @testset "identity, equality and hashing on cycles" begin
         s = P("""{"type":"record","name":"N","fields":[{"name":"next","type":["null","N"]},{"name":"p","type":"int","k":[1,{"a":2}]}]}""")
-        @test_throws Avro.FrozenError push!(s.fields, s.fields[1])
-        @test_throws Avro.FrozenError push!(s.fields[2].props["k"].items, 3)
-        @test_throws Avro.FrozenError (s.fields[2].props["k"][2].members["b"] = 1)
-        @test_throws Avro.FrozenError push!(s.fields[1].schema.branches, s)
+        @test s.fields[2].props["k"] == Any[1, Dict("a" => 2)]
         t = P(Avro.json(s))
         @test s == t && hash(s) == hash(t) && s !== t
         @test Avro.nodeid(s) == 0 && Avro.graphinfo(s).nodes == 4 && Avro.graphinfo(s).namedtypes == 1
@@ -555,7 +522,7 @@
         @test_throws ArgumentError Avro.IntSchema(; props=(type="x",))
         @test_throws ArgumentError Avro.IntSchema(; logical=Avro.DateLogical(), props=(logicalType="y",))
         @test Avro.NullSchema() == P("\"null\"") && Avro.StringSchema() == P("\"string\"")
-        @test Avro.DoubleSchema(; props=(a=[1, "x"],)).props["a"] == Avro.JSONArray(Avro.FrozenVector{Any}(Any[1, "x"], false))
+        @test Avro.DoubleSchema(; props=(a=[1, "x"],)).props["a"] == Any[1, "x"]
     end
 end
 
@@ -574,7 +541,7 @@ end
     @test Avro.Field("a", Avro.UnionSchema([Avro.NullSchema(), Avro.IntSchema()]); default=nothing).default.branch == 1
     @test Avro.Field("a", Avro.UnionSchema([Avro.NullSchema(), Avro.IntSchema()]); default=missing).default.branch == 1
     @test Avro.Field("a", Avro.UnionSchema([Avro.IntSchema(), Avro.NullSchema()]); default=7).default.branch == 1
-    @test Avro.Field("a", Avro.ArraySchema(Avro.IntSchema()); default=[1, 2]).default.span == "[1,2]"
+    @test Avro.Field("a", Avro.ArraySchema(Avro.IntSchema()); default=[1, 2]).default.json == Any[1, 2]
     @test Avro.Field("a", Avro.MapSchema(Avro.StringSchema()); default=Dict("k" => "v")).default.valid
     @test Avro.Field("a", Avro.DoubleSchema(); default=1.5).default.json == Avro.JSONNumber("1.5")
     e = Avro.EnumSchema("E", ["A", "B"]; namespace="n", default="B", aliases=["Old"], doc="doc")
@@ -607,8 +574,7 @@ end
     end
     @test mutual == P(Avro.json(mutual)) && Avro.graphinfo(mutual).namedtypes == 2
     @test_throws ErrorException Avro.RecordSchema("X") do ref; error("boom"); end
-    @test Avro.builderdepth() == 0
-    # an already-finalised child is deep-copied with fresh ids; the same child twice is one definition
+    # construction still finalises after a failed builder; an already-finalised child is deep-copied with fresh ids; the same child twice is one definition
     pt = Avro.RecordSchema("Point"; fields=[Avro.Field("x", Avro.DoubleSchema())])
     two = Avro.RecordSchema("Seg"; fields=[Avro.Field("a", pt), Avro.Field("b", pt)])
     @test two.fields[1].schema !== pt && two.fields[1].schema === two.fields[2].schema && two == P(Avro.json(two))
@@ -651,97 +617,23 @@ end
     @test_throws Avro.SchemaError Avro.parseschema(legacy_fixed_json)
     @test_throws MethodError Avro.parseschema(legacy_fixed_json; legacy_fixed_names=true)
 
-    @testset "construction scope enforces graph limits" begin
-        parse_limits = Avro.Limits(max_depth=1, max_schema_depth=7)
-        parse_budget = Avro.Budget(parse_limits)
-        parse_ctx = Avro.ParseContext(parse_limits, parse_budget, false, false)
-        expected_parse_state = Avro.vectorbytes(Avro.RecordSchema, parse_limits.max_schema_depth) +
-                               Avro.vectorbytes(Avro.NodeMeta, 16) + 128 +
-                               2 * Avro.nameindexshellbytes(Avro.Schema) +   # the name registry and identities
-                               Avro.vectorbytes(Avro.ParsePathSegment,
-                                                min(parse_limits.max_schema_depth, 16)) +
-                               Avro.shellbytes(Avro.ParsePath)
-        @test parse_budget.reserved == expected_parse_state
-
+    @testset "constructed schemas: branches, copied children, long names" begin
         generated_union = Avro.UnionSchema((Avro.FixedSchema("Generated_$i", 1) for i in 1:5))
-        @test generated_union.branches.cap == length(generated_union.branches) == 5
+        @test length(generated_union.branches) == 5
         child = Avro.RecordSchema("Copied"; fields=[Avro.Field("x", Avro.LongSchema())])
         copied = Avro.ArraySchema(child).items
         @test copied isa Avro.RecordSchema
-        @test copied.fields.cap == length(copied.fields) == 1
-
-        tight = Avro.Limits(max_schema_nodes=1)
-        @test_throws Avro.LimitError Avro.ArraySchema(Avro.LongSchema(); limits=tight)
-        @test_throws Avro.LimitError Avro.NullSchema(; limits=Avro.Limits(max_schema_nodes=0))
-        @test_throws Avro.LimitError Avro.FixedSchema("x"^2000, 4)                       # name bytes
-        @test_throws Avro.LimitError Avro.FixedSchema("F", 4; limits=Avro.Limits(max_named_types=0))
-        @test_throws Avro.LimitError Avro.schema(NamedTuple{(:a,),Tuple{Int64}}; limits=Avro.Limits(max_schema_nodes=1))
-        @test_throws Avro.LimitError Avro.EnumSchema("E", ["a", "b", "c"]; limits=Avro.Limits(max_enum_symbols=2))
-        @test_throws Avro.LimitError Avro.EnumSchema("E", ["ab"]; limits=Avro.Limits(max_name_bytes=1))
-        oversizedsymbol = repeat("a", 2000)
-        symbolerror = try
-            Avro.EnumSchema("E", [oversizedsymbol];
-                            limits=Avro.Limits(max_name_bytes=1))
-            nothing
-        catch err
-            err
-        end
-        @test symbolerror isa Avro.LimitError && symbolerror.limit == :max_name_bytes
-        frozenenum = Avro.EnumSchema("Frozen", ["longsymbol", "other"])
-        childerror = try
-            Avro.ArraySchema(frozenenum;
-                             limits=Avro.Limits(max_name_bytes=2))
-            nothing
-        catch err
-            err
-        end
-        @test childerror isa Avro.LimitError && childerror.limit == :max_name_bytes
-        @test_throws Avro.LimitError Avro.MapSchema(frozenenum;
-                                                   limits=Avro.Limits(max_enum_symbols=1))
-        @test_throws Avro.LimitError Avro.Field("abcde", Avro.IntSchema(); limits=Avro.Limits(max_name_bytes=4))
-        @test_throws Avro.LimitError Avro.Field("a", Avro.IntSchema(); aliases=["abcde"], limits=Avro.Limits(max_name_bytes=4))
-        aliased = Avro.Field("a", Avro.IntSchema(); aliases=["bc"])
-        @test_throws Avro.LimitError Avro.RecordSchema("R"; fields=[aliased], limits=Avro.Limits(max_name_bytes=1))
-        @test_throws Avro.LimitError Avro.RecordSchema("RecursiveDepth"; limits=Avro.Limits(max_schema_depth=1)) do ref
-            return [Avro.Field("next", ref)]
-        end
-        @test_throws Avro.LimitError Avro.RecordSchema("RecursiveValues"; limits=Avro.Limits(max_total_values=1)) do ref
-            return [Avro.Field("next", ref)]
-        end
-        bytebounded = Avro.Limits(max_schema_bytes=1024)
-        @test_throws Avro.LimitError Avro.NullSchema(; props=(large=repeat("a", 2000),), limits=bytebounded)
-        largefield = Avro.Field("x", Avro.StringSchema(); default=repeat("a", 2000))
-        @test_throws Avro.LimitError Avro.RecordSchema("LargeDefault"; fields=[largefield], limits=bytebounded)
-        let s = Avro.LongSchema(), lim = Avro.Limits(max_schema_depth=4)
-            e = try
-                for _ in 1:6
-                    s = Avro.ArraySchema(s; limits=lim)
-                end
-                nothing
-            catch err
-                err
-            end
-            @test e isa Avro.LimitError && e.limit === :max_schema_depth
-        end
+        @test length(copied.fields) == 1
+        @test Avro.FixedSchema("x"^2000, 4) isa Avro.FixedSchema                   # names have no length limit
+        @test Avro.EnumSchema("E", [repeat("a", 2000)]).symbols == [repeat("a", 2000)]
         @test Avro.json(Avro.ArraySchema(Avro.LongSchema())) == "{\"type\":\"array\",\"items\":\"long\"}"
     end
 
-    @testset "bounded charging printers" begin
+    @testset "printers" begin
         s = P("{\"type\":\"record\",\"name\":\"BP\",\"fields\":[{\"name\":\"a\",\"type\":\"long\"},{\"name\":\"b\",\"type\":\"string\"}]}")
-        tiny = Avro.Limits(max_schema_bytes=16)
-        for f in (Avro.json, Avro.canonical, Avro.fingerprint)
-            e = try
-                f(s; limits=tiny)
-                nothing
-            catch err
-                err
-            end
-            @test e isa Avro.LimitError && e.limit === :max_schema_bytes
-        end
-        exactwork = Avro.Limits(work_allowance=0)
-        @test Avro.json(Avro.NullSchema(); limits=exactwork) == "\"null\""
-        @test Avro.canonical(Avro.NullSchema(); limits=exactwork) == "\"null\""
-        @test Avro.json(s) == Avro.json(Avro.parseschema(Avro.json(s)))                  # recorded-limits default round-trips
-        @test occursin("BP", sprint(show, s))                                            # show never throws for admitted schemas
+        @test Avro.json(Avro.NullSchema()) == "\"null\""
+        @test Avro.canonical(Avro.NullSchema()) == "\"null\""
+        @test Avro.json(s) == Avro.json(Avro.parseschema(Avro.json(s)))
+        @test occursin("BP", sprint(show, s))
     end
 end

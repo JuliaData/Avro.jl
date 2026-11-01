@@ -1,7 +1,5 @@
-# Avro-owned JSON reader: an allocation-free lexical pre-scan (size, depth,
-# strict UTF-8, escape syntax, number grammar, literals, bracket balance, trailing content) followed by a
-# recursive-descent parser that builds frozen JSON trees with raw number tokens and WTF-8 strings.
-# JSON.jl is never used for parsing.
+# Avro's own JSON reader: size, BOM and strict UTF-8 are checked first, then one recursive descent builds
+# plain values with raw number tokens and WTF-8 strings. JSON.jl is never used for parsing.
 
 function isws(b::UInt8)
     return b == UInt8(' ') || b == UInt8('\t') || b == UInt8('\n') || b == UInt8('\r')
@@ -15,89 +13,17 @@ function ishex8(b::UInt8)
     return isdigit8(b) || (UInt8('a') <= b <= UInt8('f')) || (UInt8('A') <= b <= UInt8('F'))
 end
 
-"""
-    utf8_valid_length(buf, i, n) -> Int
-
-Length (1–4) of the strictly valid UTF-8 sequence starting at `buf[i]`, or 0 when it is malformed
-(overlong, surrogate code point, above U+10FFFF, truncated, bad continuation).
-"""
-function utf8_valid_length(buf::AbstractVector{UInt8}, i::Int, n::Int)
-    b0 = buf[i]
-    b0 < 0x80 && return 1
-    if 0xC2 <= b0 <= 0xDF
-        i + 1 <= n || return 0
-        return (buf[i + 1] & 0xC0) == 0x80 ? 2 : 0
-    elseif 0xE0 <= b0 <= 0xEF
-        i + 2 <= n || return 0
-        b1 = buf[i + 1]; b2 = buf[i + 2]
-        (b1 & 0xC0) == 0x80 && (b2 & 0xC0) == 0x80 || return 0
-        b0 == 0xE0 && b1 < 0xA0 && return 0          # overlong
-        b0 == 0xED && b1 >= 0xA0 && return 0         # surrogate code point
-        return 3
-    elseif 0xF0 <= b0 <= 0xF4
-        i + 3 <= n || return 0
-        b1 = buf[i + 1]; b2 = buf[i + 2]; b3 = buf[i + 3]
-        (b1 & 0xC0) == 0x80 && (b2 & 0xC0) == 0x80 && (b3 & 0xC0) == 0x80 || return 0
-        b0 == 0xF0 && b1 < 0x90 && return 0          # overlong
-        b0 == 0xF4 && b1 >= 0x90 && return 0         # above U+10FFFF
-        return 4
-    end
-    return 0
-end
-
-"""
-    isstrictutf8(s) -> Bool
-
-Strict UTF-8 validity (no overlongs, no surrogates, nothing above U+10FFFF) of a string or byte vector.
-"""
-function isstrictutf8(buf::AbstractVector{UInt8})
-    i = 1; n = length(buf)
-    while i <= n
-        len = utf8_valid_length(buf, i, n)
-        len == 0 && return false
-        i += len
-    end
-    return true
-end
-
+"Strict UTF-8 validity (Base rejects overlongs, surrogates and anything above U+10FFFF)."
 function isstrictutf8(s::AbstractString)
-    return isstrictutf8(codeunits(s))
+    return isvalid(String, codeunits(s))
 end
 
-function isstrictutf8(symbol::Symbol)
-    n = sizeof(symbol)
-    source = Base.unsafe_convert(Ptr{UInt8}, symbol)
-    i = 1
-    GC.@preserve symbol while i <= n
-        b0 = unsafe_load(source, i)
-        if b0 <= 0x7f
-            i += 1
-        elseif 0xc2 <= b0 <= 0xdf
-            i + 1 <= n || return false
-            (unsafe_load(source, i + 1) & 0xc0) == 0x80 || return false
-            i += 2
-        elseif 0xe0 <= b0 <= 0xef
-            i + 2 <= n || return false
-            b1 = unsafe_load(source, i + 1)
-            b2 = unsafe_load(source, i + 2)
-            (b1 & 0xc0) == 0x80 && (b2 & 0xc0) == 0x80 || return false
-            b0 == 0xe0 && b1 < 0xa0 && return false
-            b0 == 0xed && b1 >= 0xa0 && return false
-            i += 3
-        elseif 0xf0 <= b0 <= 0xf4
-            i + 3 <= n || return false
-            b1 = unsafe_load(source, i + 1)
-            b2 = unsafe_load(source, i + 2)
-            b3 = unsafe_load(source, i + 3)
-            (b1 & 0xc0) == 0x80 && (b2 & 0xc0) == 0x80 && (b3 & 0xc0) == 0x80 || return false
-            b0 == 0xf0 && b1 < 0x90 && return false
-            b0 == 0xf4 && b1 >= 0x90 && return false
-            i += 4
-        else
-            return false
-        end
-    end
-    return true
+function isstrictutf8(bytes::AbstractVector{UInt8})
+    return isvalid(String, bytes)
+end
+
+function isstrictutf8(s::String)
+    return isvalid(s)
 end
 
 const HEX_DIGITS = codeunits("0123456789abcdef")
@@ -113,86 +39,25 @@ function writehexescape(io::IO, value::Integer)
     return nothing
 end
 
-# ---- lexical pre-scan -------------------------------------------------------------------------
-
 """
-    prescan(buf, maxbytes, maxdepth, errfn) -> depth
+    JSONNumber(text)
 
-Validate the byte buffer as one JSON document without allocating: size ≤ `maxbytes`, nesting depth ≤
-`maxdepth`, strict UTF-8 everywhere, escape syntax, number grammar, exact literals, bracket balance, no
-BOM, no raw control characters in strings, no trailing content. `errfn(msg, pos)` must throw the
-appropriate error (`SchemaError`, `DataError`, …). Returns the maximum nesting depth.
+A JSON number token that is not an `Int64` (a fraction, an exponent or an overflowing integer), kept as
+its source text so schemas re-serialise it verbatim. Equality and hashing are lexical.
 """
-function prescan(buf::AbstractVector{UInt8}, maxbytes::Int, maxdepth::Int, errfn;
-                 limitfn=(limit, observed, value) -> errfn("$limit exceeded ($observed > $value)", 0),
-                 bytelimit::Symbol=:max_bytes, depthlimit::Symbol=:max_depth, lenient::Bool=false,
-                 nbytes::Int=length(buf))
-    n = nbytes
-    0 <= n <= length(buf) || throw(ArgumentError("nbytes must be within the input buffer"))
-    n <= maxbytes || limitfn(bytelimit, n, maxbytes)
-    n >= 3 && buf[1] == 0xEF && buf[2] == 0xBB && buf[3] == 0xBF && errfn("a byte-order mark is not allowed", 1)
-    i = 1
-    depth = 0
-    maxseen = 0
-    stack = UInt128(0)        # bracket kinds for depths ≤ 128; deeper levels are checked by the parser
-    nvalues = 0
-    while i <= n
-        b = buf[i]
-        if isws(b)
-            i += 1
-        elseif b == UInt8('{') || b == UInt8('[')
-            depth += 1
-            depth <= maxdepth || limitfn(depthlimit, depth, maxdepth)
-            maxseen = max(maxseen, depth)
-            depth <= 128 && (stack = b == UInt8('{') ? (stack | (UInt128(1) << (depth - 1))) : (stack & ~(UInt128(1) << (depth - 1))))
-            nvalues += 1
-            i += 1
-        elseif b == UInt8('}') || b == UInt8(']')
-            depth >= 1 || errfn("unexpected closing bracket", i)
-            if depth <= 128
-                isobj = (stack >> (depth - 1)) & 1 == 1
-                (b == UInt8('}')) == isobj || errfn("mismatched closing bracket", i)
-            end
-            depth -= 1
-            i += 1
-        elseif b == UInt8('"')
-            next = scanstring(buf, i, n, errfn)
-            after = next
-            while after <= n && isws(buf[after])
-                after += 1
-            end
-            (after <= n && buf[after] == UInt8(':')) || (nvalues += 1)
-            i = next
-        elseif b == UInt8(',') || b == UInt8(':')
-            depth >= 1 || errfn("unexpected '$(Char(b))' outside a container", i)
-            i += 1
-        elseif lenient && (b == UInt8('N') || b == UInt8('I') || (b == UInt8('-') && i < n && buf[i + 1] == UInt8('I')))
-            i = scanliteral(buf, i, n, b == UInt8('N') ? "NaN" : (b == UInt8('I') ? "Infinity" : "-Infinity"), errfn)
-            nvalues += 1
-        elseif b == UInt8('-') || isdigit8(b)
-            i = scannumber(buf, i, n, errfn)
-            nvalues += 1
-        elseif b == UInt8('t')
-            i = scanliteral(buf, i, n, "true", errfn)
-            nvalues += 1
-        elseif b == UInt8('f')
-            i = scanliteral(buf, i, n, "false", errfn)
-            nvalues += 1
-        elseif b == UInt8('n')
-            i = scanliteral(buf, i, n, "null", errfn)
-            nvalues += 1
-        elseif b >= 0x80
-            len = utf8_valid_length(buf, i, n)
-            len == 0 && errfn("invalid UTF-8 sequence", i)
-            errfn("unexpected non-ASCII character outside a string", i)
-        else
-            errfn("unexpected byte 0x$(string(b; base=16, pad=2))", i)
-        end
-    end
-    depth == 0 || errfn("unterminated container (missing closing bracket)", n + 1)
-    nvalues >= 1 || errfn("empty JSON document", 1)
-    return maxseen
+struct JSONNumber
+    text::String
 end
+
+function Base.:(==)(a::JSONNumber, b::JSONNumber)
+    return a.text == b.text
+end
+
+function Base.hash(a::JSONNumber, h::UInt)
+    return hash(a.text, hash(:JSONNumber, h))
+end
+
+# ---- lexical scanners ---
 
 function scanliteral(buf, i, n, lit::String, errfn)
     cu = codeunits(lit)
@@ -228,10 +93,6 @@ function scanstring(buf, i, n, errfn)
             end
         elseif b < 0x20
             errfn("raw control character in string", i)
-        elseif b >= 0x80
-            len = utf8_valid_length(buf, i, n)
-            len == 0 && errfn("invalid UTF-8 sequence in string", i)
-            i += len
         else
             i += 1
         end
@@ -279,32 +140,6 @@ end
 # ---- number conversion ------------------------------------------------------------------------
 
 """
-    parseinteger(token) -> Union{Nothing,Int64}
-
-Checked `Int64` accumulation of an integer token; `nothing` on overflow or when the token has a
-fraction or exponent.
-"""
-function parseinteger(tok::AbstractString)
-    cu = codeunits(tok)
-    isempty(cu) && return nothing
-    neg = cu[1] == UInt8('-')
-    i = neg ? 2 : 1
-    i <= length(cu) || return nothing
-    acc = Int64(0)
-    while i <= length(cu)
-        b = cu[i]
-        isdigit8(b) || return nothing
-        d = Int64(b - UInt8('0'))
-        acc, o1 = Base.Checked.mul_with_overflow(acc, Int64(10))
-        o1 && return nothing
-        acc, o2 = neg ? Base.Checked.sub_with_overflow(acc, d) : Base.Checked.add_with_overflow(acc, d)
-        o2 && return nothing
-        i += 1
-    end
-    return acc
-end
-
-"""
     parsefloat(T, token) -> T
 
 Correctly rounded, linear-time parse of a JSON number token as `Float32` or `Float64` (overflow gives
@@ -313,58 +148,14 @@ Correctly rounded, linear-time parse of a JSON number token as `Float32` or `Flo
 function parsefloat(::Type{T}, tok::AbstractString) where {T<:Union{Float32,Float64}}
     v = T === Float32 ? tryparsefloat32(tok) : tryparse(Float64, tok)
     v === nothing || return v
-    # Julia's parser rejects out-of-range tokens; the pre-scan guarantees the grammar, so classify
-    # overflow (±Inf) versus underflow (±0.0) from the effective decimal exponent.
-    cu = codeunits(tok)
-    (isempty(cu) || scannumber_ok(cu)) || throw(ArgumentError("not a float token: $tok"))
-    neg = cu[1] == UInt8('-')
-    i = neg ? 2 : 1
-    intdigits = 0
-    nonzero = false
-    while i <= length(cu) && isdigit8(cu[i])
-        cu[i] != UInt8('0') && (nonzero = true)
-        nonzero && (intdigits += 1)
-        i += 1
-    end
-    leadingfrac = 0
-    if i <= length(cu) && cu[i] == UInt8('.')
-        i += 1
-        while i <= length(cu) && isdigit8(cu[i])
-            if !nonzero
-                if cu[i] == UInt8('0')
-                    leadingfrac += 1
-                else
-                    nonzero = true
-                end
-            end
-            i += 1
-        end
-    end
-    nonzero || return neg ? -zero(T) : zero(T)
-    expo = 0
-    if i <= length(cu) && (cu[i] == UInt8('e') || cu[i] == UInt8('E'))
-        i += 1
-        eneg = false
-        if i <= length(cu) && (cu[i] == UInt8('+') || cu[i] == UInt8('-'))
-            eneg = cu[i] == UInt8('-')
-            i += 1
-        end
-        while i <= length(cu) && isdigit8(cu[i])
-            expo = min(expo * 10 + Int(cu[i] - UInt8('0')), 1_000_000)
-            i += 1
-        end
-        eneg && (expo = -expo)
-    end
-    effective = intdigits > 0 ? expo + intdigits - 1 : expo - leadingfrac - 1
-    effective >= 0 && return neg ? -T(Inf) : T(Inf)
-    return neg ? -zero(T) : zero(T)
+    # Julia's parser rejects out-of-range tokens; BigFloat keeps their sign and magnitude.
+    return T(BigFloat(tok; precision=256))
 end
 
 function tryparsefloat32(tok::AbstractString)
     @static if Sys.iswindows()
-        # Julia parses Float32 through Float64 on Windows to work around the CRT's incorrect ERANGE.
-        # That route can double-round values. The CRT result is correctly rounded; parsefloat handles
-        # overflow and underflow itself, so it does not depend on ERANGE.
+        # Julia parses Float32 through Float64 on Windows, which can round twice. UCRT's `strtof` rounds
+        # once, and its ±Inf and ±0 for out-of-range tokens equal the BigFloat fallback's results.
         text = tok isa String ? tok : String(tok)
         endpoint = Ref{Ptr{UInt8}}(C_NULL)
         value = GC.@preserve text begin
@@ -377,15 +168,6 @@ function tryparsefloat32(tok::AbstractString)
     else
         return tryparse(Float32, tok)
     end
-end
-
-function scannumber_ok(cu)
-    try
-        scannumber(cu, 1, length(cu), (msg, pos) -> throw(ArgumentError(msg))) == length(cu) + 1 || return false
-    catch
-        return false
-    end
-    return true
 end
 
 # ---- WTF-8 string decoding ---------------------------------------------------------------------
@@ -420,52 +202,15 @@ function writecodepoint!(out::Vector{UInt8}, position::Int, cp::UInt32)
     end
 end
 
-function codepointbytes(cp::UInt32)
-    return cp < 0x80 ? 1 : cp < 0x800 ? 2 : cp < 0x10000 ? 3 : 4
-end
-
-function decodedstringlength(buf::AbstractVector{UInt8}, i::Int, j::Int)
-    length = 0
-    k = i + 1
-    while k < j
-        b = buf[k]
-        if b != UInt8('\\')
-            length = checked_add(length, 1)
-            k += 1
-            continue
-        end
-        e = buf[k + 1]
-        if e != UInt8('u')
-            length = checked_add(length, 1)
-            k += 2
-            continue
-        end
-        cp = hex4(buf, k + 2)
-        k += 6
-        if 0xD800 <= cp <= 0xDBFF && k + 5 < j &&
-           buf[k] == UInt8('\\') && buf[k + 1] == UInt8('u')
-            lo = hex4(buf, k + 2)
-            if 0xDC00 <= lo <= 0xDFFF
-                cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00)
-                k += 6
-            end
-        end
-        length = checked_add(length, codepointbytes(cp))
-    end
-    return length
-end
-
 """
     decodestring(buf, i, j) -> String
 
-Decode the pre-scanned JSON string whose opening quote is at `buf[i]`, returning its WTF-8 form: a high
-surrogate immediately followed by a low surrogate becomes one scalar; any other surrogate code unit is
-kept as its own 3-byte sequence. `j` is the position of the closing quote. Raw
-bytes (already strict UTF-8) are copied as they are.
+Decode the pre-scanned JSON string whose opening quote is at `buf[i]` and closing quote at `buf[j]`,
+returning its WTF-8 form: a high surrogate immediately followed by a low surrogate becomes one scalar;
+any other surrogate code unit is kept as its own 3-byte sequence. Raw bytes (already strict UTF-8) are
+copied as they are.
 """
-function decodestring(buf::AbstractVector{UInt8}, i::Int, j::Int,
-                      budget::Union{Nothing,Budget}=nothing)
-    # fast path: no escapes
+function decodestring(buf::AbstractVector{UInt8}, i::Int, j::Int)
     hasescape = false
     for k in i + 1:j - 1
         if buf[k] == UInt8('\\')
@@ -475,19 +220,9 @@ function decodestring(buf::AbstractVector{UInt8}, i::Int, j::Int,
     end
     if !hasescape
         n = j - i - 1
-        if n == 0
-            budget === nothing || reserve!(budget, stringbytes(0))
-            text = ""
-        else
-            budget === nothing || reserve!(budget, stringbytes(n))
-            text = GC.@preserve buf unsafe_string(pointer(buf, i + 1), n)
-        end
-        return text
+        return n == 0 ? "" : GC.@preserve buf unsafe_string(pointer(buf, i + 1), n)
     end
-    n = decodedstringlength(buf, i, j)
-    scratch = bytesbytes(n)
-    budget === nothing || reserve!(budget, scratch)
-    out = Vector{UInt8}(undef, n)
+    out = Vector{UInt8}(undef, j - i - 1)   # an escape never decodes longer than it is written
     position = 1
     k = i + 1
     while k < j
@@ -518,13 +253,7 @@ function decodestring(buf::AbstractVector{UInt8}, i::Int, j::Int,
             k += 2
         end
     end
-    position == n + 1 || throw(ArgumentError("internal error: decoded JSON string length changed"))
-    text = if budget === nothing
-        String(out)
-    else
-        takeownedstring!(out, budget)
-    end
-    return text
+    return String(resize!(out, position - 1))
 end
 
 """
@@ -533,7 +262,8 @@ end
 Write `s` as a JSON string literal, re-escaping every WTF-8 surrogate sequence as `\\uXXXX` so metadata
 round-trips code-unit-exactly.
 """
-function escapejsoncontents(io::IO, s::AbstractString)
+function escapejson(io::IO, s::AbstractString)
+    print(io, '"')
     cu = codeunits(s)
     n = length(cu)
     i = 1
@@ -556,27 +286,20 @@ function escapejsoncontents(io::IO, s::AbstractString)
             Base.write(io, b); i += 1
         end
     end
-    return nothing
-end
-
-function escapejson(io::IO, s::AbstractString)
-    print(io, '"')
-    escapejsoncontents(io, s)
     print(io, '"')
     return nothing
 end
 
-# ---- recursive descent into frozen trees --------------------------------------------------------
+# ---- recursive descent ---------------------------------------------------------------------------
 
 mutable struct JSONReader{B<:AbstractVector{UInt8}}
     const buf::B
     const n::Int
     const maxdepth::Int
     const errfn::Any
-    const budget::Union{Nothing,Budget}
     pos::Int
     depth::Int
-    const lenient::Bool      # the non-JSON tokens NaN / Infinity / -Infinity (Java's decoder accepts them)
+    const lenient::Bool      # accept the non-JSON tokens NaN / Infinity / -Infinity
 end
 
 function skipws!(r::JSONReader)
@@ -586,28 +309,23 @@ function skipws!(r::JSONReader)
     return nothing
 end
 
-function reservecharge!(r::JSONReader, n::Int)
-    r.budget === nothing || reserve!(r.budget, n)
-    return nothing
-end
-
-function releasecharge!(r::JSONReader, n::Int)
-    r.budget === nothing || release!(r.budget, n)
-    return nothing
-end
-
 """
-    parsejson(buf; maxbytes, maxdepth, errfn, budget=nothing) -> JSON value
+    parsejson(buf; limits=Limits(), errfn, lenient=false) -> value
 
-Pre-scan and parse one JSON document into a frozen tree (objects keep source key order in `order`,
-duplicate keys are errors detected over decoded keys, numbers are raw `JSONNumber` tokens).
+Pre-scan and parse one JSON document into plain values: `nothing`, `Bool`, `Int64`, `JSONNumber` (any
+other number token), `String` (WTF-8), `Vector{Any}` and `JSON.Object{String,Any}` (source key order;
+duplicate keys are an error). `limits.max_bytes` and `limits.max_depth` bound the document (`LimitError`);
+every other defect goes through `errfn(msg, pos)`, which must throw. `lenient` admits the tokens `NaN`,
+`Infinity` and `-Infinity` as `Float64` values.
 """
-function parsejson(buf::AbstractVector{UInt8}; maxbytes::Int, maxdepth::Int, errfn, budget::Union{Nothing,Budget}=nothing,
-                   limitfn=(limit, observed, value) -> errfn("$limit exceeded ($observed > $value)", 0),
-                   bytelimit::Symbol=:max_bytes, depthlimit::Symbol=:max_depth, lenient::Bool=false)
-    prescan(buf, maxbytes, maxdepth, errfn; limitfn=limitfn, bytelimit=bytelimit, depthlimit=depthlimit, lenient=lenient)
-    r = JSONReader(buf, length(buf), maxdepth, errfn, budget, 1, 0, lenient)
+function parsejson(buf::AbstractVector{UInt8}; limits::Limits=Limits(), errfn, lenient::Bool=false)
+    n = length(buf)
+    n <= limits.max_bytes || throw(LimitError(:max_bytes, n, limits.max_bytes))
+    n >= 3 && buf[1] == 0xEF && buf[2] == 0xBB && buf[3] == 0xBF && errfn("a byte-order mark is not allowed", 1)
+    isvalid(String, buf) || errfn("invalid UTF-8 sequence", 1)
+    r = JSONReader(buf, n, limits.max_depth, errfn, 1, 0, lenient)
     skipws!(r)
+    r.pos <= n || errfn("empty JSON document", 1)
     v = parsevalue!(r)
     skipws!(r)
     r.pos <= r.n && errfn("trailing content after the JSON document", r.pos)
@@ -620,7 +338,6 @@ end
 
 function parsevalue!(r::JSONReader)
     r.pos <= r.n || r.errfn("unexpected end of input", r.pos)
-    r.budget === nothing || countvalues!(r.budget)
     b = r.buf[r.pos]
     if b == UInt8('{')
         return parseobject!(r)
@@ -629,28 +346,22 @@ function parsevalue!(r::JSONReader)
     elseif b == UInt8('"')
         return parsestring!(r)
     elseif b == UInt8('t')
-        r.pos += 4; return true
+        r.pos = scanliteral(r.buf, r.pos, r.n, "true", r.errfn); return true
     elseif b == UInt8('f')
-        r.pos += 5; return false
+        r.pos = scanliteral(r.buf, r.pos, r.n, "false", r.errfn); return false
     elseif b == UInt8('n')
-        r.pos += 4; return nothing
+        r.pos = scanliteral(r.buf, r.pos, r.n, "null", r.errfn); return nothing
     elseif r.lenient && (b == UInt8('N') || b == UInt8('I') || (b == UInt8('-') && r.pos < r.n && r.buf[r.pos + 1] == UInt8('I')))
         lit = b == UInt8('N') ? "NaN" : (b == UInt8('I') ? "Infinity" : "-Infinity")
-        r.pos += sizeof(lit)
+        r.pos = scanliteral(r.buf, r.pos, r.n, lit, r.errfn)
         return b == UInt8('N') ? NaN : (b == UInt8('I') ? Inf : -Inf)
     elseif b == UInt8('-') || isdigit8(b)
         start = r.pos
         r.pos = scannumber(r.buf, r.pos, r.n, r.errfn)
-        n = r.pos - start
-        toklen = stringbytes(n)
-        reservecharge!(r, toklen)
         buf = r.buf
-        tok = GC.@preserve buf unsafe_string(pointer(buf, start), n)
-        iv = parseinteger(tok)
-        iv === nothing || (releasecharge!(r, toklen); return iv)   # the token dies with its integer value
-        reservecharge!(r, 32)
-        number = JSONNumber(tok)
-        return number
+        tok = GC.@preserve buf unsafe_string(pointer(buf, start), r.pos - start)
+        iv = tryparse(Int64, tok)
+        return iv === nothing ? JSONNumber(tok) : iv
     else
         r.errfn("unexpected byte 0x$(string(b; base=16, pad=2))", r.pos)
     end
@@ -660,40 +371,28 @@ function parsestring!(r::JSONReader)
     start = r.pos
     j = scanstring(r.buf, r.pos, r.n, r.errfn) - 1   # closing quote
     r.pos = j + 1
-    return decodestring(r.buf, start, j, r.budget)
+    return decodestring(r.buf, start, j)
 end
 
 function enter!(r::JSONReader)
     r.depth += 1
-    r.depth <= r.maxdepth || r.errfn("JSON nesting depth exceeds $(r.maxdepth)", r.pos)
+    r.depth <= r.maxdepth || throw(LimitError(:max_depth, r.depth, r.maxdepth))
     return nothing
-end
-
-function jsonarrayshell()
-    return 64 + 24                                        # the JSONArray box and frozen wrapper
-end
-
-"Store one JSON value in an `Any` slot after reserving any isbits box it creates."
-function pushjsonvalue!(items::BuildBuf{Any}, r::JSONReader, value)
-    box = isbits(value) ? boxbytes(typeof(value)) : 0
-    reservecharge!(r, box)
-    push!(items, r.budget, value)
-    return items
 end
 
 function parsearray!(r::JSONReader)
     enter!(r)
     r.pos += 1
+    items = Any[]
     skipws!(r)
     if r.pos <= r.n && r.buf[r.pos] == UInt8(']')
         r.pos += 1
         r.depth -= 1
-        return EMPTY_JSON_ARRAY
+        return items
     end
-    items = BuildBuf{Any}(r.budget, 4)
     while true
         skipws!(r)
-        pushjsonvalue!(items, r, parsevalue!(r))
+        push!(items, parsevalue!(r))
         skipws!(r)
         r.pos <= r.n || r.errfn("unterminated array", r.pos)
         b = r.buf[r.pos]
@@ -707,14 +406,7 @@ function parsearray!(r::JSONReader)
         end
     end
     r.depth -= 1
-    data = finishbuild!(items, r.budget)
-    reservecharge!(r, jsonarrayshell())
-    a = JSONArray(freeze!(FrozenVector{Any}(data, false)))
-    return a
-end
-
-function jsonobjectshell()
-    return shellbytes(FrozenDict{String,Any}) + 2 * shellbytes(FrozenVector{Any}) + 32
+    return items
 end
 
 function parseobject!(r::JSONReader)
@@ -724,25 +416,22 @@ function parseobject!(r::JSONReader)
     if r.pos <= r.n && r.buf[r.pos] == UInt8('}')
         r.pos += 1
         r.depth -= 1
-        return EMPTY_JSON_OBJECT
+        return JSON.Object{String,Any}()
     end
-    keys = BuildBuf{String}(r.budget, 4)
-    vals = BuildBuf{Any}(r.budget, 4)
-    spans = BuildBuf{JSONMemberSpan}(r.budget, 4)
+    members = Pair{String,Any}[]
+    seen = Set{String}()
     while true
         skipws!(r)
         keystart = r.pos
         (r.pos <= r.n && r.buf[r.pos] == UInt8('"')) || r.errfn("expected a string key", r.pos)
         k = parsestring!(r)
-        keyspan = keystart:r.pos - 1
+        k in seen && r.errfn("duplicate object key $(quoted(k))", keystart)
+        push!(seen, k)
         skipws!(r)
         (r.pos <= r.n && r.buf[r.pos] == UInt8(':')) || r.errfn("expected ':' after object key", r.pos)
         r.pos += 1
         skipws!(r)
-        push!(keys, r.budget, k)
-        vstart = r.pos
-        pushjsonvalue!(vals, r, parsevalue!(r))
-        push!(spans, r.budget, JSONMemberSpan(keyspan, vstart:r.pos - 1))
+        push!(members, k => parsevalue!(r))
         skipws!(r)
         r.pos <= r.n || r.errfn("unterminated object", r.pos)
         b = r.buf[r.pos]
@@ -756,45 +445,5 @@ function parseobject!(r::JSONReader)
         end
     end
     r.depth -= 1
-    return buildobject(r, finishbuild!(keys, r.budget),
-                       finishbuild!(vals, r.budget),
-                       finishbuild!(spans, r.budget))
-end
-
-"""
-    buildobject(r, keys, vals) -> JSONObject
-
-Detect duplicate keys by sorting the decoded keys (no hashing) and build the sorted member dictionary
-plus the source order.
-"""
-function buildobject(r::JSONReader, keys::Vector{String}, vals::Vector{Any},
-                     spans::Vector{JSONMemberSpan})
-    n = length(keys)
-    scratchbytes = vectorbytes(Int32, n) + vectorbytes(Int32, cld(n, 2))
-    reservecharge!(r, scratchbytes)                    # the sort permutation and merge scratch, transient
-    perm = Vector{Int32}(undef, n)
-    scratch = Vector{Int32}(undef, cld(n, 2))
-    mergesort!(perm, scratch, keys)
-    for i in 2:n
-        key = keys[perm[i]]
-        if keymatches(key, keys[perm[i - 1]])
-            r.errfn(diagnosticstring(r.budget, "duplicate object key ",
-                                     boundedquoted(key)), r.pos)
-        end
-    end
-    sortedbytes = vectorbytes(String, n) + vectorbytes(Any, n)
-    reservecharge!(r, sortedbytes)                     # the retained sorted key/value mirrors
-    sortedkeys = Vector{String}(undef, n)
-    sortedvals = Vector{Any}(undef, n)
-    for (i, p) in enumerate(perm)
-        sortedkeys[i] = keys[p]
-        sortedvals[i] = vals[p]
-    end
-    releasecharge!(r, vectorbytes(Any, n))            # sortedvals now owns the only retained value slots
-    releasecharge!(r, scratchbytes)                    # the permutation and scratch die here
-    reservecharge!(r, jsonobjectshell())
-    d = FrozenDict{String,Any}(sortedkeys, sortedvals, false)
-    o = JSONObject(freeze!(d), freeze!(FrozenVector{String}(keys, false)),
-                   freeze!(FrozenVector{JSONMemberSpan}(spans, false)))
-    return o
+    return JSON.Object{String,Any}(members)
 end

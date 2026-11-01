@@ -207,7 +207,7 @@ end
         return all(looseeq(a[k], b[k]) for k in ka)
     end
 
-    function looseeq(a::Avro.Map, b::Avro.Map)
+    function looseeq(a::AbstractDict, b::AbstractDict)
         Set(keys(a)) == Set(keys(b)) || return false
         return all(looseeq(a[k], b[k]) for k in keys(a))
     end
@@ -245,13 +245,9 @@ end
 
     function oraclevalue(s::Avro.UnionSchema, v, j)
         j === nothing && return j
-        i, inner = if v isa Avro.UnionValue
-            (v.index, v.value)
-        else
-            (3 - Avro.nullablebranch(s), v)
-        end
-        branch = s.branches[i]
-        label = Avro.unionlabel(branch)
+        label = only(keys(j))                         # the JSON encoding names the branch
+        branch = s.branches[findfirst(b -> Avro.branchidentitylabel(b) == label, s.branches)]
+        inner = v isa Avro.UnionValue ? v.value : v
         return oraclevalue(branch, inner, j[label])
     end
 
@@ -370,7 +366,7 @@ if metadata.get("interop.suite") != suite or metadata.get("interop.case") != cas
                 jout = javaharnesstext(hd, "ReadWithReader", data, rf)
                 jvals = [Avro.fromjson(rs, line) for line in filter(!isempty, split(jout, '\n'))]
                 resolved = Avro.Rows(data; reader_schema=rs, union_resolution=:java)
-                rvals = Any[Avro.record(row) for row in resolved]
+                rvals = Any[row for row in resolved]
                 close(resolved)
                 @test !isempty(rvals)
                 @test looseeq(rvals, jvals)
@@ -505,7 +501,7 @@ for rec in records:
         compared = Set{Tuple{Symbol,Symbol}}()
         for policy in (:spec, :java)
             resolved = Avro.Rows(data; reader_schema=rs, union_resolution=policy)
-            vals = Any[Avro.record(row) for row in resolved]
+            vals = Any[row for row in resolved]
             close(resolved)
             @test length(vals) == length(rows)
             for (i, value) in enumerate(vals)

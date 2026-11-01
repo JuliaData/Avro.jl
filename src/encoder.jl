@@ -1,106 +1,48 @@
-# Byte-level encoder: a growable buffer grown only by reserved exact-capacity replacement.
+# Byte-level encoder: a growable output buffer with a write position, plus the diagnostic value path
+# that `EncodeError`s report.
 
 const ENCODE_PATH_FIELD = UInt8(1)
 const ENCODE_PATH_INDEX = UInt8(2)
 const ENCODE_PATH_KEY = UInt8(3)
 
-"One allocation-free component in the current value path."
+"One component of the value path being encoded (a record field, an array index or a map key)."
 struct EncodePathSegment
     kind::UInt8
     name::Union{Nothing,AbstractString,Symbol}
     index::Int
 end
 
-const EncodePath = BuildBuf{EncodePathSegment}
-const EMPTY_ENCODE_PATH_SEGMENT = EncodePathSegment(0, nothing, 0)
-
 """
-    Encoder(budget; capacity=256)
+    Encoder(limits=Limits(); capacity=256)
 
-A growable output buffer with a write position. Growth allocates a replacement `Vector{UInt8}` of exact
-capacity after reserving it (old and new storage charged during the copy); never `resize!`/`push!`.
+A growable output buffer with a write position. `values` counts the values encoded since the last
+`reset!`/`take!` (container writers flush blocks on it).
 """
 mutable struct Encoder
     buf::Vector{UInt8}
-    pos::Int          # number of bytes written
-    budget::Budget    # active operation limits and work accounting
-    owner::Budget     # owns the retained buffer allocation (differs during prepared append calls)
+    pos::Int
     depth::Int
-    credited::Int     # bytes already credited to the work rule (the output is the denominator)
+    values::Int
+    const limits::Limits
     expected::Union{Nothing,Schema}
-    path::EncodePath
+    const path::Vector{EncodePathSegment}
 end
 
-function Encoder(budget::Budget; capacity::Int=256)
-    reserve!(budget, bytesbytes(capacity))
-    buf = Vector{UInt8}(undef, capacity)
-    path = EncodePath(budget, min(budget.limits.max_depth, 16))
-    e = Encoder(buf, 0, budget, budget, 0, 0, nothing, path)
-    return e
-end
-
-function encodepathstorage(e::Encoder)
-    return vectorbytes(EncodePathSegment, length(e.path.data)) + shellbytes(EncodePath)
-end
-
-function encoderstorage(e::Encoder)
-    return checked_add(bytesbytes(length(e.buf)), encodepathstorage(e))
+function Encoder(limits::Limits=Limits(); capacity::Int=256)
+    return Encoder(Vector{UInt8}(undef, capacity), 0, 0, 0, limits, nothing, EncodePathSegment[])
 end
 
 function Base.length(e::Encoder)
     return e.pos
 end
 
-function capacity(e::Encoder)
-    return length(e.buf)
-end
-
-"""
-    ensureroom!(e, n)
-
-Make room for `n` more bytes; the replacement capacity is reserved before allocation and the old
-buffer's reservation released after the copy.
-"""
+"Make room for `n` more bytes (growth doubles, in steps of at most 64 MiB)."
 function ensureroom!(e::Encoder, n::Int)
     n >= 0 || throw(ArgumentError("encoder growth must be non-negative"))
-    n > typemax(Int) - e.pos &&
-        throw(limiterror(e.budget, :max_datum_bytes, typemax(Int),
-                         e.budget.limits.max_datum_bytes))
-    need = e.pos + n
+    need = checked_add(e.pos, n)
     need <= length(e.buf) && return nothing
-    doubled = satadd(length(e.buf), length(e.buf))
-    incremented = satadd(length(e.buf), 64 << 20)
-    newcap = max(need, min(doubled, incremented))
-    capacitylimit = satadd(satadd(e.budget.limits.max_datum_bytes,
-                                  e.budget.limits.max_block_bytes), 1 << 20)
-    newcap <= capacitylimit ||
-        throw(LimitError(:max_datum_bytes, newcap, e.budget.limits.max_datum_bytes, :max_datum_bytes, :encode))
-    active = e.budget
-    owner = e.owner
-    newbytes = bytesbytes(newcap)
-    oldbytes = bytesbytes(length(e.buf))
-    activecheckpoint = budgetcheckpoint(active)
-    ownercheckpoint = active === owner ? activecheckpoint : budgetcheckpoint(owner)
-    try
-        active === owner || reserve!(active, newbytes)
-        reserve!(owner, newbytes)
-    catch
-        rollbackreservations!(active, activecheckpoint)
-        active === owner || rollbackreservations!(owner, ownercheckpoint)
-        rethrow()
-    end
-    nb = try
-        value = Vector{UInt8}(undef, newcap)
-        value
-    catch
-        rollbackreservations!(active, activecheckpoint)
-        active === owner || rollbackreservations!(owner, ownercheckpoint)
-        rethrow()
-    end
-    copyto!(nb, 1, e.buf, 1, e.pos)
-    e.buf = nb                                        # the old buffer is unreachable only after the rebind
-    release!(owner, oldbytes)
-    active === owner || release!(active, oldbytes)
+    newcap = max(need, min(satadd(length(e.buf), length(e.buf)), satadd(length(e.buf), 64 * MiB)))
+    resize!(e.buf, newcap)
     return nothing
 end
 
@@ -164,7 +106,7 @@ end
 
 function writeraw!(e::Encoder, bytes::AbstractVector{UInt8}, from::Int=1, n::Int=length(bytes) - from + 1)
     ensureroom!(e, n)
-    copyto!(e.buf, e.pos + 1, bytes, from, n)
+    copyto!(e.buf, e.pos + 1, bytes, firstindex(bytes) + from - 1, n)
     e.pos += n
     return nothing
 end
@@ -176,7 +118,6 @@ Length-prefixed bytes/string (the string's UTF-8 validity is the caller's check)
 """
 function writebytes!(e::Encoder, bytes::AbstractVector{UInt8})
     n = length(bytes)
-    n <= e.budget.limits.max_bytes || throw(LimitError(:max_bytes, n, e.budget.limits.max_bytes, :max_bytes, :encode))
     writelong!(e, Int64(n))
     writeraw!(e, bytes, 1, n)
     return nothing
@@ -184,45 +125,21 @@ end
 
 function writestring!(e::Encoder, s::AbstractString)
     n = sizeof(s)
-    n <= e.budget.limits.max_bytes || throw(LimitError(:max_bytes, n, e.budget.limits.max_bytes, :max_bytes, :encode))
     writelong!(e, Int64(n))
-    writeraw!(e, codeunits(s), 1, n)
-    return nothing
-end
-
-function writesymbol!(e::Encoder, symbol::Symbol)
-    n = sizeof(symbol)
-    n <= e.budget.limits.max_bytes ||
-        throw(LimitError(:max_bytes, n, e.budget.limits.max_bytes, :max_bytes, :encode))
-    writelong!(e, Int64(n))
+    s isa Union{String,SubString{String}} || return writeraw!(e, codeunits(s), 1, n)
     ensureroom!(e, n)
-    source = Base.unsafe_convert(Ptr{UInt8}, symbol)
-    GC.@preserve symbol unsafe_copyto!(pointer(e.buf, e.pos + 1), source, n)
+    buf = e.buf
+    # `copyto!` from `codeunits(s)` would hash the whole string to rule out aliasing.
+    GC.@preserve s buf unsafe_copyto!(pointer(buf, e.pos + 1), pointer(s), n)
     e.pos += n
     return nothing
 end
 
 function writechar!(e::Encoder, char::Char)
     n = ncodeunits(char)
-    n <= e.budget.limits.max_bytes ||
-        throw(LimitError(:max_bytes, n, e.budget.limits.max_bytes, :max_bytes, :encode))
     writelong!(e, Int64(n))
-    value = UInt32(char)
-    if n == 1
-        writebyte!(e, UInt8(value))
-    elseif n == 2
-        writebyte!(e, 0xc0 | UInt8(value >> 6))
-        writebyte!(e, 0x80 | UInt8(value & 0x3f))
-    elseif n == 3
-        writebyte!(e, 0xe0 | UInt8(value >> 12))
-        writebyte!(e, 0x80 | UInt8((value >> 6) & 0x3f))
-        writebyte!(e, 0x80 | UInt8(value & 0x3f))
-    else
-        writebyte!(e, 0xf0 | UInt8(value >> 18))
-        writebyte!(e, 0x80 | UInt8((value >> 12) & 0x3f))
-        writebyte!(e, 0x80 | UInt8((value >> 6) & 0x3f))
-        writebyte!(e, 0x80 | UInt8(value & 0x3f))
-    end
+    ensureroom!(e, n)
+    e.pos = writecodepoint!(e.buf, e.pos + 1, UInt32(char)) - 1
     return nothing
 end
 
@@ -233,36 +150,80 @@ The written bytes as an exactly sized, caller-owned vector; the encoder is reset
 """
 function Base.take!(e::Encoder)
     out = e.buf[1:e.pos]
-    e.pos = 0
-    e.credited = 0
-    e.expected = nothing
-    emptyencodepath!(e)
+    reset!(e)
     return out
+end
+
+function Base.show(io::IO, e::Encoder)
+    return print(io, "Avro.Encoder(", e.pos, " bytes)")
 end
 
 function reset!(e::Encoder)
     e.pos = 0
     e.depth = 0
-    e.credited = 0
+    e.values = 0
     e.expected = nothing
-    emptyencodepath!(e)
+    empty!(e.path)
     return e
 end
 
-function emptyencodepath!(e::Encoder)
-    while e.path.len > 0
-        e.path.data[e.path.len] = EMPTY_ENCODE_PATH_SEGMENT
-        e.path.len -= 1
-    end
+@inline function countvalue!(e::Encoder)
+    e.values += 1
     return nothing
 end
 
 function enter!(e::Encoder)
-    e.depth += 1
-    checkdepth(e.budget, e.depth)
+    depth = e.depth + 1
+    depth <= e.limits.max_depth || throw(LimitError(:max_depth, depth, e.limits.max_depth))
+    e.depth = depth
     return nothing
 end
 
 function leave!(e::Encoder)
-    return (e.depth -= 1; nothing)
+    e.depth -= 1
+    return nothing
+end
+
+# ---- the diagnostic value path -----------------------------------------------------------------------
+
+function pushencodepath!(e::Encoder, kind::UInt8, name::Union{Nothing,AbstractString,Symbol}, index::Int=0)
+    push!(e.path, EncodePathSegment(kind, name, index))
+    return nothing
+end
+
+function popencodepath!(e::Encoder)
+    pop!(e.path)
+    return nothing
+end
+
+const DIAGNOSTIC_NAME_PREFIX_BYTES = 96
+
+"Untrusted text for an error message: truncated to a prefix with an ellipsis when long."
+function diagnostictext(key::Union{AbstractString,Symbol})
+    text = String(key)
+    sizeof(text) <= DIAGNOSTIC_NAME_PREFIX_BYTES && return text
+    return string(text[1:thisind(text, DIAGNOSTIC_NAME_PREFIX_BYTES)], "…")
+end
+
+"Untrusted text for an error message as a quoted, escaped JSON string."
+function quoted(s::Union{AbstractString,Symbol})
+    return sprint(escapejson, diagnostictext(s))
+end
+
+"The JSON-path form (`\$.field[3][\"key\"]`) of the value currently being encoded."
+function formatencodepath(e::Encoder)
+    io = IOBuffer()
+    print(io, '$')
+    for segment in e.path
+        if segment.kind == ENCODE_PATH_FIELD
+            print(io, '.', segment.name::String)
+        elseif segment.kind == ENCODE_PATH_INDEX
+            print(io, '[', segment.index, ']')
+        else
+            print(io, '[')
+            escapejson(io, diagnostictext(segment.name::Union{AbstractString,Symbol}))
+            print(io, ']')
+        end
+    end
+    return String(take!(io))
 end

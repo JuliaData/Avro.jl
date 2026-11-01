@@ -35,7 +35,8 @@ end
 
 @testset "Value set E and the compile-cost gate" begin
     E = Avro.valuetypes()
-    @test length(E) == length(unique(E)) && Avro.Record in E && Vector{Any} in E && Union{Missing,Avro.Map{Int32}} in E
+    @test length(E) == length(unique(E)) && Avro.Record in E && Vector{Any} in E && Union{Missing,Dict{String,Int32}} in E
+    @test Any in E && Dict{String,Any} in E && !(Avro.UnionValue in E)          # unions decode to bare branch values
     rng = Random.Xoshiro(7)
     # warm-up: one schema per expressible member of E, both union choices at every level, through the
     # generic, column and JSON paths
@@ -52,14 +53,11 @@ end
             bytes = Avro.encode(s, v)
             @test typeof(Avro.decode(s, bytes)) <: T
             rb = Avro.encode(rec, (c=v,))
-            Avro.withbudget(Avro.Limits()) do budget
-                Avro.addinput!(budget, length(rb))
-                d = Avro.Decoder(rb, budget)
-                cols = Avro.columnbuilders(plan, nothing, 1, budget)
-                Avro.decoderow!(cols, d)
-                col = Avro.finishcolumn!(cols[1], budget)
-                @test eltype(col) === T && length(col) == 1
-            end
+            d = Avro.Decoder(rb)
+            cols = Avro.columnbuilders(plan, nothing, 1)
+            Avro.decoderow!(cols, d)
+            col = Avro.finishcolumn!(cols[1])
+            @test eltype(col) === T && length(col) == 1
             Avro.fromjson(s, Avro.tojson(s, v))
         end
         warmed += 1
@@ -84,13 +82,10 @@ end
         Avro.decode(s, bytes)
         plan = Avro.readplan(s)
         if plan isa Avro.RecordPlan
-            Avro.withbudget(Avro.Limits()) do budget
-                Avro.addinput!(budget, length(bytes))
-                d = Avro.Decoder(bytes, budget)
-                cols = Avro.columnbuilders(plan, nothing, 1, budget)
-                Avro.decoderow!(cols, d)
-                foreach(c -> c isa Avro.TypedColumn && Avro.finishcolumn!(c, budget), cols)
-            end
+            d = Avro.Decoder(bytes)
+            cols = Avro.columnbuilders(plan, nothing, 1)
+            Avro.decoderow!(cols, d)
+            foreach(c -> c isa Avro.TypedColumn && Avro.finishcolumn!(c), cols)
         end
         Avro.fromjson(s, Avro.tojson(s, v))
         return nothing

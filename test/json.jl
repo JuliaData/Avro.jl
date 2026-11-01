@@ -4,11 +4,11 @@
     end
 
     function parse(s; kw...)
-        return Avro.parsejson(s; maxbytes=1 << 20, maxdepth=64, errfn=err, kw...)
+        return Avro.parsejson(s; limits=Avro.Limits(max_depth=64), errfn=err, kw...)
     end
+    JSONObject = Avro.JSON.Object{String,Any}
 
     @testset "pre-scan validates syntax, UTF-8, escapes, numbers, depth, size" begin
-        @test Avro.prescan(Vector{UInt8}(codeunits("{\"a\":[1,2.5e3,true,null,\"x\"]}")), 1 << 20, 64, err) == 2
         @test_throws Avro.DataError parse("")
         @test_throws Avro.DataError parse("   ")
         @test_throws Avro.DataError parse("\xEF\xBB\xBF{}")                 # BOM
@@ -49,8 +49,6 @@
         @test parse("9223372036854775808") == Avro.JSONNumber("9223372036854775808")   # overflow stays a raw token
         @test parse("1.0") == Avro.JSONNumber("1.0") && parse("1e0") == Avro.JSONNumber("1e0") && parse("-0.0") == Avro.JSONNumber("-0.0")
         @test parse("1.0") != parse("1e0")     # lexical equality of raw tokens
-        @test Avro.parseinteger("123") == 123 && Avro.parseinteger("-5") == -5 && Avro.parseinteger("1.0") === nothing
-        @test Avro.parseinteger("99999999999999999999") === nothing && Avro.parseinteger("") === nothing && Avro.parseinteger("-") === nothing
         @test Avro.parsefloat(Float32, "1.000000059604644775390625827180612553027674871408692069962853565812110900878906") === reinterpret(Float32, 0x3f800001)
         @test Float32(Avro.parsefloat(Float64, "1.000000059604644775390625827180612553027674871408692069962853565812110900878906")) === reinterpret(Float32, 0x3f800000)
         @test Avro.parsefloat(Float32, "1e100") == Inf32 && Avro.parsefloat(Float32, "-1e100") == -Inf32
@@ -61,23 +59,22 @@
         @test Avro.parsefloat(Float64, "1." * "0"^2000) == 1.0
         @test_throws ArgumentError Avro.parsefloat(Float64, "abc")
         # depth and size limits
-        @test_throws Avro.DataError Avro.parsejson("[[[1]]]"; maxbytes=1 << 20, maxdepth=2, errfn=err)
-        @test Avro.parsejson("[[[1]]]"; maxbytes=1 << 20, maxdepth=3, errfn=err) isa Avro.JSONArray
-        @test_throws Avro.DataError Avro.parsejson("[1]"; maxbytes=2, errfn=err, maxdepth=64)
+        @test_throws Avro.LimitError Avro.parsejson("[[[1]]]"; limits=Avro.Limits(max_depth=2), errfn=err)
+        @test Avro.parsejson("[[[1]]]"; limits=Avro.Limits(max_depth=3), errfn=err) isa Vector{Any}
+        @test_throws Avro.LimitError Avro.parsejson("[1]"; limits=Avro.Limits(max_bytes=2), errfn=err)
         deep = "["^200 * "]"^200
-        @test_throws Avro.DataError Avro.parsejson(deep; maxbytes=1 << 20, maxdepth=199, errfn=err)
-        @test Avro.parsejson(deep; maxbytes=1 << 20, maxdepth=200, errfn=err) isa Avro.JSONArray
+        @test_throws Avro.LimitError Avro.parsejson(deep; limits=Avro.Limits(max_depth=199), errfn=err)
+        @test Avro.parsejson(deep; limits=Avro.Limits(max_depth=200), errfn=err) isa Vector{Any}
         @test_throws Avro.DataError parse("[" * "{"^3 * "]" * "}"^3)     # mismatched deep brackets
     end
 
-    @testset "trees: objects keep source order, sorted members, duplicates rejected over decoded keys" begin
+    @testset "trees: objects keep source order, duplicates rejected over decoded keys" begin
         o = parse("{\"b\":1,\"a\":[true,null,\"s\"],\"c\":{\"z\":-2}}")
-        @test o isa Avro.JSONObject
+        @test o isa JSONObject
         @test collect(keys(o)) == ["b", "a", "c"]
-        @test o.members.keys == ["a", "b", "c"]
-        @test o["b"] == 1 && o["a"] isa Avro.JSONArray && o["a"][1] === true && o["a"][2] === nothing && o["a"][3] == "s"
+        @test o["b"] == 1 && o["a"] isa Vector{Any} && o["a"][1] === true && o["a"][2] === nothing && o["a"][3] == "s"
         @test o["c"]["z"] == -2 && haskey(o, "c") && !haskey(o, "zz") && get(o, "zz", :d) === :d
-        @test parse("{}") isa Avro.JSONObject && length(parse("{}")) == 0 && parse("[]") isa Avro.JSONArray && length(parse("[]")) == 0
+        @test parse("{}") isa JSONObject && length(parse("{}")) == 0 && parse("[]") isa Vector{Any} && length(parse("[]")) == 0
         @test_throws Avro.DataError parse("{\"a\":1,\"a\":2}")
         @test_throws Avro.DataError parse("{\"type\":1,\"\\u0074ype\":2}")   # decoded-key equality
         longkey = "k"^100_000
@@ -89,9 +86,7 @@
             caught
         end
         @test duplicateerror isa Avro.DataError
-        @test sizeof(duplicateerror.msg) < 256
-        @test occursin("+99904 bytes", duplicateerror.msg)
-        @test Avro.isfrozen(o.members) && Avro.isfrozen(o.order) && Avro.isfrozen(o["a"].items)
+        @test sizeof(duplicateerror.msg) < 256                 # the message does not carry the whole key
     end
 
     @testset "WTF-8 string decoding and re-escaping" begin
@@ -116,20 +111,6 @@
         @test !Avro.isstrictutf8(lone) && Avro.isstrictutf8("aé😀") && !Avro.isstrictutf8(Vector{UInt8}([0xc0, 0xaf]))
     end
 
-    @testset "budget charging" begin
-        l = Avro.Limits()
-        b = Avro.Budget(l)
-        Avro.addinput!(b, 100)
-        parse("{\"k\":[1,2,3],\"s\":\"abc\"}"; budget=b)
-        @test b.reserved > 0
-        tiny = Avro.Budget(Avro.Limits(max_total_bytes=256 << 20))
-        Avro.reserve!(tiny, tiny.ceiling - 10)
-        @test_throws Avro.LimitError parse("[" * join(fill("\"xxxxxxxxxx\"", 100), ",") * "]"; budget=tiny)
-        bc = Avro.Budget(Avro.Limits(work_allowance=0))
-        Avro.addinput!(bc, 1)
-        wide = "{" * join(["\"k$(i)\":$i" for i in 1:200], ",") * "}"
-        @test_throws Avro.LimitError parse(wide; budget=bc)
-    end
 
     @testset "JSON.json overload" begin
         import JSON

@@ -25,7 +25,7 @@
     @test occursin("`atomic=false`, the destination is opened in place", flatcontainer)
     @test occursin("failure can leave it truncated or containing complete blocks plus a partial final block", flatcontainer)
     @test occursin("does not sync the directory", flatcontainer)
-    @test occursin("Avro.Rows(\"old.avro\"; legacy=:avrojl1, decimal_byteorder=:little)", container)
+    @test occursin("Avro.Rows(\"old.avro\"; legacy=:avrojl1)", container)    # legacy=:avrojl1 reads 1.x little-endian decimals
     @test occursin("reports header and framing issues", flatcontainer)
     @test occursin("diagnoses payload count mismatches and avro.jl 1.x null-codec padding", flatcontainer)
     @test occursin("cannot infer decimal byte order", flatcontainer)
@@ -39,7 +39,7 @@
     @test !occursin("complete implementation of the avro specification", lowercase(changelog))
     @test !occursin("every logical type", lowercase(logical))
     @test occursin("big-decimal", logical) && occursin("deferred", logical)
-    @test occursin("Avro.Rows(\"old.avro\"; legacy=:avrojl1, decimal_byteorder=:little)", readme)
+    @test occursin("Avro.Rows(\"old.avro\"; legacy=:avrojl1)", readme)
     @test occursin("reports header and framing issues", flatreadme)
     @test occursin("diagnoses legacy null-codec padding", flatreadme)
     @test occursin("does not infer decimal byte order", flatreadme)

@@ -1,6 +1,6 @@
 # Precompile workload: schema parse/print/canonical/fingerprint, prepared and one-shot
 # encode/decode, container round trips over the built-in codecs, Table (with a projection), Rows,
-# single-object, and the JSON encoding. Budget: ≤ 15 s precompile, ≤ 0.5 s load.
+# single-object, and the JSON encoding.
 
 using PrecompileTools: @setup_workload, @compile_workload
 
@@ -35,10 +35,11 @@ end
         for c in (:null, :deflate, :zstandard, :snappy)
             Tables.columntable(Table(tobuffer(prows; schema=s, codec=c)))
             for row in Rows(tobuffer(prows; schema=s, codec=c))
-                row isa Row
+                row isa Record
             end
         end
         Tables.columntable(Table(tobuffer(prows; schema=s); select=(:id,)))
+        Tables.columntable(Table(tobuffer(prows)))           # the schema derived from the rows
         schema(typeof(prows[1]))
     end
 end

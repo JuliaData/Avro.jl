@@ -1,39 +1,50 @@
-# Byte-level decoder: every read is bounds-checked against an explicit end position with
-# checked arithmetic; every length/count is validated before allocation; failures are `DataError`s with
-# the byte position.
+# Byte-level decoder: bounds-checked reads against an explicit end position; every length and count is
+# validated against the remaining input before anything is allocated; malformed input is a `DataError`
+# carrying the byte position.
 
 """
-    Decoder(buf, pos, stop, budget; validate=:strict)
+    Decoder(buf, limits=Limits(); pos=1, stop=length(buf))
 
 A cursor over a contiguous byte buffer: `pos` is the next byte to read and `stop` the last valid byte
-(inclusive). `budget` is the operation's `Budget`; `validate` is `:strict` or `:fast`.
+(inclusive). `values` counts the values decoded from the current scope (one container block or one
+standalone datum) against `valuecap(limits, stop - pos + 1)`.
 """
 mutable struct Decoder{B<:AbstractVector{UInt8}}
-    buf::B                  # non-const: prepared readers reuse the decoder across calls
+    buf::B
     pos::Int
     stop::Int
     depth::Int
-    const budget::Budget
-    const validate::Symbol
-    start::Int              # reusable allocation-free encoded-span cursor state
-    const limits::Limits
-    datummax::Int
-    values0::Int
-    inputmax::Int
     values::Int
-    blind::Bool
-    scopevalues::Int
-    datumlimitactive::Bool  # the current stop is a static max_datum_bytes boundary
-    blockvalues0::Int       # operation value count before the active block, or -1
-    blockinput0::Int        # operation input count before the active block, or -1
+    valuecap::Int
+    const limits::Limits
 end
 
-function Decoder(buf::AbstractVector{UInt8}, budget::Budget; pos::Int=1, stop::Int=length(buf), validate::Symbol=:strict)
-    validate in (:strict, :fast) || throw(ArgumentError("validate must be :strict or :fast"))
-    1 <= pos <= stop + 1 || throw(ArgumentError("decoder position out of range"))
-    stop <= length(buf) || throw(ArgumentError("decoder stop out of range"))
-    return Decoder{typeof(buf)}(buf, pos, stop, 0, budget, validate, pos,
-                                budget.limits, 0, 0, 0, 0, false, 0, false, -1, -1)
+function Decoder(buf::AbstractVector{UInt8}, limits::Limits=Limits(); pos::Int=1, stop::Int=length(buf))
+    Base.require_one_based_indexing(buf)
+    1 <= pos <= stop + 1 || throw(ArgumentError("decoder position $pos out of range"))
+    stop <= length(buf) || throw(ArgumentError("decoder stop $stop out of range"))
+    return Decoder{typeof(buf)}(buf, pos, stop, 0, 0, valuecap(limits, stop - pos + 1), limits)
+end
+
+# A `Decoder` indexes from 1 under `@inbounds` and views strings in place, so it takes one-based contiguous
+# bytes; other arrays are copied.
+function onebased(bytes::AbstractVector{UInt8})
+    bytes isa Union{DenseVector{UInt8},Base.FastContiguousSubArray{UInt8,1,<:DenseArray}} &&
+        !Base.has_offset_axes(bytes) && return bytes
+    return copyto!(Vector{UInt8}(undef, length(bytes)), bytes)
+end
+
+"Rebind a decoder to a new scope: a buffer window, zero depth and value count, a fresh value cap."
+function reset!(d::Decoder{B}, buf::B, pos::Int, stop::Int=length(buf)) where {B}
+    1 <= pos <= stop + 1 || throw(ArgumentError("decoder position $pos out of range"))
+    stop <= length(buf) || throw(ArgumentError("decoder stop $stop out of range"))
+    d.buf = buf
+    d.pos = pos
+    d.stop = stop
+    d.depth = 0
+    d.values = 0
+    d.valuecap = valuecap(d.limits, stop - pos + 1)
+    return d
 end
 
 function remaining(d::Decoder)
@@ -44,21 +55,44 @@ function dataerror(d::Decoder, msg::AbstractString)
     throw(DataError(msg, d.pos))
 end
 
+@noinline function valuesexceeded(d::Decoder)
+    throw(LimitError(:max_values_per_byte, d.values, d.valuecap))
+end
+
+"Count one decoded value against the scope's value cap."
+@inline function countvalue!(d::Decoder)
+    v = d.values + 1
+    d.values = v
+    v > d.valuecap && valuesexceeded(d)
+    return nothing
+end
+
+@inline function countvalues!(d::Decoder, n::Int)
+    v = satadd(d.values, n)
+    d.values = v
+    v > d.valuecap && valuesexceeded(d)
+    return nothing
+end
+
+function enter!(d::Decoder)
+    depth = d.depth + 1
+    depth <= d.limits.max_depth || throw(LimitError(:max_depth, depth, d.limits.max_depth))
+    d.depth = depth
+    return nothing
+end
+
+function leave!(d::Decoder)
+    d.depth -= 1
+    return nothing
+end
+
 @inline function bytesavailable(d::Decoder, n::Int)
     n >= 0 || throw(ArgumentError("required byte count must be non-negative"))
-    required = n > typemax(Int) - d.pos + 1 ? typemax(Int) : d.pos + n - 1
-    required <= d.stop && return true
-    observed = required > typemax(Int) - d.start + 1 ?
-        typemax(Int) : required - d.start + 1
-    if d.datumlimitactive && observed > d.limits.max_datum_bytes
-        throw(LimitError(:max_datum_bytes, observed, d.limits.max_datum_bytes,
-                         :max_datum_bytes, :decode))
-    end
-    return false
+    return n <= d.stop - d.pos + 1
 end
 
 @inline function readbyte(d::Decoder)
-    bytesavailable(d, 1) || dataerror(d, "unexpected end of data")
+    d.pos <= d.stop || dataerror(d, "unexpected end of data")
     @inbounds b = d.buf[d.pos]
     d.pos += 1
     return b
@@ -145,22 +179,19 @@ function readdouble(d::Decoder)
 end
 
 """
-    readlen(d, max) -> Int
+    readlen(d) -> Int
 
-A non-negative length not exceeding `max` nor the remaining bytes.
+A non-negative length that does not exceed the remaining bytes.
 """
-function readlen(d::Decoder, max::Int, limit::Symbol)
+function readlen(d::Decoder)
     n = readlong(d)
     n >= 0 || dataerror(d, "negative length $n")
-    n <= max || throw(LimitError(limit, Int(n), max, limit, :decode))
-    bytesavailable(d, Int(n)) ||
-        dataerror(d, "length $n exceeds the remaining $(remaining(d)) bytes")
+    bytesavailable(d, Int(n)) || dataerror(d, "length $n exceeds the remaining $(remaining(d)) bytes")
     return Int(n)
 end
 
 function readbytes(d::Decoder)
-    n = readlen(d, d.budget.limits.max_bytes, :max_bytes)
-    reserve!(d.budget, bytesbytes(n))
+    n = readlen(d)
     out = Vector{UInt8}(undef, n)
     copyto!(out, 1, d.buf, d.pos, n)
     d.pos += n
@@ -173,63 +204,31 @@ end
 A length-prefixed string validated as strict UTF-8 (`DataError` otherwise).
 """
 function readstring(d::Decoder)
-    n = readlen(d, d.budget.limits.max_bytes, :max_bytes)
+    n = readlen(d)
     p = d.pos
     validutf8(d.buf, p, p + n - 1) || dataerror(d, "invalid UTF-8 in string")
-    if n == 0
-        reserve!(d.budget, stringbytes(0))
-        s = ""
-    else
-        s = ownedsubstring(d.buf, p, n, d.budget)
-    end
+    s = n == 0 ? "" : substring(d.buf, p, n)
     d.pos = p + n
     return s
 end
 
 function validutf8(buf::AbstractVector{UInt8}, from::Int, to::Int)
-    i = from
-    while i <= to
-        len = utf8_valid_length(buf, i, to)
-        len == 0 && return false
-        i += len
-    end
-    return true
+    return isvalid(String, view(buf, from:to))
 end
 
-function ownedsubstring(buf::AbstractVector{UInt8}, p::Int, n::Int, budget::Budget)
-    peak = bytesbytes(n) + stringbytes(0)
-    reserve!(budget, peak)
+"The `n` bytes at `p` as a new `String` (one copy; a pointer path for contiguous memory)."
+function substring(buf::AbstractVector{UInt8}, p::Int, n::Int)
     bytes = Vector{UInt8}(undef, n)
     copyto!(bytes, 1, buf, p, n)
-    text = String(bytes)
-    release!(budget, bytesbytes(0))
-    return text
+    return String(bytes)
 end
 
-function ownedsubstring(buf::Vector{UInt8}, p::Int, n::Int, budget::Budget)
-    charge = stringbytes(n)
-    reserve!(budget, charge)
-    text = unsafe_string(pointer(buf, p), n)
-    return text
-end
-
-function ownedsubstring(buf::SubArray{UInt8,1}, p::Int, n::Int, budget::Budget)
-    if !Base.iscontiguous(buf)
-        return invoke(ownedsubstring,
-                      Tuple{AbstractVector{UInt8},Int,Int,Budget},
-                      buf, p, n, budget)
-    end
-    charge = stringbytes(n)
-    reserve!(budget, charge)
-    text = GC.@preserve buf unsafe_string(pointer(buf, p), n)
-    return text
+function substring(buf::Union{Vector{UInt8},Base.FastContiguousSubArray{UInt8,1,<:DenseArray}}, p::Int, n::Int)
+    return GC.@preserve buf unsafe_string(pointer(buf, p), n)
 end
 
 function readfixed(d::Decoder, n::Int)
-    checkvaluebytes(d.budget, n)
-    bytesavailable(d, n) ||
-        dataerror(d, "fixed of $n bytes exceeds the remaining $(remaining(d)) bytes")
-    reserve!(d.budget, bytesbytes(n))
+    bytesavailable(d, n) || dataerror(d, "fixed of $n bytes exceeds the remaining $(remaining(d)) bytes")
     out = Vector{UInt8}(undef, n)
     copyto!(out, 1, d.buf, d.pos, n)
     d.pos += n
@@ -237,9 +236,13 @@ function readfixed(d::Decoder, n::Int)
 end
 
 function skipfixed(d::Decoder, n::Int)
-    checkvaluebytes(d.budget, n)
-    bytesavailable(d, n) ||
-        dataerror(d, "fixed of $n bytes exceeds the remaining $(remaining(d)) bytes")
+    bytesavailable(d, n) || dataerror(d, "fixed of $n bytes exceeds the remaining $(remaining(d)) bytes")
+    d.pos += n
+    return nothing
+end
+
+function skiplen(d::Decoder)
+    n = readlen(d)
     d.pos += n
     return nothing
 end
@@ -264,26 +267,15 @@ size (`size == -1` when absent). `typemin(Int64)` is rejected (negation overflow
 """
 function readblockcount(d::Decoder)
     c = readlong(d)
-    c >= 0 && (c <= d.budget.limits.max_block_count || throw(LimitError(:max_block_count, Int(c), d.budget.limits.max_block_count, :max_block_count, :decode)); return (Int(c), -1))
+    c >= 0 && return (Int(c), -1)
     c == typemin(Int64) && dataerror(d, "block count typemin(Int64)")
-    c = -c
-    c <= d.budget.limits.max_block_count || throw(LimitError(:max_block_count, Int(c), d.budget.limits.max_block_count, :max_block_count, :decode))
-    size = readlen(d, d.budget.limits.max_datum_bytes, :max_datum_bytes)
-    return (Int(c), size)
+    return (Int(-c), readlen(d))
 end
 
-function enter!(d::Decoder)
-    d.depth += 1
-    checkdepth(d.budget, d.depth)
-    return nothing
-end
-
-function leave!(d::Decoder)
-    return (d.depth -= 1; nothing)
-end
-
-function skiplen(d::Decoder)
-    n = readlen(d, d.budget.limits.max_bytes, :max_bytes)
-    d.pos += n
+"Reject a declared item count that the remaining bytes cannot hold (`minsize` bytes per item)."
+function checkcount(d::Decoder, count::Int, minsize::Int)
+    minsize <= 0 && return nothing
+    minsize == INFINITE && count > 0 && dataerror(d, "block declares $count items of a schema with no finite datum")
+    count <= remaining(d) ÷ minsize || dataerror(d, "block declares $count items but only $(remaining(d)) bytes remain")
     return nothing
 end

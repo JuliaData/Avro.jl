@@ -39,13 +39,6 @@
         f = "{\"type\":\"fixed\",\"name\":\"F\",\"size\":2}"
         @test tj(f, UInt8[0xc3, 0xa9]) == "\"\u00c3\u00a9\"" && fj(f, "\"\u00c3\u00a9\"") == Avro.Fixed(P(f), UInt8[0xc3, 0xa9])
         @test_throws Avro.DataError fj(f, "\"abc\"")
-        fixedat = Avro.Limits(max_bytes=2, max_datum_bytes=16)
-        fixedover = Avro.Limits(max_bytes=1, max_datum_bytes=16)
-        @test tj(f, UInt8[0xc3, 0xa9]; limits=fixedat) == "\"Ã©\""
-        @test fj(f, "\"Ã©\""; limits=fixedat) ==
-              Avro.Fixed(P(f), UInt8[0xc3, 0xa9])
-        @test_throws Avro.LimitError tj(f, UInt8[0xc3, 0xa9]; limits=fixedover)
-        @test_throws Avro.LimitError fj(f, "\"Ã©\""; limits=fixedover)
         @test tj("\"string\"", "héllo\n") == "\"héllo\\n\"" && fj("\"string\"", "\"h\\u00e9llo\\n\"") == "héllo\n"
         @test_throws Avro.DataError fj("\"string\"", "\"\\ud800\"")             # lone surrogate
         @test_throws Avro.DataError fj("\"string\"", "1")
@@ -58,7 +51,8 @@
         @test_throws Avro.DataError fj(arr, "{}")
         mp = "{\"type\":\"map\",\"values\":\"long\"}"
         @test tj(mp, Dict("b" => 1, "a" => 2)) in ("{\"a\":2,\"b\":1}", "{\"b\":1,\"a\":2}")
-        @test fj(mp, "{\"b\":1,\"a\":2}") == Avro.Map{Int64}([("a", 2), ("b", 1)]) && tj(mp, Avro.Map([("x", 1)])) == "{\"x\":1}"
+        @test fj(mp, "{\"b\":1,\"a\":2}") isa Dict{String,Int64} && fj(mp, "{\"b\":1,\"a\":2}") == Dict("a" => 2, "b" => 1)
+        @test tj(mp, Dict("x" => 1)) == "{\"x\":1}"
         @test_throws Avro.DataError fj(mp, "{\"a\":1,\"a\":2}")                   # duplicate keys
         @test_throws Avro.DataError fj(mp, "[]")
         r = "{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"a\",\"type\":\"int\"},{\"name\":\"b\",\"type\":[\"null\",\"string\"]}]}"
@@ -75,13 +69,13 @@
         @test fj(r, "{\"a\":1,\"b\":{\"null\":null}}").b === missing
         u = "[\"int\",{\"type\":\"record\",\"name\":\"ns.Rec\",\"fields\":[]},{\"type\":\"fixed\",\"name\":\"Fx\",\"size\":1},\"null\"]"
         @test tj(u, Int32(1)) == "{\"int\":1}" && tj(u, Avro.UnionValue(4, missing)) == "null" && tj(u, Avro.Record(P(u).branches[2], [])) == "{\"ns.Rec\":{}}"
-        @test fj(u, "{\"ns.Rec\":{}}") == Avro.UnionValue(2, Avro.Record(P(u).branches[2], [])) && fj(u, "{\"Fx\":\"a\"}") == Avro.UnionValue(3, Avro.Fixed(P(u).branches[3], UInt8[0x61]))
-        @test isequal(fj(u, "null"), Avro.UnionValue(4, missing))
+        @test fj(u, "{\"ns.Rec\":{}}") == Avro.Record(P(u).branches[2], []) && fj(u, "{\"Fx\":\"a\"}") == Avro.Fixed(P(u).branches[3], UInt8[0x61])
+        @test fj(u, "{\"int\":1}") === Int32(1) && fj(u, "null") === missing           # bare branch values
         @test_throws Avro.DataError fj("[\"int\",\"string\"]", "null")
         amb = "[{\"type\":\"record\",\"name\":\"map\",\"fields\":[]},{\"type\":\"map\",\"values\":\"int\"}]"
         @test_throws Avro.EncodeError tj(amb, Avro.Record(P(amb).branches[1], []))
         @test_throws Avro.DataError fj(amb, "{\"map\":{}}")
-        @test_throws Avro.EncodeError tj(amb, Avro.UnionValue(2, Avro.Map([("k", 1)])))
+        @test_throws Avro.EncodeError tj(amb, Avro.UnionValue(2, Dict("k" => 1)))
     end
 
     @testset "logical types" begin
@@ -91,8 +85,8 @@
         @test tj("{\"type\":\"long\",\"logicalType\":\"time-micros\"}", Time(0, 0, 0, 0, 1)) == "1" && fj("{\"type\":\"long\",\"logicalType\":\"time-micros\"}", "1") == Time(0, 0, 0, 0, 1)
         @test_throws Avro.DataError fj("{\"type\":\"long\",\"logicalType\":\"time-micros\"}", "-1")
         ts = "{\"type\":\"long\",\"logicalType\":\"timestamp-micros\"}"
-        @test tj(ts, DateTime(1970, 1, 1, 0, 0, 1)) == "1000000" && fj(ts, "1000000") == Avro.Timestamp{Microsecond}(1_000_000)
-        @test fj("{\"type\":\"long\",\"logicalType\":\"local-timestamp-nanos\"}", "-1") == Avro.LocalTimestamp{Nanosecond}(-1)
+        @test tj(ts, DateTime(1970, 1, 1, 0, 0, 1)) == "1000000" && fj(ts, "1000000") == Avro.timestamp(Microsecond, 1_000_000)
+        @test fj("{\"type\":\"long\",\"logicalType\":\"local-timestamp-nanos\"}", "-1") == Avro.localtimestamp(Nanosecond, -1)
         db = "{\"type\":\"bytes\",\"logicalType\":\"decimal\",\"precision\":5,\"scale\":2}"
         @test tj(db, Avro.Decimal(-129, 2)) == "\"\u00ff\u007f\"" && fj(db, "\"\u00ff\u007f\"") == Avro.Decimal(-129, 2)
         @test_throws Avro.DataError fj(db, "\"\"")
@@ -111,19 +105,13 @@
         hostilebytes = 1_000_000
         hostile = repeat("x", hostilebytes)
         quotedhostile = string('"', hostile, '"')
-        hostilelimits = Avro.Limits(max_bytes=hostilebytes,
-                                    max_datum_bytes=hostilebytes + 10)
-        uuidfailure = () -> try
-            Avro.fromjson(P(us), quotedhostile; limits=hostilelimits)
+        uuiderror = try
+            Avro.fromjson(P(us), quotedhostile)
         catch err
             err
         end
-        uuidfailure()
-        uuiderror = uuidfailure()
         @test uuiderror isa Avro.DataError
-        @test sizeof(uuiderror.msg) < 256
-        @test occursin("999904 bytes", uuiderror.msg)
-        @test @allocated(uuidfailure()) < 3 * hostilebytes
+        @test sizeof(uuiderror.msg) < 256                 # the message does not carry the hostile text
         hostilecases = (
             (P("{\"type\":\"enum\",\"name\":\"HostileEnum\",\"symbols\":[\"A\"]}"),
              quotedhostile, (;)),
@@ -133,14 +121,12 @@
         )
         for (hostileschema, hostilejson, options) in hostilecases
             err = try
-                Avro.fromjson(hostileschema, hostilejson;
-                              limits=hostilelimits, options...)
+                Avro.fromjson(hostileschema, hostilejson; options...)
             catch caught
                 caught
             end
             @test err isa Avro.DataError
             @test sizeof(err.msg) < 256
-            @test occursin("999904 bytes", err.msg)
         end
 
         uf = "{\"type\":\"fixed\",\"name\":\"U\",\"size\":16,\"logicalType\":\"uuid\"}"
@@ -148,115 +134,6 @@
         dur = "{\"type\":\"fixed\",\"name\":\"Du\",\"size\":12,\"logicalType\":\"duration\"}"
         x = Avro.Duration(UInt32(1), UInt32(2), UInt32(3))
         @test tj(dur, x) == "\"\\u0001\\u0000\\u0000\\u0000\\u0002\\u0000\\u0000\\u0000\\u0003\\u0000\\u0000\\u0000\"" && fj(dur, tj(dur, x)) == x
-
-        budget = Avro.Budget(Avro.Limits())
-        sink = Avro.BoundedWriter(budget, 1024; limit=:max_datum_bytes)
-        for printer in (Avro.printuuidstring, Avro.printuuidbytestring)
-            printer(sink, id)
-            sink.len = 0
-            @test @allocated(printer(sink, id)) == 0
-            sink.len = 0
-        end
-        Avro.printdurationbytestring(sink, x)
-        sink.len = 0
-        @test @allocated(Avro.printdurationbytestring(sink, x)) == 0
-    end
-
-    @testset "JSON conversion ownership" begin
-        function parsedjson(text::String, budget::Avro.Budget)
-            bytes = Vector{UInt8}(codeunits(text))
-            Avro.addinput!(budget, length(bytes))
-            errfn = (msg, pos) -> throw(Avro.DataError(msg, pos))
-            limitfn = (limit, observed, value) -> throw(Avro.LimitError(limit, observed, value, limit, :decode))
-            return Avro.parsejson(bytes; maxbytes=budget.limits.max_datum_bytes,
-                                  maxdepth=budget.limits.max_json_depth, errfn=errfn,
-                                  budget=budget, limitfn=limitfn,
-                                  bytelimit=:max_datum_bytes, depthlimit=:max_json_depth)
-        end
-
-        stringbudget = Avro.Budget(Avro.Limits())
-        parsedstring = parsedjson("\"x\"", stringbudget)
-        parsedcharge = stringbudget.reserved
-        convertedstring = Avro.jsontovalue(P("\"string\""), parsedstring,
-                                            Avro.JSONContext(stringbudget, false, false), 1)
-        @test convertedstring === parsedstring
-        @test stringbudget.reserved == parsedcharge
-
-        cases = (
-            ("{\"type\":\"bytes\",\"logicalType\":\"decimal\",\"precision\":5}", "\"\\u0001\"", 1),
-            ("{\"type\":\"fixed\",\"name\":\"OwnedUuid\",\"size\":16,\"logicalType\":\"uuid\"}",
-             "\"" * "\\u0000"^16 * "\"", 16),
-            ("{\"type\":\"fixed\",\"name\":\"OwnedDuration\",\"size\":12,\"logicalType\":\"duration\"}",
-             "\"" * "\\u0000"^12 * "\"", 12),
-        )
-        for (itemschema, itemjson, payloadbytes) in cases
-            schema = P("{\"type\":\"array\",\"items\":" * itemschema * "}")
-            text = "[" * join(fill(itemjson, 8), ",") * "]"
-            budget = Avro.Budget(Avro.Limits())
-            parsed = parsedjson(text, budget)
-            before = budget.reserved
-            value = Avro.jsontovalue(schema, parsed, Avro.JSONContext(budget, false, false), 1)
-            @test length(value) == 8
-            @test budget.reserved - before == Avro.vectorbytes(Avro.elementtype(schema.items), 8)
-
-            tight = Avro.Budget(Avro.Limits())
-            tightparsed = parsedjson(text, tight)
-            finalbytes = Avro.vectorbytes(Avro.elementtype(schema.items), 8)
-            needed = finalbytes + Avro.bytesbytes(payloadbytes)
-            filler = tight.ceiling - tight.reserved - needed
-            Avro.reserve!(tight, filler)
-            tightvalue = Avro.jsontovalue(schema, tightparsed,
-                                           Avro.JSONContext(tight, false, false), 1)
-            @test length(tightvalue) == 8
-            @test tight.reserved == tight.ceiling - Avro.bytesbytes(payloadbytes)
-        end
-
-        for annotation in ("", ",\"logicalType\":\"future-type\"")
-            fixedschema = P("{\"type\":\"fixed\",\"name\":\"OwnedFixed\",\"size\":1" * annotation * "}")
-            fixedbudget = Avro.Budget(Avro.Limits())
-            fixedparsed = parsedjson("\"x\"", fixedbudget)
-            fixedbefore = fixedbudget.reserved
-            fixedvalue = Avro.jsontovalue(fixedschema, fixedparsed,
-                                          Avro.JSONContext(fixedbudget, false, false), 1)
-            @test fixedvalue.bytes == UInt8['x']
-            @test fixedbudget.reserved - fixedbefore == Avro.fixedbytes(1)
-
-            tight = Avro.Budget(Avro.Limits())
-            parsed = parsedjson("\"x\"", tight)
-            Avro.reserve!(tight, tight.ceiling - tight.reserved - Avro.fixedbytes(1) + 1)
-            @test_throws Avro.LimitError Avro.jsontovalue(
-                fixedschema, parsed, Avro.JSONContext(tight, false, false), 1)
-        end
-    end
-
-    @testset "string limits across JSON, binary and resolved defaults" begin
-        cases = (
-            ("\"string\"", "\"abc\"", 3),
-            ("\"string\"", "\"\\u00e9\"", 2),
-            ("{\"type\":\"string\",\"logicalType\":\"future-type\"}", "\"abc\"", 3),
-            ("{\"type\":\"string\",\"logicalType\":\"uuid\"}",
-             "\"123e4567-e89b-12d3-a456-426614174000\"", 36),
-            ("{\"type\":\"map\",\"values\":\"null\"}", "{\"abc\":null}", 3),
-            ("{\"type\":\"map\",\"values\":\"null\"}", "{\"\\u00e9\":null}", 2),
-        )
-        writer = P("{\"type\":\"record\",\"name\":\"BoundedDefault\",\"fields\":[]}")
-        for (schematext, text, nbytes) in cases
-            schema = P(schematext)
-            at = Avro.Limits(max_bytes=nbytes, max_datum_bytes=256)
-            over = Avro.Limits(max_bytes=nbytes - 1, max_datum_bytes=256)
-            value = Avro.fromjson(schema, text; limits=at)
-            bytes = Avro.encode(schema, value; limits=at)
-            @test isequal(Avro.decode(schema, bytes; limits=at), value)
-            @test_throws Avro.LimitError Avro.fromjson(schema, text; limits=over)
-            @test_throws Avro.LimitError Avro.decode(schema, bytes; limits=over)
-
-            reader = P("{\"type\":\"record\",\"name\":\"BoundedDefault\",\"fields\":[" *
-                       "{\"name\":\"value\",\"type\":" * schematext * ",\"default\":" * text * "}]}")
-            prepared = Avro.DatumReader(writer; reader_schema=reader, limits=at)
-            @test isequal(prepared(UInt8[]).value, value)
-            @test_throws Avro.LimitError Avro.DatumReader(
-                writer; reader_schema=reader, limits=over)(UInt8[])
-        end
     end
 
     @testset "pretty printing, limits, typed targets, fixtures" begin
@@ -265,38 +142,18 @@
         @test pretty == "{\n  \"a\": [\n    1\n  ],\n  \"m\": {\n    \"k\": 2\n  },\n  \"u\": {\n    \"int\": 3\n  }\n}"
         @test tj(r, (a=Int[], m=Dict{String,Int}(), u=missing); pretty=true) == "{\n  \"a\": [],\n  \"m\": {},\n  \"u\": null\n}"
         @test fj(r, pretty) == fj(r, tj(r, (a=[1], m=Dict("k" => 2), u=3)))
-        # output bound, value bound, depth bound
-        @test_throws Avro.LimitError tj("\"string\"", "x"^100; limits=Avro.Limits(max_datum_bytes=50, max_bytes=200))
-        jsonwork = P("{\"type\":\"record\",\"name\":\"JSONWork\",\"fields\":[{\"name\":\"averylongname\",\"type\":\"null\"}]}")
-        jsonvalue = (averylongname=missing,)
-        jsonworklimits = Avro.Limits(work_allowance=0,
-                                     max_values_per_byte=1)
-        @test Avro.tojson(jsonwork, jsonvalue;
-                          limits=jsonworklimits) == "{\"averylongname\":null}"
-        jsoncomparelimits = Avro.Limits(work_allowance=2,
-                                        max_values_per_byte=1)
-        @test Avro.tojson(jsonwork, jsonvalue;
-                          limits=jsoncomparelimits) == "{\"averylongname\":null}"
-        @test Avro.tojson(Avro.DoubleSchema(), 0.0;
-                          limits=Avro.Limits(max_bytes=3,
-                                             max_datum_bytes=3,
-                                             work_allowance=100)) == "0.0"
-        @test_throws Avro.LimitError tj("{\"type\":\"array\",\"items\":\"null\"}", fill(missing, 100); limits=Avro.Limits(max_total_values=50))
-        @test_throws Avro.LimitError fj("{\"type\":\"array\",\"items\":\"null\"}", "[" * "null,"^99 * "null]"; limits=Avro.Limits(max_total_values=50))
-        @test fj("[\"int\",\"string\"]", "{\"int\":0}"; limits=Avro.Limits(max_total_values=4)) == Avro.UnionValue(1, Int32(0))
-        @test_throws Avro.LimitError fj("[\"int\",\"string\"]", "{\"int\":0}"; limits=Avro.Limits(max_total_values=3))
-        @test fj("[\"null\",\"int\"]", "null"; limits=Avro.Limits(max_total_values=3)) === missing
-        @test_throws Avro.LimitError fj("[\"null\",\"int\"]", "null"; limits=Avro.Limits(max_total_values=2))
-        @test_throws Avro.LimitError fj("\"string\"", "\"" * "x"^100 * "\""; limits=Avro.Limits(max_datum_bytes=50, max_bytes=200))
-        unionzero = Avro.Limits(max_depth=0)
-        @test fj("[\"int\",\"string\"]", "{\"int\":1}";
-                 limits=unionzero) == Avro.UnionValue(1, Int32(1))
-        @test tj("[\"int\",\"string\"]", Avro.UnionValue(1, Int32(1));
-                 limits=unionzero) == "{\"int\":1}"
+        # the JSON text is a document: max_bytes bounds its size, max_depth its nesting
+        @test Avro.tojson(P("{\"type\":\"record\",\"name\":\"JSONWork\",\"fields\":[{\"name\":\"averylongname\",\"type\":\"null\"}]}"),
+                          (averylongname=missing,)) == "{\"averylongname\":null}"
+        @test Avro.tojson(Avro.DoubleSchema(), 0.0) == "0.0"
+        @test fj("[\"int\",\"string\"]", "{\"int\":0}") === Int32(0)
+        @test fj("[\"null\",\"int\"]", "null") === missing
+        @test_throws Avro.LimitError fj("\"string\"", "\"" * "x"^100 * "\""; limits=Avro.Limits(max_bytes=50))
+        @test fj("\"string\"", "\"" * "x"^100 * "\""; limits=Avro.Limits(max_bytes=102)) == "x"^100
+        @test fj("[\"int\",\"string\"]", "{\"int\":1}"; limits=Avro.Limits(max_depth=1)) === Int32(1)
+        @test tj("[\"int\",\"string\"]", Avro.UnionValue(1, Int32(1))) == "{\"int\":1}"
         unionrecord = "[{\"type\":\"record\",\"name\":\"UnionRecord\",\"fields\":[]},\"null\"]"
-        unionrecordlimits = Avro.Limits(max_depth=1)
-        @test fj(unionrecord, "{\"UnionRecord\":{}}";
-                 limits=unionrecordlimits) ==
+        @test fj(unionrecord, "{\"UnionRecord\":{}}"; limits=Avro.Limits(max_depth=2)) ==
               Avro.Record(P(unionrecord).branches[1], Any[])
         deep = P("{\"type\":\"record\",\"name\":\"D\",\"fields\":[{\"name\":\"n\",\"type\":[\"null\",\"D\"]}]}")
         function nest(k)
@@ -306,24 +163,20 @@
             end
             return v
         end
-        lim = Avro.Limits(max_depth=2000, max_json_depth=1024)
-        text = Avro.tojson(deep, nest(510); limits=lim)            # 511 records + 511 union wrappers = 1022 levels
-        @test isequal(Avro.fromjson(deep, text; limits=lim), nest(510))
+        text = Avro.tojson(deep, nest(510))                       # 511 records + 511 union wrappers = 1022 levels
+        @test isequal(Avro.fromjson(deep, text), nest(510))       # within the default max_depth of 1024
         @test isequal(Avro.fromjson(deep, "{\"n\":null}";
                                     limits=Avro.Limits(max_depth=1)), nest(0))
         @test_throws Avro.LimitError Avro.fromjson(
             deep, "{\"n\":{\"D\":{\"n\":null}}}";
             limits=Avro.Limits(max_depth=1))
-        @test_throws Avro.LimitError Avro.tojson(deep, nest(512); limits=lim)
-        @test_throws Avro.LimitError Avro.fromjson(deep, "{\"n\":{\"D\":"^600 * "null" * "}}"^600; limits=lim)
+        @test_throws Avro.LimitError Avro.fromjson(deep, "{\"n\":{\"D\":"^600 * "null" * "}}"^600)
         @test_throws Avro.DataError fj("\"int\"", "1 2")
         @test_throws Avro.DataError fj("\"int\"", "")
         @test fj("\"int\"", IOBuffer("7")) === Int32(7) && fj("\"int\"", Vector{UInt8}("7")) === Int32(7)
-        # typed targets go through the semantic route with admission
+        # typed targets go through the semantic route
         rr = P("{\"type\":\"record\",\"name\":\"T\",\"fields\":[{\"name\":\"a\",\"type\":\"long\"},{\"name\":\"s\",\"type\":\"string\"}]}")
         @test Avro.fromjson(rr, "{\"a\":1,\"s\":\"q\"}", NamedTuple{(:a, :s),Tuple{Int,Symbol}}) == (a=1, s=:q)
-        @test_throws Avro.LimitError Avro.fromjson(rr, "{\"a\":1,\"s\":\"q\"}", NamedTuple{(:a, :s),Tuple{Int,Symbol}}; names=Avro.SymbolAdmission(max_names=0))
-        @test Avro.fromjson(rr, "{\"a\":1,\"s\":\"q\"}", NamedTuple{(:a, :s),Tuple{Int,Symbol}}; names=nothing) == (a=1, s=:q)
         @test Avro.fromjson(rr, "{\"a\":1,\"s\":\"q\"}", Avro.Record).a == 1 && Avro.fromjson(rr, "{\"a\":1,\"s\":\"q\"}", Any).s == "q"
         @test_throws Avro.ConversionError Avro.fromjson(rr, "{\"a\":1,\"s\":\"q\"}", Int)
         # Apache fixtures: weather records printed like Java's tojson
@@ -344,7 +197,7 @@
                 isempty(strip(line)) && continue
                 v = Avro.fromjson(s, line)
                 @test isequal(Avro.fromjson(s, Avro.tojson(s, v)), v)
-                @test Avro.encode(s, Avro.fromjson(s, Avro.tojson(s, v))) == Avro.encode(s, v)
+                @test isequal(Avro.fromjson(s, Avro.tojson(s, v)), Avro.decode(s, Avro.encode(s, v)))   # maps are Dicts: compare values, not byte order
                 n += 1
             end
         end
@@ -357,14 +210,17 @@
             {"name":"v","type":["int","null"],"default":3},
             {"name":"w","type":["string",{"type":"record","name":"In","fields":[{"name":"x","type":"int","default":7},{"name":"y","type":["null","In"],"default":null}]}],"default":{"x":1}},
             {"name":"f","type":"float","default":"NaN"}]}""")
-        b = Avro.Budget(Avro.Limits())
-        Avro.addinput!(b, 1 << 20)
-        d = Dict(f.name => Avro.jsonvalue(f.schema, f.default.json, b) for f in s.fields)
-        @test d["u"] === missing && d["v"] === Int32(3)
-        @test isequal(d["w"], Avro.UnionValue(2, Avro.Record(s.fields[3].schema.branches[2], [1, missing])))
-        @test isnan(d["f"])
+        # the defaults materialise when a reader adds every field to an empty writer record
+        d = Avro.decode(P("""{"type":"record","name":"R","fields":[]}"""), UInt8[]; reader_schema=s)
+        @test d.u === missing && d.v === Int32(3)
         inner = s.fields[3].schema.branches[2]
-        @test isequal(Avro.jsonvalue(inner, Avro.parsejson("{}"; maxbytes=100, maxdepth=10, errfn=(m, p) -> error(m)), b), Avro.Record(inner, [7, missing]))
-        @test_throws Avro.DataError Avro.jsonvalue(inner, Avro.parsejson("{\"x\":\"no\"}"; maxbytes=100, maxdepth=10, errfn=(m, p) -> error(m)), b)
+        @test isequal(d.w, Avro.Record(inner, [1, missing]))             # a bare union value, the omitted y defaulted
+        @test isnan(d.f)
+        emptyinner = P("""{"type":"record","name":"R","fields":[{"name":"inner","default":{},"type":
+            {"type":"record","name":"In","fields":[{"name":"x","type":"int","default":7},{"name":"y","type":["null","In"],"default":null}]}}]}""")
+        @test isequal(Avro.decode(P("""{"type":"record","name":"R","fields":[]}"""), UInt8[]; reader_schema=emptyinner).inner,
+                      Avro.Record(emptyinner.fields[1].schema, [7, missing]))
+        @test_throws Avro.SchemaError P("""{"type":"record","name":"R","fields":[{"name":"inner","default":{"x":"no"},"type":
+            {"type":"record","name":"In","fields":[{"name":"x","type":"int","default":7}]}}]}""")
     end
 end

@@ -2,7 +2,7 @@
     @test Avro.read !== Base.read
 
     leg = joinpath(@__DIR__, "fixtures", "generated", "legacy1x", "avrojl112-null.avro")
-    t = @test_deprecated Avro.readtable(leg; decimal_byteorder=:little)   # a real 1.1.2 file
+    t = @test_deprecated Avro.readtable(leg)                              # a real 1.1.2 file, little-endian decimals included
     @test t isa Avro.Table && length(t) == 2
     @test Tables.getcolumn(t, :a) == [1, 2] && Tables.getcolumn(t, :b) == ["x", "yy"]
     @test Tables.getcolumn(t, :dec) == [Avro.Decimal(12345, 2), Avro.Decimal(-123, 2)]

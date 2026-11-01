@@ -98,12 +98,9 @@ end
     @test hugetypeerror isa ArgumentError
     @test occursin("Avro maps have string keys", hugetypeerror.msg)
     @test sizeof(hugetypeerror.msg) < 512
-    hugetypefailure()
-    GC.gc(true)
-    @test @allocated(hugetypefailure()) < 512 * 1024
     @test J(Vector{Int64}) == "{\"type\":\"array\",\"items\":\"long\"}"
     @test J(Dict{String,Vector{UUID}}) == "{\"type\":\"map\",\"values\":{\"type\":\"array\",\"items\":{\"type\":\"string\",\"logicalType\":\"uuid\"}}}"
-    @test J(Avro.Map{Float64}) == "{\"type\":\"map\",\"values\":\"double\"}"
+    @test J(Dict{String,Float64}) == "{\"type\":\"map\",\"values\":\"double\"}"
     @test J(Dict{Symbol,Int32}) == "{\"type\":\"map\",\"values\":\"int\"}"
     # enums
     @test J(T.Color) == "{\"type\":\"enum\",\"name\":\"Color\",\"namespace\":\"$ns\",\"symbols\":[\"RED\",\"GREEN\",\"BLUE\"]}"
@@ -113,18 +110,7 @@ end
     push!(enumexpr.args, longenumsymbol)
     Core.eval(T, enumexpr)
     BoundedEnum = getfield(T, :BoundedEnum)
-    enumlimits = Avro.Limits(max_name_bytes=128)
-    function enumfailure()
-        try
-            Avro.schema(BoundedEnum; limits=enumlimits)
-            return nothing
-        catch err
-            return err
-        end
-    end
-    @test enumfailure() isa Avro.LimitError
-    GC.gc(true)
-    @test @allocated(enumfailure()) < sizeof(longenumsymbol)
+    @test Avro.schema(BoundedEnum).symbols == [String(longenumsymbol)]          # names have no length limit
     # structs, parametric names, nesting, defaults and tags
     pt = Avro.schema(T.Pt)
     @test Avro.fullname(pt) == "$ns.Pt" && [f.name for f in pt.fields] == ["x", "y", "tags", "when"]
@@ -136,17 +122,6 @@ end
     @test Avro.sanitize("a-b--c") == "a_b_c" && Avro.sanitize("9x") == "_9x" && Avro.sanitize("__") == "_" && Avro.sanitize("") == "_"
     longname = Avro.avroname(NTuple{40,T.Box{Int64}})[1]
     @test sizeof(longname) == 100 + 1 + 16 && longname[101] == '_' && all(c -> c in "0123456789abcdef", longname[102:end])
-    namebudget = Avro.Budget(Avro.Limits(); direction=:encode)
-    namectx = Avro.derivecontext(Avro.Limits(), namebudget, 0)
-    for namedtype in (T.Box{Int64}, T.Box{T.Box{Int64}},
-                      Dict{String,Vector{Int64}}, NTuple{40,T.Box{Int64}})
-        before = namebudget.reserved
-        internal = Avro.defaultderivedname(namectx, namedtype)
-        @test internal == Avro.avroname(namedtype)[1]
-        @test namebudget.reserved - before == Avro.stringbytes(sizeof(internal))
-        Avro.release!(namebudget, Avro.stringbytes(sizeof(internal)))
-    end
-    Avro.releasederivecontext!(namectx)
     hugeparameter = Symbol(repeat("a", 1_000_000))
     hugetype = T.HookedName{hugeparameter}
     T.AVRONAME_CALLS[] = 0
@@ -158,7 +133,7 @@ end
     @test T.AVRONAME_CALLS[] == 1
     wd = Avro.schema(T.WithDefaults)
     @test [f.name for f in wd.fields] == ["a", "bee", "c", "d"]
-    @test wd.fields[1].default.json == 7 && wd.fields[2].default.json == "x" && wd.fields[3].default.branch == 1 && wd.fields[4].default.span == "[1,2]"
+    @test wd.fields[1].default.json == 7 && wd.fields[2].default.json == "x" && wd.fields[3].default.branch == 1 && wd.fields[4].default.json == Any[1, 2]
     @test_throws ArgumentError Avro.schema(T.BadDefault)
     @test_throws InterruptException Avro.schema(T.InterruptingDefault)
     @test_throws ArgumentError Avro.schema(T.var"Bad-Name")
@@ -183,101 +158,37 @@ end
     ts = Tables.Schema((:a, :b), (Int64, Union{Missing,String}))
     tables_schema = Avro.schema(ts)
     @test Avro.json(tables_schema) == "{\"type\":\"record\",\"name\":\"Record\",\"fields\":[{\"name\":\"a\",\"type\":\"long\"},{\"name\":\"b\",\"type\":[\"null\",\"string\"]}]}"
-    @test tables_schema.fields.cap == length(tables_schema.fields) == 2
-    @test tables_schema.fieldindex.cap == length(tables_schema.fieldindex) == 2
-    @test [f.name for f in Avro.schema(ts; names=Dict(:a => "alpha")).fields] == ["alpha", "b"]
+    @test length(tables_schema.fields) == 2 && length(tables_schema.fieldindex) == 2
     @test_throws ArgumentError Avro.schema(Tables.Schema((Symbol("my col"),), (Int64,)))
     @test Avro.fullname(Avro.schema(ts; name="T", namespace="n")) == "n.T"
-    derive_budget = Avro.Budget(Avro.Limits())
-    derive_ctx = Avro.derivecontext(Avro.Limits(), derive_budget, 0)
-    first_derived = Avro.derive(derive_ctx, T.SelfRef, nothing, nothing)
-    first_charge = derive_budget.reserved
-    @test derive_ctx.named.cap >= length(derive_ctx.named) > 0
-    @test derive_ctx.origins.cap >= length(derive_ctx.origins) > 0
-    @test Avro.derive(derive_ctx, T.SelfRef, nothing, nothing) === first_derived
-    @test derive_budget.reserved == first_charge
-    Avro.releasederivecontext!(derive_ctx)
     # value-level schema(x)
     rec = Avro.Record(pt, Any[1.0, missing, String[], DateTime(2020)])
     @test Avro.schema(rec) === pt
-    @test_throws Avro.LimitError Avro.schema(rec; limits=Avro.Limits(max_fields=1))
     ev = Avro.EnumValue(Avro.schema(T.Color), 2)
     @test Avro.schema(ev) === ev.schema && Avro.schema([ev, ev]) isa Avro.ArraySchema && Avro.schema([ev]).items == ev.schema   # imported (copied) child
-    @test_throws Avro.LimitError Avro.schema(ev; limits=Avro.Limits(max_enum_symbols=1))
-    @test_throws Avro.LimitError Avro.schema([ev]; limits=Avro.Limits(max_enum_symbols=1))
     fx = Avro.Fixed(Avro.FixedSchema("F", 2), UInt8[1, 2])
-    @test Avro.schema(fx) === fx.schema && Avro.schema(Avro.Map([("a", fx)])).values == fx.schema
+    @test Avro.schema(fx) === fx.schema && Avro.schema(Dict("a" => fx)).values == fx.schema
     @test_throws ArgumentError Avro.schema(Avro.EnumValue[])
     @test_throws ArgumentError Avro.schema(Any[ev, 1])
     @test_throws ArgumentError Avro.schema([ev, Avro.EnumValue(Avro.EnumSchema("Other", ["A"]), 1)])
     @test_throws ArgumentError Avro.schema(Avro.UnionValue(1, 2))
     @test_throws ArgumentError Avro.schema(Avro.Decimal(1, 0))
     @test Avro.json(Avro.schema(UInt8[1, 2])) == "\"bytes\"" && Avro.json(Avro.schema([1, 2])) == "{\"type\":\"array\",\"items\":\"long\"}" && Avro.json(Avro.schema("s")) == "\"string\""
-    @test Avro.json(Avro.schema(Avro.Map([("k", 1.0)]))) == "{\"type\":\"map\",\"values\":\"double\"}"
+    @test Avro.json(Avro.schema(Dict("k" => 1.0))) == "{\"type\":\"map\",\"values\":\"double\"}"
     @test Avro.json(Avro.schema((a=1,))) == "{\"type\":\"record\",\"name\":\"Record\",\"fields\":[{\"name\":\"a\",\"type\":\"long\"}]}"
 end
 
 @testset "generic values" begin
     P = Avro.parseschema
     extreme_datetime = DateTime(Dates.UTM(typemin(Int64)))
-    @test_throws Avro.ConversionError Avro.Timestamp{Millisecond}(extreme_datetime)
-    @test_throws Avro.ConversionError Avro.LocalTimestamp{Millisecond}(extreme_datetime)
-    m = Avro.Map([("b", 2), ("a", 1), ("b", 3), ("c", 4)])
-    @test collect(keys(m)) == ["b", "a", "c"] && m["b"] == 3 && m["a"] == 1 && collect(values(m)) == [3, 1, 4]   # last wins, first position
-    @test_throws MethodError keys(m)[1] = "z"
-    @test_throws MethodError values(m)[1] = 7
-    @test m["b"] == 3 && haskey(m, "b")
-    @test length(m) == 3 && haskey(m, "c") && !haskey(m, "z") && get(m, "z", 0) == 0 && haskey(m, :a) && m[:a] == 1
-    @test_throws KeyError m["z"]
-    @test Dict(m) == Dict("a" => 1, "b" => 3, "c" => 4)
-    @test m == Avro.Map([("b", 3), ("a", 1), ("c", 4)]) && hash(m) == hash(Avro.Map([("b", 3), ("a", 1), ("c", 4)]))
-    @test m == Avro.Map([("a", 1), ("b", 3), ("c", 4)]) && hash(m) == hash(Avro.Map([("a", 1), ("b", 3), ("c", 4)]))   # equality ignores insertion order (AbstractDict semantics)
-    ordinary = Dict("a" => 1, "b" => 3, "c" => 4)
-    @test isequal(m, ordinary) && isequal(ordinary, m)
-    @test hash(m) == hash(ordinary)
-    @test Dict{Any,Int}(m => 7)[ordinary] == 7
-    @test length(Set{Any}([m, ordinary])) == 1
-    symbolic = Dict(:a => 1, :b => 3, :c => 4)
-    @test !isequal(m, symbolic) && !isequal(symbolic, m)
-    @test m != symbolic && symbolic != m
-    @test !((1 => 2) in m) && !((:a => 1) in m) && (("a" => 1) in m)
-    @test m != Avro.Map([("a", 1), ("b", 3)]) && m != Avro.Map([("a", 1), ("b", 3), ("c", 5)])
-    @test Avro.Map{Int}([(:x, 1)])["x"] == 1 && Avro.Map{Int}() isa Avro.Map{Int} && isempty(Avro.Map{Int}())
-    @test_throws ArgumentError Avro.Map([(1, 2)])
-    @test sprint(show, Avro.Map([("k", 1)])) == "Avro.Map{Int64}(\"k\" => 1)"
-    hugemapstring = "x"^100_000
-    hugemapvector = fill(Int32(1), 100_000)
-    for constructor in (() -> Avro.Map{Vector{UInt8}}(["a" => hugemapstring]),
-                        () -> Avro.Map{String}(["a" => hugemapvector]))
-        maperror = try
-            constructor()
-            nothing
-        catch caught
-            caught
-        end
-        @test maperror isa ArgumentError
-        @test sizeof(maperror.msg) < 256
-    end
-    # big maps: sorted permutation is a correct index for every key, duplicates resolved
-    n = 5000
-    big = Avro.Map{Int}(("k$(i % 1234)" => i for i in 1:n))
-    @test length(big) == 1234 && all(big["k$j"] == maximum(i for i in 1:n if i % 1234 == j) for j in 0:1233)
-    @test all(big.keys[big.perm[i]] < big.keys[big.perm[i + 1]] for i in 1:length(big.perm) - 1)
-    for sz in (0, 1, 11, 16, 17, 23, 43, 1001, 1024)
-        ks = ["z" * string(i; pad=5) for i in sz:-1:1]
-        mm = Avro.Map{Int}(k => i for (i, k) in enumerate(ks))
-        @test length(mm) == sz && all(mm[k] == i for (i, k) in enumerate(ks))
-        @test all(mm.keys[mm.perm[i]] < mm.keys[mm.perm[i + 1]] for i in 1:max(sz - 1, 0))
-    end
-    dups = Avro.Map{Int}("same" => i for i in 1:1000)
-    @test length(dups) == 1 && dups["same"] == 1000
-    @test (Avro.capacity(dups.keys), Avro.capacity(dups.vals), Avro.capacity(dups.perm)) ==
-          (1000, 1000, 1000)
+    @test_throws Avro.ConversionError Avro.timestamp(Millisecond, extreme_datetime)
+    @test_throws Avro.ConversionError Avro.localtimestamp(Millisecond, extreme_datetime)
     # Record
     pt = P("""{"type":"record","name":"P","fields":[{"name":"x","type":"int"},{"name":"y","type":"string"}]}""")
     r = Avro.Record(pt, [1, "a"])
-    @test r.x == 1 && r["y"] == "a" && r[:y] == "a" && r[2] == "a" && keys(r) == ["x", "y"] && length(r) == 2 && haskey(r, "x") && !haskey(r, :z) && get(r, :z, 0) == 0
-    @test r.schema === pt && r.values == Any[1, "a"] && propertynames(r) == (:schema, :values)
+    @test r.x == 1 && r["y"] == "a" && r[:y] == "a" && r[2] == "a" && keys(r) == [:x, :y] && length(r) == 2 && haskey(r, "x") && !haskey(r, :z) && get(r, :z, 0) == 0
+    @test r isa Tables.AbstractRow && Tables.columnnames(r) == [:x, :y] && Tables.getcolumn(r, :y) == "a"
+    @test Avro.schema(r) === pt && collect(r) == Any[1, "a"] && propertynames(r) == [:x, :y]
     let clash = Avro.parseschema("""{"type":"record","name":"C","fields":[{"name":"schema","type":"string"},{"name":"values","type":"long"}]}""")
         c = Avro.decode(clash, Avro.encode(clash, (schema="s", values=2)))
         @test c.schema == "s" && c.values == 2 && Avro.schema(c) === clash
@@ -301,10 +212,7 @@ end
         caught
     end
     @test symbolerror isa ArgumentError
-    @test sizeof(symbolerror.msg) < 256
-    @test occursin("+99904 bytes", symbolerror.msg)
-    @test_throws Avro.LimitError Avro.EnumValue(e, 1; limits=Avro.Limits(max_total_values=0, work_allowance=0))
-    @test_throws Avro.LimitError Avro.EnumValue(e, SubString("xB", 2); limits=Avro.Limits(max_total_values=0, work_allowance=0))
+    @test Avro.EnumValue(e, SubString("xB", 2)) == ev && Avro.EnumValue(e, :B) == ev
     @test sprint(show, ev) == "Avro.EnumValue(E.B)"
     f = Avro.FixedSchema("F", 2)
     fx = Avro.Fixed(f, UInt8[1, 2])
@@ -322,9 +230,11 @@ end
     @test Avro.juliatype(P("{\"type\":\"fixed\",\"name\":\"D\",\"size\":12,\"logicalType\":\"duration\"}")) === Avro.Duration
     @test Avro.juliatype(P("{\"type\":\"fixed\",\"name\":\"U\",\"size\":16,\"logicalType\":\"uuid\"}")) === UUID
     @test Avro.juliatype(P("[\"null\",\"string\"]")) === Union{Missing,String} && Avro.juliatype(P("[\"string\",\"null\"]")) === Union{Missing,String}
-    @test Avro.juliatype(P("[\"int\",\"string\"]")) === Avro.UnionValue && Avro.juliatype(P("[\"null\"]")) === Avro.UnionValue && Avro.juliatype(P("[]")) === Avro.UnionValue
+    @test Avro.juliatype(P("[\"int\",\"string\"]")) === Any && Avro.juliatype(P("[\"null\"]")) === Any && Avro.juliatype(P("[]")) === Any   # bare branch values
     @test Avro.juliatype(P("{\"type\":\"array\",\"items\":[\"null\",\"int\"]}")) === Vector{Union{Missing,Int32}}
+    @test Avro.juliatype(P("{\"type\":\"array\",\"items\":[\"int\",\"string\"]}")) === Vector{Any}
     @test Avro.juliatype(P("{\"type\":\"array\",\"items\":{\"type\":\"array\",\"items\":\"int\"}}")) === Vector{Any}
-    @test Avro.juliatype(P("{\"type\":\"map\",\"values\":{\"type\":\"map\",\"values\":\"int\"}}")) === Avro.Map{Any}
+    @test Avro.juliatype(P("{\"type\":\"map\",\"values\":\"int\"}")) === Dict{String,Int32}
+    @test Avro.juliatype(P("{\"type\":\"map\",\"values\":{\"type\":\"map\",\"values\":\"int\"}}")) === Dict{String,Any}
     @test Avro.juliatype(pt) === Avro.Record && Avro.juliatype(e) === Avro.EnumValue && Avro.juliatype(f) === Avro.Fixed
 end

@@ -7,399 +7,186 @@ const SINGLE_OBJECT_MARKER = (0xC3, 0x01)
     Avro.SchemaStore
 
 The interface of a schema store used by `Avro.decodesingle`: implement
-`Avro.lookup(store, fingerprint::UInt64; limits=Avro.Limits()) -> Schema` and throw
-`Avro.UnknownSchemaError` for an unknown fingerprint. Writable stores may also implement
-`Avro.register!(store, schema; limits) -> UInt64`. A custom store owns its lookup resources,
-cache bounds and ambiguity policy; the built-in `Avro.SchemaCache` is bounded and rejects any second
-schema under an existing fingerprint that is not structurally equal to the stored one. Fingerprints
-are identifiers, not authentication.
+`Avro.lookup(store, fingerprint::UInt64) -> Schema` and throw `Avro.UnknownSchemaError` for an
+unknown fingerprint. Writable stores may also implement `Avro.register!(store, schema) -> UInt64`. A
+custom store owns its lookup resources, cache bounds and ambiguity policy; the built-in
+`Avro.SchemaCache` rejects any second schema under an existing fingerprint that is not structurally
+equal to the stored one. Fingerprints are identifiers, not authentication.
 """
 abstract type SchemaStore end
 
 """
-    Avro.SchemaCache(; max_entries=10_000, max_bytes=64 << 20)
+    Avro.SchemaCache(; max_entries=10_000)
 
-A bounded, lock-protected schema store indexed by a sorted fingerprint vector (binary search; no
-hashing). `register!` is idempotent for a structurally equal schema and raises
-`Avro.AmbiguousSchemaError` for any other schema under the same fingerprint — a different Parsing
-Canonical Form (a CRC collision) or a parsing-equivalent schema with different logical types, defaults,
-props or error flag.
+A lock-protected schema store holding at most `max_entries` schemas. `register!` is idempotent for a
+structurally equal schema and raises `Avro.AmbiguousSchemaError` for any other schema under the same
+fingerprint — a different Parsing Canonical Form (a CRC collision) or a parsing-equivalent schema that
+differs in anything `==` compares (docs, aliases, order, logical types, defaults, props, error flag).
 """
-mutable struct SchemaCache <: SchemaStore
-    const lock::ReentrantLock
-    const max_entries::Int
-    const max_bytes::Int
-    const ledger::Budget             # owns every persistent index allocation across register! calls
-    fingerprints::Vector{UInt64}    # exact-capacity replacement on insert
-    schemas::Vector{Schema}
-    bytes::Int
+struct SchemaCache <: SchemaStore
+    lock::ReentrantLock
+    max_entries::Int
+    schemas::Dict{UInt64,Schema}
 end
 
-const SCHEMA_CACHE_LOCK_BYTES = Base.summarysize(ReentrantLock())
-
-"Persistent storage retained by an empty `SchemaCache`, including its ledger and index shells."
-function schemacachebasebytes()
-    return checked_add(checked_add(sizeof(SchemaCache), sizeof(Budget)),
-                       checked_add(SCHEMA_CACHE_LOCK_BYTES,
-                                   checked_add(vectorbytes(UInt64, 0), vectorbytes(Schema, 0))))
-end
-
-function SchemaCache(; max_entries::Integer=10_000, max_bytes::Integer=64 << 20)
+function SchemaCache(; max_entries::Integer=10_000)
     max_entries >= 0 || throw(ArgumentError("max_entries must be non-negative"))
-    max_bytes >= 0 || throw(ArgumentError("max_bytes must be non-negative"))
-    entries = Int(max_entries)
-    bytes = Int(max_bytes)
-    base = schemacachebasebytes()
-    bytes >= base || throw(ArgumentError("max_bytes must cover the cache's fixed structure ($base bytes)"))
-    ledger = ledgerbudget(bytes)
-    fingerprints = UInt64[]
-    schemas = Schema[]
-    reserve!(ledger, base)
-    return SchemaCache(ReentrantLock(), entries, bytes, ledger, fingerprints, schemas, base)
-end
-
-function cacheindexbytes(n::Int)
-    return checked_add(vectorbytes(UInt64, n), vectorbytes(Schema, n))
-end
-
-function cachefrozenvectorbytes(vector::FrozenVector{T}) where {T}
-    isempty(vector) && return 0
-    return checked_add(24, vectorbytes(T, vector.cap))
-end
-
-function cachejsonbytes(value)
-    value === nothing && return 0
-    value isa Union{Bool,Int64,Float64} && return boxbytes(typeof(value))
-    value isa String && return stringbytes(sizeof(value))
-    value isa JSONNumber && return checked_add(32, stringbytes(sizeof(value.text)))
-    if value isa JSONArray
-        value === EMPTY_JSON_ARRAY && return 0
-        bytes = checked_add(64, cachefrozenvectorbytes(value.items))
-        for child in value.items
-            bytes = checked_add(bytes, cachejsonbytes(child))
-        end
-        return bytes
-    end
-    if value isa JSONObject
-        value === EMPTY_JSON_OBJECT && return 0
-        bytes = checked_add(64, frozendictbytes(value.members))
-        bytes = checked_add(bytes, cachefrozenvectorbytes(value.order))
-        bytes = checked_add(bytes, cachefrozenvectorbytes(value.spans))
-        for key in value.members.keys
-            bytes = checked_add(bytes, stringbytes(sizeof(key)))
-        end
-        for child in value.members.vals
-            bytes = checked_add(bytes, cachejsonbytes(child))
-        end
-        return bytes
-    end
-    throw(ArgumentError("internal error: unsupported frozen JSON value $(typeof(value))"))
-end
-
-function cacherawmembersbytes(members::FrozenDict{String,RawMember})
-    isempty(members) && return 0
-    bytes = frozendictbytes(members)
-    for (key, member) in members
-        bytes = checked_add(bytes, stringbytes(sizeof(key)))
-        bytes = checked_add(bytes, stringbytes(sizeof(member.key)))
-        isempty(member.value) ||
-            (bytes = checked_add(bytes, stringbytes(sizeof(member.value))))
-    end
-    return bytes
-end
-
-function cachelexemesbytes(lexemes::SchemaLexemes)
-    bytes = cacherawmembersbytes(lexemes.members)
-    isempty(lexemes.fields) && return bytes
-    bytes = checked_add(bytes, cachefrozenvectorbytes(lexemes.fields))
-    for field in lexemes.fields
-        bytes = checked_add(bytes, cacherawmembersbytes(field))
-    end
-    return bytes
-end
-
-function cachepropsbytes(props::Props)
-    isempty(props) && return 0
-    bytes = frozendictbytes(props)
-    for key in props.keys
-        bytes = checked_add(bytes, stringbytes(sizeof(key)))
-    end
-    for value in props.vals
-        bytes = checked_add(bytes, cachejsonbytes(value))
-    end
-    return bytes
-end
-
-function cachedefaultbytes(default::Default)
-    default isa DefaultValue || return 0
-    bytes = cachejsonbytes(default.json)
-    isempty(default.span) || (bytes = checked_add(bytes, stringbytes(sizeof(default.span))))
-    return bytes
-end
-
-function cachestringvectorbytes(values::FrozenVector{String})
-    isempty(values) && return 0
-    bytes = cachefrozenvectorbytes(values)
-    for value in values
-        bytes = checked_add(bytes, stringbytes(sizeof(value)))
-    end
-    return bytes
-end
-
-function schemaretainedbytes(s::Schema, seen::Vector{Bool})
-    index = Int(nodeid(s)) + 1
-    seen[index] && return 0
-    seen[index] = true
-    bytes = NODE_META_BYTES + NODE_SHELL_BYTES + 192
-    bytes = checked_add(bytes, cachelexemesbytes(schemalexemes(s)))
-    s isa UnionSchema || (bytes = checked_add(bytes, cachepropsbytes(s.props)))
-    if s isa Union{IntSchema,LongSchema,BytesSchema,StringSchema,FixedSchema}
-        s.logical isa UnknownLogical &&
-            (bytes = checked_add(bytes, stringbytes(sizeof(s.logical.name))))
-    end
-    if s isa NamedSchema
-        bytes = checked_add(bytes, stringbytes(sizeof(s.name.name)))
-        bytes = checked_add(bytes, stringbytes(sizeof(s.name.namespace)))
-        bytes = checked_add(bytes, cachestringvectorbytes(s.aliases))
-        bytes = checked_add(bytes, cachestringvectorbytes(s.rawaliases))
-    end
-    if s isa ArraySchema
-        bytes = checked_add(bytes, schemaretainedbytes(s.items, seen))
-    elseif s isa MapSchema
-        bytes = checked_add(bytes, schemaretainedbytes(s.values, seen))
-    elseif s isa UnionSchema
-        bytes = checked_add(bytes, cachefrozenvectorbytes(s.branches))
-        for branch in s.branches
-            bytes = checked_add(bytes, schemaretainedbytes(branch, seen))
-        end
-    elseif s isa EnumSchema
-        s.doc === nothing || (bytes = checked_add(bytes, stringbytes(sizeof(s.doc))))
-        bytes = checked_add(bytes, cachestringvectorbytes(s.symbols))
-        bytes = checked_add(bytes, frozendictbytes(s.symbolindex))
-        bytes = checked_add(bytes, cachedefaultbytes(s.default))
-    elseif s isa RecordSchema
-        s.doc === nothing || (bytes = checked_add(bytes, stringbytes(sizeof(s.doc))))
-        bytes = checked_add(bytes, cachefrozenvectorbytes(s.fields))
-        bytes = checked_add(bytes, frozendictbytes(s.fieldindex))
-        for field in s.fields
-            bytes = checked_add(bytes, stringbytes(sizeof(field.name)))
-            field.doc === nothing ||
-                (bytes = checked_add(bytes, stringbytes(sizeof(field.doc))))
-            bytes = checked_add(bytes, cachestringvectorbytes(field.aliases))
-            bytes = checked_add(bytes, cachepropsbytes(field.props))
-            bytes = checked_add(bytes, cachedefaultbytes(field.default))
-            bytes = checked_add(bytes, schemaretainedbytes(field.schema, seen))
-        end
-    end
-    return bytes
-end
-
-function schemaretainedbytes(s::Schema, budget::Budget)
-    charge = vectorbytes(Bool, graphinfo(s).nodes)
-    reserve!(budget, charge)
-    seen = Vector{Bool}(undef, graphinfo(s).nodes)
-    fill!(seen, false)
-    try
-        return checked_add(checked_add(144, GRAPH_INFO_BYTES), schemaretainedbytes(s, seen))
-    finally
-        release!(budget, charge)
-    end
+    return SchemaCache(ReentrantLock(), Int(max_entries), Dict{UInt64,Schema}())
 end
 
 function Base.length(c::SchemaCache)
-    return lock(() -> length(c.fingerprints), c.lock)
+    return lock(() -> length(c.schemas), c.lock)
 end
 
 """
-    Avro.register!(store, schema; limits=Limits()) -> UInt64
+    Avro.register!(store, schema) -> UInt64
 
 Register `schema` and return its CRC-64-AVRO fingerprint.
 """
-function register!(c::SchemaCache, s::Schema; limits::Limits=Limits())
-    graphinfo(s).repaired_names && throw(ArgumentError("a schema with repaired invalid names has no Parsing Canonical Form"))
-    return withbudget(limits) do budget                # one operation: print, hash, compare, insert
-        w = BoundedWriter(budget, limits.max_schema_bytes)
-        seen = schemaseen(s, budget)
-        canonicalprint(w, s, seen)
-        releaseseen!(budget, seen)                     # dead before hashing and comparison
-        fp = crc64avro(boundedview(w))
-        lock(c.lock) do
-        i = cacheindex(c.fingerprints, fp)
-        if i <= length(c.fingerprints) && c.fingerprints[i] == fp
-            existing = c.schemas[i]
-            same = budgetedschemaequal(existing, s, budget)
-            same || throw(AmbiguousSchemaError(fp, existing, s))
-            return fp
+function register!(c::SchemaCache, s::Schema)
+    fp = fingerprint(s)
+    return lock(c.lock) do
+        existing = get(c.schemas, fp, nothing)
+        if existing === nothing
+            n = length(c.schemas) + 1
+            n <= c.max_entries || throw(LimitError(:max_entries, n, c.max_entries))
+            c.schemas[fp] = s
+        else
+            schemaequal(existing, s) || throw(AmbiguousSchemaError(fp, existing, s))
         end
-        n = length(c.fingerprints) + 1
-        n <= c.max_entries || throw(LimitError(:max_entries, n, c.max_entries, :max_entries, :decode))
-        schemacharge = schemaretainedbytes(s, budget)
-        checkpoint = budgetcheckpoint(c.ledger)
-        nf, ns = try
-            reserve!(c.ledger, schemacharge)
-            fingerprintcharge = vectorbytes(UInt64, n)
-            reserve!(c.ledger, fingerprintcharge)
-            newfingerprints = Vector{UInt64}(undef, n)     # exact-capacity replacement
-            schemacharge = vectorbytes(Schema, n)
-            reserve!(c.ledger, schemacharge)
-            newschemas = Vector{Schema}(undef, n)
-            copyto!(newfingerprints, 1, c.fingerprints, 1, i - 1)
-            copyto!(newschemas, 1, c.schemas, 1, i - 1)
-            newfingerprints[i] = fp
-            newschemas[i] = s
-            copyto!(newfingerprints, i + 1, c.fingerprints, i, n - i)
-            copyto!(newschemas, i + 1, c.schemas, i, n - i)
-            (newfingerprints, newschemas)
-        catch error
-            rollbackreservations!(c.ledger, checkpoint)
-            if error isa LimitError && error.limit === :max_total_bytes
-                throw(LimitError(:max_bytes, error.observed, c.max_bytes, :max_bytes, :decode))
-            end
-            rethrow()
-        end
-        oldcharge = cacheindexbytes(length(c.fingerprints))
-        c.fingerprints = nf
-        c.schemas = ns
-        release!(c.ledger, oldcharge)
-        c.bytes = c.ledger.reserved
         return fp
-        end
     end
 end
 
 """
-    Avro.lookup(store, fingerprint::UInt64; limits=Limits()) -> Schema
+    Avro.lookup(store, fingerprint::UInt64) -> Schema
 
 The schema registered under `fingerprint` (`Avro.UnknownSchemaError` otherwise).
 """
-function lookup(c::SchemaCache, fp::UInt64; limits::Limits=Limits())
-    return lock(c.lock) do
-        n = length(c.fingerprints)
-        i = cacheindex(c.fingerprints, fp)
-        (i <= n && c.fingerprints[i] == fp) || throw(UnknownSchemaError(fp))
-        return c.schemas[i]
-    end
+function lookup(c::SchemaCache, fp::UInt64)
+    s = lock(() -> get(c.schemas, fp, nothing), c.lock)
+    s === nothing && throw(UnknownSchemaError(fp))
+    return s
 end
 
-function cacheindex(fingerprints::Vector{UInt64}, fp::UInt64)
-    return searchsortedfirst(fingerprints, fp)
+"""
+    Avro.SingleObjectWriter(schema; limits=Limits())
+    Avro.SingleObjectWriter(schema, T; limits=Limits())
+
+A prepared single-object encoder: `writer(x) -> Vector{UInt8}` writes `C3 01`, the little-endian CRC-64-AVRO
+fingerprint of `schema`'s Parsing Canonical Form, and the binary datum. It holds a `DatumWriter`, so it is
+single-owner, and `T` fixes the datum type in the same way.
+"""
+struct SingleObjectWriter{W<:DatumWriter}
+    header::Vector{UInt8}
+    writer::W
+end
+
+function Base.show(io::IO, w::SingleObjectWriter)
+    return print(io, "Avro.SingleObjectWriter(", schemalabel(w.writer.schema), ")")
+end
+
+function singleobjectheader(s::Schema)
+    fp = fingerprint(s)
+    return UInt8[SINGLE_OBJECT_MARKER..., (UInt8((fp >> (8 * i)) & 0xff) for i in 0:7)...]
+end
+
+function SingleObjectWriter(s::Schema; limits::Limits=Limits())
+    return SingleObjectWriter(singleobjectheader(s), DatumWriter(s; limits=limits))
+end
+
+function SingleObjectWriter(s::Schema, ::Type{T}; limits::Limits=Limits()) where {T}
+    return SingleObjectWriter(singleobjectheader(s), DatumWriter(s, T; limits=limits))
+end
+
+function (w::SingleObjectWriter)(x)
+    writeraw!(w.writer.encoder, w.header)
+    return w.writer(x)
 end
 
 """
     Avro.encodesingle(schema, x; limits=Limits()) -> Vector{UInt8}
 
-The single-object encoding of `x`: `C3 01`, the little-endian CRC-64-AVRO fingerprint of `schema`'s
-Parsing Canonical Form, and the binary datum.
+One-shot single-object encoding of `x` (use a `SingleObjectWriter` for repeated work).
 """
 function encodesingle(s::Schema, x; limits::Limits=Limits())
-    graphinfo(s).repaired_names && throw(ArgumentError("a schema with repaired invalid names has no Parsing Canonical Form"))
-    return withbudget(limits; direction=:encode) do budget    # one operation budget
-        local fp, e, npayload
-        beginworkdefer!(budget)
-        try
-            w = BoundedWriter(budget, limits.max_schema_bytes; credit=false)
-            seen = schemaseen(s, budget)
-            canonicalprint(w, s, seen)
-            releaseseen!(budget, seen)                 # dead before hashing and the write plan
-            fp = crc64avro(boundedview(w))
-            plan = writeplan(s; budget=budget)
-            e = Encoder(budget)
-            encodedatum!(plan, e, x, s)
-            npayload = e.pos
-        finally
-            endworkdefer!(budget)
-        end
-        checkoperationwork!(budget)
-        reserve!(budget, bytesbytes(10 + npayload))
-        out = Vector{UInt8}(undef, 10 + npayload)
-        out[1], out[2] = SINGLE_OBJECT_MARKER
-        for i in 0:7
-            out[3 + i] = UInt8((fp >> (8 * i)) & 0xff)
-        end
-        copyto!(out, 11, e.buf, 1, npayload)
-        return out
-    end
+    return SingleObjectWriter(s; limits=limits)(x)
 end
 
 """
-    Avro.decodesingle(src, store; reader_schema=nothing, union_resolution=:spec, validate=:strict, limits=Limits(), names=nothing, T=nothing)
+    Avro.SingleObjectReader(store; reader_schema=nothing, union_resolution=:spec, limits=Limits())
+    Avro.SingleObjectReader(store, T; kw...)
 
-Decode a single-object message: validates the marker, looks the writer schema up by fingerprint,
-recomputes the fingerprint of the returned schema (rejecting a mismatch), resolves against
-`reader_schema` when given and decodes the payload exactly (trailing bytes are a `DataError`). `T`
-selects a typed target.
+A prepared single-object decoder: `reader(src) -> value` for `src` holding one message, as bytes or an `IO`.
+It validates the marker, looks the writer schema up by fingerprint, recomputes the fingerprint of the returned
+schema (rejecting a mismatch), resolves against `reader_schema` when given and decodes the payload exactly
+(trailing bytes are a `DataError`). The first message of each fingerprint does the schema work once; later
+ones only decode. `T` selects a typed target. Safe to share across tasks.
 """
-function decodesingleoperation(src::AbstractVector{UInt8}, store::SchemaStore, budget::Budget;
-                               reader_schema::Union{Nothing,Schema}=nothing,
-                               union_resolution::Symbol=:spec, validate::Symbol=:strict,
-                               limits::Limits=Limits(), names=nothing, T=nothing)
-    T === nothing || T isa Type || throw(ArgumentError("T must be a type or nothing"))
-    n = length(src)
+mutable struct SingleObjectReader{T}
+    const store::SchemaStore
+    const reader_schema::Union{Nothing,Schema}
+    const union_resolution::Symbol
+    const limits::Limits
+    const lock::ReentrantLock
+    @atomic readers::Dict{UInt64,DatumReader}    # replaced, never mutated, so a lookup takes no lock
+end
+
+function Base.show(io::IO, r::SingleObjectReader{T}) where {T}
+    return print(io, "Avro.SingleObjectReader(", typeof(r.store), T === Any ? "" : ", $T", ")")
+end
+
+function SingleObjectReader(store::SchemaStore; kw...)
+    return SingleObjectReader(store, Any; kw...)
+end
+
+function SingleObjectReader(store::SchemaStore, ::Type{T}; reader_schema::Union{Nothing,Schema}=nothing,
+                            union_resolution::Symbol=:spec, limits::Limits=Limits()) where {T}
+    return SingleObjectReader{T}(store, reader_schema, union_resolution, limits, ReentrantLock(), Dict{UInt64,DatumReader}())
+end
+
+function datumreader(r::SingleObjectReader{T}, fp::UInt64) where {T}
+    prepared = get(@atomic(r.readers), fp, nothing)
+    prepared === nothing || return prepared
+    writer = lookup(r.store, fp)
+    writer isa Schema || throw(ArgumentError("the schema store returned $(typeof(writer)), not an Avro.Schema"))
+    actual = fingerprint(writer)
+    actual == fp || throw(DataError("the schema store returned a schema with fingerprint $(string(actual; base=16)) for $(string(fp; base=16))", 3))
+    kw = (reader_schema=r.reader_schema, union_resolution=r.union_resolution, limits=r.limits)
+    prepared = DatumReader(writer, T; kw...)
+    lock(r.lock) do
+        readers = copy(@atomic r.readers)
+        readers[fp] = prepared
+        @atomic r.readers = readers
+    end
+    return prepared
+end
+
+function (r::SingleObjectReader)(src::AbstractVector{UInt8})
+    buf = onebased(src)
+    n = length(buf)
     n >= 10 || throw(DataError("single-object message shorter than the 10-byte header", n + 1))
-    n - 10 <= limits.max_datum_bytes || throw(LimitError(:max_datum_bytes, n - 10, limits.max_datum_bytes, :max_datum_bytes, :decode))
-    src = sourcebytes(src, n, budget, DataError)
-    (src[1] == SINGLE_OBJECT_MARKER[1] && src[2] == SINGLE_OBJECT_MARKER[2]) || throw(DataError("missing single-object marker C3 01", 1))
+    (buf[1], buf[2]) == SINGLE_OBJECT_MARKER || throw(DataError("missing single-object marker C3 01", 1))
     fp = UInt64(0)
     for i in 0:7
-        fp |= UInt64(src[3 + i]) << (8 * i)
+        fp |= UInt64(buf[3 + i]) << (8 * i)
     end
-    local tplan, adm, d, span
-    beginworkdefer!(budget)
-    try
-        writer = lookup(store, fp; limits=limits)
-        writer isa Schema || throw(ArgumentError("the schema store returned $(typeof(writer)), not an Avro.Schema"))
-        w = BoundedWriter(budget, limits.max_schema_bytes; credit=false)
-        seen = schemaseen(writer, budget)
-        canonicalprint(w, writer, seen)
-        releaseseen!(budget, seen)                     # dead before hashing
-        actual = crc64avro(boundedview(w))
-        actual == fp || throw(DataError("the schema store returned a schema with fingerprint $(string(actual; base=16)) for $(string(fp; base=16))", 3))
-        effective = reader_schema === nothing ? writer : reader_schema
-        plan = reader_schema === nothing ? readplan(writer; budget=budget) :
-               resolvingplan(writer, reader_schema; union_resolution=union_resolution, limits=limits, budget=budget)
-        spans = spanplan(writer; budget=budget)
-        tplan = T === nothing ? plan : typedplan(T, effective, plan, limits; budget=budget)
-        adm = admission(names)
-        d = Decoder(src, budget; pos=11, validate=validate)
-        datumspan!(spans, d, 11, budget.values,
-                   rawspaninputmax(budget, src, 11, limits))
-        span = decoderspan(d)
-        span.next == n + 1 || throw(DataError("trailing bytes after the datum", span.next))
-        addinput!(budget, span.bytes)
-    finally
-        endworkdefer!(budget)
-    end
-    checkoperationwork!(budget)
-    d.stop = span.next - 1
-    planneddatumspan!(tplan, d, span; resolved=reader_schema !== nothing)
-    span = decoderspan(d)
-    work = begindatum!(d, span)
-    value = try
-        decodetyped(T === nothing ? GenericDatumTarget : T, tplan, d, adm)
-    catch
-        abortdatum!(d, work)
-        rethrow()
-    end
-    finishdatum!(d, work)
-    return (value, tplan, adm)
+    value, next = datumreader(r, fp)(buf, 11)
+    next == n + 1 || throw(DataError("trailing bytes after the datum", next))
+    return value
 end
 
-function decodesingle(src::AbstractVector{UInt8}, store::SchemaStore; reader_schema::Union{Nothing,Schema}=nothing,
-                      union_resolution::Symbol=:spec, validate::Symbol=:strict, limits::Limits=Limits(),
-                      names=nothing, T=nothing)
-    value, plan, adm = withbudget(limits) do budget
-        return decodesingleoperation(src, store, budget; reader_schema=reader_schema,
-                                     union_resolution=union_resolution, validate=validate,
-                                     limits=limits, names=names, T=T)
-    end
-    return finishtyped(plan, value, adm)
+function (r::SingleObjectReader)(io::IO)
+    return r(sourcebytes(io, satadd(r.limits.max_bytes, 10)))
 end
 
-function decodesingle(io::IO, store::SchemaStore; limits::Limits=Limits(), kw...)
-    value, plan, adm = withbudget(limits) do budget
-        maxmessage = limits.max_datum_bytes > typemax(Int) - 10 ? typemax(Int) : limits.max_datum_bytes + 10
-        bytes = sourcebytes(io, maxmessage, budget, DataError)
-        return decodesingleoperation(bytes, store, budget; limits=limits, kw...)
-    end
-    return finishtyped(plan, value, adm)
+"""
+    Avro.decodesingle(src, store; reader_schema=nothing, union_resolution=:spec, limits=Limits(), T=nothing)
+
+One-shot single-object decoding of the message in `src` (use a `SingleObjectReader` for repeated work).
+"""
+function decodesingle(src::Union{AbstractVector{UInt8},IO}, store::SchemaStore; T=nothing, kw...)
+    T === nothing && return SingleObjectReader(store; kw...)(src)
+    T isa Type || throw(ArgumentError("T must be a type or nothing"))
+    return SingleObjectReader(store, T; kw...)(src)
 end

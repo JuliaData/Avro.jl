@@ -1,7 +1,7 @@
-# Column builders: the column plan family decodes record fields straight into typed column
-# vectors. Builders live in a schema-independent `Vector{ColumnBuilder}` and are driven by one loop with
-# a function barrier per cell; every builder type is one member of the closed value set `E`
-# (`valuetypes()`), so untrusted schemas never create new method instances.
+# Column builders: a record's fields decoded straight into typed column vectors. Builders live in a
+# schema-independent `Vector{ColumnBuilder}` driven by one loop with a function barrier per cell; every
+# column's element type is a member of the closed value set (`valuetypes()`), so untrusted schemas never
+# create new method instances.
 
 abstract type ColumnBuilder end
 
@@ -10,74 +10,25 @@ struct Projection
     slots::Vector{Int}         # source field position -> projected slot (0 means skipped)
 end
 
-function projectedsyntheticvalue!(plan::RecordPlan, decoder::Decoder,
-                                  projection::Projection,
-                                  counter::SyntheticCounter)
-    enter!(decoder)
-    values = countwriter!(counter)
-    try
-        for (index, field) in enumerate(plan.fields)
-            values = syntheticvalueadd(counter, values,
-                                       syntheticvalue!(field, decoder,
-                                                       projection.slots[index] != 0,
-                                                       counter))
-        end
-    finally
-        leave!(decoder)
-    end
-    return values
-end
-
-function projectionbytes(projection::Projection)
-    return sizeof(Projection) + vectorbytes(Int, length(projection.indices)) +
-           vectorbytes(Int, length(projection.slots))
-end
-
-function positionalprojection(selected::AbstractVector{Int}, nfields::Int, budget::Budget)
-    charge = sizeof(Projection) + vectorbytes(Int, length(selected)) +
-             vectorbytes(Int, nfields)
-    reserve!(budget, charge)
-    indices = Vector{Int}(undef, length(selected))
-    slots = zeros(Int, nfields)
-    for (slot, position) in enumerate(selected)
-        1 <= position <= nfields || throw(ArgumentError("selected field position $position is out of range"))
-        slots[position] == 0 || throw(ArgumentError("selected field position $position is duplicated"))
-        indices[slot] = position
-        slots[position] = slot
-    end
-    projection = Projection(indices, slots)
-    return projection
-end
-
-"Check the selected output produced through `rows`: completed slots plus retained payload, not chunk capacity."
-function checkblockoutput(budget::Budget, baseline::Int, rows::Int, slotrow::Int, cap::Int)
-    output = checked_add(max(budget.reserved - baseline, 0), checked_mul(rows, slotrow))
-    output <= cap || throw(limiterror(budget, :max_block_output_bytes, output, cap))
-    return output
-end
-
-"A selected field decoded into a `Vector{E}` (`E = juliatype(field schema)`) by its plan `P`."
+# A kept field decoded by its plan `P` into `data`, whose first `len` rows are filled.
 mutable struct TypedColumn{E,P<:ReadPlan} <: ColumnBuilder
     const plan::P
     data::Vector{E}
     len::Int
 end
 
-"A field that is not selected: skipped under the active validation mode."
+# A field that is not kept: skipped (and checked) by its concrete plan.
 struct SkipColumn{P<:ReadPlan} <: ColumnBuilder
-    plan::P                 # concrete: the skip devirtualizes
+    plan::P
 end
 
-"""
-Consecutive unselected fields fused into one cell: in `:fast` mode a run of fixed-width leaves is
-jumped in a single bounds check with its values counted in bulk (identical work-rule arithmetic);
-otherwise — and always in `:strict` mode — every member is skipped and validated individually.
-"""
+# Consecutive skipped fields fused into one cell: a run of fixed-width leaves is jumped with one bounds
+# check and its values counted in bulk; otherwise each member is skipped through the closed leaf
+# instruction set (`SKIP_FALLBACK` skips through the member's plan).
 struct SkipRun <: ColumnBuilder
     plans::Vector{ReadPlan}
-    fastkinds::Vector{UInt8} # closed leaf instruction set; zero delegates to the concrete plan
-    fastbytes::Int          # the run's total fixed width, or -1 when any member is dynamic
-    fastmaxbytes::Int       # largest max_bytes-governed fixed value in a fixed-width run
+    kinds::Vector{UInt8}
+    width::Int              # the run's total fixed width, or -1 when a member is not fixed-width
 end
 
 const SKIP_FALLBACK = UInt8(0)
@@ -89,8 +40,7 @@ const SKIP_BOOL = UInt8(5)
 const SKIP_FLOAT = UInt8(6)
 const SKIP_NULL = UInt8(7)
 
-"The parameter-free fast skip instruction for one common leaf plan."
-function fastskipkind(@nospecialize(p::ReadPlan))
+function skipkind(@nospecialize(p::ReadPlan))
     return p isa Union{StringPlan,BytesPlan} ? SKIP_LENGTH :
         p isa DoublePlan ? SKIP_DOUBLE :
         p isa Union{LongPlan,TimestampPlan,LocalTimestampPlan} ? SKIP_LONG :
@@ -100,88 +50,7 @@ function fastskipkind(@nospecialize(p::ReadPlan))
         p isa NullPlan ? SKIP_NULL : SKIP_FALLBACK
 end
 
-# @nospecialize: called with runtime builder types per column per block, where a `Type{C}` dispatch allocates.
-"The package-owned heap storage of one builder held behind `ColumnBuilder`."
-function columnnodebytes(@nospecialize(C::Type))
-    return Base.issingletontype(C) ? 0 : boxbytes(C)
-end
-
-"The builder-vector and concrete-node storage, excluding typed column data and payload."
-function columnbuildersstate(cols::Vector{ColumnBuilder})
-    charge = vectorbytes(ColumnBuilder, length(cols))
-    for col in cols
-        charge = checked_add(charge, columnnodebytes(typeof(col)))
-    end
-    return charge
-end
-
-"The retained builder state for one unresolved record plan, excluding column data."
-function columnbuildersstate(plan::RecordPlan,
-                             projection::Union{Nothing,Projection}=nothing)
-    charge = vectorbytes(ColumnBuilder, length(plan.fields))
-    for (index, fieldplan) in enumerate(plan.fields)
-        if projection === nothing || projection.slots[index] != 0
-            E = juliatype(plan.schema.fields[index].schema)
-            charge = checked_add(
-                charge, columnnodebytes(TypedColumn{E,typeof(fieldplan)}))
-        else
-            charge = checked_add(
-                charge, columnnodebytes(SkipColumn{typeof(fieldplan)}))
-        end
-    end
-    return charge
-end
-
-"The exact fused skip-view state that can coexist with one unresolved builder set."
-function fusedstate(plan::RecordPlan, projection::Union{Nothing,Projection})
-    projection === nothing && return 0
-    outlen = 0
-    charge = 0
-    hasrun = false
-    index = 1
-    while index <= length(plan.fields)
-        if projection.slots[index] == 0
-            first = index
-            while index <= length(plan.fields) && projection.slots[index] == 0
-                index += 1
-            end
-            runlength = index - first
-            if runlength > 1
-                hasrun = true
-                charge = checked_add(charge, columnnodebytes(SkipRun))
-                charge = checked_add(charge, vectorbytes(ReadPlan, runlength))
-                charge = checked_add(charge, vectorbytes(UInt8, runlength))
-            end
-        else
-            index += 1
-        end
-        outlen += 1
-    end
-    hasrun || return 0
-    return checked_add(vectorbytes(ColumnBuilder, outlen), charge)
-end
-
-"The builder construction/decode peak outside the typed column vectors and decoded payload."
-function columnbuilderpeakstate(plan::RecordPlan,
-                                projection::Union{Nothing,Projection})
-    return checked_add(columnbuildersstate(plan, projection),
-                       fusedstate(plan, projection))
-end
-
-function releasecolumnbuilders!(cols::Vector{ColumnBuilder}, budget::Budget)
-    release!(budget, columnbuildersstate(cols))
-    return nothing
-end
-
-function setskipcolumn!(cols::Vector{ColumnBuilder}, index::Int, plan::P,
-                        budget::Budget) where {P<:ReadPlan}
-    charge = columnnodebytes(SkipColumn{P})
-    reserve!(budget, charge)
-    cols[index] = SkipColumn{P}(plan)
-    return nothing
-end
-
-"The fixed encoded width of a skipped leaf, or -1 (varints, length-prefixed and nested values)."
+# The fixed encoded width of a skipped leaf, or -1 (varints, length-prefixed and nested values).
 function skipwidth(@nospecialize(p::ReadPlan))
     return p isa NullPlan ? 0 :
         p isa FloatPlan ? 4 :
@@ -191,172 +60,80 @@ function skipwidth(@nospecialize(p::ReadPlan))
         p isa FixedPlan ? p.schema.size : -1
 end
 
-"The encoded width governed by max_bytes for one fixed leaf, or zero for plain primitives."
-function skipmaxbytes(@nospecialize(p::ReadPlan))
-    return p isa FixedPlan ? p.schema.size :
-        p isa DurationPlan ? 12 : p isa UUIDFixedPlan ? 16 : 0
-end
-
-"The new vector, run nodes and plan vectors owned by a fused view of `cols`."
-function fusedstate(cells::Vector{ColumnBuilder}, cols::Vector{ColumnBuilder})
-    cells === cols && return 0
-    charge = vectorbytes(ColumnBuilder, length(cells))
-    for cell in cells
-        cell isa SkipRun || continue
-        charge = checked_add(charge, columnnodebytes(SkipRun))
-        charge = checked_add(charge, vectorbytes(ReadPlan, length(cell.plans)))
-        charge = checked_add(charge, vectorbytes(UInt8, length(cell.fastkinds)))
-    end
-    return charge
-end
-
-function releasefused!(cells::Vector{ColumnBuilder}, cols::Vector{ColumnBuilder}, budget::Budget)
-    release!(budget, fusedstate(cells, cols))
-    return nothing
-end
-
-"Fuse consecutive `SkipColumn`s of `cols` into an exactly allocated, budgeted skip view."
-function fuseskips(cols::Vector{ColumnBuilder}, budget::Union{Nothing,Budget}=nothing)
-    outlen = 0
-    hasrun = false
+# The decode cells of a record plan's builders: each run of two or more consecutive `SkipColumn`s fused
+# into a `SkipRun` (`cols` itself when there is none).
+function fuseskips(cols::Vector{ColumnBuilder})
+    any(i -> cols[i] isa SkipColumn && cols[i + 1] isa SkipColumn, 1:length(cols) - 1) || return cols
+    cells = ColumnBuilder[]
     i = 1
     while i <= length(cols)
-        if cols[i] isa SkipColumn && i < length(cols) && cols[i + 1] isa SkipColumn
-            while i <= length(cols) && cols[i] isa SkipColumn
-                i += 1
-            end
-            hasrun = true
-        else
-            i += 1
+        j = i
+        while j <= length(cols) && cols[j] isa SkipColumn
+            j += 1
         end
-        outlen += 1
-    end
-    hasrun || return cols
-    charge = vectorbytes(ColumnBuilder, outlen)
-    i = 1
-    while i <= length(cols)
-        if cols[i] isa SkipColumn && i < length(cols) && cols[i + 1] isa SkipColumn
-            first = i
-            while i <= length(cols) && cols[i] isa SkipColumn
-                i += 1
+        if j - i >= 2
+            plans = ReadPlan[(cols[k]::SkipColumn).plan for k in i:j - 1]
+            width = 0
+            for p in plans
+                w = skipwidth(p)
+                width = (width < 0 || w < 0) ? -1 : satadd(width, w)
             end
-            charge = checked_add(charge, vectorbytes(ReadPlan, i - first))
-            charge = checked_add(charge, vectorbytes(UInt8, i - first))
-            charge = checked_add(charge, columnnodebytes(SkipRun))
+            push!(cells, SkipRun(plans, UInt8[skipkind(p) for p in plans], width))
+            i = j
         else
+            push!(cells, cols[i])
             i += 1
         end
     end
-    checkpoint = budget === nothing ? nothing : budgetcheckpoint(budget)
-    out = nothing
-    try
-        budget === nothing || reserve!(budget, charge)
-        out = Vector{ColumnBuilder}(undef, outlen)
-        i = 1
-        dest = 0
-        while i <= length(cols)
-            dest += 1
-            if cols[i] isa SkipColumn && i < length(cols) && cols[i + 1] isa SkipColumn
-                first = i
-                while i <= length(cols) && cols[i] isa SkipColumn
-                    i += 1
-                end
-                plans = Vector{ReadPlan}(undef, i - first)
-                fastkinds = Vector{UInt8}(undef, i - first)
-                width = 0
-                maxbytes = 0
-                for (offset, source) in enumerate(first:i - 1)
-                    plan = (cols[source]::SkipColumn).plan
-                    plans[offset] = plan
-                    fastkinds[offset] = fastskipkind(plan)
-                    w = skipwidth(plan)
-                    width = (width < 0 || w < 0) ? -1 : satadd(width, w)
-                    maxbytes = max(maxbytes, skipmaxbytes(plan))
-                end
-                out[dest] = SkipRun(plans, fastkinds, width, maxbytes)
-            else
-                out[dest] = cols[i]
-                i += 1
-            end
-        end
-        return out
-    catch
-        out = nothing
-        budget === nothing || rollbackreservations!(budget, checkpoint::Int)
-        rethrow()
-    end
+    return cells
 end
 
-"""
-    columnbuilders(plan::RecordPlan, selected, capacity, budget) -> Vector{ColumnBuilder}
+# The plan producing each output field of a record plan, in field order.
+function slotplans(p::RecordPlan)
+    return p.fields
+end
 
-One builder per schema field in schema order: a `TypedColumn` for every field whose position is in
-`selected` (`nothing` selects all), a `SkipColumn` otherwise. Column storage for `capacity` rows is
-charged exactly at allocation (`Base.elsize` per slot plus one tag byte per isbits-`Union` element).
-"""
-function columnbuilders(p::RecordPlan, projection::Union{Nothing,Projection}, capacity::Int,
-                        budget::Budget)
+# One builder per output field: a `TypedColumn` with room for `capacity` rows for every field the
+# projection keeps (`nothing` keeps all), a `SkipColumn` otherwise.
+function columnbuilders(p::ReadPlan, projection::Union{Nothing,Projection}, capacity::Int)
     capacity >= 0 || throw(ArgumentError("capacity must be non-negative"))
-    checkpoint = budgetcheckpoint(budget)
-    cols = nothing
-    try
-        outer = vectorbytes(ColumnBuilder, length(p.fields))
-        reserve!(budget, outer)
-        cols = Vector{ColumnBuilder}(undef, length(p.fields))
-        for (i, f) in enumerate(p.schema.fields)
-            if projection === nothing || projection.slots[i] != 0
-                cols[i] = makecolumn(juliatype(f.schema), p.fields[i], capacity, budget)
-            else
-                setskipcolumn!(cols, i, p.fields[i], budget)
-            end
+    plans = slotplans(p)
+    cols = Vector{ColumnBuilder}(undef, length(plans))
+    for (i, plan) in enumerate(plans)
+        if projection === nothing || projection.slots[i] != 0
+            cols[i] = TypedColumn(plan, Vector{juliatype(p.schema.fields[i].schema)}(undef, capacity), 0)
+        else
+            cols[i] = SkipColumn(plan)
         end
-        return cols
-    catch
-        cols = nothing
-        rollbackreservations!(budget, checkpoint)
-        rethrow()
     end
+    return cols
 end
 
-function columnbuilders(p::RecordPlan, selected::AbstractVector{Int}, capacity::Int,
-                        budget::Budget)
-    projection = positionalprojection(selected, length(p.fields), budget)
-    try
-        return columnbuilders(p, projection, capacity, budget)
-    finally
-        release!(budget, projectionbytes(projection))
+# Builders that decode blocks straight into preallocated final columns: `finals[k]` is projected column `k`,
+# and each block's rows land after the row its builders' `len` is set to.
+function directbuilders(p::ReadPlan, projection::Union{Nothing,Projection}, finals::Vector{AbstractVector})
+    plans = slotplans(p)
+    cols = Vector{ColumnBuilder}(undef, length(plans))
+    for (i, plan) in enumerate(plans)
+        k = projection === nothing ? i : projection.slots[i]
+        cols[i] = k == 0 ? SkipColumn(plan) : TypedColumn(plan, finals[k], 0)
     end
+    return cols
 end
 
-function makecolumn(::Type{E}, plan::P, capacity::Int, budget::Budget) where {E,P<:ReadPlan}
-    checkpoint = budgetcheckpoint(budget)
-    data = nothing
-    try
-        databytes = vectorbytes(E, capacity)
-        node = columnnodebytes(TypedColumn{E,P})
-        reserve!(budget, checked_add(databytes, node))
-        data = Vector{E}(undef, capacity)
-        column = TypedColumn{E,P}(plan, data, 0)
-        return column
-    catch
-        data = nothing
-        rollbackreservations!(budget, checkpoint)
-        rethrow()
-    end
-end
-
-"""
-    decoderow!(cols::Vector{ColumnBuilder}, d::Decoder)
-
-Decode one record (the schema's field order) into the builders: one dynamic dispatch per cell.
-"""
-function decoderow!(cols::Vector{ColumnBuilder}, d::Decoder)
+# One record row in wire order: the record value is counted, then each cell is decoded.
+function decoderow!(cells::Vector{ColumnBuilder}, d::Decoder)
+    countvalue!(d)
     enter!(d)
-    for c in cols
+    for c in cells
         decodecell!(c, d)
     end
     leave!(d)
     return nothing
+end
+
+function decodecell!(c::TypedColumn, d::Decoder)
+    return appendcell!(c, decode(c.plan, d))
 end
 
 function decodecell!(c::SkipColumn, d::Decoder)
@@ -364,102 +141,47 @@ function decodecell!(c::SkipColumn, d::Decoder)
 end
 
 function decodecell!(c::SkipRun, d::Decoder)
-    if d.validate === :fast
-        if c.fastbytes >= 0
-            countvalues!(d.budget, length(c.plans))
-            checkvaluebytes(d.budget, c.fastmaxbytes)
-            bytesavailable(d, c.fastbytes) ||
-                dataerror(d, "fixed run of $(c.fastbytes) bytes exceeds the remaining $(remaining(d)) bytes")
-            d.pos += c.fastbytes
-            return nothing
-        end
-        b = d.budget
-        for i in eachindex(c.fastkinds)                 # parameter-free closed leaf instruction set
-            kind = @inbounds c.fastkinds[i]
-            if kind == SKIP_LENGTH
-                countvalues!(b)
-                skiplen(d)
-            elseif kind == SKIP_DOUBLE
-                countvalues!(b)
-                readdouble(d)
-            elseif kind == SKIP_LONG
-                countvalues!(b)
-                readlong(d)
-            elseif kind == SKIP_INT
-                countvalues!(b)
-                readint(d)
-            elseif kind == SKIP_BOOL
-                countvalues!(b)
-                readbool(d)                            # bools stay domain-checked in both modes
-            elseif kind == SKIP_FLOAT
-                countvalues!(b)
-                readfloat(d)
-            elseif kind == SKIP_NULL
-                countvalues!(b)
-            else
-                skip(@inbounds(c.plans[i]), d)
-            end
-        end
+    if c.width >= 0
+        countvalues!(d, length(c.plans))
+        bytesavailable(d, c.width) ||
+            dataerror(d, "fixed run of $(c.width) bytes exceeds the remaining $(remaining(d)) bytes")
+        d.pos += c.width
         return nothing
     end
-    for p in c.plans
-        skip(p, d)
+    for i in eachindex(c.kinds)
+        kind = @inbounds c.kinds[i]
+        if kind == SKIP_FALLBACK
+            skip(@inbounds(c.plans[i]), d)
+            continue
+        end
+        countvalue!(d)                                  # SKIP_NULL: counted, no bytes
+        if kind == SKIP_LENGTH
+            skiplen(d)
+        elseif kind == SKIP_DOUBLE
+            readdouble(d)
+        elseif kind == SKIP_LONG
+            readlong(d)
+        elseif kind == SKIP_INT
+            readint(d)
+        elseif kind == SKIP_BOOL
+            readbool(d)
+        elseif kind == SKIP_FLOAT
+            readfloat(d)
+        end
     end
     return nothing
 end
 
-function decodecell!(c::TypedColumn{E}, d::Decoder) where {E}
-    return appendcell!(c, d.budget, decode(c.plan, d))
-end
-
-function appendcell!(c::TypedColumn{E}, budget::Budget, v) where {E}
+# Append one value, doubling the storage when it is full.
+function appendcell!(c::TypedColumn, v)
     n = c.len + 1
-    if n > length(c.data)
-        grow!(c, budget, max(2 * length(c.data), 4))
-    end
+    n > length(c.data) && resize!(c.data, max(2 * length(c.data), 4))
     @inbounds c.data[n] = v
     c.len = n
     return nothing
 end
 
-function grow!(c::TypedColumn{E}, budget::Budget, newcap::Int) where {E}
-    reserve!(budget, vectorbytes(E, newcap))
-    nd = Vector{E}(undef, newcap)
-    copyto!(nd, 1, c.data, 1, c.len)
-    oldbytes = vectorbytes(E, length(c.data))
-    c.data = nd                                        # the old storage is unreachable only after the rebind
-    release!(budget, oldbytes)
-    return nothing
-end
-
-"""
-    finishcolumn!(c::TypedColumn, budget) -> Vector
-
-The column trimmed to its row count (over-capacity storage released from the budget).
-"""
-function finishcolumn!(c::TypedColumn{E}, budget::Budget) where {E}
-    out = c.data
-    if c.len != length(out)
-        reserve!(budget, vectorbytes(E, c.len))
-        out = Vector{E}(undef, c.len)
-        copyto!(out, 1, c.data, 1, c.len)
-        oldbytes = vectorbytes(E, length(c.data))
-        c.data = out                                   # the old storage is unreachable only after the rebind
-        release!(budget, oldbytes)
-    end
-    return out
-end
-
-"""
-    decodecolumns(plan::RecordPlan, d::Decoder, nrows; selected=nothing) -> Vector{ColumnBuilder}
-
-Decode `nrows` consecutive records from `d` into column builders.
-"""
-function decodecolumns(p::RecordPlan, d::Decoder, nrows::Int; selected=nothing)
-    cols = columnbuilders(p, selected, nrows, d.budget)
-    for _ in 1:nrows
-        countvalues!(d.budget)
-        decoderow!(cols, d)
-    end
-    return cols
+# The column trimmed to its filled rows.
+function finishcolumn!(c::TypedColumn)
+    return resize!(c.data, c.len)
 end

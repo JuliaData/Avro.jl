@@ -1,186 +1,87 @@
+# Everything a successfully closed Writer emits is accepted by the Reader, Rows and Table under the same
+# Limits: across root kinds, codecs and source modes, and at the value cap where writers split blocks.
 @testset "Writer/Reader invariant: consumers and source modes" begin
     P = Avro.parseschema
     dir = mktempdir()
-    @testset "write plan nodes are bounded and field lookup is reentrant" begin
-        for json in (
-                "{\"type\":\"array\",\"items\":\"long\"}",
-                "{\"type\":\"map\",\"values\":\"long\"}",
-                "{\"type\":\"fixed\",\"name\":\"PlanFixed\",\"size\":4}",
-                "{\"type\":\"enum\",\"name\":\"PlanEnum\",\"symbols\":[\"A\"]}",
-                "{\"type\":\"bytes\",\"logicalType\":\"decimal\",\"precision\":4,\"scale\":2}")
-            budget = Avro.Budget(Avro.Limits())
-            plan = Avro.writeplan(P(json); budget=budget)
-            @test budget.reserved >= 64
-        end
-        limited = Avro.Limits(max_resolution_work=1)
-        union = P("[\"null\",\"long\"]")
-        for build in (Avro.readplan, Avro.writeplan)
-            budget = Avro.Budget(limited)
-            @test_throws Avro.LimitError build(union; budget=budget)
-            @test budget.reserved == 0
-        end
+    function blockcount(src)
+        return Avro.Reader(r -> length(collect(Avro.eachblock(r))), src)
+    end
+    @testset "recursive field lookup is reentrant" begin
         recursive = P("{\"type\":\"record\",\"name\":\"FieldCache\",\"fields\":[{\"name\":\"child\",\"type\":[\"null\",\"FieldCache\"]},{\"name\":\"tail\",\"type\":\"int\"}]}")
         value = (child=(tail=Int32(2), child=missing), tail=Int32(1))
         @test isequal(Avro.decode(recursive, Avro.encode(recursive, value)), Avro.Record(recursive, Any[
             Avro.Record(recursive, Any[missing, Int32(2)]), Int32(1)]))
     end
-    @testset "byte and stream headers have identical near-ceiling acceptance" begin
-        maxmetadata = (40 << 20) - 6
-        smallkeys = ["k$(lpad(i, 4, '0'))" for i in 1:1024]
-        largekeybytes = maxmetadata - sizeof("avro.schema") - sizeof("\"null\"") - sum(sizeof, smallkeys)
-        limits = Avro.Limits(max_total_bytes=80 << 20, max_codec_memory=16 << 20,
-                             max_block_bytes=1 << 20, max_block_output_bytes=1 << 20,
-                             max_bytes=1 << 20, max_datum_bytes=1 << 20,
-                             max_schema_bytes=6, max_metadata_bytes=maxmetadata)
-        long = Avro.LongSchema()
-        function varint(n)
-            return Avro.encode(long, Int64(n))
-        end
-        header = IOBuffer()
-        write(header, b"Obj\x01")
-        write(header, varint(length(smallkeys) + 2))
-        write(header, varint(sizeof("avro.schema")), codeunits("avro.schema"),
-              varint(sizeof("\"null\"")), codeunits("\"null\""))
-        for key in smallkeys
-            write(header, varint(sizeof(key)), codeunits(key), varint(0))
-        end
-        write(header, varint(largekeybytes))
-        chunk = fill(UInt8('z'), 1 << 20)
-        whole, remainder = divrem(largekeybytes, length(chunk))
-        for _ in 1:whole
-            write(header, chunk)
-        end
-        write(header, view(chunk, 1:remainder), varint(0), varint(0), zeros(UInt8, 16))
-        bytes = take!(header)
-        path = joinpath(dir, "header-source-equivalence.avro")
-        write(path, bytes)
-
-        function outcome(src; kw...)
-            try
-                r = Avro.Reader(src; limits=limits, kw...)
-                close(r)
-                return :accepted
-            catch e
-                return (typeof(e), e isa Avro.LimitError ? e.limit : nothing, sprint(showerror, e))
+    @testset "writers split blocks at the value cap every consumer enforces" begin
+        lim = Avro.Limits(max_values_per_byte=1, value_allowance=100)     # 100 values per zero-byte block
+        nulls = Avro.NullSchema()
+        empty_schema = P("{\"type\":\"record\",\"name\":\"Once\",\"fields\":[]}")
+        twonulls = P("{\"type\":\"record\",\"name\":\"TwoNulls\",\"fields\":[{\"name\":\"x\",\"type\":\"null\"},{\"name\":\"y\",\"type\":\"null\"}]}")
+        for (schema, value, perdatum) in ((nulls, missing, 1), (empty_schema, (;), 1), (twonulls, (x=missing, y=missing), 3)),
+            n in (60, 250)
+            io = IOBuffer()
+            writer = Avro.Writer(io, schema; limits=lim)
+            for _ in 1:n
+                push!(writer, value)
+            end
+            close(writer)
+            bytes = take!(io)
+            @test blockcount(bytes) >= cld(n * perdatum, 100)
+            @test Avro.Reader(r -> length(collect(Avro.eachdatum(r))), IOBuffer(bytes); limits=lim) == n
+            rows = Avro.Rows(IOBuffer(bytes); limits=lim)
+            @test length(collect(rows)) == n
+            close(rows)
+            if schema isa Avro.RecordSchema
+                @test length(Avro.Table(IOBuffer(bytes); limits=lim, ntasks=1)) == n
+                @test length(Avro.Table(bytes; limits=lim, ntasks=2)) == n
             end
         end
-        frombytes = outcome(bytes)
-        fromstream = outcome(path; mmap=false)
-        @test frombytes === :accepted
-        @test fromstream == frombytes
     end
-    @testset "strict consumers charge each datum once" begin
-        lim = Avro.Limits(max_total_values=100, work_allowance=1000)
-        nullio = IOBuffer()
-        nullwriter = Avro.Writer(nullio, Avro.NullSchema(); limits=lim)
-        for _ in 1:60
-            push!(nullwriter, missing)
-        end
-        close(nullwriter)
-        nullbytes = take!(nullio)
-        @test Avro.Reader(r -> length(collect(Avro.eachdatum(r))), IOBuffer(nullbytes); limits=lim) == 60
-        nullrows = Avro.Rows(IOBuffer(nullbytes); limits=lim)
-        @test length(collect(nullrows)) == 60
-        close(nullrows)
-
-        empty_schema = P("{\"type\":\"record\",\"name\":\"Once\",\"fields\":[]}")
-        emptyio = IOBuffer()
-        emptywriter = Avro.Writer(emptyio, empty_schema; limits=lim)
-        for _ in 1:60
-            push!(emptywriter, (;))
-        end
-        close(emptywriter)
-        emptybytes = take!(emptyio)
-        @test length(Avro.Table(IOBuffer(emptybytes); limits=lim, ntasks=1)) == 60
-        Threads.nthreads() > 1 && @test length(Avro.Table(emptybytes; limits=lim, ntasks=2)) == 60
-    end
-    @testset "writer and reader use identical container work counters" begin
-        limits = Avro.Limits(max_total_values=16)
+    @testset "writer and reader count values alike" begin
         schema = Avro.StringSchema()
         for codec in Avro.codecs()
             io = IOBuffer()
-            writer = Avro.Writer(io, schema; codec=codec, limits=limits)
+            writer = Avro.Writer(io, schema; codec=codec)
             push!(writer, "x")
             close(writer)
-            bytes = take!(io)
-            writerstate = (values=writer.budget.values, input_bytes=writer.budget.input_bytes,
-                           rows=writer.budget.rows, blocks=writer.budget.blocks,
-                           members=writer.budget.members,
-                           allowance_used=Avro.allowanceused(writer.budget))
-            values, readerstate = Avro.Reader(IOBuffer(bytes); limits=limits) do reader
-                decoded = collect(Avro.eachdatum(reader))
-                state = (values=reader.budget.values, input_bytes=reader.budget.input_bytes,
-                         rows=reader.budget.rows, blocks=reader.budget.blocks,
-                         members=reader.budget.members,
-                         allowance_used=Avro.allowanceused(reader.budget))
-                return decoded, state
-            end
-            @test values == ["x"]
-            @test writerstate == readerstate
+            @test Avro.Reader(r -> collect(Avro.eachdatum(r)), take!(io)) == ["x"]
         end
-
-        tight = Avro.Limits(max_total_values=3)
+        # a datum over its own value cap is refused before anything reaches the sink
+        tight = Avro.Limits(max_values_per_byte=1, value_allowance=0)
         tightio = IOBuffer()
-        tightwriter = Avro.Writer(tightio, schema; limits=tight)
+        tightwriter = Avro.Writer(tightio, Avro.ArraySchema(Avro.NullSchema()); limits=tight)
         headersize = position(tightio)
         err = try
-            push!(tightwriter, "x")
+            push!(tightwriter, fill(missing, 10))                    # 11 values in 2 bytes
             close(tightwriter)
             nothing
         catch e
             close(tightwriter; abort=true)
             e
         end
-        @test err isa Avro.LimitError && err.limit === :max_total_values && err.observed == 4
+        @test err isa Avro.LimitError && err.limit === :max_values_per_byte
         @test position(tightio) == headersize                         # no unreadable data block was emitted
-
-        # The aligned direct-append path preserves shared counters when the next
-        # row crosses a block-count boundary and must be staged during the flush.
+        # aligned NamedTuple rows: the second row would push the block over the cap, so it starts the next block
         recordschema = P("""{"type":"record","name":"AlignedWork","fields":[
-            {"name":"id","type":"long"},{"name":"name","type":"string"}]}""")
-        recordlimits = Avro.Limits(max_block_count=1)
-        recordrows = [(id=Int64(1), name="one"), (id=Int64(2), name="two")]
+            {"name":"id","type":"long"},{"name":"gap","type":"null"},{"name":"name","type":"string"}]}""")
+        recordlimits = Avro.Limits(max_values_per_byte=1, value_allowance=2)   # one 4-value, 2-byte row per block
+        recordrows = [(id=Int64(1), gap=missing, name=""), (id=Int64(2), gap=missing, name="")]
         recordio = IOBuffer()
         recordwriter = Avro.Writer(recordio, recordschema; limits=recordlimits)
         for row in recordrows
             push!(recordwriter, row)
         end
         close(recordwriter)
-        recordbytes = take!(recordio)
-        recordwriterstate = (values=recordwriter.budget.values,
-                             input_bytes=recordwriter.budget.input_bytes,
-                             rows=recordwriter.budget.rows,
-                             blocks=recordwriter.budget.blocks,
-                             members=recordwriter.budget.members,
-                             allowance_used=Avro.allowanceused(recordwriter.budget))
-        recordvalues, recordreaderstate = Avro.Reader(recordbytes;
-                                                       limits=recordlimits) do reader
-            values = collect(Avro.eachdatum(reader))
-            state = (values=reader.budget.values,
-                     input_bytes=reader.budget.input_bytes,
-                     rows=reader.budget.rows,
-                     blocks=reader.budget.blocks,
-                     members=reader.budget.members,
-                     allowance_used=Avro.allowanceused(reader.budget))
-            return values, state
-        end
+        alignedbytes = take!(recordio)
+        @test blockcount(alignedbytes) == 2
+        recordvalues = Avro.Reader(r -> collect(Avro.eachdatum(r)), alignedbytes; limits=recordlimits)
         @test getproperty.(recordvalues, :id) == Int64[1, 2]
-        @test getproperty.(recordvalues, :name) == ["one", "two"]
-        function sharedwork(state)
-            return (values=state.values,
-                    input_bytes=state.input_bytes,
-                    rows=state.rows,
-                    blocks=state.blocks,
-                    members=state.members,
-                    allowance_used=state.allowance_used)
-        end
-        @test sharedwork(recordwriterstate) == sharedwork(recordreaderstate)
+        @test getproperty.(recordvalues, :name) == ["", ""]
+        @test Tables.getcolumn(Avro.Table(alignedbytes; limits=recordlimits), :id) == Int64[1, 2]
     end
-    @testset "schema printing does not subsidise datum work" begin
-        dense = fill(nothing, 67_000)
-        dense_schema = Avro.ArraySchema(Avro.NullSchema())
-        dense_io = IOBuffer()
-        dense_writer = Avro.Writer(dense_io, dense_schema)
+    @testset "a datum over its own value cap is refused by the writer" begin
+        dense = fill(nothing, 67_000)                                  # 67,001 values in four bytes
+        dense_writer = Avro.Writer(IOBuffer(), Avro.ArraySchema(Avro.NullSchema()))
         err = try
             push!(dense_writer, dense)
             close(dense_writer)
@@ -191,26 +92,8 @@
         err === nothing || close(dense_writer; abort=true)
         @test err isa Avro.LimitError && err.limit === :max_values_per_byte
     end
-    @testset "writer and reader enforce cumulative row and block limits" begin
-        for limits in (Avro.Limits(max_block_count=0), Avro.Limits(max_rows=0))
-            writer = Avro.Writer(IOBuffer(), Avro.NullSchema(); limits=limits)
-            @test_throws Avro.LimitError push!(writer, missing)
-            close(writer; abort=true)
-        end
-        blockwriter = Avro.Writer(IOBuffer(), Avro.NullSchema(); limits=Avro.Limits(max_blocks=0))
-        push!(blockwriter, missing)
-        @test_throws Avro.LimitError close(blockwriter)
-
-        io = IOBuffer()
-        writer = Avro.Writer(io, Avro.NullSchema())
-        push!(writer, missing)
-        close(writer)
-        bytes = take!(io)
-        @test_throws Avro.LimitError Avro.Reader(r -> collect(Avro.eachdatum(r)), IOBuffer(bytes); limits=Avro.Limits(max_rows=0))
-    end
-    @testset "a near-ceiling record file through every source mode and guaranteed consumer" begin
-        lim = Avro.Limits(max_total_bytes=96 << 20, max_block_bytes=8 << 20, max_codec_memory=16 << 20,
-                          max_block_output_bytes=32 << 20, max_bytes=8 << 20, max_datum_bytes=8 << 20)
+    @testset "a large record file through every source mode and consumer" begin
+        lim = Avro.Limits(max_bytes=1 << 20)
         s = P("{\"type\":\"record\",\"name\":\"N\",\"fields\":[{\"name\":\"a\",\"type\":\"long\"},{\"name\":\"b\",\"type\":\"string\"},{\"name\":\"c\",\"type\":[\"null\",\"double\"]}]}")
         n = 260_000
         rows = [(a=Int64(i), b="value-$(i)-payloadpayloadpayloadpayloadpayload", c=iseven(i) ? i / 3 : missing) for i in 1:n]
@@ -238,7 +121,8 @@
             @test ismissing(Tables.getcolumn(t, :c)[1]) && Tables.getcolumn(t, :c)[2] == 2 / 3
         end
     end
-    @testset "root shapes through the guaranteed consumers" begin
+    @testset "root shapes and codecs through every consumer under the same limits" begin
+        lim = Avro.Limits(max_values_per_byte=1, value_allowance=100)
         shapes = [
             ("\"null\"", fill(nothing, 1000), false),
             ("{\"type\":\"record\",\"name\":\"E\",\"fields\":[]}", fill((;), 1000), true),
@@ -249,25 +133,26 @@
             ("{\"type\":\"record\",\"name\":\"NR\",\"fields\":[{\"name\":\"inner\",\"type\":{\"type\":\"record\",\"name\":\"NI\",\"fields\":[{\"name\":\"x\",\"type\":\"null\"}]}}]}",
              fill((inner=(x=nothing,),), 1000), true),
         ]
-        for (json, vals, isrecord) in shapes
+        for (json, vals, isrecord) in shapes, codec in Avro.codecs()
             s = P(json)
             io = IOBuffer()
-            w = Avro.Writer(io, s; block_bytes=256)
+            w = Avro.Writer(io, s; block_bytes=256, codec=codec, limits=lim)
             for v in vals
                 push!(w, v)
             end
             close(w)
             bytes = take!(io)
-            cnt = Avro.Reader(rr -> sum(first(b) for b in Avro.eachblock(rr); init=0), IOBuffer(bytes))
+            cnt = Avro.Reader(rr -> sum(first(b) for b in Avro.eachblock(rr); init=0), IOBuffer(bytes); limits=lim)
             @test cnt == 1000
-            rl = Avro.Rows(IOBuffer(bytes))
+            @test length(Avro.Reader(rr -> collect(Avro.eachdatum(rr)), IOBuffer(bytes); limits=lim)) == 1000
+            rl = Avro.Rows(IOBuffer(bytes); limits=lim)
             @test count(Returns(true), rl) == 1000
             close(rl)
             if isrecord
-                t = Avro.Table(IOBuffer(bytes))
+                t = Avro.Table(IOBuffer(bytes); limits=lim)
                 @test length(t) == 1000
             else
-                @test_throws ArgumentError Avro.Table(IOBuffer(bytes))
+                @test_throws Avro.SchemaError Avro.Table(IOBuffer(bytes); limits=lim)
             end
         end
     end
@@ -311,23 +196,9 @@
             write(io, Avro.encode(long, Int64(1) << 24), Avro.encode(long, Int64(2)), UInt8[0, 0], sync)
         end
         claims = take!(io)
-        cols = Type[Int64, String]
-        @test Avro.Reader(r -> Avro.preallocatable(cols, Avro.prescanblocks(r).totalrows, r.source), claims) == false
-        @test Avro.Reader(r -> Avro.preallocatable(cols, Avro.prescanblocks(r).totalrows, r.source),
-                          take!(Avro.tobuffer((a=collect(1:1000), s=fill("x", 1000))))) == true
-        @test_throws Avro.LimitError Avro.Table(claims)
-        @test_throws Avro.LimitError Avro.Table(claims; ntasks=1)
-    end
-    @testset "admission across repeated files; exhausted admission" begin
-        s = P("{\"type\":\"record\",\"name\":\"A\",\"fields\":[{\"name\":\"p\",\"type\":\"long\"},{\"name\":\"q\",\"type\":\"long\"}]}")
-        function buf()
-            return Avro.tobuffer([(p=Int64(1), q=Int64(2))]; schema=s)
-        end
-        adm = Avro.SymbolAdmission(max_names=2)
-        @test Tables.columnnames(Avro.Table(buf(); names=adm)) == [:p, :q]
-        @test Tables.columnnames(Avro.Table(buf(); names=adm)) == [:p, :q]     # already-admitted names do not count twice
-        s2 = P("{\"type\":\"record\",\"name\":\"A2\",\"fields\":[{\"name\":\"r\",\"type\":\"long\"}]}")
-        buf2 = Avro.tobuffer([(r=Int64(1),)]; schema=s2)
-        @test_throws Avro.LimitError Avro.Table(buf2; names=adm)               # exhausted for new names
+        @test_throws Union{Avro.DataError,Avro.LimitError} Avro.Table(claims)
+        @test_throws Union{Avro.DataError,Avro.LimitError} Avro.Table(claims; ntasks=1)
+        @test @allocated(try Avro.Table(claims) catch end) < 64 << 20
+        @test length(Avro.Table(take!(Avro.tobuffer((a=collect(1:1000), s=fill("x", 1000)))))) == 1000
     end
 end

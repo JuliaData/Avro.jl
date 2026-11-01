@@ -29,9 +29,7 @@ import DataAPI
         @test Tables.getcolumn(t, :e) isa Vector{Avro.EnumValue} && String(Tables.getcolumn(t, :e)[1]) == "X"
         @test Avro.schema(t) isa Avro.RecordSchema && Avro.fullname(Avro.schema(t)) == "t.T"
         @test Avro.codec(t) === :deflate && Avro.writerschema(t) === Avro.schema(t)
-        parts = collect(Tables.partitions(t))
-        @test length(parts) > 1 && sum(length, parts) == 250
-        @test Tables.getcolumn(parts[1], :a)[1] == 1 && Tables.getcolumn(parts[end], :a)[end] == 250
+        @test only(Tables.partitions(t)) === t
         @test DataAPI.metadatasupport(Avro.Table) == (read=true, write=false)
         @test "k" in collect(DataAPI.metadatakeys(t))
         @test DataAPI.metadata(t, "k") == "v"
@@ -44,10 +42,10 @@ import DataAPI
         push!(w, 1)
         close(w)
         seekstart(arrio)
-        @test_throws ArgumentError Avro.Table(arrio)
+        @test_throws Avro.SchemaError Avro.Table(arrio)
     end
     @testset "column access does not shadow table metadata accessors" begin
-        columns = (schema=[1], writerschema=[2], metadata=[3], columns=[4], names=[5], nrows=[6])
+        columns = NamedTuple{(:schema, :writerschema, :metadata, :columns, :names, :nrows)}(([1], [2], [3], [4], [5], [6]))
         collision = Avro.Table(Avro.tobuffer(columns))
         for name in keys(columns)
             @test getproperty(collision, name) == columns[name]
@@ -60,27 +58,25 @@ import DataAPI
         @test Tables.columntable(collision) == columns
         @test Tables.columntable(Avro.Table(Avro.tobuffer(collision))) == columns
     end
-    @testset "partition output limits match column materialization" begin
+    @testset "Rows partitions and Table agree, including on a block over max_bytes" begin
         data = take!(Avro.tobuffer([(x=Int64(1),)]))
-        exact = Avro.Limits(max_block_output_bytes=8)
-        for validate in (:strict, :fast)
-            expected = Tables.columntable(Avro.Table(data; limits=exact, validate))
-            Avro.Rows(data; limits=exact, validate) do stream
-                @test Tables.columntable(only(Tables.partitions(stream))) == expected
-            end
+        expected = Tables.columntable(Avro.Table(data))
+        Avro.Rows(data) do stream
+            @test Tables.columntable(only(Tables.partitions(stream))) == expected
         end
-        many = take!(Avro.tobuffer([(x=repeat("a", 64),) for _ in 1:1_000]))
-        bounded = Avro.Limits(max_block_output_bytes=1024)
-        Avro.Rows(many; limits=bounded) do stream
-            failure = try
-                first(Tables.partitions(stream))
-            catch err
-                err
-            end
-            @test failure isa Avro.LimitError
-            if failure isa Avro.LimitError
-                @test failure.limit === :max_block_output_bytes
-                @test 1024 < failure.observed < 2048
+        many = take!(Avro.tobuffer([(x=repeat("a", 64),) for _ in 1:1_000]))   # a first block of about 64 KiB
+        bounded = Avro.Limits(max_bytes=1024)
+        failure(f) = try
+            f()
+            nothing
+        catch err
+            err
+        end
+        for err in (failure(() -> Avro.Rows(stream -> first(Tables.partitions(stream)), many; limits=bounded)),
+                    failure(() -> Avro.Table(many; limits=bounded)))
+            @test err isa Avro.LimitError
+            if err isa Avro.LimitError
+                @test err.limit === :max_bytes && err.value == 1024 && err.observed > 1024
             end
         end
     end
@@ -96,12 +92,12 @@ import DataAPI
         end
         r2 = Avro.Rows(buf())
         row1, _ = iterate(r2)
-        @test row1 isa Avro.Row && row1.a === Int64(1) && Tables.getcolumn(row1, :b) == "r1" && Tables.getcolumn(row1, 2) == "r1"
+        @test row1 isa Avro.Record && row1.a === Int64(1) && Tables.getcolumn(row1, :b) == "r1" && Tables.getcolumn(row1, 2) == "r1"
         @test Tables.columnnames(row1) == [:a, :b, :c, :e]
-        @test Avro.record(row1) isa Avro.Record
+        @test Avro.schema(row1) == Avro.schema(t) && Avro.fullname(Avro.schema(row1)) == "t.T"
         close(r2)
         rec = Avro.decode(s, Avro.encode(s, rows[1]))
-        @test Avro.Row(rec).a === Int64(1)
+        @test rec isa Tables.AbstractRow && rec.a === Int64(1)
         rt = Avro.Rows(buf(); T=NamedTuple{(:a, :b, :c, :e),Tuple{Int64,String,Union{Missing,Float64},String}})
         @test !Tables.istable(rt)
         vals = collect(rt)
@@ -137,77 +133,28 @@ import DataAPI
         close(string_writer)
         string_data = take!(string_io)
         string_rows = Avro.Rows(string_data)
-        string_budget = string_rows.reader.budget
-        string_base = string_budget.reserved
         string_parts = Avro.Table[]
         partitions = Tables.partitions(string_rows)
+        state = false
         for _ in string_values
-            part, _ = iterate(partitions)
+            part, state = iterate(partitions, state)
             push!(string_parts, part)
-            @test string_budget.reserved == string_base
         end
-        @test iterate(partitions) === nothing
+        @test iterate(partitions, state) === nothing
         @test [only(Tables.getcolumn(part, :x)) for part in string_parts] == string_values
         close(string_rows)
         string_column_rows = Avro.Rows(string_data)
-        string_column_budget = string_column_rows.reader.budget
-        string_column_base = string_column_budget.reserved
         string_table = Tables.columns(string_column_rows)
         @test Tables.getcolumn(string_table, :x) == string_values
-        @test string_column_budget.reserved == string_column_base
         close(string_column_rows)
-        retained_rows = Avro.Rows(string_data)
-        retained_budget = retained_rows.reader.budget
-        Avro.reserve!(retained_budget, retained_budget.ceiling - retained_budget.reserved - 4096)
-        retained_base = retained_budget.reserved
-        @test_throws Avro.LimitError Tables.columns(retained_rows)
-        @test retained_budget.reserved == retained_base
-        close(retained_rows)
-        rejected_rows = Avro.Rows(string_data; names=Avro.SymbolAdmission(max_names=0))
-        rejected_budget = rejected_rows.reader.budget
-        rejected_base = rejected_budget.reserved
-        @test_throws Avro.LimitError first(Tables.partitions(rejected_rows))
-        @test rejected_budget.reserved == rejected_base
-        close(rejected_rows)
-        close(rejected_rows)
-        tiny_schema = P("{\"type\":\"record\",\"name\":\"Tiny\",\"fields\":[{\"name\":\"x\",\"type\":\"string\"}]}")
-        tiny = take!(Avro.tobuffer([(x="abcdefghij",)]; schema=tiny_schema))
-        limited = Avro.Rows(tiny; limits=Avro.Limits(max_block_output_bytes=1))
-        limited_budget = limited.reader.budget
-        limited_base = limited_budget.reserved
-        @test_throws Avro.LimitError first(Tables.partitions(limited))
-        @test limited_budget.reserved == limited_base
-        close(limited)
         fixed_tuple_schema = P("""{"type":"record","name":"FixedTupleLimit","fields":[
             {"name":"f","type":{"type":"fixed","name":"FixedTupleLimitValue","size":4}}]}""")
         fixed_tuple_data = take!(Avro.tobuffer([(f=UInt8[1, 2, 3, 4],)];
                                                schema=fixed_tuple_schema, codec=:null))
         FixedTupleRow = @NamedTuple{f::NTuple{4,UInt8}}
-        fixed_tuple_limit = 8
-        fixed_tuple_rows = Avro.Rows(fixed_tuple_data; T=FixedTupleRow,
-                                     limits=Avro.Limits(max_block_output_bytes=fixed_tuple_limit))
+        fixed_tuple_rows = Avro.Rows(fixed_tuple_data; T=FixedTupleRow)
         @test collect(fixed_tuple_rows) == [(f=(0x01, 0x02, 0x03, 0x04),)]
         close(fixed_tuple_rows)
-        @test_throws Avro.LimitError collect(Avro.Rows(
-            fixed_tuple_data; T=FixedTupleRow,
-            limits=Avro.Limits(max_block_output_bytes=fixed_tuple_limit - 1)))
-        column_io = IOBuffer()
-        column_schema = P("{\"type\":\"record\",\"name\":\"ColumnLimit\",\"fields\":[{\"name\":\"x\",\"type\":\"long\"}]}")
-        column_writer = Avro.Writer(column_io, column_schema; codec=:null, block_bytes=20_000)
-        for _ in 1:10_000
-            push!(column_writer, (x=Int64(0),))
-        end
-        close(column_writer)
-        column_rows = Avro.Rows(take!(column_io))
-        column_budget = column_rows.reader.budget
-        Avro.reserve!(column_budget, column_budget.ceiling - column_budget.reserved - 130_000)
-        column_base = column_budget.reserved
-        try
-            @test_throws Avro.LimitError Tables.columns(column_rows)
-            @test column_budget.reserved == column_base
-        finally
-            close(column_rows)
-        end
         @test Avro.Rows(rr -> sum(row.a for row in rr), buf()) == sum(1:250)
     end
     @testset "select= projection" begin
@@ -234,28 +181,17 @@ import DataAPI
                 end
             end
         end
-        @test_throws ArgumentError Avro.Table(buf(); select=(:nope,))
+        @test_throws Avro.SchemaError Avro.Table(buf(); select=(:nope,))
         @test_throws ArgumentError Avro.Table(buf(); select=(:a, :a))
-        selectlimits = Avro.Limits(max_name_bytes=128)
         longselector = repeat("x", 100_000)
-        longsubselector = SubString("p" * longselector, 2)
-        longsymbolselector = Symbol(longselector)
-        for selector in (longselector, longsubselector, longsymbolselector)
-            selecterror = try
-                Avro.Table(buf(); select=(selector,), limits=selectlimits)
-                nothing
-            catch err
-                err
-            end
-            @test selecterror isa Avro.LimitError
-            @test selecterror === nothing || selecterror.limit == :max_name_bytes
+        for selector in (longselector, SubString("p" * longselector, 2), Symbol(longselector))
+            @test_throws Avro.SchemaError Avro.Table(buf(); select=(selector,))   # no such field
         end
         pr = Avro.Rows(buf(); select=(:e, :a))
         row1, _ = iterate(pr)
         @test Tables.columnnames(row1) == [:e, :a] && row1.a === Int64(1) && String(row1.e) == "X"
         close(pr)
-        ptf = Avro.Table(buf(); select=(:a,), validate=:fast)
-        @test Tables.getcolumn(ptf, :a) == 1:250
+        @test Tables.getcolumn(Avro.Table(buf(); select=(:a,)), :a) == 1:250
     end
     @testset "reader_schema through Table and Rows" begin
         rdr = P("{\"type\":\"record\",\"name\":\"T\",\"namespace\":\"t\",\"fields\":[{\"name\":\"a\",\"type\":\"double\"},{\"name\":\"b\",\"type\":\"string\"},{\"name\":\"z\",\"type\":\"int\",\"default\":7}]}")
@@ -271,7 +207,7 @@ import DataAPI
         t2 = Avro.Table(buf(); reader_schema=rdr, select=(:z, :b))
         @test Tables.columnnames(t2) == [:z, :b] && Tables.getcolumn(t2, :b)[1] == "r1" && Tables.getcolumn(t2, :z)[1] === Int32(7)
     end
-    @testset "retained schemas on write; admission boundaries; ownership" begin
+    @testset "retained schemas on write; ownership" begin
         io = IOBuffer()
         rsrc = Avro.Rows(buf())
         Avro.write(io, rsrc)
@@ -292,17 +228,6 @@ import DataAPI
         close(rn)
         seekstart(out)
         @test isequal(Avro.Reader(rr -> collect(Avro.eachdatum(rr)), out), Any[[1, 2], Int64[]])
-        adm = Avro.SymbolAdmission(max_names=3)
-        @test_throws Avro.LimitError Avro.Table(buf(); names=adm)
-        t3 = Avro.Table(buf(); names=Avro.SymbolAdmission(max_names=100, max_bytes=1000))
-        @test Tables.columnnames(t3) == [:a, :b, :c, :e]
-        @test Tables.columnnames(Avro.Table(buf(); names=nothing)) == [:a, :b, :c, :e]
-        adm3 = Avro.SymbolAdmission(max_names=2)
-        r3 = Avro.Rows(buf(); names=adm3)
-        v3, _ = iterate(r3)
-        @test Avro.record(v3).a === Int64(1)                                    # iteration interned nothing
-        @test_throws Avro.LimitError Tables.schema(r3)                          # names admit only when requested
-        close(r3)
         src = buf()
         mark0 = position(src)
         Avro.Table(src)
@@ -311,15 +236,12 @@ import DataAPI
     @testset "resolved little-endian decimals through tables (legacy fixture)" begin
         leg = joinpath(@__DIR__, "fixtures", "generated", "legacy1x", "avrojl112-null.avro")
         rdr = P("{\"type\":\"record\",\"name\":\"Record_5380612083211919099\",\"fields\":[{\"name\":\"a\",\"type\":\"double\"},{\"name\":\"dec\",\"type\":{\"type\":\"fixed\",\"name\":\"_avrojl1_fixed_1\",\"size\":16,\"logicalType\":\"decimal\",\"precision\":10,\"scale\":2}},{\"name\":\"z\",\"type\":\"int\",\"default\":7}]}")
-        t = @test_logs (:warn, r"legacy") match_mode=:any Avro.Table(leg; reader_schema=rdr, legacy=:avrojl1, decimal_byteorder=:little)
+        t = @test_logs (:warn, r"legacy") match_mode=:any Avro.Table(leg; reader_schema=rdr, legacy=:avrojl1)
         @test Tables.columnnames(t) == [:a, :dec, :z]
         @test Tables.getcolumn(t, :a) == [1.0, 2.0]                              # PromotePlan under the little rewrite
         @test Tables.getcolumn(t, :dec) == [Avro.Decimal(12345, 2), Avro.Decimal(-123, 2)]
         @test Tables.getcolumn(t, :z) == Int32[7, 7]
-        tf = @test_logs (:warn, r"legacy") match_mode=:any Avro.Table(leg; reader_schema=rdr, legacy=:avrojl1,
-                                                                       decimal_byteorder=:little, validate=:fast)
-        @test Tables.columntable(tf) == Tables.columntable(t)                    # the null-block cushion is independent of validation mode
-        rl = Avro.Rows(leg; reader_schema=rdr, legacy=:avrojl1, decimal_byteorder=:little, select=(:dec,))
+        rl = Avro.Rows(leg; reader_schema=rdr, legacy=:avrojl1, select=(:dec,))
         got = @test_logs (:warn, r"legacy") match_mode=:any [Tables.getcolumn(row, :dec) for row in rl]
         close(rl)
         @test got == [Avro.Decimal(12345, 2), Avro.Decimal(-123, 2)]
@@ -327,6 +249,15 @@ import DataAPI
     @testset "Tables.rows of a Table has a column path" begin
         t = Avro.Table(Avro.tobuffer([(a=1, b="x"), (a=2, b="y")]))
         @test isequal(Tables.columntable(Tables.rows(t)), Tables.columntable(t))
+    end
+
+    @testset "map and multi-branch union columns" begin
+        ms = P("""{"type":"record","name":"MU","fields":[{"name":"m","type":{"type":"map","values":"long"}},
+            {"name":"u","type":["long","string"]}]}""")
+        mt = Avro.Table(Avro.tobuffer([(m=Dict("k" => 1), u=Avro.UnionValue(1, 2)), (m=Dict{String,Int}(), u="s")]; schema=ms))
+        @test collect(Tables.schema(mt).types) == [Dict{String,Int64}, Any]
+        @test Tables.getcolumn(mt, :m) == [Dict("k" => 1), Dict{String,Int64}()] && Tables.getcolumn(mt, :m) isa Vector{Dict{String,Int64}}
+        @test Tables.getcolumn(mt, :u) == Any[Int64(2), "s"]
     end
 
     @testset "string columns whose later rows outgrow the first" begin
@@ -347,20 +278,6 @@ import DataAPI
         @test collect(Tables.columnnames(p)) == collect(sel) && Tables.getcolumn(p, :x2000) == [3999, 4000]
     end
 
-    @testset "acceptance does not depend on names interned earlier" begin
-        # Two 400-column files read alternately: acceptance is the same however many names exist already.
-        widefile(prefix) = Avro.tobuffer(NamedTuple{Tuple(Symbol(prefix, i) for i in 1:400)}(Tuple([i] for i in 1:400)))
-        a, b = take!(widefile("metric_a_")), take!(widefile("metric_b_"))
-        warm = Avro.SymbolAdmission()
-        for i in 1:5_000
-            Avro.admit!(warm, "warm-$i")
-        end
-        for names in (nothing, warm)
-            @test length(Avro.Table(a; names=names)) == 1
-            @test length(Avro.Table(b; names=names)) == 1
-            @test length(Avro.Table(a; names=names)) == 1
-        end
-    end
 
     @testset "column tables write through aligned rows or by name" begin
         cols = (id=collect(1:5), x=[1.5, missing, 2.5, missing, 3.5], s=["a", "b", missing, "d", "e"])
@@ -436,7 +353,7 @@ import DataAPI
     @testset "Rows length via the byte-source pre-scan" begin
         bytes = take!(Avro.tobuffer([(a=Int64(i),) for i in 1:250]; block_bytes=128))
         rl = Avro.Rows(IOBuffer(bytes))
-        @test Base.IteratorSize(typeof(rl)) === Base.HasLength()
+        @test Base.IteratorSize(typeof(rl)) === Base.SizeUnknown()   # the count is the headers' claim
         @test length(rl) == 250
         @test count(Returns(true), rl) == 250                        # the pre-scan count matches iteration
         @test length(rl) == 0

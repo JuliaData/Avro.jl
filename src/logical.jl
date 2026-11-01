@@ -33,8 +33,7 @@ struct DurationLogical <: LogicalType end
 """
     Avro.UnknownLogical(name)
 
-An unrecognised `logicalType` name (e.g. `big-decimal`, deferred), kept so the schema re-serialises
-faithfully.
+An unrecognised `logicalType` name (e.g. `big-decimal`), kept so the schema re-serialises faithfully.
 """
 struct UnknownLogical <: LogicalType
     name::String
@@ -44,52 +43,15 @@ function logicalname(::DecimalLogical)
     return "decimal"
 end
 
-function logicalname(::UUIDLogical)
-    return "uuid"
-end
-
-function logicalname(::DateLogical)
-    return "date"
-end
-
-function logicalname(::TimeMillis)
-    return "time-millis"
-end
-
-function logicalname(::TimeMicros)
-    return "time-micros"
-end
-
-function logicalname(::TimestampMillis)
-    return "timestamp-millis"
-end
-
-function logicalname(::TimestampMicros)
-    return "timestamp-micros"
-end
-
-function logicalname(::TimestampNanos)
-    return "timestamp-nanos"
-end
-
-function logicalname(::LocalTimestampMillis)
-    return "local-timestamp-millis"
-end
-
-function logicalname(::LocalTimestampMicros)
-    return "local-timestamp-micros"
-end
-
-function logicalname(::LocalTimestampNanos)
-    return "local-timestamp-nanos"
-end
-
-function logicalname(::DurationLogical)
-    return "duration"
-end
-
 function logicalname(l::UnknownLogical)
     return l.name
+end
+
+function logicalname(l::LogicalType)
+    for (name, (logical, _)) in SIMPLE_LOGICALS
+        logical === l && return name
+    end
+    throw(ArgumentError("no logical type name for $l"))
 end
 
 const SIMPLE_LOGICALS = Dict{String,Tuple{LogicalType,Tuple{Vararg{Symbol}}}}(

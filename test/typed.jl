@@ -109,6 +109,11 @@ end
 struct HasWrapper
     w::Wrapper
 end
+struct CheckedSet
+    x::Int64
+    s::Set{Int64}
+    CheckedSet(x::Int64, s::Set{Int64}) = x > 0 ? new(x, s) : throw(ArgumentError("x must be positive"))
+end
 struct SymField
     s::Symbol
     e::Symbol
@@ -132,9 +137,6 @@ struct ResolvedDTO
     a::Float64
     b::Union{Missing,Int64}
     z::Int32
-    function ResolvedDTO()
-        return error("the positional constructor must not run on the fast route")
-    end
 end
 
 struct Hooked
@@ -170,31 +172,6 @@ struct OversizedTypedFieldName
     x::Int64
 end
 
-struct InterruptingSummary
-    value::String
-end
-
-function Base.summarysize(::InterruptingSummary)
-    throw(InterruptException())
-end
-
-struct FailingSummary
-    value::String
-end
-
-const SUMMARY_SENTINEL = ArgumentError("summarysize sentinel")
-
-function Base.summarysize(::FailingSummary)
-    throw(SUMMARY_SENTINEL)
-end
-
-struct DefaultProbe end
-struct DefaultProbeError <: Exception end
-
-function Avro.convertleaf(::Type{DefaultProbe}, ::String, budget)
-    throw(DefaultProbeError())
-end
-
 struct BadSemanticHook end
 mutable struct NestedBadSemanticHook
     value::BadSemanticHook
@@ -216,7 +193,7 @@ function StructUtils.fieldtags(::Avro.AvroStyle, ::Type{OversizedTypedFieldName}
 end
 
 @testset "Typed decoding" begin
-    using .TypedTestTypes: Plain, Mut, Empty, MutEmpty, Bits, Guarded, Colour, red, green, blue, EnumFallback, TransactionFail, TransactionGood, Tagged, WithDefault, NoDefault, Optional, LL, Node, Shape, Circle, Lifted, Wrapper, HasWrapper, SymField, Nested
+    using .TypedTestTypes: Plain, Mut, Empty, MutEmpty, Bits, Guarded, Colour, red, green, blue, EnumFallback, TransactionFail, TransactionGood, Tagged, WithDefault, NoDefault, Optional, LL, Node, Shape, Circle, Lifted, Wrapper, HasWrapper, CheckedSet, SymField, Nested
     P = Avro.parseschema
     rs = P("""{"type":"record","name":"R","fields":[
         {"name":"a","type":"int"},{"name":"b","type":"string"},{"name":"c","type":["null","long"]},
@@ -230,14 +207,14 @@ end
 
     @testset "typed targets convert exactly or fail" begin
         ms = P("""{"type":"long","logicalType":"timestamp-millis"}""")
-        second = Avro.encode(ms, Avro.Timestamp{Millisecond}(1_000))
-        @test Avro.decode(ms, second, Avro.Timestamp{Microsecond}) == Avro.Timestamp{Microsecond}(1_000_000)
-        @test Avro.decode(ms, second, Avro.Timestamp{Nanosecond}) == Avro.Timestamp{Nanosecond}(1_000_000_000)
+        second = Avro.encode(ms, Avro.timestamp(Millisecond, 1_000))
+        @test Avro.decode(ms, second, Avro.Timestamp{Microsecond}) == Avro.timestamp(Microsecond, 1_000_000)
+        @test Avro.decode(ms, second, Avro.Timestamp{Nanosecond}) == Avro.timestamp(Nanosecond, 1_000_000_000)
         @test_throws Avro.ConversionError Avro.decode(ms, second, Avro.LocalTimestamp{Millisecond})
         us = P("""{"type":"long","logicalType":"timestamp-micros"}""")
-        @test Avro.decode(us, Avro.encode(us, Avro.Timestamp{Microsecond}(2_000)), Avro.Timestamp{Millisecond}) ==
-              Avro.Timestamp{Millisecond}(2)
-        @test_throws Avro.ConversionError Avro.decode(us, Avro.encode(us, Avro.Timestamp{Microsecond}(1_500)),
+        @test Avro.decode(us, Avro.encode(us, Avro.timestamp(Microsecond, 2_000)), Avro.Timestamp{Millisecond}) ==
+              Avro.timestamp(Millisecond, 2)
+        @test_throws Avro.ConversionError Avro.decode(us, Avro.encode(us, Avro.timestamp(Microsecond, 1_500)),
                                                       Avro.Timestamp{Millisecond})
         # decoded scalars are not collections
         @test_throws Avro.ConversionError Avro.decode(P("\"string\""), Avro.encode(P("\"string\""), "abc"), Vector{UInt8})
@@ -263,8 +240,8 @@ end
         cases = (
             (Avro.IntSchema(; logical=Avro.DateLogical()), Date(2026, 1, 2)),
             (Avro.IntSchema(; logical=Avro.TimeMillis()), Time(1, 2, 3)),
-            (Avro.LongSchema(; logical=Avro.TimestampMicros()), Avro.Timestamp{Microsecond}(1)),
-            (Avro.LongSchema(; logical=Avro.LocalTimestampMicros()), Avro.LocalTimestamp{Microsecond}(1)),
+            (Avro.LongSchema(; logical=Avro.TimestampMicros()), Avro.timestamp(Microsecond, 1)),
+            (Avro.LongSchema(; logical=Avro.LocalTimestampMicros()), Avro.localtimestamp(Microsecond, 1)),
             (Avro.StringSchema(; logical=Avro.UUIDLogical()), UUID("123e4567-e89b-12d3-a456-426614174000")),
             (Avro.FixedSchema("Duration", 12; logical=Avro.DurationLogical()), Avro.Duration(1, 2, 3)),
             (Avro.BytesSchema(; logical=Avro.DecimalLogical(9, 2)), Avro.Decimal(123, 2)),
@@ -284,7 +261,6 @@ end
 
     @testset "NamedTuple targets and leaf conversions" begin
         NT = NamedTuple{(:a, :b, :c, :d, :e, :f, :g, :t, :ch, :fl),Tuple{Int,String,Union{Missing,Int},Vector{Float64},Dict{String,Int},Symbol,NTuple{2,UInt8},DateTime,Char,Float64}}
-        @test plan(NT) isa Avro.SemanticTarget       # the Dict field converts after generic ownership transfer
         v = Avro.decode(rs, bytes, NT)
         @test v === NT((1, "s", 2, [1.5], Dict("k" => 3), :green, (0x01, 0x02), DateTime(2020), 'é', 0.5)) || v == NT((1, "s", 2, [1.5], Dict("k" => 3), :green, (0x01, 0x02), DateTime(2020), 'é', 0.5))
         @test v.a isa Int && v.c isa Int && v.e isa Dict{String,Int} && v.g === (0x01, 0x02) && v.fl === 0.5
@@ -311,17 +287,14 @@ end
         @test_throws Avro.ConversionError Avro.decode(P("\"string\""), Avro.encode(P("\"string\""), "ab"), Char)
         @test Avro.decode(P("\"string\""), Avro.encode(P("\"string\""), "😀"), Char) === '😀'
         longchar = "x"^100_000
-        charbudget = Avro.Budget(Avro.Limits())
         charerror = try
-            Avro.convertleaf(Char, longchar, charbudget)
+            Avro.decode(P("\"string\""), Avro.encode(P("\"string\""), longchar), Char)
             nothing
         catch caught
             caught
         end
         @test charerror isa Avro.ConversionError
-        @test sizeof(charerror.msg) < 256
-        @test occursin("+99904 bytes", charerror.msg)
-        @test charbudget.reserved == Avro.stringbytes(sizeof(charerror.msg))
+        @test sizeof(charerror.msg) < 256                 # the message does not carry the whole string
         @test Avro.decode(P("\"null\""), UInt8[], Nothing) === nothing
         @test Avro.decode(rs, bytes, Any) == Avro.decode(rs, bytes)
         @test Avro.decode(rs, bytes, Avro.Record) == Avro.decode(rs, bytes) && plan(Avro.Record) isa Avro.GenericTarget
@@ -333,7 +306,7 @@ end
         @test_throws Avro.ConversionError Avro.decode(ts, Avro.encode(ts, missing), DateTime)
         @test Avro.decode(ts, Avro.encode(ts, DateTime(2021)), DateTime) == DateTime(2021)
         # timestamps out of the DateTime range
-        far = Avro.encode(P("{\"type\":\"long\",\"logicalType\":\"timestamp-millis\"}"), Avro.Timestamp{Millisecond}(typemax(Int64)))
+        far = Avro.encode(P("{\"type\":\"long\",\"logicalType\":\"timestamp-millis\"}"), Avro.timestamp(Millisecond, typemax(Int64)))
         @test_throws Avro.ConversionError Avro.decode(P("{\"type\":\"long\",\"logicalType\":\"timestamp-millis\"}"), far, DateTime)
     end
 
@@ -366,7 +339,7 @@ end
         end
         # Implicit optional defaults retain the direct route, including resolution.
         @test Avro.DatumReader(defaultschema, Optional).plan isa Avro.RecordTarget
-        @test Avro.DatumReader(promotedwriter, Optional; reader_schema=defaultschema).plan isa Avro.ResolvedRecordTarget
+        @test Avro.DatumReader(promotedwriter, Optional; reader_schema=defaultschema).plan isa Avro.RecordTarget
         for source in (defaultschema, promotedwriter)
             TypedTestTypes.DEFAULT_FACTORY_CALLS[] = 0
             factoryreader = Avro.DatumReader(source, TypedTestTypes.GeneratedDefault; reader_schema=defaultschema)
@@ -403,14 +376,14 @@ end
         @test TypedTestTypes.DEFAULT_FACTORY_CALLS[] == 0
     end
 
-    @testset "struct targets: fast route never calls a constructor" begin
+    @testset "struct targets: the fast route builds through the positional constructor" begin
         ps = P("{\"type\":\"record\",\"name\":\"Plain\",\"fields\":[{\"name\":\"a\",\"type\":\"long\"},{\"name\":\"b\",\"type\":\"string\"}]}")
         pb = Avro.encode(ps, Plain(1, "x"))
         @test Avro.decode(ps, pb, Plain) == Plain(1, "x") && plan(Plain, ps) isa Avro.RecordTarget
         gs = P("{\"type\":\"record\",\"name\":\"Guarded\",\"fields\":[{\"name\":\"a\",\"type\":\"long\"}]}")
         @test_throws ArgumentError Guarded(-5)
-        g = Avro.decode(gs, Avro.encode(gs, (a=-5,)), Guarded)
-        @test g.a == -5                                    # constructed with Expr(:new): the throwing constructor never ran
+        @test_throws ArgumentError Avro.decode(gs, Avro.encode(gs, (a=-5,)), Guarded)   # its validation runs
+        @test Avro.decode(gs, Avro.encode(gs, (a=5,)), Guarded).a == 5
         ms = P("{\"type\":\"record\",\"name\":\"Mut\",\"fields\":[{\"name\":\"a\",\"type\":\"int\"},{\"name\":\"b\",\"type\":[\"null\",\"long\"]}]}")
         m = Avro.decode(ms, Avro.encode(ms, (a=1, b=missing)), Mut)
         @test m isa Mut && m.a === Int32(1) && m.b === missing
@@ -424,26 +397,24 @@ end
         ns = P(replace("""{"type":"record","name":"Nested","fields":[{"name":"inner","type":"Plain"},{"name":"items","type":{"type":"array","items":"Plain"}},{"name":"byname","type":{"type":"map","values":"Plain"}}]}""", "\"Plain\"" => Avro.json(ps); count=1))
         nv = Nested(Plain(1, "i"), [Plain(2, "x"), Plain(3, "y")], Dict("k" => Plain(4, "z")))
         @test Avro.decode(ns, Avro.encode(ns, nv), Nested) == nv
-        @test plan(Nested, ns) isa Avro.SemanticTarget   # nested Dict also forces the whole DTO to the semantic route
+
         # field name tags, defaults, optional fields, missing defaults
         ts = P("{\"type\":\"record\",\"name\":\"T\",\"fields\":[{\"name\":\"a\",\"type\":\"long\"},{\"name\":\"b\",\"type\":\"string\"}]}")
         @test Avro.decode(ts, Avro.encode(ts, (a=1, b="x")), Tagged) == Tagged(1, "x")
         @test plan(Tagged, ts) isa Avro.RecordTarget
         as = P("{\"type\":\"record\",\"name\":\"A\",\"fields\":[{\"name\":\"a\",\"type\":\"long\"}]}")
-        namelimits = Avro.Limits(max_name_bytes=4)
-        @test_throws Avro.LimitError Avro.DatumReader(as, OversizedTypedFieldName;
-                                                       limits=namelimits)
+        @test_throws Avro.ConversionError Avro.DatumReader(as, OversizedTypedFieldName)   # a 1024-byte target field name the schema lacks
         wd = Avro.decode(as, Avro.encode(as, (a=9,)), WithDefault)
         @test wd.a == 9 && wd.extra == "dflt" && wd.opt === missing
-        @test_throws ArgumentError Avro.DatumReader(as, NoDefault)
+        @test_throws Avro.ConversionError Avro.DatumReader(as, NoDefault)
         @test Avro.decode(as, Avro.encode(as, (a=9,)), Optional) == Optional(9, nothing)
-        # schema fields absent from the target are skipped under the validation mode
+        # schema fields absent from the target are skipped: a sized block is jumped by its size
         xs = P("{\"type\":\"record\",\"name\":\"X\",\"fields\":[{\"name\":\"a\",\"type\":\"long\"},{\"name\":\"junk\",\"type\":{\"type\":\"array\",\"items\":\"boolean\"}},{\"name\":\"b\",\"type\":\"string\"}]}")
         xb = Avro.encode(xs, (a=1, junk=[true], b="x"))
         @test Avro.decode(xs, xb, Plain) == Plain(1, "x")
         bad = vcat(Avro.encode(P("\"long\""), 1), hex2bytes("01" * "02" * "02" * "00"), Avro.encode(P("\"string\""), "x"))  # sized block with a bad boolean
-        @test_throws Avro.DataError Avro.decode(xs, bad, Plain)
-        @test Avro.decode(xs, bad, Plain; validate=:fast) == Plain(1, "x")
+        @test Avro.decode(xs, bad, Plain) == Plain(1, "x")
+        @test_throws Avro.DataError Avro.decode(xs, bad)                 # the generic decode reads the block
     end
 
     @testset "recursion and Julia unions" begin
@@ -451,17 +422,8 @@ end
         v = LL(1, LL(2, LL(3, missing)))
         @test Avro.decode(ll, Avro.encode(ll, v), LL) == v
         @test plan(LL, ll) isa Avro.RecordTarget
-        countedunion = P("[\"int\",\"string\"]")
-        countedbytes = UInt8[0x00, 0x00]
-        @test Avro.decode(countedunion, countedbytes, Union{Int32,String};
-                          limits=Avro.Limits(max_total_values=2)) === Int32(0)
-        @test_throws Avro.LimitError Avro.decode(countedunion, countedbytes, Union{Int32,String};
-                                                  limits=Avro.Limits(max_total_values=1))
-        countednullable = P("[\"null\",\"int\"]")
-        @test Avro.decode(countednullable, UInt8[0x00], Union{Missing,Int32};
-                          limits=Avro.Limits(max_total_values=2)) === missing
-        @test_throws Avro.LimitError Avro.decode(countednullable, UInt8[0x00], Union{Missing,Int32};
-                                                  limits=Avro.Limits(max_total_values=1))
+        @test Avro.decode(P("[\"int\",\"string\"]"), UInt8[0x00, 0x00], Union{Int32,String}) === Int32(0)
+        @test Avro.decode(P("[\"null\",\"int\"]"), UInt8[0x00], Union{Missing,Int32}) === missing
         tree = P("{\"type\":\"record\",\"name\":\"Node\",\"fields\":[{\"name\":\"name\",\"type\":\"string\"},{\"name\":\"children\",\"type\":{\"type\":\"array\",\"items\":\"Node\"}}]}")
         n = Node("r", [Node("a", Node[]), Node("b", [Node("c", Node[])])])
         @test Avro.decode(tree, Avro.encode(tree, n), Node) == n
@@ -488,17 +450,20 @@ end
         @test plan(Lifted, ls) isa Avro.SemanticTarget                       # a dateformat tag affects construction
         @test Avro.decode(ls, Avro.encode(ls, (when="2020-02-03",)), Lifted) == Lifted(Date(2020, 2, 3))
         ws = P("{\"type\":\"record\",\"name\":\"HasWrapper\",\"fields\":[{\"name\":\"w\",\"type\":\"string\"}]}")
-        @test plan(HasWrapper, ws) isa Avro.SemanticTarget                   # custom lift on the field type
+        @test plan(HasWrapper, ws) isa Avro.RecordTarget                     # only the field converts through its lift
         @test Avro.decode(ws, Avro.encode(ws, (w="x",)), HasWrapper) == HasWrapper(Wrapper("w:x"))
+        # a field StructUtils converts keeps its record on the direct route, so the constructor's own error propagates
+        cs = P("{\"type\":\"record\",\"name\":\"CheckedSet\",\"fields\":[{\"name\":\"x\",\"type\":\"long\"},{\"name\":\"s\",\"type\":{\"type\":\"array\",\"items\":\"long\"}}]}")
+        @test plan(CheckedSet, cs) isa Avro.RecordTarget
+        @test Avro.decode(cs, Avro.encode(cs, (x=2, s=[1, 1])), CheckedSet).s == Set([1])
+        @test_throws ArgumentError Avro.decode(cs, Avro.encode(cs, (x=-1, s=[1])), CheckedSet)
         # arraylike / dictlike targets outside the fast route
         arr = P("{\"type\":\"array\",\"items\":\"int\"}")
         @test Avro.decode(arr, Avro.encode(arr, [1, 2, 2]), Set{Int}) == Set([1, 2])
         @test Avro.decode(arr, Avro.encode(arr, [1, 2]), NTuple{2,Int}) === (1, 2)
         mp = P("{\"type\":\"map\",\"values\":\"int\"}")
         @test Avro.decode(mp, Avro.encode(mp, Dict("a" => 1)), Dict{String,Any}) == Dict("a" => 1)
-        @test Avro.decode(mp, Avro.encode(mp, Dict("a" => 1)), Avro.Map{Int64}) == Avro.Map{Int64}([("a", 1)])
-        @test plan(Dict{String,Int64}, mp) isa Avro.SemanticTarget
-        @test plan(Avro.Map{Int64}, mp) isa Avro.MapTarget
+        @test Avro.decode(mp, Avro.encode(mp, Dict("a" => 1)), Dict{String,Int64}) == Dict{String,Int64}("a" => 1)
         # generic values as StructUtils sources
         rec = Avro.decode(rs, bytes)
         @test StructUtils.make(Plain, Avro.decode(P("{\"type\":\"record\",\"name\":\"Plain\",\"fields\":[{\"name\":\"a\",\"type\":\"long\"},{\"name\":\"b\",\"type\":\"string\"}]}"), Avro.encode(Plain(1, "x"))), Avro.AvroStyle()) == Plain(1, "x")
@@ -539,59 +504,44 @@ end
         @test length(Avro.HOOK_CACHE.answers) <= Avro.HOOK_CACHE_SIZE
     end
 
-    @testset "Symbol admission on every typed path" begin
+    @testset "Symbol targets on every typed path" begin
         ss = P("{\"type\":\"record\",\"name\":\"S\",\"fields\":[{\"name\":\"s\",\"type\":\"string\"},{\"name\":\"e\",\"type\":{\"type\":\"enum\",\"name\":\"E\",\"symbols\":[\"p\",\"q\"]}}]}")
         sb = Avro.encode(ss, (s="hello", e="q"))
         @test Avro.decode(ss, sb, SymField) == SymField(:hello, :q) && plan(SymField, ss) isa Avro.RecordTarget
-        tiny = Avro.SymbolAdmission(max_names=1)
-        @test_throws Avro.LimitError Avro.decode(ss, sb, SymField; names=tiny)
-        @test Avro.decode(ss, sb, SymField; names=nothing) == SymField(:hello, :q)
-        @test Avro.decode(ss, sb, SymField; names=Avro.SymbolAdmission(max_names=2)) == SymField(:hello, :q)
-        # repeated values do not count twice
-        adm = Avro.SymbolAdmission(max_names=2)
-        for _ in 1:3
-            @test Avro.decode(ss, sb, SymField; names=adm) == SymField(:hello, :q)
-        end
         # map keys and the semantic route
         mp = P("{\"type\":\"map\",\"values\":\"int\"}")
         mb = Avro.encode(mp, Dict("a" => 1, "b" => 2))
         @test Avro.decode(mp, mb, Dict{Symbol,Int}) == Dict(:a => 1, :b => 2)
-        @test_throws Avro.LimitError Avro.decode(mp, mb, Dict{Symbol,Int}; names=Avro.SymbolAdmission(max_names=1))
-        @test_throws Avro.LimitError Avro.decode(mp, mb, Dict{Symbol,Any}; names=Avro.SymbolAdmission(max_names=1))    # semantic (Dict{Symbol,Any})
+        @test Avro.decode(mp, mb, Dict{Symbol,Any}) == Dict{Symbol,Any}(:a => 1, :b => 2)
         sym = P("\"string\"")
         @test Avro.decode(sym, Avro.encode(sym, "zz"), Symbol) === :zz
-        @test_throws Avro.LimitError Avro.decode(sym, Avro.encode(sym, "zz"), Symbol; names=Avro.SymbolAdmission(max_names=0))
-        semantic = Vector{Symbol}                                                # arrays of Symbol: fast route
         arr = P("{\"type\":\"array\",\"items\":\"string\"}")
-        @test Avro.decode(arr, Avro.encode(arr, ["a", "b"]), semantic) == [:a, :b]
-        @test_throws Avro.LimitError Avro.decode(arr, Avro.encode(arr, ["a", "b"]), Set{Symbol}; names=Avro.SymbolAdmission(max_names=1))   # semantic route honours the admission object
-        @test Avro.decode(arr, Avro.encode(arr, ["a", "b"]), Set{Symbol}; names=nothing) == Set([:a, :b])
+        @test Avro.decode(arr, Avro.encode(arr, ["a", "b"]), Vector{Symbol}) == [:a, :b]
+        @test Avro.decode(arr, Avro.encode(arr, ["a", "b"]), Set{Symbol}) == Set([:a, :b])
     end
 
-    @testset "allocation budgets (kernel) and prepared readers" begin
+    @testset "allocation-free typed and generic kernels; prepared readers" begin
         bs = P("{\"type\":\"record\",\"name\":\"Bits\",\"fields\":[{\"name\":\"a\",\"type\":\"int\"},{\"name\":\"f\",\"type\":\"float\"},{\"name\":\"flag\",\"type\":\"boolean\"}]}")
         reader = Avro.DatumReader(bs, Bits)
         bb = Avro.encode(bs, Bits(3, 1.5f0, true))
         @test reader(bb) === Bits(3, 1.5f0, true)
-        budget = Avro.Budget(Avro.Limits())
-        Avro.addinput!(budget, 1 << 20)
-        d = Avro.Decoder(bb, budget)
-        function kernel(plan, d, names)
-            d.pos = 1
-            return Avro.decodetyped(plan, d, names)
+        d = Avro.Decoder(bb)
+        function kernel(plan, d)
+            Avro.reset!(d, d.buf, 1)
+            return Avro.decoderoot(plan, d)
         end
 
-        function measure(plan, d, names)
-            kernel(plan, d, names)
-            return @allocated(kernel(plan, d, names))   # function barrier: concrete plan type
+        function measure(plan, d)
+            kernel(plan, d)
+            return @allocated(kernel(plan, d))   # function barrier: concrete plan type
         end
-        @test measure(reader.plan, d, reader.names) == 0
+        @test measure(reader.plan, d) == 0
         ls = P("\"long\"")
         lr = Avro.DatumReader(ls)
         lb = Avro.encode(ls, 7)
-        d2 = Avro.Decoder(lb, budget)
+        d2 = Avro.Decoder(lb)
         function gk(plan, d)
-            d.pos = 1
+            Avro.reset!(d, d.buf, 1)
             return Avro.decode(plan, d)
         end
 
@@ -599,7 +549,7 @@ end
             gk(plan, d)
             return @allocated(gk(plan, d))
         end
-        @test gmeasure(lr.plan, d2) == 0
+        @test gmeasure(lr.plan.plan, d2) == 0
         tasks = [Threads.@spawn reader(bb) for _ in 1:4]
         foreach(errormonitor, tasks)
         @test all(fetch(t) === Bits(3, 1.5f0, true) for t in tasks)
@@ -607,145 +557,60 @@ end
         @test Avro.DatumReader(bs, Bits)(vcat(bb, bb), length(bb) + 1) == (Bits(3, 1.5f0, true), 2 * length(bb) + 1)
     end
 
-    @testset "measured typed shells: layouts, marginals, true-up" begin
-        for T in (@NamedTuple{a::Int64, s::String}, @NamedTuple{a::Int64, b::Float64},
-                  @NamedTuple{s::String, v::Vector{Int64}}, @NamedTuple{}, ShellMut, ShellPadded)
-            probeshell = Avro.measuredshell(T)
-            @test probeshell == (isbitstype(T) ? 0 : max(Int(Base.summarysize(Avro.emptyprobe(T))), 8))
-        end
-        @test Avro.measuredshell(@NamedTuple{a::Int64}) == 0
-        # an inline nested struct charges its own shell: the outer measures the marginal
-        Outer = @NamedTuple{x::Int64, inner::@NamedTuple{s::String, y::Int64}}
-        Inner = @NamedTuple{s::String, y::Int64}
-        expectedshell = max(Int(Base.summarysize(Avro.emptyprobe(Outer))), 8)
-        VERSION < v"1.11" && (expectedshell += Avro.measuredshell(Inner)) # Julia 1.10's oracle counts the inline child again
-        @test Avro.measuredshell(Outer) + Avro.measuredshell(Inner) == expectedshell
-        # the probe bound reserves and trues up to zero on a live budget
-        b = Avro.Budget(Avro.Limits())
-        r0 = b.reserved
-        Avro.measuredshell(Outer, b)
-        @test b.reserved == r0
-        @test_throws InterruptException Avro.measuredshell(InterruptingSummary)
-        @test_throws ArgumentError Avro.measuredshell(FailingSummary)
-        summarybudget = Avro.Budget(Avro.Limits())
-        @test_throws InterruptException Avro.measuredinlineshell(InterruptingSummary,
-                                                                 summarybudget)
-        @test summarybudget.reserved == 0
-        summaryerror = try
-            Avro.measuredinlineshell(FailingSummary, summarybudget)
-            nothing
-        catch err
-            err
-        end
-        @test summaryerror === SUMMARY_SENTINEL
-        @test summarybudget.reserved == 0
-        # typedplan construction is budget-bounded
+    @testset "typed layouts: scalars, arrays, nullables and maps" begin
         deep = Avro.parseschema("{\"type\":\"record\",\"name\":\"TPB\",\"fields\":[{\"name\":\"a\",\"type\":\"long\"}]}")
-        @test Avro.typedplan(@NamedTuple{a::Int64}, deep, Avro.readplan(deep), Avro.Limits()) isa Avro.TypedPlan
+        @test Avro.typedplan(@NamedTuple{a::Int64}, deep, Avro.readplan(deep)) isa Avro.TypedPlan
+        NestedLayout = @NamedTuple{lead::Int8, inner::@NamedTuple{x::Int64, s::String}, tail::Int16}
+        ReferenceLayout = @NamedTuple{s::String, bytes::Vector{UInt8}, items::Vector{String}}
+        NullableChild = @NamedTuple{x::Int64, s::String}
+        NullableLayout = @NamedTuple{label::Union{Missing,String}, child::Union{Missing,NullableChild}}
+        cases = (
+            (label="zero-field immutable", T=Empty, value=Empty()),
+            (label="zero-field mutable", T=MutEmpty, value=MutEmpty()),
+            (label="padded isbits", T=Bits, value=Bits(Int32(3), 1.5f0, true)),
+            (label="padded reference-bearing", T=ShellPadded, value=ShellPadded(Int8(1), Int64(2), "pad")),
+            (label="mutable reference-bearing", T=ShellMut, value=ShellMut(Int64(3), "mutable")),
+            (label="nested inline", T=NestedLayout,
+             value=NestedLayout((Int8(4), (x=Int64(5), s="nested"), Int16(6)))),
+            (label="multiple references", T=ReferenceLayout,
+             value=ReferenceLayout(("refs", UInt8[0x01, 0x02, 0x03], String["a", "bb"]))),
+            (label="nullable fields", T=NullableLayout,
+             value=NullableLayout((missing, NullableChild((Int64(7), "nullable"))))),
+        )
 
-        @testset "generated scalar, array and nullable layout oracle" begin
-            NestedLayout = @NamedTuple{lead::Int8, inner::@NamedTuple{x::Int64, s::String}, tail::Int16}
-            ReferenceLayout = @NamedTuple{s::String, bytes::Vector{UInt8}, items::Vector{String}}
-            NullableChild = @NamedTuple{x::Int64, s::String}
-            NullableLayout = @NamedTuple{label::Union{Missing,String}, child::Union{Missing,NullableChild}}
-            cases = (
-                (label="zero-field immutable", T=Empty, value=Empty()),
-                (label="zero-field mutable", T=MutEmpty, value=MutEmpty()),
-                (label="padded isbits", T=Bits, value=Bits(Int32(3), 1.5f0, true)),
-                (label="padded reference-bearing", T=ShellPadded, value=ShellPadded(Int8(1), Int64(2), "pad")),
-                (label="mutable reference-bearing", T=ShellMut, value=ShellMut(Int64(3), "mutable")),
-                (label="nested inline", T=NestedLayout,
-                 value=NestedLayout((Int8(4), (x=Int64(5), s="nested"), Int16(6)))),
-                (label="multiple references", T=ReferenceLayout,
-                 value=ReferenceLayout(("refs", UInt8[0x01, 0x02, 0x03], String["a", "bb"]))),
-                (label="nullable fields", T=NullableLayout,
-                 value=NullableLayout((missing, NullableChild((Int64(7), "nullable"))))),
-            )
+        function typed(s::Avro.Schema, ::Type{T}, x) where {T}
+            bytes = Avro.encode(s, x)
+            target = Avro.typedplan(T, s, Avro.readplan(s))
+            d = Avro.Decoder(bytes)
+            value = Avro.decoderoot(target, d)
+            @test d.pos == length(bytes) + 1
+            return value
+        end
 
-            function chargedtyped(s::Avro.Schema, ::Type{T}, x, names=nothing) where {T}
-                bytes = Avro.encode(s, x)
-                target = Avro.typedplan(T, s, Avro.readplan(s), Avro.Limits())
-                budget = Avro.Budget(Avro.Limits())
-                Avro.addinput!(budget, length(bytes))
-                d = Avro.Decoder(bytes, budget)
-                value = Avro.decodetyped(target, d, names)
-                @test d.pos == length(bytes) + 1
-                return value, budget.reserved
-            end
-
-            fixed_schema = Avro.FixedSchema("TypedLeafFixed", 4)
-            fixed_value = Avro.Fixed(fixed_schema, UInt8[1, 2, 3, 4])
-            bytes_value, bytes_charge = chargedtyped(fixed_schema, Vector{UInt8}, fixed_value)
-            @test bytes_value == UInt8[1, 2, 3, 4]
-            @test bytes_charge == Avro.bytesbytes(4)
-            tuple_value, tuple_charge = chargedtyped(fixed_schema, NTuple{4,UInt8}, fixed_value)
-            @test tuple_value === (0x01, 0x02, 0x03, 0x04)
-            @test tuple_charge == 0
-            char_value, char_charge = chargedtyped(Avro.StringSchema(), Char, "é")
-            @test char_value === 'é'
-            @test char_charge == 0
-            for names in (nothing, Avro.SymbolAdmission(max_names=1))
-                symbol_value, symbol_charge = chargedtyped(Avro.StringSchema(), Symbol, "hello", names)
-                @test symbol_value === :hello
-                @test symbol_charge == 0
-            end
-
-            function summarysize(x)
-                return Int(Base.summarysize(x; exclude=Avro.Schema))
-            end
-
-            function probeshell(::Type{T}) where {T}
-                isbitstype(T) && return 0
-                return max(Int(Base.summarysize(Avro.emptyprobe(T))), 8)
-            end
-
-            for (i, case) in enumerate(cases)
-                @testset "$(case.label)" begin
-                    T = case.T
-                    scalar_schema = Avro.schema(T; name="ShellOracle$i")
-                    scalar, scalar_charge = chargedtyped(scalar_schema, T, case.value)
-                    @test typeof(scalar) === T
-                    if isbitstype(T)
-                        @test scalar_charge == 0             # the returned scalar owns no heap storage
-                    else
-                        @test scalar_charge >= summarysize(scalar)
-                    end
-
-                    # A concrete immutable non-isbits record lives inline in Vector{T}. Its exact vector
-                    # slots already contain the scalar probe shell; only referenced payload stays extra.
-                    array_schema = Avro.ArraySchema(scalar_schema)
-                    array, array_charge = chargedtyped(array_schema, Vector{T}, T[case.value, case.value])
-                    inline_shell = VERSION >= v"1.11" && isstructtype(T) && !ismutabletype(T) &&
-                                   !isbitstype(T) ? probeshell(T) : 0
-                    expected_array_charge = Avro.vectorbytes(T, length(array)) +
-                                            length(array) * (scalar_charge - inline_shell)
-                    @test array_charge == expected_array_charge
-                    @test array_charge >= summarysize(array)
-
-                    # A non-isbits nullable vector stores non-missing records through reference slots, so
-                    # each present value keeps its scalar shell. Isbits nullable payload stays in the slot.
-                    NullableT = Union{Missing,T}
-                    nullable_schema = Avro.ArraySchema(Avro.UnionSchema((Avro.NullSchema(), scalar_schema)))
-                    nullable_input = Vector{NullableT}(undef, 3)
-                    nullable_input[1] = missing
-                    nullable_input[2] = case.value
-                    nullable_input[3] = case.value
-                    nullable, nullable_charge = chargedtyped(nullable_schema, Vector{NullableT}, nullable_input)
-                    expected_nullable_charge = Avro.vectorbytes(NullableT, length(nullable)) + 2 * scalar_charge
-                    @test nullable_charge == expected_nullable_charge
-                    @test nullable_charge >= summarysize(nullable)
-
-                    # A typed map's values vector receives the same immutable inline-shell transfer as
-                    # arrays: each decoded value's shell moves into its exact Vector{T} slot.
-                    map_schema = Avro.MapSchema(scalar_schema)
-                    map_input = Avro.Map{T}([("k1", case.value), ("k2", case.value)])
-                    avromap, map_charge = chargedtyped(map_schema, Avro.Map{T}, map_input)
-                    expected_map_charge = Avro.vectorbytes(String, 2) + 2 * Avro.stringbytes(2) +
-                                          Avro.vectorbytes(T, 2) + 2 * (scalar_charge - inline_shell) +
-                                          Avro.mapshellbytes(2)
-                    @test map_charge == expected_map_charge
-                    @test map_charge >= summarysize(avromap)
-                end
+        fixed_schema = Avro.FixedSchema("TypedLeafFixed", 4)
+        fixed_value = Avro.Fixed(fixed_schema, UInt8[1, 2, 3, 4])
+        @test typed(fixed_schema, Vector{UInt8}, fixed_value) == UInt8[1, 2, 3, 4]
+        @test typed(fixed_schema, NTuple{4,UInt8}, fixed_value) === (0x01, 0x02, 0x03, 0x04)
+        @test typed(Avro.StringSchema(), Char, "é") === 'é'
+        @test typed(Avro.StringSchema(), Symbol, "hello") === :hello
+        for (i, case) in enumerate(cases)
+            @testset "$(case.label)" begin
+                T = case.T
+                scalar_schema = Avro.schema(T; name="ShellOracle$i")
+                @test typeof(typed(scalar_schema, T, case.value)) === T
+                array = typed(Avro.ArraySchema(scalar_schema), Vector{T}, T[case.value, case.value])
+                @test array isa Vector{T} && length(array) == 2
+                NullableT = Union{Missing,T}
+                nullable_schema = Avro.ArraySchema(Avro.UnionSchema((Avro.NullSchema(), scalar_schema)))
+                nullable_input = Vector{NullableT}(undef, 3)
+                nullable_input[1] = missing
+                nullable_input[2] = case.value
+                nullable_input[3] = case.value
+                nullable = typed(nullable_schema, Vector{NullableT}, nullable_input)
+                @test nullable isa Vector{NullableT} && ismissing(nullable[1]) && nullable[2] isa T && nullable[3] isa T
+                map_input = Dict{String,T}("k1" => case.value, "k2" => case.value)
+                typedmap = typed(Avro.MapSchema(scalar_schema), Dict{String,T}, map_input)
+                @test typedmap isa Dict{String,T} && sort!(collect(keys(typedmap))) == ["k1", "k2"]
             end
         end
     end
@@ -753,7 +618,7 @@ end
     @testset "typed map rejects an infinite-minimum value before recursion" begin
         infinite = P("""{"type":"map","values":{"type":"record","name":"InfiniteMapNode","fields":[{"name":"next","type":"InfiniteMapNode"}]}}""")
         err = try
-            Avro.DatumReader(infinite, Avro.Map{InfiniteMapNode})(UInt8[0x02, 0x00, 0x00])
+            Avro.DatumReader(infinite, Dict{String,InfiniteMapNode})(UInt8[0x02, 0x00, 0x00])
             nothing
         catch caught
             caught
@@ -767,12 +632,12 @@ end
         r = P("{\"type\":\"record\",\"name\":\"E1\",\"fields\":[{\"name\":\"a\",\"type\":\"double\"},{\"name\":\"b\",\"type\":[\"null\",\"long\"]},{\"name\":\"z\",\"type\":\"int\",\"default\":9}]}")
         T = @NamedTuple{a::Float64, b::Union{Missing,Int64}, z::Int32}
         dr = Avro.DatumReader(w, T; reader_schema=r)
-        @test dr.plan isa Avro.ResolvedRecordTarget                              # not the semantic fallback
+        @test dr.plan isa Avro.RecordTarget                              # not the semantic fallback
         @test dr(Avro.encode(w, (a=Int32(3), drop="x", b=Int64(7)))) == (a=3.0, b=7, z=Int32(9))
         @test isequal(dr(Avro.encode(w, (a=Int32(1), drop="y", b=missing))), (a=1.0, b=missing, z=Int32(9)))
-        # an immutable struct target through Expr(:new), no constructor invoked
+        # an immutable struct target
         drs = Avro.DatumReader(w, ResolvedDTO; reader_schema=r)
-        @test drs.plan isa Avro.ResolvedRecordTarget
+        @test drs.plan isa Avro.RecordTarget
         v = drs(Avro.encode(w, (a=Int32(2), drop="q", b=Int64(5))))
         @test v.a == 2.0 && v.b == 5 && v.z == Int32(9)
         # nested resolved records recurse onto the direct route
@@ -780,13 +645,13 @@ end
         rn = P("{\"type\":\"record\",\"name\":\"O\",\"fields\":[{\"name\":\"in\",\"type\":{\"type\":\"record\",\"name\":\"I\",\"fields\":[{\"name\":\"x\",\"type\":\"long\"}]}}]}")
         TN = @NamedTuple{in::@NamedTuple{x::Int64}}
         drn = Avro.DatumReader(wn, TN; reader_schema=rn)
-        @test drn.plan isa Avro.ResolvedRecordTarget
+        @test drn.plan isa Avro.RecordTarget
         @test drn(Avro.encode(wn, (in=(x=Int32(4),),))) == (in=(x=Int64(4),),)
         # recursive resolved records terminate plan construction and stay on the direct route
         wll = P("{\"type\":\"record\",\"name\":\"RLL\",\"fields\":[{\"name\":\"value\",\"type\":\"int\"},{\"name\":\"next\",\"type\":[\"null\",\"RLL\"]}]}")
         rll = P("{\"type\":\"record\",\"name\":\"RLL\",\"fields\":[{\"name\":\"value\",\"type\":\"long\"},{\"name\":\"next\",\"type\":[\"null\",\"RLL\"]}]}")
         drll = Avro.DatumReader(wll, LL; reader_schema=rll)
-        @test drll.plan isa Avro.ResolvedRecordTarget
+        @test drll.plan isa Avro.RecordTarget
         llbytes = Avro.encode(wll, (value=Int32(1), next=(value=Int32(2), next=missing)))
         @test drll(llbytes) == LL(1, LL(2, missing))
         # reader defaults are materialised for every datum
@@ -798,110 +663,59 @@ end
         y = drdflt(UInt8[])
         @test x == y == (xs=Int64[1],)
         @test x.xs !== y.xs
-        tiny = Avro.Limits(max_total_values=2)
-        @test_throws Avro.LimitError Avro.DatumReader(wdflt; reader_schema=rdflt, limits=tiny)(UInt8[])
-        @test_throws Avro.LimitError Avro.DatumReader(wdflt, TD; reader_schema=rdflt, limits=tiny)(UInt8[])
-        resolveddefault = Avro.resolve(wdflt, rdflt).plan.defaults[1].second
-        defaultbudget = Avro.Budget(Avro.Limits())
-        defaultnode = Avro.checkedreaderdefault(Vector{Int64}, resolveddefault, defaultbudget)
-        defaultnodecharge = Avro.nodebytes(typeof(defaultnode))
-        @test defaultbudget.reserved == defaultnodecharge                    # validation value is construction scratch
-        Avro.release!(defaultbudget, defaultnodecharge)
-        probereader = P("{\"type\":\"record\",\"name\":\"D\",\"fields\":[{\"name\":\"value\",\"type\":\"string\",\"default\":\"x\"}]}")
-        probeplan = Avro.resolve(wdflt, probereader).plan.defaults[1].second
-        probebudget = Avro.Budget(Avro.Limits())
-        @test_throws DefaultProbeError Avro.checkedreaderdefault(
-            DefaultProbe, probeplan, probebudget)
-        @test probebudget.reserved == 0
+        # defaults are the caller's values, so they do not count against the file's value cap
+        tiny = Avro.Limits(value_allowance=1)
+        @test Avro.DatumReader(wdflt; reader_schema=rdflt, limits=tiny)(UInt8[]).xs == [1]
+        @test Avro.DatumReader(wdflt, TD; reader_schema=rdflt, limits=tiny)(UInt8[]).xs == [1]
+        # a reader's fixed default fills only a byte tuple of the fixed's size
+        rfix = P("{\"type\":\"record\",\"name\":\"D\",\"fields\":[{\"name\":\"f\",\"type\":{\"type\":\"fixed\",\"name\":\"F2\",\"size\":2},\"default\":\"ab\"}]}")
+        @test Avro.decode(wdflt, UInt8[], @NamedTuple{f::NTuple{2,UInt8}}; reader_schema=rfix) == (f=(0x61, 0x62),)
+        @test_throws Avro.ConversionError Avro.decode(wdflt, UInt8[], @NamedTuple{f::NTuple{8,UInt8}}; reader_schema=rfix)
+        @test_throws Avro.ConversionError Avro.decode(wdflt, UInt8[], @NamedTuple{f::NTuple{1,UInt8}}; reader_schema=rfix)
+        # and a fixed value converts only to a byte tuple of its size on every route
+        fx = P("{\"type\":\"record\",\"name\":\"FX\",\"fields\":[{\"name\":\"f\",\"type\":{\"type\":\"fixed\",\"name\":\"F3\",\"size\":2}}]}")
+        fxbytes = Avro.encode(fx, (f=(0x61, 0x62),))
+        @test Avro.decode(fx, fxbytes, @NamedTuple{f::NTuple{2,UInt8}}) == (f=(0x61, 0x62),)
+        @test_throws Avro.ConversionError Avro.decode(fx, fxbytes, @NamedTuple{f::NTuple{1,UInt8}})
+        @test_throws Avro.ConversionError Avro.decode(fx.fields[1].schema, UInt8[0x61, 0x62], NTuple{1,UInt8})
 
-        failedplanbudget = Avro.Budget(Avro.Limits())
         onlya = P("{\"type\":\"record\",\"name\":\"OnlyA\",\"fields\":[{\"name\":\"a\",\"type\":\"long\"}]}")
-        @test_throws ArgumentError Avro.typedplan(NoDefault, onlya, Avro.readplan(onlya), Avro.Limits();
-            budget=failedplanbudget)
-        @test failedplanbudget.reserved == 0     # failed construction releases all scratch
+        @test_throws Avro.ConversionError Avro.typedplan(NoDefault, onlya, Avro.readplan(onlya))
 
         directschema = P("{\"type\":\"record\",\"name\":\"DirectCharge\",\"fields\":[{\"name\":\"a\",\"type\":\"long\"}]}")
-        directread = Avro.readplan(directschema)
-        directbudget = Avro.Budget(Avro.Limits())
-        directplan = Avro.typedplan(@NamedTuple{a::Int64}, directschema, directread,
-            Avro.Limits(); budget=directbudget)
-        directreachable = Avro.nodebytes(typeof(directplan)) + Avro.vectorbytes(Any, length(directplan.defaults))
-        @test directbudget.reserved == directreachable
-        directwork = directbudget.resolution_work
-        @test directwork > 0
-        zerowork = Avro.Limits(max_resolution_work=0)
-        zerobudget = Avro.Budget(zerowork)
-        @test_throws Avro.LimitError Avro.typedplan(@NamedTuple{a::Int64}, directschema, directread,
-            zerowork; budget=zerobudget)
-        @test zerobudget.reserved == 0
-        exactwork = Avro.Limits(max_resolution_work=directwork)
-        exactbudget = Avro.Budget(exactwork)
-        @test Avro.typedplan(@NamedTuple{a::Int64}, directschema, directread,
-            exactwork; budget=exactbudget) isa Avro.RecordTarget
-        @test exactbudget.resolution_work == directwork
-        shortwork = Avro.Limits(max_resolution_work=directwork - 1)
-        shortbudget = Avro.Budget(shortwork)
-        @test_throws Avro.LimitError Avro.typedplan(@NamedTuple{a::Int64}, directschema, directread,
-            shortwork; budget=shortbudget)
-
+        @test Avro.typedplan(@NamedTuple{a::Int64}, directschema, Avro.readplan(directschema)) isa Avro.RecordTarget
         resolvedwriter = P("{\"type\":\"record\",\"name\":\"ResolvedCharge\",\"fields\":[{\"name\":\"a\",\"type\":\"int\"}]}")
         resolvedreader = P("{\"type\":\"record\",\"name\":\"ResolvedCharge\",\"fields\":[{\"name\":\"a\",\"type\":\"long\"}]}")
         resolvedplan = Avro.resolve(resolvedwriter, resolvedreader).plan
-        resolvedbudget = Avro.Budget(Avro.Limits())
-        resolvedtarget = Avro.typedplan(@NamedTuple{a::Int64}, resolvedreader, resolvedplan,
-            Avro.Limits(); budget=resolvedbudget)
-        resolvedreachable = Avro.nodebytes(typeof(resolvedtarget)) + Avro.vectorbytes(Any, length(resolvedtarget.defaults))
-        @test resolvedbudget.reserved == resolvedreachable
+        @test Avro.typedplan(@NamedTuple{a::Int64}, resolvedreader, resolvedplan) isa Avro.RecordTarget
 
         fallbackwriter = P("{\"type\":\"record\",\"name\":\"FallbackDefaults\",\"fields\":[]}")
         FallbackTarget = @NamedTuple{x::Int32,y::Int64}
-        fallbackcharges = Int[]
         for fieldsjson in (
                 "[{\"name\":\"x\",\"type\":\"int\",\"default\":1},{\"name\":\"y\",\"type\":\"string\",\"default\":\"a\"}]",
                 "[{\"name\":\"y\",\"type\":\"string\",\"default\":\"a\"},{\"name\":\"x\",\"type\":\"int\",\"default\":1}]")
             fallbackreader = P("{\"type\":\"record\",\"name\":\"FallbackDefaults\",\"fields\":" * fieldsjson * "}")
             fallbackplan = Avro.resolve(fallbackwriter, fallbackreader).plan
-            fallbackbudget = Avro.Budget(Avro.Limits())
-            @test Avro.typedplan(FallbackTarget, fallbackreader, fallbackplan, Avro.Limits();
-                budget=fallbackbudget) isa Avro.SemanticTarget
-            push!(fallbackcharges, fallbackbudget.reserved)
+            @test Avro.typedplan(FallbackTarget, fallbackreader, fallbackplan) isa Avro.SemanticTarget
         end
-        @test fallbackcharges[1] == fallbackcharges[2]
 
         enumfallbackschema = P("{\"type\":\"record\",\"name\":\"EnumFallback\",\"fields\":[{\"name\":\"f\",\"type\":{\"type\":\"enum\",\"name\":\"FallbackEnum\",\"symbols\":[\"red\",\"green\",\"blue\"]}},{\"name\":\"bad\",\"type\":\"string\"}]}")
-        enumfallbackbudget = Avro.Budget(Avro.Limits())
-        enumfallback = Avro.typedplan(EnumFallback, enumfallbackschema, Avro.readplan(enumfallbackschema),
-            Avro.Limits(); budget=enumfallbackbudget)
-        @test enumfallback isa Avro.SemanticTarget
-        @test enumfallbackbudget.reserved == Avro.nodebytes(typeof(enumfallback))
-
+        enumfallbackplan = Avro.typedplan(EnumFallback, enumfallbackschema, Avro.readplan(enumfallbackschema))
+        @test enumfallbackplan isa Avro.RecordTarget && !Avro.isdirect(enumfallbackplan)   # `bad` converts through StructUtils
+        @test_throws Avro.ConversionError Avro.decode(enumfallbackschema, Avro.encode(enumfallbackschema, (f="red", bad="7")), EnumFallback)
         unionfallbackschema = P("[{\"type\":\"enum\",\"name\":\"UnionFallbackEnum\",\"symbols\":[\"red\",\"green\",\"blue\"]},\"string\"]")
-        unionfallbackbudget = Avro.Budget(Avro.Limits())
-        unionfallback = Avro.typedplan(Union{Colour,Int64}, unionfallbackschema,
-            Avro.readplan(unionfallbackschema), Avro.Limits(); budget=unionfallbackbudget)
-        @test unionfallback isa Avro.SemanticTarget
-        @test unionfallbackbudget.reserved == Avro.nodebytes(typeof(unionfallback))
+        @test Avro.typedplan(Union{Colour,Int64}, unionfallbackschema, Avro.readplan(unionfallbackschema)) isa Avro.SemanticTarget
 
         transactionschema = P("[{\"type\":\"record\",\"name\":\"TransactionOuter\",\"fields\":[{\"name\":\"child\",\"type\":{\"type\":\"record\",\"name\":\"TransactionChild\",\"fields\":[{\"name\":\"f\",\"type\":{\"type\":\"enum\",\"name\":\"TransactionColour\",\"symbols\":[\"red\",\"green\",\"blue\"]}}]}},{\"name\":\"bad\",\"type\":\"string\"}]},\"long\"]")
         transactionplan = Avro.readplan(transactionschema)
-        failedfirstbudget = Avro.Budget(Avro.Limits())
-        failedfirst = Avro.typedplan(Union{TransactionFail,TransactionGood,Int64}, transactionschema,
-            transactionplan, Avro.Limits(); budget=failedfirstbudget)
-        successfulbudget = Avro.Budget(Avro.Limits())
-        successful = Avro.typedplan(Union{TransactionGood,Int64}, transactionschema,
-            transactionplan, Avro.Limits(); budget=successfulbudget)
+        failedfirst = Avro.typedplan(Union{TransactionFail,TransactionGood,Int64}, transactionschema, transactionplan)
+        successful = Avro.typedplan(Union{TransactionGood,Int64}, transactionschema, transactionplan)
         @test typeof.(failedfirst.branches) == typeof.(successful.branches)
-        @test failedfirstbudget.reserved == successfulbudget.reserved
-        @test failedfirstbudget.resolution_work > successfulbudget.resolution_work
 
         for (T, json) in ((Vector{Int64}, "{\"type\":\"array\",\"items\":\"string\"}"),
                           (Dict{String,Int64}, "{\"type\":\"map\",\"values\":\"string\"}"))
             compositeschema = P(json)
-            compositebudget = Avro.Budget(Avro.Limits())
-            composite = Avro.typedplan(T, compositeschema, Avro.readplan(compositeschema),
-                Avro.Limits(); budget=compositebudget)
-            @test composite isa Avro.SemanticTarget
-            @test compositebudget.reserved == Avro.nodebytes(typeof(composite))
+            @test Avro.typedplan(T, compositeschema, Avro.readplan(compositeschema)) isa Avro.SemanticTarget
         end
 
         # a null writer resolves through either nullable reader position and null target convention
@@ -919,11 +733,9 @@ end
             @test !(enumreader.plan isa Avro.SemanticTarget)
             @test enumreader(enumbytes) === expected
         end
-        @test_throws Avro.LimitError Avro.DatumReader(wenum, Symbol; reader_schema=renum,
-            names=Avro.SymbolAdmission(max_names=0))(enumbytes)
         # a custom-hooked target still takes the semantic route
         drh = Avro.DatumReader(w, Hooked; reader_schema=r)
-        @test drh.plan isa Avro.SemanticTarget || !(drh.plan isa Avro.ResolvedRecordTarget)
+        @test drh.plan isa Avro.SemanticTarget || !(drh.plan isa Avro.RecordTarget)
         # results agree with the semantic route on the same bytes
         drg = Avro.DatumReader(w; reader_schema=r)
         g = drg(Avro.encode(w, (a=Int32(3), drop="x", b=Int64(7))))

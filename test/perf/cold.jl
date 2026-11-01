@@ -29,10 +29,6 @@ function rows()
     return [(id=Int64(i), x=i / 7, name="name-$(i % 1000)", flag=isodd(i)) for i in 1:N]
 end
 
-function raisedlimits()
-    return Avro.Limits(max_total_bytes=4 << 30, max_block_bytes=16 << 20, max_block_output_bytes=256 << 20,
-                       max_codec_memory=32 << 20, max_bytes=64 << 20, max_datum_bytes=64 << 20)
-end
 
 function bestof3(f)
     f()
@@ -65,7 +61,7 @@ elseif metric == "table1"
     Avro.write(file, rows(); schema=S4)
     println("table1 ", bestof3(() -> Avro.Table(file; ntasks=1)))
 elseif metric == "table8"
-    lim = raisedlimits()
+    lim = Avro.Limits()
     file = joinpath(mktempdir(), "t8.avro")
     Avro.write(file, rows(); schema=S4, block_bytes=1 << 20, limits=lim)
     t1 = bestof3(() -> Avro.Table(file; ntasks=1, limits=lim))
@@ -85,8 +81,7 @@ elseif startswith(metric, "codec-")
     src = r.source
     function transcode1()
         for e in entries
-            Avro.decompressblock(r.codecname, r.codec, view(src.buf, e.offset:e.offset + e.size - 1), r.limits, r.budget)
-            Avro.release!(r.budget, r.budget.reserved)
+            Avro.decompressblock(r.codecname, view(src.buf, e.offset:e.offset + e.size - 1), r.limits)
         end
         return nothing
     end
@@ -96,8 +91,8 @@ elseif startswith(metric, "codec-")
 elseif metric == "projection"
     file = joinpath(mktempdir(), "p.avro")
     Avro.write(file, rows(); schema=S4)
-    tsel = bestof3(() -> Avro.Table(file; select=(:id,), validate=:fast, ntasks=1))
-    tfull = bestof3(() -> Avro.Table(file; validate=:fast, ntasks=1))
+    tsel = bestof3(() -> Avro.Table(file; select=(:id,), ntasks=1))
+    tfull = bestof3(() -> Avro.Table(file; ntasks=1))
     println("projection ", tfull / tsel)
 elseif metric == "kernels"
     T = @NamedTuple{id::Int64, x::Float64, name::String, flag::Bool}
@@ -105,7 +100,7 @@ elseif metric == "kernels"
     dw = Avro.DatumWriter(S4, T)
     v = (id=Int64(1), x=2.0, name="abcd", flag=true)
     bytes = Avro.encode(S4, v)
-    enc = Avro.Encoder(Avro.Budget(Avro.Limits(); direction=:encode))
+    enc = Avro.Encoder()
     function deck(dr, bytes, n)
         acc = 0
         for _ in 1:n

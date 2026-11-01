@@ -1,544 +1,72 @@
-# Generic value types that carry schema identity: Record, EnumValue, Fixed, UnionValue and
-# the package-owned Avro.Map (sorted permutation; no hashing).
+# The generic value model: `Record`, `EnumValue` and `Fixed` carry their schema identity, `UnionValue`
+# forces a union branch on encode, and `juliatype` maps every schema node to the closed set of Julia
+# types a generic decode produces.
 
 """
-    Avro.Map{V}
+    Avro.Record(schema::RecordSchema, values)
 
-The generic representation of an Avro `map`: an `AbstractDict{String,V}` keeping keys and values in
-insertion order with an `Int32` permutation sorted by key bytes (built once by a deterministic merge
-sort; lookups are binary searches with a fixed per-call bound). No hashing, seeds, rehashing or growth.
-Duplicate keys keep the first occurrence's position with the last value. `Dict(m)` converts.
+The generic record: field values in schema order. A `Record` is a `Tables.AbstractRow`, so fields read
+as `record.name`, `record[:name]`, `record["name"]` or `record[i]`; `Avro.schema(record)` is the
+record schema (a field named `schema` wins the property). Equality is structural.
 """
-struct Map{V} <: AbstractDict{String,V}
-    keys::Vector{String}
-    vals::Vector{V}
-    perm::Vector{Int32}     # sorted by keys[perm[i]]; length == length(keys)
-end
-
-function Map{V}() where {V}
-    return Map{V}(String[], V[], Int32[])
-end
-
-"""
-    Avro.Map(pairs; limits=Limits())
-
-Build a map from `key => value` pairs (keys `AbstractString` or `Symbol`); copying, validated, charged
-to its own budget scope.
-"""
-struct InferredMapConstructor
-    pairs::Any
-end
-
-struct TypedMapConstructor{V}
-    pairs::Any
-end
-
-function (constructor::InferredMapConstructor)(budget::Budget)
-    ks, vs, boxes = collectpairs(Any, constructor.pairs, budget)
-    return convertmap(valuetype(vs), ks, vs, boxes, budget)
-end
-
-function (constructor::TypedMapConstructor{V})(budget::Budget) where {V}
-    ks, vs, boxes = collectpairs(V, constructor.pairs, budget)
-    return convertmap(V, ks, vs, boxes, budget)
-end
-
-function Map(@nospecialize(pairs); limits::Limits=Limits())
-    return withbudget(InferredMapConstructor(pairs), limits; direction=:encode)
-end
-
-function Map{V}(@nospecialize(pairs); limits::Limits=Limits()) where {V}
-    return withbudget(TypedMapConstructor{V}(pairs), limits; direction=:encode)
-end
-
-# Copy `key => value` pairs through exact-replacement builders under the constructor's budget.
-function collectpairs(::Type{V}, @nospecialize(pairs), budget::Budget) where {V}
-    trait = Base.IteratorSize(typeof(pairs))
-    capacity = trait isa Union{Base.HasLength,Base.HasShape} ? min(length(pairs), 1024) : 0
-    capacity >= 0 || throw(ArgumentError("map pair count must be non-negative"))
-    keys = BuildBuf{String}(budget, capacity)
-    vals = BuildBuf{V}(budget, capacity)
-    boxes = 0
-    countvalues!(budget)                               # the map itself
-    for (k, v) in pairs
-        countvalues!(budget)
-        keys.len < typemax(Int32) || throw(ArgumentError("a map cannot hold more than $(typemax(Int32)) pairs"))
-        k isa Union{AbstractString,Symbol} || mapkey(k) # public constructors use `ArgumentError`
-        key = copymapkey(k, budget)
-        value, owned = preparedmapvalue(V, v, budget)
-        box = V === Any && isbits(value) ? boxbytes(typeof(value)) : 0
-        addinput!(budget, checked_add(checked_add(checked_add(sizeof(key), 8), box), owned))
-        push!(keys, budget, key)
-        box > 0 && reserve!(budget, box)
-        push!(vals, budget, value)
-        boxes = checked_add(boxes, box)
-    end
-    return finishbuild!(keys, budget), finishbuild!(vals, budget), boxes
-end
-
-function convertmap(::Type{V}, ks::Vector{String}, vs::Vector{Any}, boxes::Int,
-                    budget::Budget) where {V}
-    V === Any && return buildmap(Any, ks, vs, budget; ownvalues=false)
-    charge = vectorbytes(V, length(vs))
-    reserve!(budget, charge)
-    converted = Vector{V}(undef, length(vs))
-    for i in eachindex(vs)
-        converted[i], owned = preparedmapvalue(V, vs[i], budget)
-        addinput!(budget, owned)
-    end
-    vs = nothing
-    release!(budget, vectorbytes(Any, length(converted)) + boxes)
-    return buildmap(V, ks, converted, budget; ownvalues=V === String)
-end
-
-function convertmap(::Type{V}, ks::Vector{String}, vs::Vector{V}, boxes::Int,
-                    budget::Budget) where {V}
-    boxes == 0 || V === Any || throw(ArgumentError("concrete map values retained unexpected boxes"))
-    return buildmap(V, ks, vs, budget; ownvalues=V === String)
-end
-
-function preparedmapvalue(::Type{Any}, @nospecialize(value), ::Budget)
-    return (value, 0)
-end
-
-function preparedmapvalue(::Type{String}, value, budget::Budget)
-    value isa AbstractString ||
-        throw(ArgumentError(diagnosticstring(
-            budget,
-            "map value cannot be converted to String without an allocating user conversion")))
-    isstrictutf8(value) || encodeerror("map string value is not valid UTF-8", value)
-    text = ownedstringcopy(value, budget)
-    return (text, stringbytes(sizeof(text)))
-end
-
-function preparedmapvalue(::Type{V}, value, budget::Budget) where {V}
-    value isa V && return (value, 0)
-    (isbitstype(V) || Base.isbitsunion(V)) && return (convert(V, value), 0)
-    throw(ArgumentError(diagnosticstring(
-        budget,
-        "map value is not an instance of the requested concrete value type and cannot be converted without an allocating user conversion")))
-end
-
-# The value type of an inferred map: the promoted join of the value types (`Union{Missing,T}` for
-# `missing` and `T`), narrowed to the generic model's element types so the result is a member of `E`.
-function valuetype(vs::Vector{Any})
-    isempty(vs) && return Any
-    return narrowelement(mapreduce(typeof, Base.promote_typejoin, vs))
-end
-
-function mapkey(k::AbstractString)
-    return String(k)
-end
-
-function mapkey(k::Symbol)
-    return String(k)
-end
-
-function mapkey(k)
-    throw(ArgumentError("map keys must be strings or symbols, got $(typeof(k))"))
-end
-
-"Copy one map key into operation-owned storage after reserving its exact charge."
-function copymapkey(k::Union{AbstractString,Symbol}, budget::Budget)
-    n = sizeof(k)
-    charge = stringbytes(n)
-    checkpoint = budgetcheckpoint(budget)
-    key = nothing
-    try
-        reserve!(budget, charge)
-        value = k isa String ? GC.@preserve(k, unsafe_string(pointer(k), n)) : String(k)
-        key = value
-        isstrictutf8(key) || encodeerror("map key is not valid UTF-8", k)
-        return key
-    catch
-        key = nothing
-        rollbackreservations!(budget, checkpoint)
-        rethrow()
-    end
-end
-
-function copymapkey(k, budget::Budget)
-    return encodeerror("map keys must be strings or symbols", k)
-end
-
-"""
-    buildmap(V, keys, vals, budget) -> Map{V}
-
-The construction used by decoding and the public constructors: reserve the `npairs` permutation plus
-the merge-sort scratch, sort the candidate indices by key bytes, resolve duplicates last-wins into the
-first occurrence's position, and compact in place (the vectors keep their `npairs` capacity).
-"""
-function buildmap(::Type{V}, keys::Vector{String}, vals::Vector{V}, budget::Union{Nothing,Budget};
-                  duplicateposition::Union{Nothing,Int}=nothing, ownvalues::Bool=true) where {V}
-    n = length(keys)
-    n <= typemax(Int32) || throw(ArgumentError("a map cannot hold more than $(typemax(Int32)) pairs"))
-    budget === nothing || reserve!(budget, mapshellbytes(n) + vectorbytes(Int32, cld(n, 2)))   # struct, permutation and the sort scratch
-    perm = Vector{Int32}(undef, n)
-    scratch = Vector{Int32}(undef, cld(n, 2))
-    mergesort!(perm, scratch, keys)
-    # duplicates: the sorted run groups equal keys; the earliest index keeps the position, the last value wins
-    ndup = 0
-    discardbytes = 0
-    if n > 1
-        budget === nothing || reserve!(budget, vectorbytes(Bool, n))
-        keep = fill(true, n)
-        i = 1
-        while i <= n
-            j = i
-            while j < n && keymatches(keys[perm[j + 1]], keys[perm[i]])
-                j += 1
-            end
-            if j > i
-                if duplicateposition !== nothing
-                    keybytes = sizeof(keys[perm[i]])
-                    msg = budget === nothing ? "duplicate metadata key" :
-                          diagnosticstring(budget, "duplicate metadata key (", keybytes, " bytes)")
-                    throw(DataError(msg, duplicateposition))
-                end
-                first = minimum(view(perm, i:j))
-                last = maximum(view(perm, i:j))
-                for k in i:j
-                    p = perm[k]
-                    p == first || (discardbytes = checked_add(discardbytes, stringbytes(sizeof(keys[p]))))
-                    p == last || (discardbytes = checked_add(discardbytes, mapvaluebytes(V, vals[p], ownvalues)))
-                end
-                vals[first] = vals[last]
-                for k in i:j
-                    perm[k] == first || (keep[perm[k]] = false; ndup += 1)
-                end
-            end
-            i = j + 1
-        end
-        if ndup > 0
-            budget === nothing || reserve!(budget, vectorbytes(Int32, n))
-            newindex = Vector{Int32}(undef, n)
-            w = 0
-            for i in 1:n
-                if keep[i]
-                    w += 1
-                    keys[w] = keys[i]
-                    vals[w] = vals[i]
-                    newindex[i] = Int32(w)
-                end
-            end
-            resize!(keys, w)
-            resize!(vals, w)
-            budget === nothing || release!(budget, discardbytes)
-            r = 0
-            for k in 1:n
-                p = perm[k]
-                keep[p] || continue
-                r += 1
-                perm[r] = newindex[p]
-            end
-            resize!(perm, w)                                                 # keep the original `npairs` capacity
-            budget === nothing || release!(budget, vectorbytes(Int32, n))   # the index map dies here
-        end
-        budget === nothing || release!(budget, vectorbytes(Bool, n))         # the keep mask dies with this block
-    end
-    budget === nothing || release!(budget, vectorbytes(Int32, cld(n, 2)))
-    m = Map{V}(keys, vals, perm)
-    return m
-end
-
-function mapvaluebytes(::Type{V}, @nospecialize(value), ownvalues::Bool) where {V}
-    ownvalues && return elementbytes(V, value)
-    V === Any && isbits(value) && return boxbytes(typeof(value))
-    return 0
-end
-
-"""
-    mergesort!(perm, scratch, keys)
-
-Stable merge sort of `perm` by `keys[perm[i]]` (`isless`; strings in byte order) using `scratch` of length
-`cld(n, 2)`; initialises `perm` and allocates nothing.
-"""
-function mergesort!(perm::Vector{Int32}, scratch::Vector{Int32}, keys::Vector)
-    for i in eachindex(perm)
-        perm[i] = Int32(i)
-    end
-    msort!(perm, 1, length(perm), scratch, keys)
-    return nothing
-end
-
-function msort!(v::Vector{Int32}, lo::Int, hi::Int, t::Vector{Int32}, keys::Vector)
-    if hi - lo < 16
-        for i in lo + 1:hi
-            x = v[i]
-            j = i - 1
-            while j >= lo && isless(keys[x], keys[v[j]])
-                v[j + 1] = v[j]
-                j -= 1
-            end
-            v[j + 1] = x
-        end
-        return v
-    end
-    mid = (lo + hi) >>> 1
-    msort!(v, lo, mid, t, keys)
-    msort!(v, mid + 1, hi, t, keys)
-    isless(keys[v[mid + 1]], keys[v[mid]]) || return v   # already ordered
-    nl = mid - lo + 1
-    copyto!(t, 1, v, lo, nl)
-    i = 1; j = mid + 1; k = lo
-    while i <= nl && j <= hi
-        if isless(keys[v[j]], keys[t[i]])
-            v[k] = v[j]; j += 1
-        else
-            v[k] = t[i]; i += 1
-        end
-        k += 1
-    end
-    while i <= nl
-        v[k] = t[i]; i += 1; k += 1
-    end
-    return v
-end
-
-function Base.length(m::Map)
-    return length(m.keys)
-end
-
-function Base.isempty(m::Map)
-    return isempty(m.keys)
-end
-
-function Base.iterate(m::Map, i::Int=1)
-    i > length(m.keys) && return nothing
-    return (m.keys[i] => m.vals[i], i + 1)
-end
-
-function Base.keys(m::Map)
-    return Base.KeySet(m)
-end
-
-function Base.values(m::Map)
-    return Base.ValueIterator(m)
-end
-
-function keyposition(m::Map, k::AbstractString)
-    lo = 1; hi = length(m.perm)
-    while lo <= hi
-        mid = (lo + hi) >>> 1
-        km = m.keys[m.perm[mid]]
-        c = cmp(km, k)
-        c == 0 && return Int(m.perm[mid])
-        c < 0 ? (lo = mid + 1) : (hi = mid - 1)
-    end
-    return 0
-end
-
-"Compare an owned UTF-8 string with a Symbol without materialising the Symbol as a String."
-function stringsymbolcompare(text::String, symbol::Symbol)
-    nt = sizeof(text)
-    ns = sizeof(symbol)
-    source = Base.unsafe_convert(Ptr{UInt8}, symbol)
-    GC.@preserve text symbol begin
-        for i in 1:min(nt, ns)
-            a = codeunit(text, i)
-            b = unsafe_load(source, i)
-            a == b || return a < b ? -1 : 1
-        end
-    end
-    return cmp(nt, ns)
-end
-
-function keyposition(m::Map, k::Symbol)
-    lo = 1; hi = length(m.perm)
-    while lo <= hi
-        mid = (lo + hi) >>> 1
-        km = m.keys[m.perm[mid]]
-        c = stringsymbolcompare(km, k)
-        c == 0 && return Int(m.perm[mid])
-        c < 0 ? (lo = mid + 1) : (hi = mid - 1)
-    end
-    return 0
-end
-
-function Base.haskey(m::Map, k::AbstractString)
-    return keyposition(m, k) != 0
-end
-
-function Base.haskey(m::Map, k::Symbol)
-    return keyposition(m, k) != 0
-end
-
-function Base.getindex(m::Map, k::AbstractString)
-    i = keyposition(m, k)
-    i == 0 && throw(KeyError(k))
-    return m.vals[i]
-end
-
-function Base.getindex(m::Map, k::Symbol)
-    i = keyposition(m, k)
-    i == 0 && throw(KeyError(k))
-    return m.vals[i]
-end
-
-function Base.get(m::Map, k::AbstractString, default)
-    i = keyposition(m, k)
-    i == 0 && return default
-    return m.vals[i]
-end
-
-function Base.get(m::Map, k::Symbol, default)
-    i = keyposition(m, k)
-    i == 0 && return default
-    return m.vals[i]
-end
-
-# Symbol indexing is a convenience; dictionary equality compares the actual string keys.
-function Base.in(pair::Pair, m::Map, valcmp=(==))
-    pair.first isa AbstractString || return false
-    index = keyposition(m, pair.first)
-    return index != 0 && valcmp(m.vals[index], pair.second)
-end
-
-# Compare maps in sorted key order; AbstractDict supplies the compatible, order-independent hash.
-function Base.:(==)(a::Map, b::Map)
-    length(a.perm) == length(b.perm) || return false
-    result = true
-    for i in eachindex(a.perm)
-        ia, ib = a.perm[i], b.perm[i]
-        a.keys[ia] == b.keys[ib] || return false
-        eq = a.vals[ia] == b.vals[ib]
-        eq === false && return false
-        eq === missing && (result = missing)
-    end
-    return result
-end
-
-function Base.isequal(a::Map, b::Map)
-    length(a.perm) == length(b.perm) || return false
-    for i in eachindex(a.perm)
-        ia, ib = a.perm[i], b.perm[i]
-        (a.keys[ia] == b.keys[ib] && isequal(a.vals[ia], b.vals[ib])) || return false
-    end
-    return true
-end
-
-function Base.show(io::IO, m::Map{V}) where {V}
-    print(io, "Avro.Map{", V, "}(")
-    for (i, (k, v)) in enumerate(m)
-        i > 1 && print(io, ", ")
-        show(io, k); print(io, " => "); show(io, v)
-    end
-    print(io, ")")
-    return nothing
-end
-
-# ---- identity-bearing values -------------------------------------------------------------------------
-
-"""
-    Avro.Record(schema::RecordSchema, values::Vector{Any}; limits=Limits())
-
-The generic record: field values in schema order. `record[:f]`, `record["f"]` and `record.f` look a
-field up by name **without interning** (`keys(record)` returns strings); the Tables row interface is
-provided by `Avro.Row`. Equality is structural.
-"""
-struct Record
+struct Record <: Tables.AbstractRow
     schema::RecordSchema
     values::Vector{Any}
     function Record(schema::RecordSchema, values::Vector{Any}, ::Val{:unchecked})
         return new(schema, values)
     end
+end
 
-    function Record(schema::RecordSchema, values; limits::Limits=Limits())
-        nf = length(schema.fields)
-        return withbudget(limits; direction=:encode) do budget
-            countvalues!(budget)                                         # the record itself
-            reserve!(budget, recordbytes(nf))                                # before the values copy
-            vs = Vector{Any}(undef, nf)
-            i = 0
-            for v in values
-                countvalues!(budget)
-                i += 1
-                i <= nf || throw(ArgumentError("record \"$(fullname(schema))\" has $nf fields, got more values"))
-                box = isbits(v) ? boxbytes(typeof(v)) : 0
-                box > 0 && reserve!(budget, box)
-                vs[i] = v
-            end
-            i == nf || throw(ArgumentError("record \"$(fullname(schema))\" has $nf fields, got $i values"))
-            r = new(schema, vs)
-            return r
-        end
+function Record(schema::RecordSchema, values)
+    nf = length(schema.fields)
+    vs = Vector{Any}(undef, nf)
+    i = 0
+    for v in values
+        i += 1
+        i <= nf || throw(ArgumentError("record \"$(fullname(schema))\" has $nf fields, got more values"))
+        vs[i] = v
     end
+    i == nf || throw(ArgumentError("record \"$(fullname(schema))\" has $nf fields, got $i values"))
+    return Record(schema, vs, Val(:unchecked))
 end
 
-function fieldposition(r::Record, name::AbstractString)
-    i = get(getfield(r, :schema).fieldindex, name, 0)
-    i == 0 && throw(KeyError(name))
-    return i
+function Tables.columnnames(r::Record)
+    return getfield(r, :schema).fieldnames
 end
 
-function symbolfieldposition(r::Record, name::Symbol)
-    index = getfield(r, :schema).fieldindex
-    lo = 1; hi = length(index.keys)
-    while lo <= hi
-        mid = (lo + hi) >>> 1
-        c = stringsymbolcompare(index.keys[mid], name)
-        c == 0 && return index.vals[mid]
-        c < 0 ? (lo = mid + 1) : (hi = mid - 1)
-    end
-    return 0
-end
-
-function fieldposition(r::Record, name::Symbol)
-    i = symbolfieldposition(r, name)
-    i != 0 && return i
-    throw(KeyError(name))
-end
-
-function Base.getindex(r::Record, name::AbstractString)
-    return getfield(r, :values)[fieldposition(r, name)]
-end
-
-function Base.getindex(r::Record, name::Symbol)
-    return getfield(r, :values)[fieldposition(r, name)]
-end
-
-function Base.getindex(r::Record, i::Integer)
+function Tables.getcolumn(r::Record, i::Int)
     return getfield(r, :values)[i]
 end
 
-function Base.getproperty(r::Record, name::Symbol)
-    i = symbolfieldposition(r, name)                   # a field named `schema` or `values` wins
-    i != 0 && return getfield(r, :values)[i]
-    name === :schema && return getfield(r, :schema)
-    name === :values && return getfield(r, :values)
-    throw(KeyError(name))
+function Tables.getcolumn(r::Record, nm::Symbol)
+    i = get(getfield(r, :schema).fieldindex, nm, 0)
+    i == 0 && throw(KeyError(nm))
+    return getfield(r, :values)[i]
 end
 
-function Base.propertynames(r::Record, private::Bool=false)
-    return (:schema, :values)
-end
-
-function Base.keys(r::Record)
-    return [f.name for f in getfield(r, :schema).fields]
-end
-
-function Base.length(r::Record)
-    return length(getfield(r, :values))
+function Base.getindex(r::Record, name::AbstractString)
+    return Tables.getcolumn(r, Symbol(name))
 end
 
 function Base.haskey(r::Record, name::AbstractString)
-    return haskey(getfield(r, :schema).fieldindex, name)
+    return haskey(getfield(r, :schema).fieldindex, Symbol(name))
 end
 
-function Base.haskey(r::Record, name::Symbol)
-    return symbolfieldposition(r, name) != 0
-end
-
-function Base.get(r::Record, name, default)
+function Base.get(r::Record, name::AbstractString, default)
     return haskey(r, name) ? r[name] : default
 end
 
+function Base.NamedTuple(r::Record)
+    schema = getfield(r, :schema)
+    return NamedTuple{Tuple(schema.fieldnames)}(Tuple(getfield(r, :values)))
+end
+
 function Base.:(==)(a::Record, b::Record)
-    return fullnameequal(getfield(a, :schema).name, getfield(b, :schema).name) && getfield(a, :values) == getfield(b, :values)
+    return getfield(a, :schema).name == getfield(b, :schema).name && getfield(a, :values) == getfield(b, :values)
 end
 
 function Base.isequal(a::Record, b::Record)
-    return fullnameequal(getfield(a, :schema).name, getfield(b, :schema).name) && isequal(getfield(a, :values), getfield(b, :values))
+    return getfield(a, :schema).name == getfield(b, :schema).name && isequal(getfield(a, :values), getfield(b, :values))
 end
 
 function Base.hash(a::Record, h::UInt)
@@ -558,64 +86,47 @@ function Base.show(io::IO, r::Record)
     return nothing
 end
 
+function Base.show(io::IO, ::MIME"text/plain", r::Record)
+    return show(io, r)
+end
+
 """
     Avro.EnumValue(schema::EnumSchema, index::Integer)
+    Avro.EnumValue(schema::EnumSchema, symbol::Union{AbstractString,Symbol})
 
-A generic enum value: the 1-based position into `schema.symbols` (`Avro.ordinal(x)` is the zero-based
-wire value). `String(x)` is the symbol; `Symbol(x)` is an explicit caller-owned interning action.
-Equality is by fullname and symbol string.
+A generic enum value: an `AbstractString` holding its symbol, so it compares, hashes, prints and converts
+like that string, and it keeps its schema for encoding (`Avro.ordinal(x)` is the zero-based wire value,
+`index` the 1-based position into `schema.symbols`).
 """
-struct EnumValue
+struct EnumValue <: AbstractString
     schema::EnumSchema
     index::Int32
     function EnumValue(schema::EnumSchema, index::Int32, ::Val{:unchecked})
         return new(schema, index)
     end
-
-    function EnumValue(schema::EnumSchema, index::Integer; limits::Limits=Limits())
-        return withbudget(limits; direction=:encode) do budget
-            return publicenumvalue(schema, index, budget)
-        end
-    end
 end
 
-function EnumValue(schema::EnumSchema, symbol::AbstractString; limits::Limits=Limits())
-    return withbudget(limits; direction=:encode) do budget
-        countvalues!(budget)
-        addinput!(budget, sizeof(symbol))
-        for (i, candidate) in enumerate(schema.symbols)
-            candidate == symbol && return publicenumvalue(schema, i, budget; counted=true)
-        end
-        throw(ArgumentError(diagnosticstring(
-            budget, boundedquoted(symbol), " is not a symbol of enum \"",
-            schema.name, "\"")))
-    end
-end
-
-function publicenumvalue(schema::EnumSchema, index::Integer, budget::Budget; counted::Bool=false)
-    counted || countvalues!(budget)
-    reserve!(budget, enumvaluebytes())
+function EnumValue(schema::EnumSchema, index::Integer)
     1 <= index <= length(schema.symbols) ||
         throw(ArgumentError("enum \"$(fullname(schema))\" has $(length(schema.symbols)) symbols; index $index is out of range"))
-    value = EnumValue(schema, Int32(index), Val(:unchecked))
-    return value
+    return EnumValue(schema, Int32(index), Val(:unchecked))
+end
+
+function EnumValue(schema::EnumSchema, symbol::Union{AbstractString,Symbol})
+    i = get(schema.symbolindex, String(symbol), 0)
+    i == 0 && throw(ArgumentError("$(repr(diagnostictext(symbol))) is not a symbol of enum \"$(fullname(schema))\""))
+    return EnumValue(schema, Int32(i), Val(:unchecked))
 end
 
 function Base.String(x::EnumValue)
     return x.schema.symbols[x.index]
 end
 
-function Base.Symbol(x::EnumValue)
-    return Symbol(String(x))
-end
-
-function Base.:(==)(a::EnumValue, b::EnumValue)
-    return fullnameequal(a.schema.name, b.schema.name) && String(a) == String(b)
-end
-
-function Base.hash(a::EnumValue, h::UInt)
-    return hash(String(a), hash(a.schema.name, hash(:AvroEnum, h)))
-end
+Base.ncodeunits(x::EnumValue) = ncodeunits(String(x))
+Base.codeunit(::EnumValue) = UInt8
+Base.codeunit(x::EnumValue, i::Integer) = codeunit(String(x), i)
+Base.isvalid(x::EnumValue, i::Int) = isvalid(String(x), i)
+Base.iterate(x::EnumValue, i::Int=1) = iterate(String(x), i)
 
 function Base.show(io::IO, x::EnumValue)
     print(io, "Avro.EnumValue(")
@@ -626,34 +137,25 @@ end
 """
     Avro.Fixed(schema::FixedSchema, bytes)
 
-A generic fixed value (copied bytes of exactly `schema.size`). Equality is by fullname, size and bytes.
+A generic fixed value: an `AbstractVector{UInt8}` of exactly `schema.size` copied bytes, so it compares
+and hashes like any byte vector, and it keeps its schema for encoding.
 """
-struct Fixed
+struct Fixed <: AbstractVector{UInt8}
     schema::FixedSchema
     bytes::Vector{UInt8}
     function Fixed(schema::FixedSchema, bytes::Vector{UInt8}, ::Val{:unchecked})
         return new(schema, bytes)
     end
-
-    function Fixed(schema::FixedSchema, bytes::AbstractVector{UInt8}; limits::Limits=Limits())
-        length(bytes) == schema.size || throw(ArgumentError("fixed \"$(fullname(schema))\" has size $(schema.size), got $(length(bytes)) bytes"))
-        return withbudget(limits; direction=:encode) do budget
-            checkvaluebytes(budget, length(bytes))
-            countvalues!(budget)
-            reserve!(budget, fixedbytes(length(bytes)))
-            f = new(schema, Vector{UInt8}(bytes))
-            return f
-        end
-    end
 end
 
-function Base.:(==)(a::Fixed, b::Fixed)
-    return fullnameequal(a.schema.name, b.schema.name) && a.schema.size == b.schema.size && a.bytes == b.bytes
+function Fixed(schema::FixedSchema, bytes::AbstractVector{UInt8})
+    length(bytes) == schema.size || throw(ArgumentError("fixed \"$(fullname(schema))\" has size $(schema.size), got $(length(bytes)) bytes"))
+    return Fixed(schema, copyto!(Vector{UInt8}(undef, length(bytes)), bytes), Val(:unchecked))
 end
 
-function Base.hash(a::Fixed, h::UInt)
-    return hash(a.bytes, hash(a.schema.name, hash(:AvroFixed, h)))
-end
+Base.size(x::Fixed) = size(x.bytes)
+Base.getindex(x::Fixed, i::Int) = x.bytes[i]
+Base.IndexStyle(::Type{Fixed}) = IndexLinear()
 
 function Base.show(io::IO, x::Fixed)
     print(io, "Avro.Fixed(")
@@ -661,12 +163,17 @@ function Base.show(io::IO, x::Fixed)
     return print(io, ": 0x", bytes2hex(x.bytes), ")")
 end
 
+function Base.show(io::IO, ::MIME"text/plain", x::Fixed)
+    return show(io, x)
+end
+
 """
     Avro.UnionValue(index::Integer, value)
 
-A generic value of a union that is not the two-branch nullable form: `index` is the 1-based branch
-position (`Avro.ordinal(x)` is the wire index); non-copying — `value` is retained. Branch acceptance is
-checked at encode time against the enclosing union.
+Forces the union branch `value` is encoded under: `index` is the 1-based branch position
+(`Avro.ordinal(x)` is the wire index). Decoding never produces `UnionValue`s: union values decode to
+the bare value of their branch, and encoding selects the branch from the value when no `UnionValue`
+is given.
 """
 struct UnionValue
     index::Int
@@ -767,12 +274,12 @@ function decimaltype(l::DecimalLogical)
     return l.precision <= 38 ? Decimal : WideDecimal
 end
 
-# ---- the closed value set E --------------------------------------------------------------
+# ---- the closed value set ----------------------------------------------------------------
 
 """
     Avro.LEAF_TYPES
 
-The leaf members `L` of the generic value model.
+The leaf types of the generic value model.
 """
 const LEAF_TYPES = (Missing, Bool, Int32, Int64, Float32, Float64, Vector{UInt8}, String, Fixed, EnumValue, Decimal, WideDecimal,
                     UUID, Date, Time, Timestamp{Millisecond}, Timestamp{Microsecond}, Timestamp{Nanosecond},
@@ -781,20 +288,21 @@ const LEAF_TYPES = (Missing, Bool, Int32, Int64, Float32, Float64, Vector{UInt8}
 """
     Avro.valuetypes() -> Vector{Type}
 
-The closed set `E` of types a generic decode can produce: the leaves, `Record`, `UnionValue`,
-`Vector{x}`/`Map{x}` for `x` a leaf, `Record`, `UnionValue` or `Union{Missing,y}`, `Vector{Any}`,
-`Map{Any}`, and `Union{Missing,x}` for every non-missing member.
+The closed set of types a generic decode can produce: the leaves, `Record`, `Any` (the bare values
+of unions with more than one non-null branch), `Vector{x}`/`Dict{String,x}` for `x` a leaf, `Record` or
+`Union{Missing,y}`, `Vector{Any}`, `Dict{String,Any}`, and `Union{Missing,x}` for every non-missing
+member.
 """
 function valuetypes()
-    elements = Any[LEAF_TYPES..., Record, UnionValue]
+    elements = Any[LEAF_TYPES..., Record]
     nullable = Any[Union{Missing,x} for x in (LEAF_TYPES[2:end]..., Record)]
-    composites = Any[Record, UnionValue]
+    composites = Any[Record, Any]
     for x in (elements..., nullable...)
         push!(composites, Vector{x})
-        push!(composites, Map{x})
+        push!(composites, Dict{String,x})
     end
     push!(composites, Vector{Any})
-    push!(composites, Map{Any})
+    push!(composites, Dict{String,Any})
     all = Any[LEAF_TYPES..., composites...]
     for x in (LEAF_TYPES[2:end]..., composites...)
         push!(all, Union{Missing,x})
@@ -805,12 +313,12 @@ end
 """
     narrowelement(t::Type) -> Type
 
-The element type the generic model stores for values of type `t` inside an array or map (one
-level of typed nesting): a leaf, `Record`, `UnionValue` or `Union{Missing,y}` for a non-missing leaf or
-`Record` is kept; every other type (nested arrays and maps, abstract joins) is stored as `Any`.
+The element type the generic model stores for values of type `t` inside an array or map (one level
+of typed nesting): a leaf, `Record` or `Union{Missing,y}` for a non-missing leaf or `Record` is kept;
+every other type (nested arrays and maps, bare union values, abstract joins) is stored as `Any`.
 """
 function narrowelement(@nospecialize(t::Type))
-    t isa Union || return (t in LEAF_TYPES || t === Record || t === UnionValue) ? t : Any
+    t isa Union || return (t in LEAF_TYPES || t === Record) ? t : Any
     u = Base.nonmissingtype(t)
     return (t === Union{Missing,u} && ((u in LEAF_TYPES && u !== Missing) || u === Record)) ? t : Any
 end
@@ -824,14 +332,13 @@ function juliatype(s::ArraySchema)
 end
 
 function juliatype(s::MapSchema)
-    return Map{elementtype(s.values)}
+    return Dict{String,elementtype(s.values)}
 end
 
 function juliatype(s::UnionSchema)
     nullable = nullablebranch(s)
-    nullable == 0 && return UnionValue
-    other = s.branches[3 - nullable]
-    return Union{Missing,juliatype(other)}
+    nullable == 0 && return Any
+    return Union{Missing,juliatype(s.branches[3 - nullable])}
 end
 
 """

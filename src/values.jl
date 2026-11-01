@@ -1,7 +1,7 @@
-# Value types that do not reference schemas. `Record`, `EnumValue`, `Fixed`, `UnionValue` and
-# `Avro.Map` live in `generic.jl` because they carry schema identity or frozen storage.
+# Value types that do not reference schemas. `Record`, `EnumValue`, `Fixed` and `UnionValue` live in
+# `generic.jl` because they carry schema identity.
 
-using Dates: Dates, Millisecond, Microsecond, Nanosecond, DateTime, Date, Time
+using Dates: Dates, Millisecond, Microsecond, Nanosecond, DateTime, Date, Time, UTC, UTInstant
 
 """
     Avro.Decimal(unscaled::Int128, scale::Int)
@@ -30,25 +30,83 @@ function Base.hash(a::WideDecimal, h::UInt)
 end
 
 """
-    Avro.Timestamp{P}(ticks::Int64)
+    Avro.Timestamp{P}
 
-An exact global instant: `ticks` units of `P` (`Millisecond`, `Microsecond` or `Nanosecond`) since the
-Unix epoch. `DateTime(x)` is an explicit, range-checked conversion (`ConversionError`) that floors
-sub-millisecond units. Equality, ordering and hashing compare exact instants across these units.
+The value of an Avro `timestamp-millis`, `timestamp-micros` or `timestamp-nanos`: an instant on the
+global timeline, `Durations.ZonedTimestamp{P,:UTC}` — `Int64` ticks of `P` since the Unix epoch, an
+`AbstractDateTime` displayed in UTC. `DateTime(x)` converts explicitly (flooring to milliseconds);
+`Avro.LocalTimestamp{P}(x, UTC)` is the UTC wall-clock time. [`Avro.timestamp`](@ref) builds one from raw
+ticks.
 """
-struct Timestamp{P<:Dates.TimePeriod}
-    ticks::Int64
+const Timestamp{P} = Durations.ZonedTimestamp{P,:UTC}
+
+"""
+    Avro.LocalTimestamp{P}
+
+The value of an Avro `local-timestamp-*`: a wall-clock date-time without a time zone,
+`Durations.Timestamp{P}` (the `Dates.Timestamp` of Julia ≥ 1.14) in `Int64` ticks of `P` since
+1970-01-01T00:00:00. [`Avro.localtimestamp`](@ref) builds one from raw ticks.
+"""
+const LocalTimestamp{P} = Durations.Timestamp{P}
+
+"""
+    Avro.timestamp(P, ticks) -> Avro.Timestamp{P}
+    Avro.timestamp(P, dt::DateTime) -> Avro.Timestamp{P}
+
+The instant `ticks` units of `P` (`Millisecond`, `Microsecond` or `Nanosecond`) after the Unix epoch, or
+the one a `DateTime` names (a `DateTime` that does not fit raises `Avro.ConversionError`). `Dates.value(x)`
+is the tick count of a timestamp.
+"""
+function timestamp(::Type{P}, ticks::Integer) where {P<:Dates.TimePeriod}
+    return Timestamp{P}(localtimestamp(P, ticks), UTC)
+end
+
+function timestamp(::Type{P}, dt::DateTime) where {P<:Dates.TimePeriod}
+    return timestamp(P, datetimeticks(P, dt))
 end
 
 """
-    Avro.LocalTimestamp{P}(ticks::Int64)
+    Avro.localtimestamp(P, ticks) -> Avro.LocalTimestamp{P}
+    Avro.localtimestamp(P, dt::DateTime) -> Avro.LocalTimestamp{P}
 
-An exact local (zone-less) timestamp: `ticks` units of `P` (`Millisecond`, `Microsecond` or
-`Nanosecond`) since 1970-01-01T00:00:00 local time. Equality, ordering and hashing compare exact
-local times across these units. Local timestamps are distinct from global `Timestamp` instants.
+The wall-clock time `ticks` units of `P` after 1970-01-01T00:00:00, or the one a `DateTime` names, like
+[`Avro.timestamp`](@ref) without a time zone.
 """
-struct LocalTimestamp{P<:Dates.TimePeriod}
-    ticks::Int64
+function localtimestamp(::Type{P}, ticks::Integer) where {P<:Dates.TimePeriod}
+    return LocalTimestamp{P}(UTInstant(P(Int64(ticks))))
+end
+
+function localtimestamp(::Type{P}, dt::DateTime) where {P<:Dates.TimePeriod}
+    return localtimestamp(P, datetimeticks(P, dt))
+end
+
+const UNIX_EPOCH_MS = Dates.value(DateTime(1970, 1, 1))
+
+# Ticks per millisecond of each Avro timestamp unit.
+function tickscale(::Type{Millisecond})
+    return 1
+end
+
+function tickscale(::Type{Microsecond})
+    return 1_000
+end
+
+function tickscale(::Type{Nanosecond})
+    return 1_000_000
+end
+
+function datetimeticks(::Type{P}, dt::DateTime) where {P}
+    delta, o1 = Base.Checked.sub_with_overflow(Dates.value(dt), UNIX_EPOCH_MS)
+    ticks, o2 = Base.Checked.mul_with_overflow(delta, Int64(tickscale(P)))
+    (o1 || o2) && throw(ConversionError("DateTime $dt does not fit a timestamp in $(nameof(P))s"))
+    return ticks
+end
+
+# `DateTime(x)` with an out-of-range value raising `ConversionError` (it floors sub-millisecond units).
+function todatetime(x::Union{Timestamp{P},LocalTimestamp{P}}) where {P}
+    ms, overflow = Base.Checked.add_with_overflow(fld(Dates.value(x), tickscale(P)), UNIX_EPOCH_MS)
+    overflow && throw(ConversionError("timestamp $(Dates.value(x)) in $(nameof(P))s is outside the DateTime range"))
+    return DateTime(Dates.UTM(ms))
 end
 
 """
@@ -62,118 +120,15 @@ struct Duration
     millis::UInt32
 end
 
-const UNIX_EPOCH_MS = Dates.value(DateTime(1970, 1, 1)) # Rata Die milliseconds of the Unix epoch
-
-function tickscale(::Type{Millisecond})
-    return 1
-end
-
-function tickscale(::Type{Microsecond})
-    return 1_000
-end
-
-function tickscale(::Type{Nanosecond})
-    return 1_000_000
-end
-
-# Int128 holds the full Int64 millisecond range in nanoseconds without rounding or overflow.
-function timestampnanoseconds(x::Union{Timestamp{P},LocalTimestamp{P}}) where {P}
-    return Int128(x.ticks) * (1_000_000 ÷ tickscale(P))
-end
-
-function Base.:(==)(a::Timestamp, b::Timestamp)
-    return timestampnanoseconds(a) == timestampnanoseconds(b)
-end
-
-function Base.:(==)(a::LocalTimestamp, b::LocalTimestamp)
-    return timestampnanoseconds(a) == timestampnanoseconds(b)
-end
-
-function Base.isequal(a::Union{Timestamp,LocalTimestamp}, b::Union{Timestamp,LocalTimestamp})
-    return a == b
-end
-
-function Base.isless(a::Timestamp, b::Timestamp)
-    return timestampnanoseconds(a) < timestampnanoseconds(b)
-end
-
-function Base.isless(a::LocalTimestamp, b::LocalTimestamp)
-    return timestampnanoseconds(a) < timestampnanoseconds(b)
-end
-
-function Base.:(<)(a::Timestamp, b::Timestamp)
-    return isless(a, b)
-end
-
-function Base.:(<)(a::LocalTimestamp, b::LocalTimestamp)
-    return isless(a, b)
-end
-
-function Base.:(<=)(a::Timestamp, b::Timestamp)
-    return isless(a, b) || a == b
-end
-
-function Base.:(<=)(a::LocalTimestamp, b::LocalTimestamp)
-    return isless(a, b) || a == b
-end
-
-function Base.hash(x::Timestamp, h::UInt)
-    return hash(timestampnanoseconds(x), hash(:AvroTimestamp, h))
-end
-
-function Base.hash(x::LocalTimestamp, h::UInt)
-    return hash(timestampnanoseconds(x), hash(:AvroLocalTimestamp, h))
-end
-
-"""
-    DateTime(x::Avro.Timestamp{P}) / DateTime(x::Avro.LocalTimestamp{P})
-
-Range-checked conversion to a `DateTime` (floors sub-millisecond units). Out-of-range values raise
-`Avro.ConversionError`.
-"""
-function Dates.DateTime(x::Union{Timestamp{P},LocalTimestamp{P}}) where {P}
-    ms = fld(x.ticks, tickscale(P))
-    r = Base.Checked.add_with_overflow(ms, UNIX_EPOCH_MS)
-    r[2] && throw(ConversionError("timestamp $(x.ticks) $(P) is outside the DateTime range"))
-    return DateTime(Dates.UTM(r[1]))
-end
-
-function fromdatetime(::Type{T}, dt::DateTime) where {T<:Union{Timestamp,LocalTimestamp}}
-    P = T.parameters[1]
-    delta = Base.Checked.sub_with_overflow(Dates.value(dt), UNIX_EPOCH_MS)
-    delta[2] && throw(ConversionError("DateTime $dt does not fit a $(T)"))
-    r = Base.Checked.mul_with_overflow(delta[1], Int64(tickscale(P)))
-    r[2] && throw(ConversionError("DateTime $dt does not fit a $(T)"))
-    return T(r[1])
-end
-
-function Timestamp{P}(dt::DateTime) where {P<:Dates.TimePeriod}
-    return fromdatetime(Timestamp{P}, dt)
-end
-
-function LocalTimestamp{P}(dt::DateTime) where {P<:Dates.TimePeriod}
-    return fromdatetime(LocalTimestamp{P}, dt)
-end
-
-function Base.show(io::IO, x::Timestamp{P}) where {P}
-    print(io, "Avro.Timestamp{", nameof(P), "}(", x.ticks, ")")
-    return nothing
-end
-
-function Base.show(io::IO, x::LocalTimestamp{P}) where {P}
-    print(io, "Avro.LocalTimestamp{", nameof(P), "}(", x.ticks, ")")
-    return nothing
-end
-
 """
     Avro.truncate(t::Time, P) / Avro.round(t::Time, P)
 
 Align a `Dates.Time` to the `time-millis` (`Millisecond`) or `time-micros` (`Microsecond`) precision
-`P`; encoding a non-aligned `Time` is an `EncodeError` (Java truncates silently — recorded deviation).
+`P`; encoding a non-aligned `Time` is an `EncodeError`.
 """
 function truncate(t::Time, ::Type{P}) where {P<:Dates.TimePeriod}
     ns = Dates.value(t)
-    unit = P === Millisecond ? 1_000_000 : (P === Microsecond ? 1_000 : 1)
+    unit = Dates.tons(P(1))
     return Time(Nanosecond(fld(ns, unit) * unit))
 end
 
@@ -184,7 +139,7 @@ Round-to-nearest alignment; see [`Avro.truncate`](@ref).
 """
 function round(t::Time, ::Type{P}) where {P<:Dates.TimePeriod}
     ns = Dates.value(t)
-    unit = P === Millisecond ? 1_000_000 : (P === Microsecond ? 1_000 : 1)
+    unit = Dates.tons(P(1))
     aligned = Base.round(Int64, ns / unit) * unit
     aligned >= 86_400_000_000_000 && (aligned -= unit)
     return Time(Nanosecond(aligned))
@@ -194,9 +149,11 @@ function Duration(x::Durations.Duration)
     iszero(rem(x.nanoseconds, 1_000_000)) || throw(ArgumentError("Avro duration requires exact milliseconds"))
     return Duration(UInt32(x.months), UInt32(x.days), UInt32(div(x.nanoseconds, 1_000_000)))
 end
+
 function Durations.Duration(x::Duration)
     return Durations.Duration(x.months, x.days, Int64(x.millis) * 1_000_000)
 end
 
-_decimalinput(x::DataDecimals.AbstractDecimal) =
-    WideDecimal(BigInt(DataDecimals.unscaled(x)), DataDecimals.scale(x))
+function decimalinput(x::DataDecimals.AbstractDecimal)
+    return WideDecimal(BigInt(DataDecimals.unscaled(x)), DataDecimals.scale(x))
+end

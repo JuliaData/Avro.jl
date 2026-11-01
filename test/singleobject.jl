@@ -39,9 +39,8 @@
         @test_throws Avro.DataError Avro.decodesingle(vcat(UInt8[0xc3, 0x02], wbin[3:end]), store)
         @test_throws Avro.DataError Avro.decodesingle(vcat(wbin, UInt8[0x00]), store)            # trailing byte
         @test_throws Avro.DataError Avro.decodesingle(wbin[1:end - 1], store)                    # truncated payload
-        @test_throws Avro.LimitError Avro.decodesingle(wbin, store; limits=Avro.Limits(max_datum_bytes=10, max_bytes=10))
-        @test Avro.decodesingle(wbin, store; validate=:fast) == w1
-        @test_throws ArgumentError Avro.decodesingle(wbin, store; validate=:loose)
+        @test_throws Avro.LimitError Avro.decodesingle(IOBuffer(wbin), store; limits=Avro.Limits(max_bytes=10))   # a datum read from a stream
+        @test Avro.decodesingle(wbin, store; limits=Avro.Limits(max_bytes=10)) == w1
     end
 
     @testset "SchemaCache ambiguity and bounds" begin
@@ -61,15 +60,12 @@
         e = try Avro.register!(c, err); nothing catch x; x end
         @test e isa Avro.AmbiguousSchemaError && e.fingerprint == fp && e.existing === rec && e.offered === err
         @test Avro.register!(c, P("\"int\"")) == Avro.fingerprint(P("\"int\""))
-        @test_throws Avro.LimitError Avro.register!(c, P("\"string\""))                         # max_entries
+        entrieserror = try Avro.register!(c, P("\"string\"")); nothing catch x; x end
+        @test entrieserror isa Avro.LimitError && entrieserror.limit === :max_entries && entrieserror.value == 2
         @test length(c) == 2
-        base = Avro.schemacachebasebytes()
-        @test_throws ArgumentError Avro.SchemaCache(max_bytes=base - 1)
-        emptycache = Avro.SchemaCache(max_entries=0, max_bytes=base)
-        @test emptycache.bytes == emptycache.ledger.reserved == base
-        @test Base.summarysize(emptycache; exclude=Avro.Schema) == base
-        small = Avro.SchemaCache(max_bytes=base)
-        @test_throws Avro.LimitError Avro.register!(small, ws)
+        emptycache = Avro.SchemaCache(max_entries=0)
+        @test_throws Avro.LimitError Avro.register!(emptycache, ws)
+        @test length(emptycache) == 0
         @test_throws ArgumentError Avro.SchemaCache(max_entries=-1)
         # registration is safe across tasks
         big = Avro.SchemaCache()
@@ -84,30 +80,26 @@
     @testset "custom stores" begin
         struct DictStore <: Avro.SchemaStore
             d::Dict{UInt64,Avro.Schema}
-            seen::Base.RefValue{Union{Nothing,Avro.Limits}}
         end
 
-        function Avro.lookup(s::DictStore, fp::UInt64; limits=Avro.Limits())
-            s.seen[] = limits
+        function Avro.lookup(s::DictStore, fp::UInt64)
             return haskey(s.d, fp) ? s.d[fp] : throw(Avro.UnknownSchemaError(fp))
         end
 
-        function Avro.register!(s::DictStore, schema::Avro.Schema;
-                                limits=Avro.Limits())
+        function Avro.register!(s::DictStore, schema::Avro.Schema)
             fp = Avro.fingerprint(schema)
             s.d[fp] = schema
             return fp
         end
 
-        ds = DictStore(Dict{UInt64,Avro.Schema}(), Ref{Union{Nothing,Avro.Limits}}(nothing))
+        ds = DictStore(Dict{UInt64,Avro.Schema}())
         Avro.register!(ds, ws)
-        limits = Avro.Limits(max_datum_bytes=1024)
-        @test Avro.decodesingle(wbin, ds; limits=limits) == w1
-        @test ds.seen[] === limits
+        @test Avro.decodesingle(wbin, ds) == w1
+        @test Avro.decodesingle(wbin, ds; limits=Avro.Limits(max_depth=8)) == w1
         # a store returning a schema under the wrong fingerprint is rejected
-        liar = DictStore(Dict(Avro.fingerprint(ws) => P("\"int\"")), Ref{Union{Nothing,Avro.Limits}}(nothing))
+        liar = DictStore(Dict(Avro.fingerprint(ws) => P("\"int\"")))
         @test_throws Avro.DataError Avro.decodesingle(wbin, liar)
-        e = try Avro.decodesingle(wbin, DictStore(Dict{UInt64,Avro.Schema}(), Ref{Union{Nothing,Avro.Limits}}(nothing))); nothing catch x; x end
+        e = try Avro.decodesingle(wbin, DictStore(Dict{UInt64,Avro.Schema}())); nothing catch x; x end
         @test e isa Avro.UnknownSchemaError && e.fingerprint == Avro.fingerprint(ws)
         @test occursin("fingerprint", sprint(showerror, e))
 
@@ -115,7 +107,7 @@
             d::Dict{UInt64,Avro.Schema}
         end
 
-        function Avro.lookup(s::ReadOnlyStore, fp::UInt64; limits=Avro.Limits())
+        function Avro.lookup(s::ReadOnlyStore, fp::UInt64)
             return haskey(s.d, fp) ? s.d[fp] : throw(Avro.UnknownSchemaError(fp))
         end
 
@@ -125,39 +117,18 @@
         @test_throws Avro.UnknownSchemaError Avro.decodesingle(wbin, ReadOnlyStore(Dict{UInt64,Avro.Schema}()))
     end
 
-    @testset "one operation budget; transactional exact-capacity cache" begin
+    @testset "transactional cache bounds; views; the value cap of a datum" begin
         s1 = P("{\"type\":\"record\",\"name\":\"C1\",\"fields\":[{\"name\":\"a\",\"type\":\"long\"}]}")
         s2 = P("{\"type\":\"record\",\"name\":\"C2\",\"fields\":[{\"name\":\"a\",\"type\":\"long\"}]}")
         c = Avro.SchemaCache(max_entries=1)
         fp1 = Avro.register!(c, s1)
         @test_throws Avro.LimitError Avro.register!(c, s2)                               # the failed insert left the table untouched
         @test length(c) == 1 && Avro.lookup(c, fp1) === s1
-        cb = Avro.SchemaCache(max_bytes=Avro.schemacachebasebytes())
-        @test_throws Avro.LimitError Avro.register!(cb, s1)
-        @test length(cb) == 0
         c2 = Avro.SchemaCache()
         for s in (s1, s2)
             Avro.register!(c2, s)
         end
-        @test length(c2.fingerprints) == length(c2.schemas) == 2                          # exact-capacity replacement
-        nullschema = P("\"null\"")
-        longschema = P("\"long\"")
-        probe = Avro.SchemaCache(max_bytes=1 << 20)
-        Avro.register!(probe, nullschema)
-        chargebudget = Avro.Budget(Avro.Limits())
-        longcharge = Avro.schemaretainedbytes(longschema, chargebudget)
-        exactlimit = probe.bytes + longcharge + Avro.cacheindexbytes(2)
-        peakbounded = Avro.SchemaCache(max_bytes=exactlimit - 1)
-        nullfp = Avro.register!(peakbounded, nullschema)
-        @test_throws Avro.LimitError Avro.register!(peakbounded, longschema)        # old and new index vectors overlap
-        @test length(peakbounded) == 1 && Avro.lookup(peakbounded, nullfp) isa Avro.NullSchema
-        exactpeak = Avro.SchemaCache(max_bytes=exactlimit)
-        Avro.register!(exactpeak, nullschema)
-        Avro.register!(exactpeak, longschema)
-        @test length(exactpeak) == 2 && exactpeak.bytes == exactpeak.ledger.reserved
-        @test exactpeak.ledger.peak == exactpeak.max_bytes
-        largeprops = Avro.IntSchema(props=(x=repeat("x", 1_000_000),))
-        @test_throws Avro.LimitError Avro.register!(Avro.SchemaCache(max_bytes=Avro.schemacachebasebytes()), largeprops)
+        @test length(c2) == 2
         msg = Avro.encodesingle(s1, (a=Int64(7),))
         @test Avro.decodesingle(msg, c2).a === Int64(7)
         big = Avro.encodesingle(s1, (a=typemax(Int64),))
@@ -169,60 +140,36 @@
         stringmessage = Avro.encodesingle(stringschema, (s="abc",))
         viewbytes = vcat(UInt8[0xff], stringmessage, UInt8[0xff])
         viewmessage = view(viewbytes, 2:length(viewbytes) - 1)
-        vectorbudget = Avro.Budget(Avro.Limits())
-        vectorvalue, _, _ = Avro.decodesingleoperation(stringmessage, stringcache, vectorbudget;
-                                                       limits=vectorbudget.limits)
-        viewbudget = Avro.Budget(Avro.Limits())
-        viewvalue, _, _ = Avro.decodesingleoperation(viewmessage, stringcache, viewbudget;
-                                                     limits=viewbudget.limits)
-        @test viewvalue == vectorvalue == Avro.Record(stringschema, ["abc"])
-        @test Avro.storagebytes(viewvalue) == Avro.heldbytes(viewvalue)
-        @test viewbudget.reserved == vectorbudget.reserved
-        @test viewbudget.peak == vectorbudget.peak
+        @test Avro.decodesingle(viewmessage, stringcache) == Avro.decodesingle(stringmessage, stringcache) ==
+              Avro.Record(stringschema, ["abc"])
 
+        # a datum of one value per byte decodes under the tightest density limit, from bytes and streams
         compareschema = P("\"string\"")
         comparecache = Avro.SchemaCache()
         Avro.register!(comparecache, compareschema)
-        comparelimits = Avro.Limits(work_allowance=0,
-                                    max_values_per_byte=1)
+        tightest = Avro.Limits(max_values_per_byte=1, value_allowance=0)
         comparevalue = repeat("x", 20)
         comparemessage = Avro.encodesingle(compareschema, comparevalue)
-        @test length(comparemessage) - 10 == 21
-        @test Avro.decodesingle(comparemessage, comparecache;
-                                limits=comparelimits) == comparevalue
-        @test Avro.decodesingle(IOBuffer(comparemessage), comparecache;
-                                limits=comparelimits) == comparevalue
-
-        shortvalue = repeat("x", 14)
-        shortmessage = Avro.encodesingle(compareschema, shortvalue)
-        @test length(shortmessage) - 10 == 15
-        @test Avro.decodesingle(shortmessage, comparecache; limits=comparelimits) == shortvalue
-
+        @test Avro.decodesingle(comparemessage, comparecache; limits=tightest) == comparevalue
+        @test Avro.decodesingle(IOBuffer(comparemessage), comparecache; limits=tightest) == comparevalue
         workschema = P("{\"type\":\"record\",\"name\":\"WorkSymmetry\",\"fields\":[{\"name\":\"n\",\"type\":\"null\"},{\"name\":\"s\",\"type\":\"string\"}]}")
-        workvalue = Avro.Record(workschema, Any[missing, "xxx"])
-        strictwork = Avro.Limits(work_allowance=0,
-                                 max_values_per_byte=1)
-        encodeerror = try
-            Avro.encodesingle(workschema, workvalue; limits=strictwork)
-            nothing
-        catch error
-            error
-        end
-        @test encodeerror isa Avro.LimitError
-        @test encodeerror.limit === :max_values_per_byte
-        @test encodeerror.observed == 6
-        @test encodeerror.value == 4
-
-        boundarywork = Avro.Limits(work_allowance=2,
-                                   max_values_per_byte=1)
-        workmessage = Avro.encodesingle(workschema, workvalue;
-                                        limits=boundarywork)
-        @test length(workmessage) - 10 == 4
         workcache = Avro.SchemaCache()
         Avro.register!(workcache, workschema)
-        workroundtrip = Avro.decodesingle(workmessage, workcache;
-                                          limits=boundarywork)
-        @test workroundtrip.n === missing
-        @test workroundtrip.s == "xxx"
+        workroundtrip = Avro.decodesingle(Avro.encodesingle(workschema, Avro.Record(workschema, Any[missing, "xxx"])),
+                                          workcache; limits=tightest)
+        @test workroundtrip.n === missing && workroundtrip.s == "xxx"
+        # twenty null fields beside an empty string: far more values than bytes
+        densefields = join(("{\"name\":\"n$i\",\"type\":\"null\"}" for i in 1:20), ",")
+        denseschema = P("{\"type\":\"record\",\"name\":\"Dense\",\"fields\":[" * densefields * ",{\"name\":\"s\",\"type\":\"string\"}]}")
+        Avro.register!(workcache, denseschema)
+        densemessage = Avro.encodesingle(denseschema, NamedTuple{Tuple(vcat([Symbol("n$i") for i in 1:20], :s))}((fill(missing, 20)..., "")))
+        denseerror = try
+            Avro.decodesingle(densemessage, workcache; limits=tightest)
+            nothing
+        catch caught
+            caught
+        end
+        @test denseerror isa Avro.LimitError && denseerror.limit === :max_values_per_byte
+        @test length(Avro.decodesingle(densemessage, workcache)) == 21
     end
 end

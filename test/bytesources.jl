@@ -33,7 +33,7 @@ Base.getindex(x::ByteOffsetVector, i::Int) = x.data[i - x.offset]
         @test Avro.fromjson(schema, ByteOffsetVector(collect(codeunits("\"hello λ\"")), offset)) == value
         @test Avro.decodesingle(ByteOffsetVector(message, offset), store) == value
         @test_throws Avro.DataError Avro.decodesingle(ByteOffsetVector(vcat(message, 0x00), offset), store)
-        @test_throws Avro.LimitError Avro.decodesingle(ByteOffsetVector(message, offset), store;
-                                                    limits=Avro.Limits(max_datum_bytes=1))
+        @test Avro.decodesingle(ByteOffsetVector(message, offset), store;
+                                limits=Avro.Limits(max_values_per_byte=1, value_allowance=0)) == value
     end
 end

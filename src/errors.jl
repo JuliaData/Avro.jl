@@ -1,13 +1,9 @@
-# Error hierarchy. Every defect the package detects in its input surfaces as an `AvroError`;
-# exceptions that are not about the content (IOError, InterruptException, OutOfMemoryError, user-hook
-# errors) propagate unchanged.
-
 """
     Avro.AvroError <: Exception
 
 Abstract supertype of every error Avro.jl raises about the content it processes (schemas, datums,
-container files, JSON, limits, codecs). I/O errors, interruptions and errors thrown by user code are
-never wrapped.
+container files, JSON, limits, codecs). I/O errors, interruptions and errors raised by caller code that
+typed decoding calls (a target's positional constructor, a StructUtils hook) are never wrapped.
 """
 abstract type AvroError <: Exception end
 
@@ -21,8 +17,9 @@ abstract type DecodeError <: AvroError end
 """
     Avro.SchemaError(msg, path)
 
-A schema document violates the Avro schema rules. `path` is the JSON path of the offending
-element (e.g. `"\$.fields[2].type"`).
+A schema violates the Avro schema rules, or does not fit the requested read (a non-record root read as
+a table, a `select=` name the record lacks). `path` is the JSON path of the offending element (e.g.
+`"\$.fields[2].type"`).
 """
 struct SchemaError <: AvroError
     msg::String
@@ -52,22 +49,16 @@ struct ResolutionError <: AvroError
 end
 
 """
-    Avro.LimitError(limit, observed, value, keyword; direction)
+    Avro.LimitError(limit, observed, value)
 
-A configured resource limit was exceeded. `limit` names the limit, `observed` is the value that tripped
-it, `value` the configured bound, and `keyword` the `Avro.Limits` keyword that raises it (the manual
-states that limits must be raised on every side that processes the data).
+A resource limit was exceeded: `limit` names the [`Avro.Limits`](@ref) keyword that raises it (or
+`:max_entries` for a full `Avro.SchemaCache`), `observed` is the value that tripped it and `value` the bound
+it crossed. For `:max_values_per_byte`, `value` is the value cap computed for the input being read.
 """
 struct LimitError <: AvroError
     limit::Symbol
     observed::Int
     value::Int
-    keyword::Symbol
-    direction::Symbol   # :decode | :encode
-end
-
-function LimitError(limit::Symbol, observed::Integer, value::Integer; direction::Symbol=:decode)
-    return LimitError(limit, Int(observed), Int(value), limit, direction)
 end
 
 """
@@ -164,8 +155,8 @@ function Base.showerror(io::IO, e::ResolutionError)
 end
 
 function Base.showerror(io::IO, e::LimitError)
-    print(io, "LimitError: ", e.limit, " exceeded while ", e.direction == :encode ? "encoding" : "decoding",
-        ": observed ", e.observed, ", limit ", e.value, "; raise `Avro.Limits(", e.keyword, "=...)` on every side that processes this data")
+    print(io, "LimitError: ", e.limit, " exceeded: observed ", e.observed, ", limit ", e.value)
+    e.limit in fieldnames(Limits) && print(io, "; raise `Avro.Limits(", e.limit, "=...)`")
     return nothing
 end
 

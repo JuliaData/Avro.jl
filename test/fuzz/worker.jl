@@ -192,47 +192,39 @@ function attempt(f)
 end
 
 function skipdatum(plan, m::Vector{UInt8}, limits)
-    return Avro.withbudget(limits) do b
-        Avro.addinput!(b, length(m))
-        d = Avro.Decoder(m, b)
-        Avro.skip(plan, d)
-        d.pos == length(m) + 1 || throw(Avro.DataError("trailing bytes after the datum", d.pos))
-        nothing
-    end
+    d = Avro.Decoder(m, limits)
+    Avro.skip(plan, d)
+    d.pos == length(m) + 1 || throw(Avro.DataError("trailing bytes after the datum", d.pos))
+    return nothing
 end
 
 function projectdatum(plan, m::Vector{UInt8}, i::Int, limits)
-    return Avro.withbudget(limits) do b
-        Avro.addinput!(b, length(m))
-        d = Avro.Decoder(m, b)
-        Avro.decodecolumns(plan, d, 1; selected=[i])
-        d.pos == length(m) + 1 || throw(Avro.DataError("trailing bytes after the datum", d.pos))
-        nothing
-    end
+    d = Avro.Decoder(m, limits)
+    slots = zeros(Int, length(plan.schema.fields))
+    slots[i] = 1
+    Avro.decoderow!(Avro.columnbuilders(plan, Avro.Projection([i], slots), 1), d)
+    d.pos == length(m) + 1 || throw(Avro.DataError("trailing bytes after the datum", d.pos))
+    return nothing
 end
 
-function isutf8(msg)
-    return occursin("UTF-8", msg)
-end
-
-"A raw datum under its valid schema: DataError/LimitError or a valid decode, and the acceptance rules."
+"""
+A raw datum under its valid schema: DataError/LimitError or a valid decode, and the acceptance rule:
+skipping and projection read no more than decoding (sized blocks are jumped, skipped strings are not
+UTF-8-checked), so whatever decodes also skips and projects.
+"""
 function datumcase(ctx, m::Vector{UInt8}, limits)
     s, plan = ctx.schema, ctx.plan
-    strict = attempt(() -> Avro.decode(s, m; limits=limits))
-    strict[1] in (:ok, :data, :limit) || return "guarantee: decode raised $(strict[1]) — $(strict[2])"
-    fast = attempt(() -> Avro.decode(s, m; limits=limits, validate=:fast))
-    fast[1] in (:ok, :data, :limit) || return "guarantee: fast decode raised $(fast[1]) — $(fast[2])"
-    strict[1] === :ok && fast[1] !== :ok && return "equivalence: fast rejects a datum strict accepts — $(fast[2])"
+    full = attempt(() -> Avro.decode(s, m; limits=limits))
+    full[1] in (:ok, :data, :limit) || return "guarantee: decode raised $(full[1]) — $(full[2])"
     sk = attempt(() -> skipdatum(plan, m, limits))
     sk[1] in (:ok, :data, :limit) || return "guarantee: skip raised $(sk[1]) — $(sk[2])"
-    strict[1] === :ok && sk[1] !== :ok && return "equivalence: skip rejects a datum decode accepts — $(sk[2])"
-    sk[1] === :ok && strict[1] !== :ok && !isutf8(strict[2]) && return "equivalence: skip accepts a datum decode rejects — $(strict[2])"
+    full[1] === :ok && sk[1] !== :ok && return "equivalence: skip rejects a datum decode accepts — $(sk[2])"
     if s isa Avro.RecordSchema
         for i in eachindex(s.fields)
             pr = attempt(() -> projectdatum(plan, m, i, limits))
             pr[1] in (:ok, :data, :limit) || return "guarantee: projection $i raised $(pr[1]) — $(pr[2])"
-            (pr[1] === :ok) == (strict[1] === :ok) || isutf8(strict[2]) || isutf8(pr[2]) ||
-                return "equivalence: projection $i is $(pr[1]) but the full decode is $(strict[1]) — $(strict[2]) / $(pr[2])"
+            full[1] === :ok && pr[1] !== :ok &&
+                return "equivalence: projection $i rejects a datum decode accepts — $(pr[2])"
         end
     end
     return nothing
@@ -257,7 +249,7 @@ function jsoncase(ctx, m::Vector{UInt8}, limits)
     r = attempt(() -> (v[] = Avro.fromjson(ctx.schema, m; limits=limits)))
     r[1] === :other && return "guarantee: fromjson raised — $(r[2])"
     r[1] === :ok || return nothing
-    t = attempt(() -> Avro.encode(ctx.schema, v[]; limits=limits))
+    t = attempt(() -> Avro.encode(ctx.schema, v[]))
     t[1] === :ok || return "invariant: a value from fromjson does not encode — $(t[2])"
     return nothing
 end

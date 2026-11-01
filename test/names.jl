@@ -5,6 +5,5 @@
     @test Avro.isreservedfullname(Avro.FullName("int", "")) && !Avro.isreservedfullname(Avro.FullName("int", "a"))
     f = Avro.FullName("R", "ns")
     @test f == Avro.FullName("R", "ns") && hash(f) == hash(Avro.FullName("R", "ns")) && f != Avro.FullName("R", "")
-    @test Avro.FullName("A", "") < Avro.FullName("B", "")
     @test sprint(show, f) == "FullName(\"ns.R\")"
 end

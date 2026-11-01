@@ -1,76 +1,40 @@
 # Parsing Canonical Form and fingerprints (spec "Parsing Canonical Form for Schemas").
 
 """
-    Avro.canonical(schema; limits=Limits()) -> String
+    Avro.canonical(schema) -> String
 
 The Parsing Canonical Form of `schema`: primitives as bare strings, named types by fullname with
 `name`/`type`/`fields`/`symbols`/`items`/`values`/`size` in spec order, the first definition in full and
 later references by fullname, no whitespace, no attributes other than the canonical ones. A graph with
 repaired invalid names has no specification PCF and raises `ArgumentError`.
 """
-function canonical(s::Schema; limits::Limits=Limits())
-    graphinfo(s).repaired_names && throw(ArgumentError("a schema with repaired invalid names has no Parsing Canonical Form"))
-    return withbudget(limits) do budget
-        w = BoundedWriter(budget, limits.max_schema_bytes)
-        seen = schemaseen(s, budget)
-        canonicalprint(w, s, seen)
-        releaseseen!(budget, seen)
-        return boundedtake!(w)
-    end
+function canonical(s::Schema)
+    return String(canonicalbytes(s))
 end
 
-function canonicalprint(io::IO, s::Schema, seen::Vector{Bool})
-    if s isa PrimitiveSchema
-        print(io, '"', kind(s), '"')
-    elseif s isa UnionSchema
-        print(io, '[')
-        for (i, b) in enumerate(s.branches)
-            i > 1 && print(io, ',')
-            canonicalprint(io, b, seen)
-        end
-        print(io, ']')
-    elseif s isa ArraySchema
-        print(io, "{\"type\":\"array\",\"items\":")
-        canonicalprint(io, s.items, seen)
-        print(io, '}')
-    elseif s isa MapSchema
-        print(io, "{\"type\":\"map\",\"values\":")
-        canonicalprint(io, s.values, seen)
-        print(io, '}')
-    else
-        seenindex = Int(nodeid(s)) + 1
-        if seen[seenindex]
-            escapefullname(io, s)
-            countnode!(io)
-            return nothing
-        end
-        seen[seenindex] = true
-        print(io, "{\"name\":")
-        escapefullname(io, s)
-        if s isa FixedSchema
-            print(io, ",\"type\":\"fixed\",\"size\":", s.size, '}')
-        elseif s isa EnumSchema
-            print(io, ",\"type\":\"enum\",\"symbols\":[")
-            for (i, sym) in enumerate(s.symbols)
-                i > 1 && print(io, ',')
-                escapejson(io, sym)
-            end
-            print(io, "]}")
-        else
-            print(io, ",\"type\":\"record\",\"fields\":[")
-            for (i, f) in enumerate(s.fields)
-                i > 1 && print(io, ',')
-                print(io, "{\"name\":")
-                escapejson(io, f.name)
-                print(io, ",\"type\":")
-                canonicalprint(io, f.schema, seen)
-                print(io, '}')
-            end
-            print(io, "]}")
-        end
-    end
-    countnode!(io)
-    return nothing
+function canonicalbytes(s::Schema)
+    graphinfo(s).repaired_names && throw(ArgumentError("a schema with repaired invalid names has no Parsing Canonical Form"))
+    return pcfbytes(s)
+end
+
+function pcfbytes(s::Schema)
+    io = IOBuffer()
+    printjson(io, canonicaltree(s, schemaseen(s)), false, 0)
+    return take!(io)
+end
+
+function canonicaltree(s::Schema, seen::Vector{Bool})
+    s isa PrimitiveSchema && return String(kind(s))
+    s isa UnionSchema && return Any[canonicaltree(b, seen) for b in s.branches]
+    s isa ArraySchema && return Pair{String,Any}["type" => "array", "items" => canonicaltree(s.items, seen)]
+    s isa MapSchema && return Pair{String,Any}["type" => "map", "values" => canonicaltree(s.values, seen)]
+    index = Int(nodeid(s)) + 1
+    seen[index] && return fullname(s)
+    seen[index] = true
+    s isa FixedSchema && return Pair{String,Any}["name" => fullname(s), "type" => "fixed", "size" => Int64(s.size)]
+    s isa EnumSchema && return Pair{String,Any}["name" => fullname(s), "type" => "enum", "symbols" => s.symbols]
+    fields = Any[Pair{String,Any}["name" => f.name, "type" => canonicaltree(f.schema, seen)] for f in s.fields]
+    return Pair{String,Any}["name" => fullname(s), "type" => "record", "fields" => fields]
 end
 
 # CRC-64-AVRO (spec pseudo-code): empty = 0xc15d213aa4d7a795, table built from the polynomial.
@@ -107,64 +71,24 @@ function crc64avro(s::AbstractString)
     return crc64avro(codeunits(s))
 end
 
-"Hash canonical bytes after reserving the exact retained digest and pinned-library workspace."
-function hashfingerprint(pcf::AbstractVector{UInt8}, algorithm::Symbol, budget::Budget)
-    # MD5 retains a 16-byte state vector behind a 16-byte ReinterpretArray shell. SHA-256
-    # retains its 32-byte output vector. Their pinned implementations also allocate one
-    # context object, one state vector and one 64-byte block buffer while hashing.
-    retained = algorithm === :md5 ? checked_add(bytesbytes(16), 16) : bytesbytes(32)
-    transient = algorithm === :md5 ? checked_add(32, bytesbytes(64)) :
-                checked_add(32, checked_add(bytesbytes(32), bytesbytes(64)))
-    peak = checked_add(retained, transient)
-    reserve!(budget, peak)
-    try
-        digest = algorithm === :md5 ? MD5.md5(pcf) : SHA.sha256(pcf)
-        release!(budget, transient)
-        return digest
-    catch
-        release!(budget, peak)
-        rethrow()
-    end
-end
-
 """
-    Avro.fingerprint(schema; algorithm=:crc64avro, limits=Limits()) -> UInt64 | AbstractVector{UInt8}
+    Avro.fingerprint(schema; algorithm=:crc64avro) -> UInt64 | Vector{UInt8}
 
 A fingerprint of the Parsing Canonical Form: `:crc64avro` (`UInt64`), `:md5` or `:sha256` (bytes).
 """
-function fingerprint(s::Schema; algorithm::Symbol=:crc64avro, limits::Limits=Limits())
-    graphinfo(s).repaired_names && throw(ArgumentError("a schema with repaired invalid names has no Parsing Canonical Form"))
+function fingerprint(s::Schema; algorithm::Symbol=:crc64avro)
     algorithm in (:crc64avro, :md5, :sha256) ||
         throw(ArgumentError("unknown fingerprint algorithm :$algorithm (use :crc64avro, :md5 or :sha256)"))
-    return withbudget(limits) do budget                # one operation: print and hash in the same scope
-        w = BoundedWriter(budget, limits.max_schema_bytes)
-        seen = schemaseen(s, budget)
-        canonicalprint(w, s, seen)
-        releaseseen!(budget, seen)                     # the seen table dies before hashing
-        pcf = boundedview(w)
-        algorithm === :crc64avro && return crc64avro(pcf)
-        return hashfingerprint(pcf, algorithm, budget)
-    end
+    pcf = canonicalbytes(s)
+    algorithm === :crc64avro && return crc64avro(pcf)
+    return algorithm === :md5 ? MD5.md5(pcf) : SHA.sha256(pcf)
 end
 
 """
-    Avro.parsingequivalent(a, b; limits=Limits()) -> Bool
+    Avro.parsingequivalent(a, b) -> Bool
 
 `true` when the two schemas have the same Parsing Canonical Form.
 """
-function parsingequivalent(a::Schema, b::Schema; limits::Limits=Limits())
-    for s in (a, b)
-        graphinfo(s).repaired_names && throw(ArgumentError("a schema with repaired invalid names has no Parsing Canonical Form"))
-    end
-    return withbudget(limits) do budget                # one operation for both canonical forms
-        wa = BoundedWriter(budget, limits.max_schema_bytes)
-        seena = schemaseen(a, budget)
-        canonicalprint(wa, a, seena)
-        releaseseen!(budget, seena)                    # dead before the second print
-        wb = BoundedWriter(budget, limits.max_schema_bytes)
-        seenb = schemaseen(b, budget)
-        canonicalprint(wb, b, seenb)
-        releaseseen!(budget, seenb)
-        return boundedview(wa) == boundedview(wb)
-    end
+function parsingequivalent(a::Schema, b::Schema)
+    return canonicalbytes(a) == canonicalbytes(b)
 end

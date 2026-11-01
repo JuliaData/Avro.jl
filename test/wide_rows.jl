@@ -89,22 +89,14 @@ end
     staged = [merge(row, (f1=Iterators.Stateful(Int64[1, 2]),)) for row in rows]
     @test all(x == [1, 2] for x in Avro.Table(Avro.tobuffer(staged; schema=array_schema)).f1)
 
-    for limits in (Avro.Limits(max_rows=5), Avro.Limits(max_depth=0),
-                   Avro.Limits(max_total_values=20), Avro.Limits(max_block_output_bytes=128))
-        a = failure(() -> rowwise(schema, rows; limits=limits))
-        b = failure(() -> Avro.tobuffer(rows; schema=schema, limits=limits))
-        @test a isa Avro.LimitError && b isa Avro.LimitError && a.limit == b.limit
-    end
-    writer = Avro.Writer(IOBuffer(), schema)
-    budget = writer.budget
-    # Leave space for field positions but refuse the cells, without allocating a large input.
-    filler = budget.limits.max_total_bytes - budget.reserved - 1024
-    Avro.reserve!(budget, filler)
-    before = budget.reserved
-    @test_throws Avro.LimitError Avro.pushrowcells!(writer, rows)
-    @test budget.reserved == before
-    Avro.release!(budget, filler)
-    close(writer; abort=true)
+    # the row and cell paths refuse a datum over max_bytes alike
+    bigrows = [merge(row, (f1="x"^10_000,)) for row in rows[1:3]]
+    smallblocks = Avro.Limits(max_bytes=8192)
+    a = failure(() -> rowwise(schema, bigrows; limits=smallblocks))
+    b = failure(() -> Avro.tobuffer(bigrows; schema=schema, limits=smallblocks))
+    @test a isa Avro.LimitError && b isa Avro.LimitError && a.limit == b.limit == :max_bytes
+    @test take!(Avro.tobuffer(rows; schema=schema, sync=zeros(UInt8, 16), block_bytes=1024, limits=smallblocks)) ==
+          rowwise(schema, rows; limits=smallblocks)
 
     function floats(width, count)
         keys = Tuple(Symbol("c", i) for i in 1:width)

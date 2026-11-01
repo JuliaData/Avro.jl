@@ -1,162 +1,44 @@
-# Tables.jl integration: `Avro.Table` (a column table with a stored `Tables.Schema`),
-# `Avro.Rows` in its three modes, `Avro.Row` (a record plus the operation's `names=` choice),
-# projection pushdown through `select=`, and the read-only DataAPI metadata interface. Column names
-# intern through `names=` (directly by default, or through a caller's `SymbolAdmission`), lazily for
-# `Rows`.
+# Tables.jl integration: `Avro.Table` (a column table with a stored `Tables.Schema`), `Avro.Rows` in its
+# three modes, projection pushdown through `select=`, and the read-only DataAPI metadata interface.
 
 import DataAPI
 
-# ---- Avro.Row ---------------------------------------------------------------------------------------
-
-"""
-    Avro.Row
-
-The row type `Avro.Rows` yields in generic record mode: the decoded `Avro.Record` together with the
-operation's `names=` choice, so every `Symbol`-producing path honours a caller's `SymbolAdmission`.
-`Avro.Row(record; names=nothing)` wraps a detached record.
-"""
-struct Row <: Tables.AbstractRow
-    record::Record
-    admission::Union{Nothing,SymbolAdmission}
-end
-
-function rowwrapperbytes()
-    return sizeof(Row) - STORAGE[].record
-end
-
-function Row(record::Record; names=nothing)
-    return Row(record, admission(names))
-end
-
-function admitnames(s::RecordSchema, adm, budget::Union{Nothing,Budget}=nothing)
-    budget === nothing &&
-        return Symbol[admit!(adm, f.name) for f in s.fields]
-    charge = vectorbytes(Symbol, length(s.fields))
-    reserve!(budget, charge)
-    names = Vector{Symbol}(undef, length(s.fields))
-    for (index, field) in enumerate(s.fields)
-        names[index] = admit!(adm, field.name)
-    end
-    return names
-end
-
-function Tables.columnnames(r::Row)
-    return admitnames(getfield(getfield(r, :record), :schema), getfield(r, :admission))
-end
-
-function Tables.getcolumn(r::Row, i::Int)
-    return getfield(getfield(r, :record), :values)[i]
-end
-
-function Tables.getcolumn(r::Row, nm::Symbol)
-    return getfield(r, :record)[nm]
-end
-
-function Base.show(io::IO, r::Row)
-    return (print(io, "Avro.Row"); show(io, getfield(r, :record)))
-end
-
-"The wrapped `Avro.Record` of a row."
-function record(r::Row)
-    return getfield(r, :record)
-end
-
 # ---- projection -------------------------------------------------------------------------------------
 
-"The `select=` field positions of `s` in the caller's order (unknown and duplicate names are errors)."
-function selectindices(s::RecordSchema, select, budget::Budget)
-    nf = length(s.fields)
-    trait = Base.IteratorSize(typeof(select))
-    capacity = trait isa Union{Base.HasLength,Base.HasShape} ? min(length(select), nf) : 0
-    capacity >= 0 || throw(ArgumentError("select= length must be non-negative"))
-    selected = BuildBuf{Int}(budget, capacity)
-    slotcharge = vectorbytes(Int, nf)
-    reserve!(budget, slotcharge)
-    slots = zeros(Int, nf)
-    for nm in select
+"The `select=` field positions of `s` in the caller's order: one name or a collection (unknown and duplicate names are errors)."
+function selectindices(s::RecordSchema, select)
+    indices = Int[]
+    slots = zeros(Int, length(s.fields))
+    for nm in (select isa Union{Symbol,AbstractString} ? (select,) : select)
         (nm isa Symbol || nm isa AbstractString) || throw(ArgumentError("select= takes column names (Symbols or strings), got $(typeof(nm))"))
-        sizeof(nm) <= budget.limits.max_name_bytes ||
-            throw(LimitError(:max_name_bytes, sizeof(nm), budget.limits.max_name_bytes,
-                             :max_name_bytes, :decode))
-        owned = nm isa Symbol
-        name = owned ? ownedstringcopy(nm, budget) : nm
-        try
-            i = get(s.fieldindex, name, 0)
-            i == 0 && throw(ArgumentError("select: the record has no selected field with that name"))
-            slots[i] == 0 || throw(ArgumentError("select: a field name appears more than once"))
-            push!(selected, budget, i)
-            slots[i] = selected.len
-        finally
-            owned && release!(budget, stringbytes(sizeof(name)))
-        end
+        i = get(s.fieldindex, Symbol(nm), 0)
+        i == 0 && throw(SchemaError("select: record $(fullname(s)) has no field \"$nm\"", "\$"))
+        slots[i] == 0 || throw(ArgumentError("select: field \"$nm\" appears more than once"))
+        push!(indices, i)
+        slots[i] = length(indices)
     end
-    indices = finishbuild!(selected, budget)
-    charge = sizeof(Projection)
-    reserve!(budget, charge)
-    projection = Projection(indices, slots)
-    return projection
+    return Projection(indices, slots)
 end
 
 """
 The derived effective schema of a projection: the selected fields in the selected order with names,
-types, defaults, aliases, order, docs and props unchanged; a recursive root is substituted graph-wide.
+types, defaults, aliases, order, docs and props unchanged.
 """
-function projectschema(s::RecordSchema, sel::Vector{Int}, limits::Limits,
-                       budget::Budget)
+function projectschema(s::RecordSchema, sel::Vector{Int})
     # Nested values decode with every field, so a projected root substituted inside them would
     # describe them wrongly and a write of the table would drop their unselected fields.
     if length(sel) < length(s.fields)
         for i in sel
-            refersto(s.fields[i].schema, s, budget) && throw(ArgumentError(
+            refersto(s.fields[i].schema, s) && throw(ArgumentError(
                 "select= cannot leave fields out of record $(fullname(s)): field \"$(s.fields[i].name)\" refers back to it"))
         end
     end
-    return withconstructionbudget(budget) do _
-        n = length(sel)
-        memo = NameIndex{Schema}(budget)
-        charge = vectorbytes(Field, n) + vectorbytes(String, n) + vectorbytes(Int, n) + 128
-        reserve!(budget, charge)
-        fields = emptywithcapacity(FrozenVector{Field}, n)
-        index = emptywithcapacity(FrozenDict{String,Int}, n)
-        name = copyfullname(s.name, budget)
-        aliases = copystringvector(s.aliases, budget)
-        rawaliases = copystringvector(s.rawaliases, budget)
-        sourcedoc = s.doc
-        doc = sourcedoc === nothing ? nothing : ownedstringcopy(sourcedoc, budget)
-        props = copyprops(s.props, budget, 2)
-        meta = copiedmeta(s, sel, budget)
-        out = publicnode(RecordSchema(name, aliases, rawaliases, doc, s.iserror,
-                                      props, fields, index, meta))
-        try
-            rootkey = ownedfullname(s.name, budget)
-            insert!(memo, rootkey, out, budget)
-            for (k, i) in enumerate(sel)
-                f = s.fields[i]
-                field = copyfield(f, deepcopyschema(f.schema, memo), budget, 3)
-                budgetedpush!(fields, field, budget)
-                budgetedappend!(index, field.name, k, budget)
-            end
-            budgetedsort!(index, budget)               # select= names are distinct
-            freeze!(fields)
-            freeze!(index)
-            return finalizepublic!(out, limits, 0, 0)
-        finally
-            releaseownedmemo!(budget, memo)
-        end
-    end
+    return projectrecord(s, sel)
 end
 
 "Whether `root` is reachable from `x` in their schema graph."
-function refersto(x::Schema, root::RecordSchema, budget::Budget)
-    n = graphinfo(root).nodes
-    charge = vectorbytes(UInt64, cld(n, 64)) + 32       # the visited set's chunks and shell
-    reserve!(budget, charge)
-    seen = falses(n)
-    try
-        return refersto(x, root, seen)
-    finally
-        release!(budget, charge)
-    end
+function refersto(x::Schema, root::RecordSchema)
+    return refersto(x, root, falses(graphinfo(root).nodes))
 end
 
 function refersto(x::Schema, root::RecordSchema, seen::BitVector)
@@ -173,10 +55,9 @@ end
 
 # ---- the effective schema and plan of a container operation ------------------------------------------
 
-function effectiveplan(r::Reader, reader_schema, union_resolution::Symbol, limits::Limits, decimal_byteorder::Symbol)
+function effectiveplan(r::Reader, reader_schema, union_resolution::Symbol)
     reader_schema === nothing && return (r.schema, r.plan)
-    plan = resolvingplan(r.schema, reader_schema; union_resolution=union_resolution, limits=limits,
-                         budget=r.budget, decimal_little=decimal_byteorder === :little)
+    plan = resolvingplan(r.schema, reader_schema; union_resolution=union_resolution, little=r.legacy === :avrojl1)
     return (reader_schema, plan)
 end
 
@@ -184,15 +65,15 @@ end
 
 """
     Avro.Table(src; reader_schema=nothing, union_resolution=:spec, ntasks=Threads.nthreads(),
-               limits=Limits(), legacy=nothing, decimal_byteorder=:big, allow_invalid_names=false,
-               allow_invalid_defaults=false, validate=:strict, mmap=true, names=nothing,
-               select=nothing)
+               limits=Limits(), legacy=nothing, allow_invalid_names=false, allow_invalid_defaults=false,
+               mmap=true, select=nothing)
 
 Materialise a container file with a record root as a Tables.jl column table (plain `Vector` columns,
-a stored `Tables.Schema` without eltype parameters, `Tables.partitions` per block, DataAPI metadata).
+a stored `Tables.Schema` without eltype parameters, DataAPI metadata).
 Access columns with `table.name`, `table[:name]`, or `table[index]`; `length(table)` is the row count.
-`select=` is projection pushdown: unselected fields are skipped under the active validation mode and
-the result's derived schema keeps the selected fields in the selected order.
+`select=` (one column name or a collection of them) is projection pushdown: unselected fields are skipped
+and the result's derived schema keeps the selected fields in the selected order. Byte and memory-mapped sources decode their blocks with up to
+`ntasks` tasks; the result and any error are the same at every `ntasks`.
 """
 struct Table
     schema::RecordSchema
@@ -201,16 +82,15 @@ struct Table
     tablesschema::Tables.Schema{nothing,nothing}
     columns::Vector{AbstractVector}
     nrows::Int
-    blockranges::Vector{UnitRange{Int}}
-    metadata::Map{Vector{UInt8}}
+    metadata::Dict{String,Vector{UInt8}}
     codecname::Symbol
     syncmarker::NTuple{16,UInt8}
 end
 
 # Block counts are claims until each block is decompressed and decoded. Final columns are preallocated
-# from the claimed total only while it is no more than this floor or this multiple of the file's block
-# bytes; larger claims decode block by block, so a small file cannot make the reader allocate gigabytes
-# before its first block is checked.
+# from the claimed total only while it is no more than this floor or this multiple of the source's bytes;
+# larger claims decode block by block, so a small file cannot make the reader allocate gigabytes before
+# its first block is checked.
 const PREALLOC_CLAIM_FLOOR = 256 * MiB
 const PREALLOC_CLAIM_RATIO = 256
 
@@ -218,84 +98,38 @@ const PREALLOC_CLAIM_RATIO = 256
 function preallocatable(colstypes::Vector{Type}, nrows::Int, source::BytesSource)
     claimed = 0
     for E in colstypes
-        claimed = satadd(claimed, muladdcap(slotbytes(E), nrows, STORAGE[].vector))
+        slot = Base.elsize(Vector{E})
+        slot = max(slot, 1)                                    # a column of `missing` still counts its claimed rows
+        claimed = satadd(claimed, nrows > INFINITE ÷ slot ? INFINITE : slot * nrows)
     end
-    return claimed <= max(PREALLOC_CLAIM_FLOOR, muladdcap(PREALLOC_CLAIM_RATIO, source.stop - source.pos + 1, 0))
-end
-
-function exactvector(::Type{T}, n::Int, budget::Budget) where {T}
-    charge = vectorbytes(T, n)
-    reserve!(budget, charge)
-    values = Vector{T}(undef, n)
-    return values
+    datasize = source.stop - source.pos + 1
+    allowed = datasize > INFINITE ÷ PREALLOC_CLAIM_RATIO ? INFINITE : PREALLOC_CLAIM_RATIO * datasize
+    return claimed <= max(PREALLOC_CLAIM_FLOOR, allowed)
 end
 
 function Table(src; reader_schema::Union{Nothing,Schema}=nothing, union_resolution::Symbol=:spec,
                ntasks::Integer=Threads.nthreads(), limits::Limits=Limits(), legacy::Union{Nothing,Symbol}=nothing,
-               decimal_byteorder::Symbol=:big, allow_invalid_names::Bool=false, allow_invalid_defaults::Bool=false,
-               validate::Symbol=:strict, mmap::Bool=true, names=nothing, select=nothing)
+               allow_invalid_names::Bool=false, allow_invalid_defaults::Bool=false, mmap::Bool=true, select=nothing)
     1 <= ntasks <= typemax(Int) || throw(ArgumentError("ntasks must be in 1:$(typemax(Int)), got $ntasks"))
-    taskcount = Int(ntasks)
-    adm = admission(names)
-    r = Reader(src; limits=limits, legacy=legacy, decimal_byteorder=decimal_byteorder, allow_invalid_names=allow_invalid_names,
-               allow_invalid_defaults=allow_invalid_defaults, validate=validate, mmap=mmap)
+    r = Reader(src; limits=limits, legacy=legacy, allow_invalid_names=allow_invalid_names,
+               allow_invalid_defaults=allow_invalid_defaults, mmap=mmap)
     try
-        effective, plan = effectiveplan(r, reader_schema, union_resolution, limits, decimal_byteorder)
+        effective, plan = effectiveplan(r, reader_schema, union_resolution)
         effective isa RecordSchema ||
-            throw(ArgumentError("Avro.Table requires a record root; this source's root is $(kind(effective)) — use Avro.Rows or Avro.eachdatum"))
-        projection = select === nothing ? nothing : selectindices(effective, select, r.budget)
-        sel = projection === nothing ? nothing : projection.indices
-        outschema = sel === nothing ? effective : projectschema(effective, sel, limits,
-                                                                 r.budget)
-        nkept = length(outschema.fields)
-        keptowned = sel === nothing
-        keptidx = keptowned ? exactvector(Int, nkept, r.budget) : sel
-        keptowned && copyto!(keptidx, 1:nkept)
-        colstypes = exactvector(Type, nkept, r.budget)
-        for (index, field) in enumerate(outschema.fields)
-            colstypes[index] = juliatype(field.schema)
-        end
+            throw(SchemaError("Avro.Table requires a record root; this source's root is $(kind(effective)): use Avro.Rows or Avro.eachdatum", "\$"))
+        plan = recordrowplan(plan, effective)
+        projection = select === nothing ? nothing : selectindices(effective, select)
+        outschema = projection === nothing ? effective : projectschema(effective, projection.indices)
+        colstypes = Type[juliatype(f.schema) for f in outschema.fields]
         pre = r.source isa BytesSource ? prescanblocks(r) : nothing
-        if pre !== nothing && !preallocatable(colstypes, pre.totalrows, r.source::BytesSource)
-            release!(r.budget, blocktablecharge(capacity(pre.entries)))
-            pre = nothing
-        end
-        if pre !== nothing
-            # byte and mapped sources: pre-scan, exact final preallocation, direct/parallel decode
+        if pre !== nothing && preallocatable(colstypes, pre.totalrows, r.source::BytesSource)
+            finals = AbstractVector[Vector{E}(undef, pre.totalrows) for E in colstypes]
+            decodeblocks!(r, plan, projection, finals, pre, Int(ntasks))
             nrows = pre.totalrows
-            finals = exactvector(AbstractVector, nkept, r.budget)
-            for (index, E) in enumerate(colstypes)
-                reserve!(r.budget, vectorbytes(E, nrows))
-                finals[index] = Vector{E}(undef, nrows)
-            end
-            decodeblocks!(r, plan, projection, finals, keptidx, colstypes, pre, taskcount,
-                          reader_schema !== nothing)
-            counts = exactvector(Int, length(pre.entries), r.budget)
-            for (index, entry) in enumerate(pre.entries)
-                counts[index] = entry.count
-            end
-            release!(r.budget, blocktablecharge(capacity(pre.entries)))
         else
-            finals, counts = decodestreamed!(r, plan, projection, colstypes,
-                                             reader_schema !== nothing)
+            finals, nrows = decodestreamed!(r, plan, projection)
         end
-        nrows = sum(counts; init=0)
-        ranges = exactvector(UnitRange{Int}, length(counts), r.budget)
-        off = 0
-        for (index, c) in enumerate(counts)
-            ranges[index] = off + 1:off + c
-            off += c
-        end
-        outnames = admitnames(outschema, adm, r.budget)
-        tablesschema = storedschema(outnames, outschema, r.budget)
-        reserve!(r.budget, shellbytes(Table))
-        table = Table(outschema, r.schema, outnames, tablesschema, finals, nrows,
-                      ranges, r.metadata, r.codecname, r.sync)
-        release!(r.budget, vectorbytes(Type, length(colstypes)))
-        release!(r.budget, vectorbytes(Int, length(counts)))
-        keptowned && release!(r.budget, vectorbytes(Int, length(keptidx)))
-        projection === nothing || release!(r.budget, projectionbytes(projection))
-        return table
+        return Table(outschema, r.schema, outschema.fieldnames, storedschema(outschema), finals, nrows, r.metadata, r.codecname, r.sync)
     finally
         close(r)
     end
@@ -322,29 +156,8 @@ function Tables.columns(t::Table)
 end
 
 "A stored `Tables.Schema{nothing,nothing}`: file-derived names and eltypes never become type parameters."
-function storedschema(names::Vector{Symbol}, s::RecordSchema, budget::Budget)
-    n = length(s.fields)
-    scratch = vectorbytes(Type, n)
-    checkpoint = budgetcheckpoint(budget)
-    types = nothing
-    try
-        reserve!(budget, scratch)
-        types = Vector{Type}(undef, n)
-        for (index, field) in enumerate(s.fields)
-            types[index] = juliatype(field.schema)
-        end
-        retained = checked_add(checked_add(vectorbytes(Symbol, n), vectorbytes(Type, n)),
-                               shellbytes(Tables.Schema{nothing,nothing}))
-        reserve!(budget, retained)
-        value = Tables.Schema(names, types; stored=true)
-        types = nothing
-        release!(budget, scratch)
-        return value
-    catch
-        types = nothing
-        rollbackreservations!(budget, checkpoint)
-        rethrow()
-    end
+function storedschema(s::RecordSchema)
+    return Tables.Schema(s.fieldnames, Type[juliatype(f.schema) for f in s.fields]; stored=true)
 end
 
 function Tables.schema(t::Table)
@@ -360,99 +173,21 @@ function Tables.getcolumn(t::Table, i::Int)
 end
 
 function Tables.getcolumn(t::Table, nm::Symbol)
-    i = findfirst(==(nm), getfield(t, :names))
-    i === nothing && throw(ArgumentError("no column $nm"))
+    i = get(getfield(t, :schema).fieldindex, nm, 0)
+    i == 0 && throw(ArgumentError("no column $nm"))
     return getfield(t, :columns)[i]
 end
 
 Base.getindex(t::Table, column::Union{Int,Symbol}) = Tables.getcolumn(t, column)
 
 function Base.getproperty(t::Table, name::Symbol)
-    i = findfirst(==(name), getfield(t, :names))
-    return i === nothing ? getfield(t, name) : Tables.getcolumn(t, i)
+    i = get(getfield(t, :schema).fieldindex, name, 0)
+    return i == 0 ? getfield(t, name) : Tables.getcolumn(t, i)
 end
 
 function Base.propertynames(t::Table, private::Bool=false)
     columns = getfield(t, :names)
     return private ? unique(vcat(columns, collect(fieldnames(Table)))) : copy(columns)
-end
-
-function Tables.partitions(t::Table)
-    return (subtable(t, r) for r in getfield(t, :blockranges))
-end
-
-# Tables' generic column-to-row fallback derives the row count from the first column, so it yields no
-# rows for a zero-column table. Keep Table's column-access contract, but provide a row view that uses
-# the authoritative `nrows` field. This preserves row counts when `select=()` is written again.
-struct _TableRows
-    table::Table
-end
-
-struct _TableRow <: Tables.AbstractRow
-    table::Table
-    index::Int
-end
-
-function Tables.rows(t::Table)
-    return _TableRows(t)
-end
-
-function Tables.isrowtable(::Type{_TableRows})
-    return true
-end
-
-# The stored schema has no type parameters, so Tables.jl's generic row-to-column fallback cannot use it.
-function Tables.columnaccess(::Type{_TableRows})
-    return true
-end
-
-function Tables.columns(rows::_TableRows)
-    return getfield(rows, :table)
-end
-
-function Tables.schema(rows::_TableRows)
-    return Tables.schema(getfield(rows, :table))
-end
-
-function Tables.columnnames(rows::_TableRows)
-    return Tables.columnnames(getfield(rows, :table))
-end
-
-function Base.IteratorSize(::Type{_TableRows})
-    return Base.HasLength()
-end
-
-function Base.eltype(::Type{_TableRows})
-    return _TableRow
-end
-
-function Base.length(rows::_TableRows)
-    return length(getfield(rows, :table))
-end
-
-function Base.iterate(rows::_TableRows, index::Int=1)
-    table = getfield(rows, :table)
-    index > length(table) && return nothing
-    return (_TableRow(table, index), index + 1)
-end
-
-function Tables.columnnames(row::_TableRow)
-    return Tables.columnnames(getfield(row, :table))
-end
-
-function Tables.getcolumn(row::_TableRow, column::Int)
-    return Tables.getcolumn(getfield(row, :table), column)[getfield(row, :index)]
-end
-
-function Tables.getcolumn(row::_TableRow, name::Symbol)
-    return Tables.getcolumn(getfield(row, :table), name)[getfield(row, :index)]
-end
-
-function subtable(t::Table, range::UnitRange{Int})
-    return Table(getfield(t, :schema), getfield(t, :writerschema), getfield(t, :names),
-                 getfield(t, :tablesschema),
-                 AbstractVector[view(c, range) for c in getfield(t, :columns)], length(range), [1:length(range)],
-                 getfield(t, :metadata), getfield(t, :codecname), getfield(t, :syncmarker))
 end
 
 function schema(t::Table)
@@ -480,11 +215,11 @@ function DataAPI.metadatasupport(::Type{Table})
 end
 
 function DataAPI.metadatakeys(t::Table)
-    return (k for k in getfield(t, :metadata).keys)
+    return keys(getfield(t, :metadata))
 end
 
 function metadatavalue(v::Vector{UInt8})
-    return validutf8(v, 1, length(v)) ? String(copy(v)) : copy(v)
+    return isstrictutf8(v) ? String(copy(v)) : copy(v)
 end
 
 function DataAPI.metadata(t::Table, key::AbstractString; style::Bool=false)
@@ -498,143 +233,76 @@ function DataAPI.metadata(t::Table, key::AbstractString, default; style::Bool=fa
     return DataAPI.metadata(t, key; style=style)
 end
 
-"The streamed consumer: per-block exact chunk columns assembled once at the end."
-function decodestreamed!(r::Reader, plan, projection::Union{Nothing,Projection},
-                         colstypes::Vector{Type}, resolved::Bool=false)
-    countbuilder = BuildBuf{Int}(r.budget, 0)
-    chunkbuilder = BuildBuf{Vector{AbstractVector}}(r.budget, 0)
-    slotrow = sum(slotbytes, colstypes; init=0)
-    while (blk = nextblock!(r; walk=false)) !== nothing
-        count, bytes, blockwork = blk
-        reserve!(r.budget, bytesbytes(length(bytes)))
-        d = setblockscope!(Decoder(bytes, r.budget; validate=r.validate),
-                           blockwork)
-        cols = columnbuilders(plan, projection, count, r.budget)
-        cells = plan isa RecordPlan ? fuseskips(cols, r.budget) : cols
-        try
-            outputbase = r.budget.reserved
-            cap = r.limits.max_block_output_bytes
-            decodeblockrows!(r.span, d, plan, cells, count, r.budget,
-                             projection, resolved, outputbase, slotrow, cap)
-            d.pos == length(bytes) + 1 || throw(DataError("block datums did not consume the block exactly", d.pos))
-            finishblockwork!(r.budget, blockwork)
-            release!(r.budget, bytesbytes(length(bytes)))
-            keep = exactvector(AbstractVector, length(colstypes), r.budget)
-            for (position, i) in enumerate(projection === nothing ?
-                                           eachindex(cols) : projection.indices)
-                keep[position] = finishcolumn!(cols[i]::TypedColumn, r.budget)
-            end
-            push!(chunkbuilder, r.budget, keep)
-            push!(countbuilder, r.budget, count)
-        finally
-            releasefused!(cells, cols, r.budget)
-            releasecolumnbuilders!(cols, r.budget)
-        end
+# The builders' finished columns: the kept fields in projection order.
+function finishedcolumns(cols::Vector{ColumnBuilder}, projection::Union{Nothing,Projection})
+    kept = projection === nothing ? eachindex(cols) : projection.indices
+    return AbstractVector[finishcolumn!(cols[i]::TypedColumn) for i in kept]
+end
+
+"Every remaining block decoded into columns that grow as rows arrive, and the number of rows."
+function decodestreamed!(r::Reader, plan, projection::Union{Nothing,Projection})
+    d = Decoder(UInt8[], r.limits)
+    cols = columnbuilders(plan, projection, 0)
+    cells = rowcells(plan, cols)
+    nrows = 0
+    while (blk = nextblock!(r)) !== nothing
+        count, bytes = blk
+        reset!(d, bytes, 1)
+        decoderows!(plan, cells, d, count)
+        nrows += count
     end
-    chunkcols = finishbuild!(chunkbuilder, r.budget)
-    counts = finishbuild!(countbuilder, r.budget)
-    nrows = sum(counts; init=0)
-    finals = exactvector(AbstractVector, length(colstypes), r.budget)
-    for (index, E) in enumerate(colstypes)             # both sets of reference slots coexist during assembly
-        reserve!(r.budget, vectorbytes(E, nrows))
-        finals[index] = Vector{E}(undef, nrows)
-    end
-    for k in eachindex(finals)
-        col = finals[k]
-        off = 0
-        for chunk in chunkcols
-            c = chunk[k]
-            copyto!(col, off + 1, c, 1, length(c))
-            off += length(c)
-        end
-    end
-    for chunk in chunkcols
-        for c in chunk
-            release!(r.budget, vectorbytes(eltype(c), length(c)))   # referenced payload transfers, counted once
-        end
-        release!(r.budget, vectorbytes(AbstractVector, length(chunk)))
-    end
-    release!(r.budget, vectorbytes(Vector{AbstractVector}, length(chunkcols)))
-    return (finals, counts)
+    return (finishedcolumns(cols, projection), nrows)
 end
 
 # ---- Avro.Rows --------------------------------------------------------------------------------------
 
 """
     Avro.Rows(src; T=nothing, reader_schema=nothing, union_resolution=:spec, limits=Limits(),
-              legacy=nothing, decimal_byteorder=:big, allow_invalid_names=false,
-              allow_invalid_defaults=false, validate=:strict, mmap=true, names=nothing,
+              legacy=nothing, allow_invalid_names=false, allow_invalid_defaults=false, mmap=true,
               select=nothing)
 
 Stream a container file's datums. **Generic record mode** (record root, no `T`): a Tables.jl row source
-yielding `Avro.Row`, with lazily interned column names and per-block `Tables.partitions`. **Typed mode**
-(`T`): a plain iterator of `T` (no Tables interface). **Non-record mode**: a plain iterator of the generic
-values. `select=` applies to the generic record mode only. `close(rows)` is idempotent; the do-block
-form closes on exit. Byte and memory-mapped sources report the number of remaining rows with `length`;
-streamed sources have no known length. All modes are single-pass iterators.
+yielding `Avro.Record`, with one `Tables.partitions` entry per block when the schema fixes every column's
+value types. **Typed mode** (`T`): a plain iterator of `T`
+(no Tables interface). **Non-record mode**: a plain iterator of the generic values. `select=` applies to
+the generic record mode only. `close(rows)` is idempotent; the do-block form closes on exit. Byte and
+memory-mapped sources report the number of rows their block headers still claim with `length`; streamed
+sources have no known length. All modes are single-pass iterators. A bad row or payload ends its block, and
+iterating again continues with the next block; damaged block framing ends the stream.
 """
-mutable struct Rows{L}                     # L::Bool — a byte-source pre-scan supplied an exact length
+mutable struct Rows
     const reader::Reader
     const mode::Symbol                     # :generic, :typed or :nonrecord
     const effective::Schema
     const outschema::Union{Nothing,RecordSchema}
     const plan::Any                        # ReadPlan or TypedPlan
     const T::Any
-    const adm::Union{Nothing,SymbolAdmission}
     const select::Union{Nothing,Projection}
-    const resolved::Bool                     # the plan can add zero-input reader defaults
-    nrows::Int                             # remaining datum count when L (0 otherwise)
-    symbols::Union{Nothing,Vector{Symbol}} # lazy
-    tablesschema::Union{Nothing,Tables.Schema{nothing,nothing}} # lazy
-    bytes::Vector{UInt8}
-    decoder::Union{Nothing,Decoder{Vector{UInt8}}}
-    remaining::Int
-    lastcharge::Int
-    lastwrapper::Int
-    blockout::Int
-    blockwork::Union{Nothing,BlockWork}
+    const decoder::Decoder{Vector{UInt8}}  # rebound to each block
+    nrows::Int                             # datums the block headers of a byte source still claim, or -1
+    tablesschema::Union{Nothing,Tables.Schema{nothing,nothing}}   # built on first request
+    remaining::Int                         # datums left in the current block
 end
 
 function Rows(src; T=nothing, reader_schema::Union{Nothing,Schema}=nothing, union_resolution::Symbol=:spec,
-              limits::Limits=Limits(), legacy::Union{Nothing,Symbol}=nothing, decimal_byteorder::Symbol=:big,
-              allow_invalid_names::Bool=false, allow_invalid_defaults::Bool=false, validate::Symbol=:strict,
-              mmap::Bool=true, names=nothing, select=nothing)
-    adm = admission(names)
-    r = Reader(src; limits=limits, legacy=legacy, decimal_byteorder=decimal_byteorder, allow_invalid_names=allow_invalid_names,
-               allow_invalid_defaults=allow_invalid_defaults, validate=validate, mmap=mmap)
+              limits::Limits=Limits(), legacy::Union{Nothing,Symbol}=nothing, allow_invalid_names::Bool=false,
+              allow_invalid_defaults::Bool=false, mmap::Bool=true, select=nothing)
+    r = Reader(src; limits=limits, legacy=legacy, allow_invalid_names=allow_invalid_names,
+               allow_invalid_defaults=allow_invalid_defaults, mmap=mmap)
     try
-        effective, plan = effectiveplan(r, reader_schema, union_resolution, limits, decimal_byteorder)
+        effective, plan = effectiveplan(r, reader_schema, union_resolution)
         mode = T !== nothing ? :typed : effective isa RecordSchema ? :generic : :nonrecord
         select !== nothing && mode !== :generic &&
             throw(ArgumentError("select= applies to the generic record mode only (no typed T, record root)"))
-        projection = select === nothing ? nothing : selectindices(effective, select, r.budget)
-        sel = projection === nothing ? nothing : projection.indices
-        outschema = mode === :generic ?
-            (sel === nothing ? effective : projectschema(effective, sel, limits,
-                                                          r.budget)) : nothing
-        rowplan = mode === :typed ? typedplan(T, effective, plan, limits; budget=r.budget) : plan
+        projection = select === nothing ? nothing : selectindices(effective, select)
+        outschema = mode === :generic ? (projection === nothing ? effective : projectschema(effective, projection.indices)) : nothing
+        rowplan = mode === :typed ? typedplan(T, effective, plan) : mode === :generic ? recordrowplan(plan, effective) : plan
         nrows = -1
         if r.source isa BytesSource
-            pre = prescanblocks(r)                      # headers only; the table charge is transient
-            release!(r.budget, blocktablecharge(max(64, nextpow2rows(length(pre.entries)))))
-            pre.pending === nothing && (nrows = pre.totalrows)   # a structural error keeps SizeUnknown
-        end                                                       # so acceptance matches streamed sources
-        if nrows >= 0
-            charge = shellbytes(Rows{true})
-            reserve!(r.budget, charge)
-            rows = Rows{true}(r, mode, effective, outschema, rowplan, T, adm,
-                              projection, reader_schema !== nothing, nrows,
-                              nothing, nothing, UInt8[], nothing,
-                              0, 0, 0, 0, nothing)
-            return rows
-        end
-        charge = shellbytes(Rows{false})
-        reserve!(r.budget, charge)
-        rows = Rows{false}(r, mode, effective, outschema, rowplan, T, adm,
-                           projection, reader_schema !== nothing, 0,
-                           nothing, nothing, UInt8[], nothing,
-                           0, 0, 0, 0, nothing)
-        return rows
+            pre = prescanblocks(r)
+            pre.pending === nothing && (nrows = pre.totalrows)   # a structural error leaves `length` unknown,
+        end                                                       # as for a streamed source
+        return Rows(r, mode, effective, outschema, rowplan, T, projection, Decoder(UInt8[], limits), nrows, nothing, 0)
     catch
         close(r)
         rethrow()
@@ -650,55 +318,54 @@ function Rows(f::Function, src; kw...)
     end
 end
 
-function Base.close(rows::Rows)
-    reader = getfield(rows, :reader)
-    reader.closed && return nothing
-    budget = reader.budget
-    release!(budget, rows.lastcharge)
-    rows.lastcharge = 0
-    rows.lastwrapper = 0
-    if rows.decoder !== nothing
-        rows.blockwork = nothing
-        releaseblock!(rows, budget)
+function Base.show(io::IO, rows::Rows)
+    print(io, "Avro.Rows(")
+    rows.nrows >= 0 && print(io, rows.nrows, " rows: ")
+    if rows.mode === :generic
+        join(io, (rows.outschema::RecordSchema).fieldnames, ", ")
+    else
+        print(io, rows.mode === :typed ? rows.T : kind(rows.effective))
     end
-    return close(reader)
+    return print(io, ")")
+end
+
+function Base.close(rows::Rows)
+    rows.remaining = 0
+    reset!(rows.decoder, UInt8[], 1)
+    return close(rows.reader)
 end
 
 function schema(rows::Rows)
-    return something(getfield(rows, :outschema), getfield(rows, :effective))
+    return something(rows.outschema, rows.effective)
 end
 
 function writerschema(rows::Rows)
-    return getfield(rows, :reader).schema
+    return rows.reader.schema
 end
 
 function metadata(rows::Rows)
-    return getfield(rows, :reader).metadata
+    return rows.reader.metadata
 end
 
 function codec(rows::Rows)
-    return getfield(rows, :reader).codecname
+    return rows.reader.codecname
 end
 
 function sync(rows::Rows)
-    return getfield(rows, :reader).sync
+    return rows.reader.sync
 end
 
-function rowsymbols(rows::Rows)
-    getfield(rows, :mode) === :generic || throw(ArgumentError("only the generic record mode has columns"))
-    s = getfield(rows, :symbols)
-    s === nothing || return s
-    s = admitnames(getfield(rows, :outschema)::RecordSchema, getfield(rows, :adm), getfield(rows, :reader).budget)   # names admit lazily, on first request
-    setfield!(rows, :symbols, s)
-    return s
+function rowschema(rows::Rows)
+    rows.mode === :generic || throw(ArgumentError("only the generic record mode has columns"))
+    return rows.outschema::RecordSchema
 end
 
 function Tables.istable(rows::Rows)
-    return getfield(rows, :mode) === :generic
+    return rows.mode === :generic
 end
 
 function Tables.rowaccess(rows::Rows)
-    return getfield(rows, :mode) === :generic
+    return rows.mode === :generic
 end
 
 function Tables.rows(rows::Rows)
@@ -706,192 +373,95 @@ function Tables.rows(rows::Rows)
 end
 
 function Tables.schema(rows::Rows)
-    cached = getfield(rows, :tablesschema)
+    cached = rows.tablesschema
     cached === nothing || return cached
-    value = storedschema(rowsymbols(rows), getfield(rows, :outschema)::RecordSchema,
-                         getfield(rows, :reader).budget)
-    setfield!(rows, :tablesschema, value)
+    value = storedschema(rowschema(rows))
+    rows.tablesschema = value
     return value
 end
 
 function Tables.columnnames(rows::Rows)
-    return rowsymbols(rows)
+    return rowschema(rows).fieldnames
 end
 
-"The block-table capacity the pre-scan grew to for `n` entries (its growth doubles from 64)."
-function nextpow2rows(n::Int)
-    cap = 64
-    while cap < n
-        cap *= 2
-    end
-    return cap
-end
-
-function Base.IteratorSize(::Type{<:Rows})
+# A row count from block headers is a claim, so `collect` and friends grow as rows decode rather than trust it.
+function Base.IteratorSize(::Type{Rows})
     return Base.SizeUnknown()
 end
 
-function Base.IteratorSize(::Type{Rows{true}})
-    return Base.HasLength()
+function Base.length(rows::Rows)
+    rows.nrows >= 0 || throw(ArgumentError("a streamed source has no known row count"))
+    return rows.nrows
 end
 
-function Base.length(rows::Rows{true})
-    return getfield(rows, :nrows)
-end
-
-function consumedrows!(rows::Rows{true}, count::Int)
-    rows.nrows -= count
+function consumedrows!(rows::Rows, count::Int)
+    rows.nrows >= 0 && (rows.nrows -= count)
     return nothing
 end
 
-consumedrows!(::Rows{false}, ::Int) = nothing
-
-function Base.IteratorEltype(::Type{<:Rows})
+function Base.IteratorEltype(::Type{Rows})
     return Base.EltypeUnknown()
 end
 
 function Base.iterate(rows::Rows, ::Nothing=nothing)
     r = rows.reader
     checkopen(r)
-    b = r.budget
-    release!(b, rows.lastcharge)
-    rows.lastcharge = 0
-    rows.lastwrapper = 0
+    d = rows.decoder
     while rows.remaining == 0
-        blk = nextblock!(r; walk=false)
+        blk = nextblock!(r)
         blk === nothing && return nothing
         rows.remaining = blk[1]
-        rows.bytes = blk[2]
-        rows.blockwork = blk[3]
-        rows.blockout = 0
-        reserve!(b, bytesbytes(length(rows.bytes)))
-        rows.decoder = setblockscope!(Decoder(rows.bytes, b; validate=r.validate),
-                                      rows.blockwork::BlockWork)
-        if rows.remaining == 0
-            validateemptyblock(rows.bytes)
-            finishblockwork!(b, rows.blockwork::BlockWork)
-            rows.blockwork = nothing
-            releaseblock!(rows, b)
-        end
+        reset!(d, blk[2], 1)
+        rows.remaining == 0 && checkconsumed(d)
     end
-    rows.remaining -= 1
-    before = b.reserved
-    decoder = rows.decoder::Decoder{Vector{UInt8}}
-    datumspan!(r.span, decoder, decoder.pos, decoder.budget.values,
-               decoder.budget.input_bytes)
-    span = decoderspan(decoder)
-    projection = getfield(rows, :mode) === :generic && rows.select !== nothing ?
-        rows.select : nothing
-    planneddatumspan!(rows.plan, decoder, span; resolved=rows.resolved,
-                      projection=projection)
-    span = decoderspan(decoder)
-    datumwork = begindatum!(decoder, span)
-    v = try
-        decoderow(rows)
-    catch
-        abortdatum!(decoder, datumwork)
-        rethrow()
-    end
-    finishdatum!(decoder, datumwork)
-    rows.lastcharge = max(b.reserved - before, 0)
-    rows.blockout = checked_add(rows.blockout,
-                                rows.lastcharge - rows.lastwrapper +
-                                representationslot(juliatype(rows.effective)))
-    rows.blockout <= b.limits.max_block_output_bytes ||
-        throw(LimitError(:max_block_output_bytes, rows.blockout, b.limits.max_block_output_bytes, :max_block_output_bytes, :decode))
-    if rows.remaining == 0
-        d = rows.decoder::Decoder{Vector{UInt8}}
-        d.pos == length(rows.bytes) + 1 || throw(DataError("block datums did not consume the block exactly", d.pos))
-        finishblockwork!(b, rows.blockwork::BlockWork)
-        rows.blockwork = nothing
-        releaseblock!(rows, b)
-    end
+    left = rows.remaining - 1
+    rows.remaining = 0                                 # a row that fails takes the rest of its block with it
+    v = decoderow(rows, d)
+    left == 0 && checkconsumed(d)
+    rows.remaining = left
     consumedrows!(rows, 1)
     return (v, nothing)
 end
 
-function releaseblock!(rows::Rows, budget::Budget)
-    charge = bytesbytes(length(rows.bytes))
-    decoder = rows.decoder
-    decoder === nothing || (decoder.buf = EMPTY_BYTES)
-    rows.decoder = nothing
-    rows.bytes = EMPTY_BYTES
-    release!(budget, charge)
-    return nothing
+function decoderow(rows::Rows, d::Decoder)
+    plan = rows.plan
+    if rows.mode === :typed
+        v = decoderoot(plan, d)
+        return finishtyped(plan, v)                      # semantic conversion in caller space
+    end
+    projection = rows.select
+    projection === nothing || return Record(rows.outschema::RecordSchema, projectrow(plan, d, projection), Val(:unchecked))
+    return decode(plan, d)
 end
 
-function decoderow(rows::Rows)
-    d = rows.decoder::Decoder{Vector{UInt8}}
-    mode = getfield(rows, :mode)
-    if mode === :typed
-        v = decodetyped(rows.plan isa TypedPlan ? rows.T : GenericDatumTarget, rows.plan, d, rows.adm)
-        return finishtyped(rows.plan, v, rows.adm)                      # semantic conversion in caller space
-    end
-    if mode === :generic && rows.select !== nothing
-        p = rows.plan
-        out = rows.outschema::RecordSchema
-        vals = projectrow(p, d, rows.select, out)
-        wrapper = rowwrapperbytes()
-        reserve!(d.budget, wrapper)
-        row = Row(Record(out, vals, Val(:unchecked)), rows.adm)
-        rows.lastwrapper = wrapper
-        return row
-    end
-    v = decode(rows.plan, d)
-    if mode === :generic
-        wrapper = rowwrapperbytes()
-        reserve!(d.budget, wrapper)
-        row = Row(v::Record, rows.adm)
-        rows.lastwrapper = wrapper
-        return row
-    end
-    return v
+function projectrow(p::WholeRecordPlan, d::Decoder, projection::Projection)
+    return getfield(decode(p.plan, d)::Record, :values)[projection.indices]
 end
 
 "Decode one record keeping the selected fields (in the caller's order); the rest are skipped."
-function projectrow(p::RecordPlan, d::Decoder, projection::Projection, out::RecordSchema)
+function projectrow(p::RecordPlan, d::Decoder, projection::Projection)
+    countvalue!(d)
     enter!(d)
-    n = length(projection.indices)
-    reserve!(d.budget, recordbytes(n))
-    kept = Vector{Any}(undef, n)
+    kept = Vector{Any}(undef, length(projection.indices))
     for (i, f) in enumerate(p.fields)
         slot = projection.slots[i]
-        if slot != 0
-            v = decode(f, d)
-            b = p.boxes[i]
-            b > 0 && reserve!(d.budget, b)
-            kept[slot] = v                                     # an isbits value boxes on assignment
-        else
-            skip(f, d)
-        end
+        slot == 0 ? skip(f, d) : (kept[slot] = decode(f, d))
     end
     leave!(d)
     return kept
 end
 
-function projectrow(p::ResolvedRecordPlan, d::Decoder, projection::Projection, out::RecordSchema)
+function projectrow(p::ResolvedRecordPlan, d::Decoder, projection::Projection)
+    countvalue!(d)
     enter!(d)
-    n = length(projection.indices)
-    reserve!(d.budget, recordbytes(n))
-    kept = Vector{Any}(undef, n)
+    kept = Vector{Any}(undef, length(projection.indices))
     for (slot, plan) in p.steps
         projected = slot == 0 ? 0 : projection.slots[slot]
-        if projected != 0
-            v = decode(plan, d)
-            b = p.boxes[slot]
-            b > 0 && reserve!(d.budget, b)
-            kept[projected] = v                                # an isbits value boxes on assignment
-        else
-            skip(plan, d)
-        end
+        projected == 0 ? skip(plan, d) : (kept[projected] = decode(plan, d))
     end
     for (slot, dp) in p.defaults
         projected = projection.slots[slot]
-        projected == 0 && continue
-        b = p.boxes[slot]
-        b > 0 && reserve!(d.budget, b)
-        kept[projected] = jsonvalue(dp, d.budget;
-                                    depth=satadd(d.depth, 1))
+        projected == 0 || (kept[projected] = freshvalue(dp.value))
     end
     leave!(d)
     return kept
@@ -902,9 +472,18 @@ struct RowsPartitions
     rows::Rows
 end
 
+# Whether the schema alone fixes the types of a column's values, rather than each value choosing its own.
+function typesfixed(@nospecialize(T))
+    T isa Union && return all(typesfixed, Base.uniontypes(T))
+    (T === Any || T === Record) && return false
+    return T <: Vector ? typesfixed(eltype(T)) : T <: Dict ? typesfixed(valtype(T)) : true
+end
+
+# Sinks such as Arrow.jl choose a partition's storage from its values, and its partitions must agree. A column
+# whose types vary by value could differ from block to block, so such rows stay one partition.
 function Tables.partitions(rows::Rows)
-    getfield(rows, :mode) === :generic || throw(ArgumentError("only the generic record mode has Tables partitions"))
-    return RowsPartitions(rows)
+    rows.mode === :generic || throw(ArgumentError("only the generic record mode has Tables partitions"))
+    return all(f -> typesfixed(juliatype(f.schema)), rowschema(rows).fields) ? RowsPartitions(rows) : (rows,)
 end
 
 function Base.IteratorSize(::Type{RowsPartitions})
@@ -915,50 +494,27 @@ function Base.eltype(::Type{RowsPartitions})
     return Table
 end
 
-function Base.iterate(it::RowsPartitions, ::Nothing=nothing)
+function Base.iterate(it::RowsPartitions, yielded::Bool=false)
     rows = it.rows
     rows.remaining == 0 || throw(ArgumentError("Tables.partitions cannot start mid-block; iterate one interface only"))
     r = rows.reader
-    blk = nextblock!(r; walk=false)
-    blk === nothing && return nothing
-    count, bytes, blockwork = blk
-    b = r.budget
-    baseline = b.reserved
-    try
-        reserve!(b, bytesbytes(length(bytes)))
-        d = setblockscope!(Decoder(bytes, b; validate=r.validate), blockwork)
-        plan = rows.plan
-        cols = columnbuilders(plan, rows.select, count, b)
-        out = rows.outschema::RecordSchema
-        slotrow = sum(field -> slotbytes(juliatype(field.schema)), out.fields; init=0)
-        cells = plan isa RecordPlan ? fuseskips(cols, b) : cols
-        try
-            decodeblockrows!(r.span, d, plan, cells, count, b, rows.select, rows.resolved,
-                             b.reserved, slotrow, r.limits.max_block_output_bytes)
-        finally
-            releasefused!(cells, cols, b)
-        end
-        d.pos == length(bytes) + 1 || throw(DataError("block datums did not consume the block exactly", d.pos))
-        finishblockwork!(b, blockwork)
-        release!(b, bytesbytes(length(bytes)))
-        sel = rows.select === nothing ? eachindex(out.fields) : rows.select.indices
-        finals = exactvector(AbstractVector, length(out.fields), b)
-        for (position, i) in enumerate(sel)
-            finals[position] = finishcolumn!(cols[i]::TypedColumn, b)
-        end
-        releasecolumnbuilders!(cols, b)
-        outnames = admitnames(out, rows.adm, b)
-        tableschema = storedschema(outnames, out, b)
-        ranges = exactvector(UnitRange{Int}, 1, b)
-        ranges[1] = 1:count
-        reserve!(b, shellbytes(Table))
-        t = Table(out, r.schema, outnames, tableschema, finals, count, ranges,
-                  r.metadata, r.codecname, r.sync)
-        consumedrows!(rows, count)
-        return (t, nothing)
-    finally
-        release!(b, max(b.reserved - baseline, 0))       # completed output transfers at return; partial output dies here
+    out = rows.outschema::RecordSchema
+    blk = nextblock!(r)
+    while blk !== nothing && first(blk) == 0
+        blk = nextblock!(r)
     end
+    if blk === nothing                              # an empty source is one empty partition, so a sink sees its columns
+        yielded && return nothing
+        count, bytes = 0, UInt8[]
+    else
+        count, bytes = blk
+    end
+    reset!(rows.decoder, bytes, 1)
+    cols = columnbuilders(rows.plan, rows.select, min(count, length(bytes)))    # a block's count is a claim, so columns grow
+    decoderows!(rows.plan, rowcells(rows.plan, cols), rows.decoder, count)
+    consumedrows!(rows, count)
+    t = Table(out, r.schema, out.fieldnames, storedschema(out), finishedcolumns(cols, rows.select), count, r.metadata, r.codecname, r.sync)
+    return (t, true)
 end
 
 """
@@ -967,36 +523,17 @@ a stored `Tables.Schema{nothing,nothing}`, so `Rows` materialises through its ow
 builders (also faster). The result is an `Avro.Table` over the not-yet-iterated remainder.
 """
 function Tables.columns(rows::Rows)
-    getfield(rows, :mode) === :generic || throw(ArgumentError("only the generic record mode has columns"))
-    out = getfield(rows, :outschema)::RecordSchema
+    out = rowschema(rows)
     rows.remaining == 0 || throw(ArgumentError("Tables.columns cannot start mid-block; iterate one interface only"))
-    b = rows.reader.budget
-    baseline = b.reserved
-    try
-        colstypes = exactvector(Type, length(out.fields), b)
-        for (index, field) in enumerate(out.fields)
-            colstypes[index] = juliatype(field.schema)
-        end
-        finals, counts = decodestreamed!(rows.reader, rows.plan, rows.select,
-                                         colstypes, rows.resolved)
-        nrows = sum(counts; init=0)
-        ranges = exactvector(UnitRange{Int}, length(counts), b)
-        off = 0
-        for (index, count) in enumerate(counts)
-            ranges[index] = off + 1:off + count
-            off += count
-        end
-        outnames = rowsymbols(rows)
-        tableschema = storedschema(outnames, out, b)
-        reserve!(b, shellbytes(Table))
-        t = Table(out, writerschema(rows), outnames, tableschema, finals, nrows,
-                  ranges, metadata(rows), codec(rows), sync(rows))
-        release!(b, vectorbytes(Int, length(counts)))
-        consumedrows!(rows, nrows)
-        return t
-    finally
-        release!(b, max(b.reserved - baseline, 0))       # completed output transfers at return; partial output dies here
-    end
+    finals, nrows = decodestreamed!(rows.reader, rows.plan, rows.select)
+    consumedrows!(rows, nrows)
+    return Table(out, writerschema(rows), out.fieldnames, Tables.schema(rows), finals, nrows, metadata(rows), codec(rows), sync(rows))
+end
+
+# The stored schema keeps file-derived names out of the type system, which Tables.jl reads as a table too
+# wide for `NamedTuple` rows. A caller asking for such rows (`Tables.rowtable`) opts into their types.
+function Tables.namedtupleiterator(x::Union{Table,Tables.RowIterator{Table},Rows})
+    return Tables.namedtupleiterator(Tables.columntable(x))
 end
 
 function retainedschema(x)
@@ -1013,4 +550,17 @@ end
 
 function retainedschema(r::Reader)
     return r.schema
+end
+
+function retainedschema(records::AbstractVector{Record})
+    return isempty(records) ? nothing : uniformschema(records)
+end
+
+"The user metadata a rewrite of `x` keeps."
+function retainedmetadata(x)
+    return Dict{String,Vector{UInt8}}()
+end
+
+function retainedmetadata(x::Union{Table,Rows,Reader})
+    return Dict{String,Vector{UInt8}}(k => v for (k, v) in metadata(x) if !startswith(k, "avro."))
 end

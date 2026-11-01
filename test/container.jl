@@ -33,17 +33,17 @@ function Base.flush(f::FailIO)
     return flush(f.io)
 end
 
-struct StagingLengthMismatch <: AbstractVector{Any} end
+struct NestedLengthMismatch <: AbstractVector{Any} end
 
-function Base.size(::StagingLengthMismatch)
+function Base.size(::NestedLengthMismatch)
     return (2,)
 end
 
-function Base.getindex(::StagingLengthMismatch, ::Int)
+function Base.getindex(::NestedLengthMismatch, ::Int)
     return Iterators.Stateful(Int64[1])
 end
 
-function Base.iterate(::StagingLengthMismatch, state::Int=1)
+function Base.iterate(::NestedLengthMismatch, state::Int=1)
     return state == 1 ? (Iterators.Stateful(Int64[1]), 2) : nothing
 end
 
@@ -166,19 +166,6 @@ end
     reference = WeakRef((reader.source::Avro.BytesSource).buf)
     close(reader)
     return reference
-end
-
-@noinline function writerheaderownership(schema)
-    key = join(("caller", "-metadata"))
-    value = UInt8[0x01, 0x02, 0x03]
-    keyreference = WeakRef(key)
-    valuereference = WeakRef(value)
-    keypointer = pointer(key)
-    valuepointer = pointer(value)
-    budget = Avro.Budget(Avro.Limits(); direction=:encode)
-    _, entries = Avro.writerheaderentries(
-        schema, :zstandard, Dict(key => value), Avro.Limits(), budget)
-    return entries, keyreference, valuereference, keypointer, valuepointer, budget
 end
 
 @enum InterruptingEnum InterruptingA
@@ -311,15 +298,14 @@ end
             blocks = Avro.Reader(rr -> collect(Avro.eachblock(rr)), Avro.tobuffer(rows; codec=codecname, block_bytes=256))
             @test sum(first, blocks) == length(rows) && length(blocks) > 3
         end
-        # Exact reader-header indexes at and across growth boundaries. The two reserved Avro
-        # entries make these total metadata counts 8, 16, and 33.
+        # user entries plus the two reserved Avro entries
         for nuser in (6, 14, 31)
             usermeta = Dict("user-$(lpad(i, 2, '0'))" => UInt8[mod(i, 256)] for i in 1:nuser)
             metadata_reader = Avro.Reader(Avro.tobuffer(rows[1:1]; metadata=usermeta))
             parsed_metadata = Avro.metadata(metadata_reader)
+            @test parsed_metadata isa Dict{String,Vector{UInt8}}
             @test length(parsed_metadata) == nuser + 2
-            @test Avro.capacity(parsed_metadata.keys) == length(parsed_metadata.keys)
-            @test Avro.capacity(parsed_metadata.vals) == length(parsed_metadata.vals)
+            @test all(parsed_metadata[k] == v for (k, v) in usermeta)
             close(metadata_reader)
         end
         # a held block's bytes stay valid after iteration advances
@@ -329,10 +315,7 @@ end
         (c1, b1), _ = iterate(it)
         rest = collect(it)
         @test !isempty(rest)
-        d = Avro.Budget(L)
-        Avro.addinput!(d, length(b1))
-        dec = Avro.Decoder(b1, d)
-        @test Avro.decode(Avro.readplan(Avro.writerschema(r)), dec).a == 1
+        @test Avro.decode(Avro.readplan(Avro.writerschema(r)), Avro.Decoder(b1)).a == 1
         close(r)
         # partitions become block boundaries
         parts = Tables.partitioner([rows[1:100], rows[101:503]])
@@ -378,17 +361,16 @@ end
 
         nested = P("{\"type\":\"array\",\"items\":{\"type\":\"array\",\"items\":\"long\"}}")
         nestedwriter = Avro.Writer(IOBuffer(), nested)
-        @test_throws Avro.EncodeError push!(nestedwriter, StagingLengthMismatch())
+        @test_throws Avro.EncodeError push!(nestedwriter, NestedLengthMismatch())
         close(nestedwriter; abort=true)
 
-        # OCF staging uses the same composite-depth model as binary encode/decode. Union edges are
+        # Writers use the same composite-depth model as binary encode/decode. Union edges are
         # transparent; arrays, maps, and records are the only nodes that increase value depth.
         stageddepth = P("""{"type":"record","name":"StagedDepth","fields":[
             {"name":"next","type":["null","StagedDepth"]}]}""")
         stagedleaf = (next=missing,)
-        stagedlimits = Avro.Limits(max_depth=1)
-        @test Avro.decode(stageddepth,
-                          Avro.encode(stageddepth, stagedleaf; limits=stagedlimits);
+        stagedlimits = Avro.Limits(max_depth=4)                 # the schema JSON itself nests four deep
+        @test Avro.decode(stageddepth, Avro.encode(stageddepth, stagedleaf);
                           limits=stagedlimits).next === missing
         stagedio = IOBuffer()
         stagedocf = Avro.Writer(stagedio, stageddepth; codec=:null,
@@ -405,18 +387,7 @@ end
         @test only(collect(Avro.eachdatum(Avro.Reader(take!(stagedtableio);
                                                       limits=stagedlimits)))).next === missing
 
-        rootunion = Avro.UnionSchema([Avro.NullSchema(),
-                                      Avro.RecordSchema("RootUnionRecord")])
-        rootlimits = Avro.Limits(max_depth=0)
-        rootio = IOBuffer()
-        rootwriter = Avro.Writer(rootio, rootunion; codec=:null,
-                                 limits=rootlimits)
-        push!(rootwriter, missing)
-        close(rootwriter)
-        @test only(collect(Avro.eachdatum(Avro.Reader(take!(rootio);
-                                                      limits=rootlimits)))) === missing
-        nestedvalue = Avro.Record(stageddepth, Any[
-            Avro.Record(stageddepth, Any[missing])])
+        nestedvalue = foldl((inner, _) -> Avro.Record(stageddepth, Any[inner]), 1:5; init=missing)
         nesteddeptherror = try
             writer = Avro.Writer(IOBuffer(), stageddepth; codec=:null,
                                  limits=stagedlimits)
@@ -431,8 +402,8 @@ end
         end
         @test nesteddeptherror isa Avro.LimitError
         @test nesteddeptherror.limit === :max_depth
-        @test nesteddeptherror.observed == 2
-        @test nesteddeptherror.value == 1
+        @test nesteddeptherror.observed == 5
+        @test nesteddeptherror.value == 4
 
         pathrecord = P("""{"type":"record","name":"WriterPath","fields":[
             {"name":"xs","type":{"type":"array","items":{"type":"map","values":"int"}}}]}""")
@@ -473,22 +444,6 @@ end
         @test writeerror.path == "\$.xs[0]"
         @test writeerror.schema === stagepathrecord.fields[1].schema.items
 
-        estimatebudget = Avro.Budget(Avro.Limits(); direction=:encode)
-        estimateplan = Avro.writeplan(stagepathrecord; budget=estimatebudget)
-        estimateencoder = Avro.Encoder(estimatebudget)
-        estimateerror = try
-            Avro.withencoderroot!(estimateencoder, stagepathrecord) do
-                Avro.estimaterootvalue(estimateplan, stagebad, estimatebudget,
-                                       estimateencoder)
-            end
-            nothing
-        catch err
-            err
-        end
-        @test estimateerror isa Avro.EncodeError
-        @test estimateerror.path == "\$.xs[0]"
-        @test estimateerror.schema === stagepathrecord.fields[1].schema.items
-
         missingpathrecord = P("""{"type":"record","name":"WriterMissingPath","fields":[
             {"name":"xs","type":{"type":"array","items":"int"}}]}""")
         missingbad = (bad=Int32[1],)
@@ -504,7 +459,7 @@ end
         @test missingerror.schema === missingpathrecord.fields[1].schema
         close(missingwriter; abort=true)
         missingwriteerror = try
-            Avro.write(IOBuffer(), [missingbad]; schema=missingpathrecord)
+            Avro.write(IOBuffer(), [(;)]; schema=missingpathrecord)
             nothing
         catch err
             err
@@ -513,48 +468,35 @@ end
         @test missingwriteerror.path == "\$.xs"
         @test missingwriteerror.schema === missingpathrecord.fields[1].schema
 
-        boundedfixed = Avro.FixedSchema("ContainerFixed", 2)
-        fixedat = Avro.Limits(max_bytes=2, max_datum_bytes=2)
-        fixedover = Avro.Limits(max_bytes=1, max_datum_bytes=2)
-        fixedio = IOBuffer()
-        fixedwriter = Avro.Writer(fixedio, boundedfixed; limits=fixedat)
-        push!(fixedwriter, UInt8[1, 2])
-        close(fixedwriter)
-        fixedcontainer = take!(fixedio)
-        @test only(collect(Avro.eachdatum(Avro.Reader(fixedcontainer; limits=fixedat)))) ==
-              Avro.Fixed(boundedfixed, UInt8[1, 2])
-        @test_throws Avro.LimitError collect(Avro.eachdatum(Avro.Reader(fixedcontainer;
-                                                                        limits=fixedover)))
-        rejectedfixed = Avro.Writer(IOBuffer(), boundedfixed; limits=fixedover)
-        @test_throws Avro.LimitError push!(rejectedfixed, UInt8[1, 2])
-        close(rejectedfixed; abort=true)
-
-        projectedfixed = P("""{"type":"record","name":"ProjectedFixed","fields":[
-            {"name":"f","type":{"type":"fixed","name":"ProjectedF","size":2}},
-            {"name":"x","type":"int"}]}""")
-        projectedat = Avro.Limits(max_bytes=2, max_datum_bytes=3)
-        projectedover = Avro.Limits(max_bytes=1, max_datum_bytes=3)
-        projectedio = IOBuffer()
-        projectedwriter = Avro.Writer(projectedio, projectedfixed; limits=projectedat)
-        push!(projectedwriter, (f=UInt8[1, 2], x=Int32(3)))
-        close(projectedwriter)
-        @test_throws Avro.LimitError Avro.Table(take!(projectedio); select=[:x],
-                                                limits=projectedover, ntasks=1)
-
+        # max_bytes bounds one block: the writer refuses a datum that cannot fit one, and every
+        # reader refuses a block larger than its limit
         boundedrecord = P("""{"type":"record","name":"BoundedStaticDatum","fields":[
             {"name":"x","type":"string"}]}""")
-        boundedcontainer = Avro.tobuffer([(x="abcdefghij",)]; schema=boundedrecord)
-        boundedlimits = Avro.Limits(max_datum_bytes=4, max_bytes=64)
-        for mode in (:strict, :fast), ntasks in (1, 2)
+        boundedcontainer = Avro.tobuffer([(x="x"^1000,)]; schema=boundedrecord)
+        @test readall(boundedcontainer; limits=Avro.Limits(max_bytes=2048))[1].x == "x"^1000
+        boundedlimits = Avro.Limits(max_bytes=512)       # above the header metadata, below the 1002-byte block
+        rejectedwriter = Avro.Writer(IOBuffer(), boundedrecord; limits=boundedlimits)
+        push!(rejectedwriter, (x="fits",))
+        rejectederror = try
+            push!(rejectedwriter, (x="x"^1000,))
+            nothing
+        catch err
+            err
+        end
+        @test rejectederror isa Avro.LimitError && rejectederror.limit == :max_bytes
+        close(rejectedwriter; abort=true)
+        for readcall in (src -> readall(src; limits=boundedlimits),
+                         src -> Avro.Rows(collect, src; limits=boundedlimits),
+                         src -> Avro.Table(src; limits=boundedlimits, ntasks=1),
+                         src -> Avro.Table(src; limits=boundedlimits, ntasks=2))
             boundederror = try
-                Avro.Table(boundedcontainer; limits=boundedlimits, validate=mode,
-                           ntasks=ntasks)
+                readcall(boundedcontainer)
                 nothing
             catch err
                 err
             end
             @test boundederror isa Avro.LimitError
-            @test boundederror.limit == boundederror.keyword == :max_datum_bytes
+            @test boundederror.limit == :max_bytes && boundederror.value == 512
         end
 
         leafarray = Avro.ArraySchema(Avro.LongSchema())
@@ -581,56 +523,13 @@ end
         close(enumwriter; abort=true)
 
         charschema = Avro.StringSchema()
-        for (char, outputbytes) in (('a', 25), ('é', 26), ('😀', 28))
-            charlimits = Avro.Limits(max_block_output_bytes=outputbytes)
+        for char in ('a', 'é', '😀')
             chario = IOBuffer()
-            charwriter = Avro.Writer(chario, charschema; limits=charlimits)
+            charwriter = Avro.Writer(chario, charschema)
             push!(charwriter, char)
             close(charwriter)
-            @test collect(Avro.eachdatum(Avro.Reader(take!(chario); limits=charlimits))) == [string(char)]
+            @test collect(Avro.eachdatum(Avro.Reader(take!(chario)))) == [string(char)]
         end
-
-        widebytes = P("{\"type\":\"bytes\",\"logicalType\":\"decimal\",\"precision\":1000000000}")
-        wideplan = Avro.writeplan(widebytes)
-        estimatebudget = Avro.Budget(Avro.Limits())
-        positiveestimate = Avro.estimatevalue(wideplan, Avro.WideDecimal(big(1), 0), estimatebudget)
-        negativeestimate = Avro.estimatevalue(wideplan, Avro.WideDecimal(big(-1), 0), estimatebudget)
-        @test positiveestimate.retained == Avro.widedecimalbytes(1)
-        @test positiveestimate.peakextra == 0
-        @test negativeestimate.retained == Avro.widedecimalbytes(1)
-        @test negativeestimate.peakextra == Avro.bytesbytes(1)
-
-        peaklimits = Avro.Limits(max_total_bytes=512 << 20, max_block_bytes=64 << 20,
-                                 max_block_output_bytes=256 << 20)
-        peakschema = Avro.ArraySchema(Avro.ArraySchema(Avro.IntSchema()))
-        peakvalue = [Int32[] for _ in 1:1500]
-        peakvalue[1499] = fill(Int32(1), 100_000)
-        writebudget = Avro.Budget(peaklimits; direction=:encode)
-        writeplan = Avro.writeplan(peakschema; budget=writebudget)
-        outputestimate = Avro.estimaterootvalue(writeplan, peakvalue, writebudget)
-        peakbytes = Avro.encode(peakschema, peakvalue; limits=peaklimits)
-        readbudget = Avro.Budget(peaklimits)
-        Avro.addinput!(readbudget, length(peakbytes))
-        readplan = Avro.readplan(peakschema; budget=readbudget)
-        baseline = readbudget.reserved
-        Avro.decode(readplan, Avro.Decoder(peakbytes, readbudget))
-        @test outputestimate[1] + outputestimate[2] >= readbudget.peak - baseline
-
-        mappeakschema = Avro.MapSchema(Avro.ArraySchema(Avro.IntSchema()))
-        mapkeys = Any["k" * lpad(string(i), 4, "0") for i in 1:1500]
-        mapvalues = Any[Int32[] for _ in 1:1500]
-        mapvalues[1499] = fill(Int32(1), 100_000)
-        mappeakvalue = Avro.StagedWriterMap(mapkeys, mapvalues)
-        mapwritebudget = Avro.Budget(peaklimits; direction=:encode)
-        mapwriteplan = Avro.writeplan(mappeakschema; budget=mapwritebudget)
-        mapestimate = Avro.estimaterootvalue(mapwriteplan, mappeakvalue, mapwritebudget)
-        mapbytes = Avro.encode(mappeakschema, mappeakvalue; limits=peaklimits)
-        mapreadbudget = Avro.Budget(peaklimits)
-        Avro.addinput!(mapreadbudget, length(mapbytes))
-        mapreadplan = Avro.readplan(mappeakschema; budget=mapreadbudget)
-        mapbaseline = mapreadbudget.reserved
-        Avro.decode(mapreadplan, Avro.Decoder(mapbytes, mapreadbudget))
-        @test mapestimate[1] + mapestimate[2] >= mapreadbudget.peak - mapbaseline
     end
     @testset "IOBuffer offsets, partition columns, published file modes" begin
         rows = [(x=Int64(i),) for i in 1:10]
@@ -726,7 +625,7 @@ end
         @test constructorerror isa Avro.SchemaError
         @test constructorcloses[] == 1
     end
-    @testset "legacy 1.x files and decimal byte order" begin
+    @testset "legacy 1.x files and their little-endian decimals" begin
         legacy_schema_json = """{"type":"record","name":"LegacyFixedOrdinals","fields":[
             {"name":"plain","type":"long"},
             {"name":"first","type":{"type":"fixed","size":1}},
@@ -751,14 +650,14 @@ end
         leg = joinpath(gen, "legacy1x")
         @test_throws Avro.SchemaError readall(joinpath(leg, "avrojl112-null.avro"))               # 1.x wrote nameless fixed schemas
         @test_throws Avro.SchemaError readall(joinpath(leg, "avrojl112-zstd.avro"))
-        vals = @test_logs (:warn, r"legacy") match_mode=:any readall(joinpath(leg, "avrojl112-null.avro"); legacy=:avrojl1, decimal_byteorder=:little)
+        vals = @test_logs (:warn, r"legacy") match_mode=:any readall(joinpath(leg, "avrojl112-null.avro"); legacy=:avrojl1)
         @test length(vals) == 2 && vals[1].a == 1 && vals[1].b == "x" && vals[2].b == "yy"
-        @test vals[1].dec == Avro.Decimal(12345, 2) && vals[2].dec == Avro.Decimal(-123, 2)
+        @test vals[1].dec == Avro.Decimal(12345, 2) && vals[2].dec == Avro.Decimal(-123, 2)   # legacy=:avrojl1 reads 1.x's little-endian decimals
         @test vals[1].u == UUID(0x123e4567e89b12d3a456426614174000)
-        zvals = readall(joinpath(leg, "avrojl112-zstd.avro"); legacy=:avrojl1, decimal_byteorder=:little)
-        @test length(zvals) == 2 && zvals[1].dec == Avro.Decimal(12345, 2)
-        e = try; readall(joinpath(leg, "avrojl112-deflate.avro"); legacy=:avrojl1); nothing; catch err; err; end
-        @test e isa Avro.DataError && occursin("precision", e.msg)                                # a :big misread of 1.x decimals fails validation rather than yielding garbage
+        for name in ("avrojl112-zstd.avro", "avrojl112-deflate.avro")
+            cvals = readall(joinpath(leg, name); legacy=:avrojl1)
+            @test length(cvals) == 2 && cvals[1].dec == Avro.Decimal(12345, 2) && cvals[2].dec == Avro.Decimal(-123, 2)
+        end
     end
     @testset "truncation, corruption, crafted headers" begin
         defaultcodec = IOBuffer()
@@ -772,7 +671,6 @@ end
         write(defaultcodec, zeros(UInt8, 16))
         defaultreader = Avro.Reader(take!(defaultcodec))
         @test Avro.codec(defaultreader) === :null
-        @test defaultreader.budget.reserved == 3945 + 2 * Avro.nameindexshellbytes(Avro.Schema)   # plus the parser's name indexes
         close(defaultreader)
 
         rows = [(x=Int64(i),) for i in 1:10]
@@ -801,14 +699,11 @@ end
         zero_with_payload = vcat(header, varint(0), varint(1), UInt8[0x00], sync)
         @test_throws Avro.DataError Avro.Reader(r -> collect(Avro.eachblock(r)), zero_with_payload)
         @test_throws Avro.DataError readall(zero_with_payload)
-        # every reader and validation mode rejects a block holding more datums than it declares
+        # every reader rejects a block holding more datums than it declares
         twoofthree = vcat(header, varint(2), varint(3), UInt8[0x02, 0x04, 0x06], sync)
-        for v in (:strict, :fast)
-            @test_throws Avro.DataError readall(zero_with_payload; validate=v)
-            @test_throws Avro.DataError readall(twoofthree; validate=v)
-            @test_throws Avro.DataError Avro.Rows(collect, twoofthree; validate=v)
-            @test_throws Avro.DataError Avro.Table(twoofthree; validate=v)
-        end
+        @test_throws Avro.DataError readall(twoofthree)
+        @test_throws Avro.DataError Avro.Rows(collect, twoofthree)
+        @test_throws Avro.DataError Avro.Table(twoofthree)
         zerorows = Avro.Rows(zero_with_payload)
         @test_throws Avro.DataError collect(zerorows)
         close(zerorows)
@@ -816,8 +711,9 @@ end
                         Avro.encode(P("{\"type\":\"record\",\"name\":\"Record\",\"fields\":[{\"name\":\"x\",\"type\":\"long\"}]}"), (x=Int64(7),)), UInt8[0x00], sync)
         lv = @test_logs (:warn, r"legacy") match_mode=:any Avro.Reader(r -> collect(Avro.eachdatum(r)), trailing; legacy=:avrojl1)
         @test length(lv) == 1 && lv[1].x == 7                                                     # the null-codec trailing tolerance
-        toobig = vcat(header, varint(1), varint(Int64(L.max_block_bytes) + 1))
+        toobig = vcat(header, varint(1), varint(Int64(L.max_bytes) + 1))                          # a claimed block size over max_bytes
         @test_throws Avro.LimitError readall(toobig)
+        @test_throws Avro.LimitError readall(NoPositionIO(IOBuffer(toobig)))
         # a block that declares more datums than it holds, and one with trailing bytes
         one = Avro.encode(P("{\"type\":\"record\",\"name\":\"Record\",\"fields\":[{\"name\":\"x\",\"type\":\"long\"}]}"), (x=Int64(7),))
         @test_throws Avro.DataError readall(vcat(header, varint(2), varint(length(one)), one, sync))
@@ -876,20 +772,15 @@ end
         append!(hugeblock, Avro.encode(Avro.LongSchema(), typemax(Int64)))
         append!(hugeblock, Avro.encode(Avro.LongSchema(), Int64(0)))
         append!(hugeblock, zeros(UInt8, 16))
-        hugelimits = Avro.Limits(max_block_count=typemax(Int),
-                                 max_rows=typemax(Int),
-                                 max_total_values=typemax(Int),
-                                 max_values_per_byte=typemax(Int))
         hugeerr = try
-            Avro.Reader(r -> collect(Avro.eachblock(r)), hugeblock;
-                        limits=hugelimits)
+            readall(hugeblock)                         # typemax(Int64) null datums claimed by an empty block
             nothing
         catch caught
             caught
         end
         @test hugeerr isa Avro.LimitError
-        @test hugeerr.limit === :max_total_values
-        @test hugeerr.observed === typemax(Int)
+        @test hugeerr.limit === :max_values_per_byte
+        @test hugeerr.value == Avro.Limits().value_allowance   # an empty block allows only the flat allowance
 
         denseocfschema = Avro.UnionSchema([Avro.ArraySchema(Avro.NullSchema()),
                                            Avro.BytesSchema()])
@@ -911,22 +802,12 @@ end
         append!(denseocf, Avro.encode(Avro.LongSchema(), Int64(length(densepayload))))
         append!(denseocf, densepayload)
         append!(denseocf, zeros(UInt8, 16))
-        denselimits = Avro.Limits(max_values_per_byte=1, work_allowance=0)
-        observed = Int[]
-        for mode in (:strict, :fast)
-            reader = Avro.Reader(denseocf; limits=denselimits, validate=mode)
-            err = try
-                iterate(Avro.eachdatum(reader))
-                nothing
-            catch caught
-                caught
-            end
-            @test err isa Avro.LimitError
-            @test err.limit == :max_values_per_byte
-            push!(observed, reader.budget.values)
-            close(reader)
-        end
-        @test observed[1] == observed[2]
+        # values are counted per block: a datum of 500 nulls in five bytes stays within one value per
+        # byte of the whole block
+        denselimits = Avro.Limits(max_values_per_byte=1, value_allowance=0)
+        densevalues = readall(denseocf; limits=denselimits)
+        @test length(densevalues) == 2 && length(densevalues[1]) == firstcount && all(ismissing, densevalues[1])
+        @test densevalues[2] == zeros(UInt8, secondbytes)
 
         staticfields = ["{\"name\":\"n$i\",\"type\":\"null\"}" for i in 1:20]
         append!(staticfields, ["{\"name\":\"s\",\"type\":\"string\"}",
@@ -950,21 +831,14 @@ end
         staticgood = take!(staticio)
         staticbad = copy(staticgood)
         staticbad[end - 16] = 0x02
-        staticlimits = Avro.Limits(max_values_per_byte=1, work_allowance=50,
-                                   max_total_bytes=1 << 30,
-                                   max_block_bytes=1 << 20,
-                                   max_block_output_bytes=1 << 20)
+        # the second block holds 10 datums of 23 values each in 20 bytes: over 1 × 20 + 50 values, so
+        # every decoding reader stops there, before the corrupt boolean of its last datum
+        staticlimits = Avro.Limits(max_values_per_byte=1, value_allowance=50)
         staticcalls = (
-            bytes -> Avro.Table(bytes; limits=staticlimits, validate=:strict,
-                                ntasks=1),
-            bytes -> Avro.Table(IOBuffer(bytes); limits=staticlimits,
-                                validate=:fast, ntasks=2),
-            bytes -> Avro.Rows(rows -> collect(rows), bytes; limits=staticlimits,
-                               validate=:strict),
-            bytes -> Avro.Reader(r -> collect(Avro.eachdatum(r)), bytes;
-                                 limits=staticlimits, validate=:fast),
-            bytes -> Avro.Reader(r -> collect(Avro.eachblock(r)), IOBuffer(bytes);
-                                 limits=staticlimits, validate=:strict),
+            bytes -> Avro.Table(bytes; limits=staticlimits, ntasks=1),
+            bytes -> Avro.Table(IOBuffer(bytes); limits=staticlimits, ntasks=2),
+            bytes -> Avro.Rows(rows -> collect(rows), bytes; limits=staticlimits),
+            bytes -> Avro.Reader(r -> collect(Avro.eachdatum(r)), bytes; limits=staticlimits),
         )
         for call in staticcalls, bytes in (staticgood, staticbad)
             staticerror = try
@@ -975,8 +849,10 @@ end
             end
             @test staticerror isa Avro.LimitError
             @test staticerror.limit == :max_values_per_byte
-            @test staticerror.observed == 231
+            @test staticerror.value == 1 * 20 + 50 && staticerror.observed > staticerror.value
         end
+        @test length(Avro.Table(staticgood; limits=Avro.Limits(max_values_per_byte=1, value_allowance=230))) == 11
+        @test_throws Avro.DataError Avro.Table(staticbad; limits=Avro.Limits(max_values_per_byte=1, value_allowance=230))
 
         function encodedpair(k, v)
             return vcat(varint(sizeof(k)), Vector{UInt8}(k), varint(length(v)), v)
@@ -1072,19 +948,19 @@ end
         close(enumwriter)
 
         limitio = IOBuffer()
-        limitwriter = Avro.Writer(limitio, Avro.NullSchema(); limits=Avro.Limits(max_rows=0))
+        limitwriter = Avro.Writer(limitio, Avro.StringSchema(); limits=Avro.Limits(max_bytes=64))
         limitcause = try
-            push!(limitwriter, missing)
+            push!(limitwriter, "x"^100)                # one datum larger than a block may be
             nothing
         catch err
             err
         end
         @test limitcause isa Avro.LimitError
         if limitcause isa Avro.LimitError
-            @test limitcause.limit == :max_rows
+            @test limitcause.limit == :max_bytes
         end
         limitfollowup = try
-            push!(limitwriter, missing)
+            push!(limitwriter, "x")
             nothing
         catch err
             err
@@ -1167,18 +1043,15 @@ end
                     finalalias = joinpath(root, "final.avro")
                     symlink(intended, finalalias)
                     Avro.write(finalalias, [(x=Int64(9),)]; schema=s)
-                    @test !islink(finalalias)
+                    @test islink(finalalias)                   # the link stays and its target is updated
                     @test [v.x for v in readall(finalalias)] == [9]
-                    @test [v.x for v in readall(intended)] == [7]
+                    @test [v.x for v in readall(intended)] == [9]
                 end
             end
         end
 
         constructionschema = Avro.ArraySchema(Avro.IntSchema())
-        constructionprobe = Avro.Writer(IOBuffer(), constructionschema)
-        constructioncap = constructionprobe.budget.resolution_work - 1
-        close(constructionprobe; abort=true)
-        constructionlimits = Avro.Limits(max_resolution_work=constructioncap)
+        constructionlimits = Avro.Limits(max_bytes=8)      # the header's schema metadata alone exceeds it
         for constructionatomic in (true, false)
             constructionpath = joinpath(dir, "constructor-$(constructionatomic).avro")
             Base.write(constructionpath, "old")
@@ -1190,7 +1063,7 @@ end
                 err
             end
             @test constructionerror isa Avro.LimitError
-            @test read(constructionpath, String) == (constructionatomic ? "old" : "")
+            constructionatomic && @test read(constructionpath, String) == "old"
             @test sort(readdir(dir)) == sort(["out.avro", "constructor-$(constructionatomic).avro"])
             open(constructionpath, "a") do reopened
                 Base.write(reopened, "closed")
@@ -1234,7 +1107,7 @@ end
         end
 
         blockcap = 1 << 20
-        blocklimits = Avro.Limits(max_block_bytes=blockcap)
+        blocklimits = Avro.Limits(max_bytes=blockcap)
         exactdatum = stringofencodedsize(blockcap)
         oversizeddatum = stringofencodedsize(blockcap + 1)
         firstdatum = stringofencodedsize(blockcap ÷ 2, 'a')
@@ -1258,8 +1131,8 @@ end
             end
             @test oversizederror isa Avro.LimitError
             if oversizederror isa Avro.LimitError
-                @test oversizederror.limit == :max_block_bytes
-                @test oversizederror.observed == blockcap + 1
+                @test oversizederror.limit == :max_bytes
+                @test oversizederror.observed == blockcap + 1 && oversizederror.value == blockcap
             end
             close(oversizedwriter)
 
@@ -1300,23 +1173,21 @@ end
         @test_throws ArgumentError Avro.Writer(IOBuffer(), s; sync=UInt8[1, 2])
         @test_throws ArgumentError Avro.Writer(IOBuffer(), s; block_bytes=0)
         @test_throws ArgumentError Avro.Writer(IOBuffer(), s; codec=:snappy, level=3)
-        @test_throws Avro.LimitError Avro.Writer(IOBuffer(), s; codec=:zstandard, level=22,
-                                                 limits=Avro.Limits(max_total_bytes=256 << 20))   # ≈ 834 MB workspace
-        headerentries, metadatakeyref, metadatavalueref, metadatakeypointer,
-            metadatavaluepointer, headerbudget = writerheaderownership(s)
-        retainedentry = only(entry for entry in headerentries if entry[1] == "caller-metadata")
-        @test pointer(retainedentry[1]) != metadatakeypointer
-        @test pointer(retainedentry[2]) != metadatavaluepointer
-        @test headerentries[2][2] == Vector{UInt8}("zstandard")
-        GC.gc(true)
-        GC.gc(true)
-        @test metadatakeyref.value === nothing
-        @test metadatavalueref.value === nothing
+        # the header keeps the metadata given at construction, whatever the caller does afterwards
+        callervalue = UInt8[0x01, 0x02, 0x03]
+        ownedio = IOBuffer()
+        ownedwriter = Avro.Writer(ownedio, s; codec=:zstandard, metadata=Dict("caller-metadata" => callervalue))
+        callervalue[1] = 0xff
+        push!(ownedwriter, (x=Int64(1),))
+        close(ownedwriter)
+        ownedmetadata = Avro.Reader(Avro.metadata, take!(ownedio))
+        @test ownedmetadata["caller-metadata"] == UInt8[0x01, 0x02, 0x03]
+        @test ownedmetadata["avro.codec"] == Vector{UInt8}("zstandard")
         rep = P("{\"type\":\"record\",\"name\":\"B\",\"fields\":[{\"name\":\"bad-name\",\"type\":\"int\"}]}"; allow_invalid_names=true)
         @test_throws ArgumentError Avro.Writer(IOBuffer(), rep)
         @test Avro.Writer(IOBuffer(), rep; allow_invalid_names=true) isa Avro.Writer
     end
-    @testset "the million-empty-string block and output-estimate caps" begin
+    @testset "a million empty strings in one datum" begin
         arr = P("{\"type\":\"array\",\"items\":\"string\"}")
         io = IOBuffer()
         w = Avro.Writer(io, arr)
@@ -1325,25 +1196,12 @@ end
         seekstart(io)
         got = readall(io)
         @test length(got) == 1 && length(got[1]) == 1_000_000 && all(isempty, got[1])
-        w2 = Avro.Writer(IOBuffer(), arr)
-        @test_throws Avro.LimitError push!(w2, fill("", 4_000_000))                               # ≈ 96 MiB of reader-side slots > 64 MiB
-        close(w2; abort=true)
-        raised = Avro.Limits(max_block_output_bytes=128 << 20)
-        io3 = IOBuffer()
-        w3 = Avro.Writer(io3, arr; limits=raised)
-        push!(w3, fill("", 4_000_000))
-        close(w3)
-        seekstart(io3)
-        @test_throws Avro.LimitError readall(io3)                                                 # and the default reader refuses it
-        seekstart(io3)
-        @test length(Avro.Reader(r -> collect(Avro.eachdatum(r)), io3; limits=raised)[1]) == 4_000_000
     end
-    @testset "malformed codec blocks release transient reservations" begin
+    @testset "a malformed codec block is a CodecError and the next block still reads" begin
         rows = [(x=Int64(1),), (x=Int64(2),)]
         function checkmalformed(src)
             r = Avro.Reader(src)
             blocks = Avro.eachblock(r)
-            baseline = r.budget.reserved
             err = try
                 iterate(blocks)
                 nothing
@@ -1351,7 +1209,6 @@ end
                 e
             end
             @test err isa Avro.CodecError
-            @test r.budget.reserved == baseline
             next = iterate(blocks)
             @test next !== nothing
             if next !== nothing
@@ -1359,7 +1216,6 @@ end
                 @test count == 1
                 @test Avro.decode(Avro.writerschema(r), bytes).x == 2
             end
-            @test r.budget.reserved == baseline
             close(r)
             close(r)
             return nothing
@@ -1385,18 +1241,17 @@ end
         hw = joinpath(gen, "highwindow")
         for name in ("zstd-window1g.avro", "xz-dict1g.avro")
             e = try; readall(joinpath(hw, name)); nothing; catch err; err; end
-            @test e isa Avro.CodecError                                                           # the member requirement exceeds max_codec_memory
+            @test e isa Union{Avro.CodecError,Avro.LimitError}                                   # a 1 GiB decoder window is refused under the defaults
         end
         @test !isempty(readall(joinpath(hw, "zstd-default.avro")))
         @test !isempty(readall(joinpath(hw, "xz-default.avro")))
         if get(ENV, "AVRO_BIG_MEMORY", "false") == "true"
-            raised = Avro.Limits(max_codec_memory=2 << 30, max_total_bytes=16 << 30, max_block_bytes=1 << 30, max_block_output_bytes=8 << 30, max_bytes=1 << 30, max_datum_bytes=1 << 30)
+            raised = Avro.Limits(max_bytes=2 << 30)
             @test !isempty(readall(joinpath(hw, "zstd-window1g.avro"); limits=raised))
             @test !isempty(readall(joinpath(hw, "xz-dict1g.avro"); limits=raised))
         end
-        # mmap=false streams a file larger than the effective ceiling (176 MiB here) with one block resident
-        small = Avro.Limits(max_total_bytes=176 << 20, max_block_bytes=1 << 20, max_codec_memory=16 << 20, max_block_output_bytes=8 << 20,
-                            max_bytes=4 << 20, max_datum_bytes=4 << 20)
+        # mmap=false streams a file larger than max_bytes block by block
+        small = Avro.Limits(max_bytes=4 << 20)
         dir = mktempdir()
         big = joinpath(dir, "big.avro")
         bs = P("\"bytes\"")
@@ -1458,18 +1313,12 @@ end
         @test occursin("issues", sprint(show, MIME("text/plain"), trep))
 
         limitedio = IOBuffer()
-        limitedwriter = Avro.Writer(limitedio, Avro.NullSchema())
-        push!(limitedwriter, missing)
-        flush(limitedwriter)
-        push!(limitedwriter, missing)
+        limitedwriter = Avro.Writer(limitedio, Avro.StringSchema())
+        push!(limitedwriter, "x"^1000)
         close(limitedwriter)
-        limiteddata = take!(limitedio)
-        blockreport = Avro.inspect(limiteddata; limits=Avro.Limits(max_blocks=1))
-        @test blockreport.blocks == blockreport.datums == 1
-        @test length(blockreport.issues) == 1 && occursin("max_blocks", only(blockreport.issues))
-        rowreport = Avro.inspect(limiteddata; limits=Avro.Limits(max_rows=1))
-        @test rowreport.blocks == rowreport.datums == 1
-        @test length(rowreport.issues) == 1 && occursin("max_rows", only(rowreport.issues))
+        limitedreport = Avro.inspect(take!(limitedio); limits=Avro.Limits(max_bytes=512))
+        @test limitedreport.datums == 0
+        @test length(limitedreport.issues) == 1 && occursin("max_bytes", only(limitedreport.issues))
 
         shareddecimal = Avro.parseschema("{\"type\":\"record\",\"name\":\"InspectDecimal\",\"fields\":[{\"name\":\"a\",\"type\":{\"type\":\"fixed\",\"name\":\"D\",\"size\":4,\"logicalType\":\"decimal\",\"precision\":8}},{\"name\":\"b\",\"type\":\"D\"}]}")
         decimalio = IOBuffer()

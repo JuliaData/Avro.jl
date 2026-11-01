@@ -1,12 +1,11 @@
-# 1.x deprecation shims: kept for one major cycle, removal in 3.0. Tested against real
-# files written by the pinned Avro.jl 1.1.2 (test/fixtures/generated/legacy1x).
+# Avro.jl 1.x names kept as deprecations.
 
 """
     Avro.readtable(source; kw...)
 
 Deprecated 1.x entry point: reads an object container file as a column table with `legacy=:avrojl1`
 (tolerating the 1.x writer's defects). Use [`Avro.Table`](@ref) — with `legacy=:avrojl1` only for
-files written by Avro.jl ≤ 1.1.2, and `decimal_byteorder=:little` if they contain decimals.
+files written by Avro.jl ≤ 1.1.2.
 """
 function readtable(source; kw...)
     Base.depwarn("`Avro.readtable(src)` is deprecated; use `Avro.Table(src)` " *
@@ -27,15 +26,14 @@ function writetable(dst, table; compress::Union{Nothing,Symbol}=nothing, kw...)
 end
 
 """
-    Avro.write(x; schema=nothing, limits=Limits())
+    Avro.write(x; schema=nothing)
 
 Deprecated 1.x datum writer. Use [`Avro.encode`](@ref), or [`Avro.encode!`](@ref) for an `IO`.
 """
 function write(x; schema=nothing, limits::Limits=Limits())
     Base.depwarn("`Avro.write(x; schema=...)` is deprecated; use `Avro.encode(schema, x)`.", :write)
-    schema === nothing && return encode(x; limits=limits)
-    s = deprecatedschema(schema, limits)
-    return encode(s, x; limits=limits)
+    schema === nothing && return encode(x)
+    return encode(deprecatedschema(schema), x)
 end
 
 """
@@ -50,13 +48,13 @@ end
 
 function read(src, ::Type{T}; schema=nothing, limits::Limits=Limits(), kw...) where {T}
     Base.depwarn("`Avro.read(src, T)` is deprecated; use `Avro.decode(schema, src, T)`.", :read)
-    s = schema === nothing ? Avro.schema(T; limits=limits) : deprecatedschema(schema, limits)
+    s = schema === nothing ? Avro.schema(T) : deprecatedschema(schema)
     return deprecateddecode(src, s, T; limits=limits, kw...)
 end
 
-function deprecatedschema(s, limits::Limits)
+function deprecatedschema(s)
     s isa Schema && return s
-    s isa Type && return Avro.schema(s; limits=limits)
+    s isa Type && return Avro.schema(s)
     throw(ArgumentError("`schema` must be an `Avro.Schema` or Julia type"))
 end
 

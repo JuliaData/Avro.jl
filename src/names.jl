@@ -1,4 +1,4 @@
-# Names: the fullname algorithm, name grammar validation and namespace resolution.
+# `FullName` and the Avro name grammar.
 
 """
     FullName(name, namespace)
@@ -15,58 +15,6 @@ function fullname(f::FullName)
     return isempty(f.namespace) ? f.name : string(f.namespace, ".", f.name)
 end
 
-function fullnamesize(f::FullName)
-    isempty(f.namespace) && return sizeof(f.name)
-    return checked_add(checked_add(sizeof(f.namespace), 1), sizeof(f.name))
-end
-
-function fullnamebyte(f::FullName, i::Int)
-    namespacebytes = sizeof(f.namespace)
-    if namespacebytes == 0
-        return codeunit(f.name, i)
-    elseif i <= namespacebytes
-        return codeunit(f.namespace, i)
-    elseif i == namespacebytes + 1
-        return UInt8('.')
-    end
-    return codeunit(f.name, i - namespacebytes - 1)
-end
-
-function fullnamecompare(a::FullName, b::FullName)
-    na = fullnamesize(a)
-    nb = fullnamesize(b)
-    for i in 1:min(na, nb)
-        ai = fullnamebyte(a, i)
-        bi = fullnamebyte(b, i)
-        ai == bi || return ai < bi ? -1 : 1
-    end
-    return cmp(na, nb)
-end
-
-function fullnamecompare(a::FullName, b::AbstractString)
-    na = fullnamesize(a)
-    nb = sizeof(b)
-    bytes = codeunits(b)
-    for i in 1:min(na, nb)
-        ai = fullnamebyte(a, i)
-        bi = bytes[i]
-        ai == bi || return ai < bi ? -1 : 1
-    end
-    return cmp(na, nb)
-end
-
-function fullnamecompare(a::AbstractString, b::FullName)
-    return -fullnamecompare(b, a)
-end
-
-function fullnameequal(a::FullName, b::FullName)
-    return a.name == b.name && a.namespace == b.namespace
-end
-
-function fullnameequal(a::FullName, b::AbstractString)
-    return fullnamecompare(a, b) == 0
-end
-
 function writefullname(io::IO, f::FullName)
     isempty(f.namespace) || print(io, f.namespace, '.')
     return print(io, f.name)
@@ -80,34 +28,10 @@ function Base.hash(a::FullName, h::UInt)
     return hash(a.namespace, hash(a.name, hash(:FullName, h)))
 end
 
-function Base.isless(a::FullName, b::FullName)
-    return fullnamecompare(a, b) < 0
-end
-
-function Base.isless(a::FullName, b::AbstractString)
-    return fullnamecompare(a, b) < 0
-end
-
-function Base.isless(a::AbstractString, b::FullName)
-    return fullnamecompare(a, b) < 0
-end
-
 function Base.show(io::IO, f::FullName)
     print(io, "FullName(\"")
     writefullname(io, f)
     return print(io, "\")")
-end
-
-function keymatches(a::FullName, b::FullName)
-    return fullnameequal(a, b)
-end
-
-function keymatches(a::FullName, b::AbstractString)
-    return fullnameequal(a, b)
-end
-
-function keymatches(a::AbstractString, b::FullName)
-    return fullnameequal(b, a)
 end
 
 const PRIMITIVE_NAMES = ("null", "boolean", "int", "long", "float", "double", "bytes", "string")

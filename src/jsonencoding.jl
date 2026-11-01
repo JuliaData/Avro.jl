@@ -1,790 +1,266 @@
-# JSON encoding. `tojson` validates through the binary write plan (identical validation and
-# union branch recovery to `encode`), decodes the bytes back into the closed generic value set and prints
-# that with Java-compatible labels; `fromjson` parses with Avro's own bounded JSON reader (never JSON.jl)
-# and converts by the JSON encoding rules. Both are bounded by `max_datum_bytes`, `max_total_values`,
-# `max_json_depth` and the operation budget.
-
-struct JSONOut
-    io::BoundedWriter
-    maxbytes::Int
-    pretty::Bool
-end
-
-function checkoutput!(out::JSONOut)
-    n = out.io.len
-    n <= out.maxbytes || throw(LimitError(:max_datum_bytes, n, out.maxbytes, :max_datum_bytes, :encode))
-    return nothing
-end
+# JSON encoding. `tojson` encodes through the binary write plan (the validation and union branch
+# selection of `encode`) and prints the encoded datum with Java-compatible labels; `fromjson` parses with
+# Avro's own JSON reader (never JSON.jl) and converts by the JSON encoding rules into the generic values.
 
 """
-    Avro.tojson(schema, x; pretty=false, limits=Limits()) -> String
+    Avro.tojson(schema, x; pretty=false) -> String
 
 The Avro JSON encoding of `x` under `schema` (Java-compatible: unions as one-member objects keyed by
-the branch's fullname or type name, bytes/fixed as strings of code points U+0000–U+00FF, non-finite
-floats as the strings `"NaN"`, `"Infinity"`, `"-Infinity"`). Validation and union branch recovery are
-those of `Avro.encode`; the output text is bounded by `max_datum_bytes`.
+the branch's fullname or type name (the null branch as `null`), bytes/fixed as strings of code points U+0000–U+00FF, non-finite
+floats as the strings `"NaN"`, `"Infinity"`, `"-Infinity"`; map entries in key order). Validation and
+union branch selection are those of `Avro.encode`.
 """
 function tojson(s::Schema, x; pretty::Bool=false, limits::Limits=Limits())
     graphinfo(s).repaired_names &&
         throw(ArgumentError("tojson rejects a schema parsed with allow_invalid_names=true"))
-    return withbudget(limits; direction=:encode) do budget
-        local text
-        beginworkdefer!(budget)
-        try
-            writer = writeplan(s; budget=budget)
-            encoder = Encoder(budget)
-            withencoderroot!(encoder, s) do
-                encode(writer, encoder, x)
-            end
-            d = Decoder(encoder.buf, budget; stop=encoder.pos)
-            v = decode(readplan(s; budget=budget), d)
-            d.pos == encoder.pos + 1 || throw(DataError("internal error: encoded datum was not fully consumed", d.pos))
-            sink = BoundedWriter(budget, limits.max_datum_bytes;
-                                 limit=:max_datum_bytes)
-            out = JSONOut(sink, limits.max_datum_bytes, pretty)
-            printvalue(out, s, v, 0, budget)
-            text = boundedtake!(sink)
-        finally
-            endworkdefer!(budget)
-        end
-        checkoperationwork!(budget)
-        return text
-    end
+    e = Encoder(limits)
+    encodedatum!(writeplan(s), e, x, s)
+    io = IOBuffer()
+    printdatum(io, s, Decoder(e.buf, uncapped(limits); stop=e.pos), pretty, 0)
+    return String(take!(io))
 end
 
-function printvalue(out::JSONOut, s::Schema, v, depth::Int, budget::Budget)
-    countvalues!(budget)
-    depth <= budget.limits.max_json_depth || throw(LimitError(:max_json_depth, depth, budget.limits.max_json_depth, :max_json_depth, :encode))
-    printkind(out, s, v, depth, budget)
-    checkoutput!(out)
+# The printer reads the datum `encodedatum!` just wrote: logical types print as their underlying type
+# and a union prints the label of the branch the encoder selected.
+function printdatum(io::IO, ::NullSchema, d::Decoder, pretty::Bool, level::Int)
+    return print(io, "null")
+end
+
+function printdatum(io::IO, ::BooleanSchema, d::Decoder, pretty::Bool, level::Int)
+    return print(io, readbool(d))
+end
+
+function printdatum(io::IO, ::IntSchema, d::Decoder, pretty::Bool, level::Int)
+    return print(io, readint(d))
+end
+
+function printdatum(io::IO, ::LongSchema, d::Decoder, pretty::Bool, level::Int)
+    return print(io, readlong(d))
+end
+
+function printdatum(io::IO, ::FloatSchema, d::Decoder, pretty::Bool, level::Int)
+    return printfloat(io, readfloat(d))
+end
+
+function printdatum(io::IO, ::DoubleSchema, d::Decoder, pretty::Bool, level::Int)
+    return printfloat(io, readdouble(d))
+end
+
+function printdatum(io::IO, ::BytesSchema, d::Decoder, pretty::Bool, level::Int)
+    n = readlen(d)
+    printbytes(io, d.buf, d.pos, n)
+    d.pos += n
     return nothing
 end
 
-function printkind(out::JSONOut, ::NullSchema, v, depth, budget)
-    return print(out.io, "null")
+function printdatum(io::IO, s::FixedSchema, d::Decoder, pretty::Bool, level::Int)
+    p = d.pos
+    skipfixed(d, s.size)
+    return printbytes(io, d.buf, p, s.size)
 end
 
-function printkind(out::JSONOut, ::BooleanSchema, v::Bool, depth, budget)
-    return print(out.io, v ? "true" : "false")
+function printdatum(io::IO, s::StringSchema, d::Decoder, pretty::Bool, level::Int)
+    text = readstring(d)
+    # uuid text is encoded as given; print the canonical lowercase form a decoded UUID has
+    return escapejson(io, s.logical isa UUIDLogical ? lowercase(text) : text)
 end
 
-function printkind(out::JSONOut, ::Union{FloatSchema,DoubleSchema}, v::AbstractFloat, depth, budget)
-    return printfloat(out.io, v, budget)
+function printdatum(io::IO, s::EnumSchema, d::Decoder, pretty::Bool, level::Int)
+    return escapejson(io, s.symbols[readindex(d, length(s.symbols))])
 end
 
-function printkind(out::JSONOut, ::StringSchema, v::String, depth, budget)
-    return escapejson(out.io, v)
-end
-
-function printkind(out::JSONOut, ::StringSchema, v::UUID, depth, budget)
-    return printuuidstring(out.io, v)
-end
-
-function printkind(out::JSONOut, ::EnumSchema, v::EnumValue, depth, budget)
-    return escapejson(out.io, String(v))
-end
-
-function printkind(out::JSONOut, ::BytesSchema, v::Vector{UInt8}, depth, budget)
-    return printbytestring(out.io, v)
-end
-
-function printkind(out::JSONOut, ::BytesSchema, v::WideDecimal, depth, budget)
-    bytes = twoscomplement(v.unscaled, budget)
-    try
-        return printbytestring(out.io, bytes)
-    finally
-        release!(budget, bytesbytes(length(bytes)))
-    end
-end
-
-function printkind(out::JSONOut, s::IntSchema, v, depth, budget)
-    l = s.logical
-    n = l isa DateLogical ? Dates.value(v::Date - DATE_EPOCH) :
-        l isa TimeMillis ? Dates.value(v::Time) ÷ 1_000_000 : Int(v::Int32)
-    return print(out.io, n)
-end
-
-function printkind(out::JSONOut, s::LongSchema, v, depth, budget)
-    l = s.logical
-    n = l isa TimeMicros ? Dates.value(v::Time) ÷ 1_000 :
-        (l isa Union{TimestampMillis,TimestampMicros,TimestampNanos,LocalTimestampMillis,LocalTimestampMicros,LocalTimestampNanos} ? v.ticks : v::Int64)
-    return print(out.io, n)
-end
-
-function printkind(out::JSONOut, s::FixedSchema, v, depth, budget)
-    checkvaluebytes(budget, s.size)
-    v isa Fixed && return printbytestring(out.io, v.bytes)
-    v isa UUID && return printuuidbytestring(out.io, v)
-    v isa Durations.Duration && (v = Duration(v))
-    v isa DataDecimals.AbstractDecimal && !(v isa Decimal) && (v = _decimalinput(v))
-    v isa Duration && return printdurationbytestring(out.io, v)
-    bytes = twoscomplement(v.unscaled, budget; maxbytes=s.size)
-    try
-        length(bytes) <= s.size ||
-            throw(EncodeError("decimal does not fit the fixed size $(s.size)", "\$", s))
-        return printpaddedbytestring(out.io, bytes, s.size, v.unscaled < 0 ? 0xff : 0x00)
-    finally
-        release!(budget, bytesbytes(length(bytes)))
-    end
-end
-
-function printkind(out::JSONOut, s::ArraySchema, v::AbstractVector, depth, budget)
-    io = out.io
+function printdatum(io::IO, s::ArraySchema, d::Decoder, pretty::Bool, level::Int)
     print(io, '[')
-    for (i, x) in enumerate(v)
-        i > 1 && print(io, ',')
-        indent(io, out.pretty, depth + 1)
-        printvalue(out, s.items, x, depth + 1, budget)
+    n = 0
+    while true
+        count, _ = readblockcount(d)
+        count == 0 && break
+        for _ in 1:count
+            n > 0 && print(io, ',')
+            n += 1
+            indent(io, pretty, level + 1)
+            printdatum(io, s.items, d, pretty, level + 1)
+        end
     end
-    isempty(v) || indent(io, out.pretty, depth)
-    print(io, ']')
-    return nothing
+    n > 0 && indent(io, pretty, level)
+    return print(io, ']')
 end
 
-function printkind(out::JSONOut, s::MapSchema, v::Map, depth, budget)
-    io = out.io
+function printdatum(io::IO, s::MapSchema, d::Decoder, pretty::Bool, level::Int)
+    entries = Pair{String,String}[]
+    while true
+        count, _ = readblockcount(d)
+        count == 0 && break
+        for _ in 1:count
+            key = readstring(d)
+            value = IOBuffer()
+            printdatum(value, s.values, d, pretty, level + 1)
+            push!(entries, key => String(take!(value)))
+        end
+    end
+    sort!(entries; by=first)
     print(io, '{')
-    for i in eachindex(v.keys)
+    for (i, (key, value)) in enumerate(entries)
         i > 1 && print(io, ',')
-        indent(io, out.pretty, depth + 1)
-        escapejson(io, v.keys[i])
-        print(io, out.pretty ? ": " : ":")
-        printvalue(out, s.values, v.vals[i], depth + 1, budget)
+        indent(io, pretty, level + 1)
+        escapejson(io, key)
+        print(io, pretty ? ": " : ":", value)
     end
-    isempty(v.keys) || indent(io, out.pretty, depth)
-    print(io, '}')
-    return nothing
+    isempty(entries) || indent(io, pretty, level)
+    return print(io, '}')
 end
 
-function printkind(out::JSONOut, s::RecordSchema, v::Record, depth, budget)
-    io = out.io
-    vals = getfield(v, :values)
+function printdatum(io::IO, s::RecordSchema, d::Decoder, pretty::Bool, level::Int)
     print(io, '{')
     for (i, f) in enumerate(s.fields)
         i > 1 && print(io, ',')
-        indent(io, out.pretty, depth + 1)
+        indent(io, pretty, level + 1)
         escapejson(io, f.name)
-        print(io, out.pretty ? ": " : ":")
-        printvalue(out, f.schema, vals[i], depth + 1, budget)
+        print(io, pretty ? ": " : ":")
+        printdatum(io, f.schema, d, pretty, level + 1)
     end
-    isempty(s.fields) || indent(io, out.pretty, depth)
-    print(io, '}')
-    return nothing
+    isempty(s.fields) || indent(io, pretty, level)
+    return print(io, '}')
 end
 
-function printkind(out::JSONOut, s::UnionSchema, v, depth, budget)
-    nb = nullablebranch(s)
-    if nb != 0
-        if v === missing
-            countvalues!(budget)
-            return print(out.io, "null")
-        end
-        return printmember(out, s, 3 - nb, v, depth, budget)
-    end
-    u = v::UnionValue
-    branch = s.branches[u.index]
-    if branch isa NullSchema
-        countvalues!(budget)
-        return print(out.io, "null")
-    end
-    return printmember(out, s, u.index, u.value, depth, budget)
-end
-
-function printmember(out::JSONOut, s::UnionSchema, i::Int, v, depth, budget)
+function printdatum(io::IO, s::UnionSchema, d::Decoder, pretty::Bool, level::Int)
+    i = readindex(d, length(s.branches))
     branch = s.branches[i]
+    branch isa NullSchema && return print(io, "null")
     ambiguouslabel(s, i) &&
         throw(EncodeError("union label is ambiguous (a named type and a kind share it)", "\$", s))
-    io = out.io
     print(io, '{')
-    indent(io, out.pretty, depth + 1)
-    escapeunionlabel(io, branch)
-    print(io, out.pretty ? ": " : ":")
-    printvalue(out, branch, v, depth + 1, budget)
-    indent(io, out.pretty, depth)
-    print(io, '}')
-    return nothing
+    indent(io, pretty, level + 1)
+    escapejson(io, branchidentitylabel(branch))
+    print(io, pretty ? ": " : ":")
+    printdatum(io, branch, d, pretty, level + 1)
+    indent(io, pretty, level)
+    return print(io, '}')
 end
 
-function unionlabel(s::NamedSchema)
-    return fullname(s)
+function ambiguouslabel(s::UnionSchema, i::Int)
+    label = branchidentitylabel(s.branches[i])
+    return count(b -> branchidentitylabel(b) == label, s.branches) > 1
 end
 
-function unionlabel(s::Schema)
-    return unionkindlabel(s)
-end
-
-function unionkindlabel(s::Schema)
-    k = kind(s)
-    k === :null && return "null"
-    k === :boolean && return "boolean"
-    k === :int && return "int"
-    k === :long && return "long"
-    k === :float && return "float"
-    k === :double && return "double"
-    k === :bytes && return "bytes"
-    k === :string && return "string"
-    k === :array && return "array"
-    k === :map && return "map"
-    throw(ArgumentError("internal error: a union label has no schema kind"))
-end
-
-function unionlabelmatches(s::NamedSchema, label::String)
-    return fullnameequal(s.name, label)
-end
-
-function unionlabelmatches(s::Schema, label::String)
-    return unionkindlabel(s) == label
-end
-
-function sameunionlabel(a::NamedSchema, b::NamedSchema)
-    return fullnameequal(a.name, b.name)
-end
-
-function sameunionlabel(a::NamedSchema, b::Schema)
-    return fullnameequal(a.name, unionkindlabel(b))
-end
-
-function sameunionlabel(a::Schema, b::NamedSchema)
-    return sameunionlabel(b, a)
-end
-
-function sameunionlabel(a::Schema, b::Schema)
-    return unionkindlabel(a) == unionkindlabel(b)
-end
-
-function ambiguouslabel(s::UnionSchema, index::Int)
-    selected = s.branches[index]
-    for (i, branch) in enumerate(s.branches)
-        i == index && continue
-        sameunionlabel(selected, branch) && return true
-    end
-    return false
-end
-
+# The branch of `s` labelled `label`: 0 when none is, -1 when several are.
 function branchbylabel(s::UnionSchema, label::String)
     found = 0
     for (i, b) in enumerate(s.branches)
-        unionlabelmatches(b, label) || continue
+        branchidentitylabel(b) == label || continue
         found == 0 || return -1
         found = i
     end
     return found
 end
 
-function escapeunionlabel(io::IO, s::NamedSchema)
-    print(io, '"')
-    if !isempty(s.name.namespace)
-        escapejsoncontents(io, s.name.namespace)
-        print(io, '.')
-    end
-    escapejsoncontents(io, s.name.name)
-    return print(io, '"')
-end
-
-function escapeunionlabel(io::IO, s::Schema)
-    return escapejson(io, unionkindlabel(s))
-end
-
-function printfloat(io::IO, v::AbstractFloat, budget::Budget)
-    isfinite(v) || return print(io, isnan(v) ? "\"NaN\"" : (v > 0 ? "\"Infinity\"" : "\"-Infinity\""))
-    capacity = Base.Ryu.neededdigits(typeof(v))
-    charge = bytesbytes(capacity)
-    reserve!(budget, charge)
-    bytes = Vector{UInt8}(undef, capacity)
-    try
-        stop = Base.Ryu.writeshortest(bytes, 1, v)
-        GC.@preserve bytes Base.unsafe_write(io, pointer(bytes), UInt(stop - 1))
-        return nothing
-    finally
-        release!(budget, charge)
-    end
+function printfloat(io::IO, v::AbstractFloat)
+    isnan(v) && return print(io, "\"NaN\"")
+    isinf(v) && return print(io, v > 0 ? "\"Infinity\"" : "\"-Infinity\"")
+    return print(io, Base.Ryu.writeshortest(v))
 end
 
 # Bytes as a JSON string of code points U+0000–U+00FF (Java's form).
-function printbytestring(io::IO, bytes::AbstractVector{UInt8})
-    print(io, '"')
-    for b in bytes
-        printjsonbyte(io, b)
-    end
-    print(io, '"')
-    return nothing
-end
-
-function printjsonbyte(io::IO, b::UInt8)
-    if b == UInt8('"')
-        print(io, "\\\"")
-    elseif b == UInt8('\\')
-        print(io, "\\\\")
-    elseif b < 0x20
-        if b == 0x08; print(io, "\\b") elseif b == 0x0C; print(io, "\\f") elseif b == 0x0A; print(io, "\\n")
-        elseif b == 0x0D; print(io, "\\r") elseif b == 0x09; print(io, "\\t")
-        else writehexescape(io, b) end
-    elseif b < 0x80
-        Base.write(io, b)
-    else
-        Base.write(io, 0xC0 | (b >> 6), 0x80 | (b & 0x3F))
-    end
-    return nothing
-end
-
-"Print canonical lowercase UUID text as a JSON string without a temporary `String`."
-function printuuidstring(io::IO, u::UUID)
-    Base.write(io, UInt8('"'))
-    value = UInt128(u)
-    for i in 0:31
-        if i == 8 || i == 12 || i == 16 || i == 20
-            Base.write(io, UInt8('-'))
-        end
-        Base.write(io, HEX_DIGITS[Int((value >> (4 * (31 - i))) & 0x0f) + 1])
-    end
-    Base.write(io, UInt8('"'))
-    return nothing
-end
-
-"Print the 16 big-endian UUID bytes as an Avro JSON bytes string without a temporary vector."
-function printuuidbytestring(io::IO, u::UUID)
-    Base.write(io, UInt8('"'))
-    value = UInt128(u)
-    for i in 0:15
-        printjsonbyte(io, UInt8((value >> (8 * (15 - i))) & 0xff))
-    end
-    Base.write(io, UInt8('"'))
-    return nothing
-end
-
-"Print the 12 little-endian duration bytes without a temporary vector."
-function printdurationbytestring(io::IO, x::Duration)
-    Base.write(io, UInt8('"'))
-    for value in (x.months, x.days, x.millis)
-        for i in 0:3
-            printjsonbyte(io, UInt8((value >> (8 * i)) & 0xff))
-        end
-    end
-    Base.write(io, UInt8('"'))
-    return nothing
-end
-
-function printpaddedbytestring(io::IO, bytes::Vector{UInt8}, size::Int, pad::UInt8)
-    print(io, '"')
-    for _ in 1:size - length(bytes)
-        printjsonbyte(io, pad)
-    end
-    for b in bytes
-        printjsonbyte(io, b)
-    end
-    print(io, '"')
-    return nothing
+function printbytes(io::IO, buf::AbstractVector{UInt8}, from::Int, n::Int)
+    return escapejson(io, String(Char.(view(buf, from:from + n - 1))))
 end
 
 # ---- fromjson ---------------------------------------------------------------------------------------
 
-struct JSONContext
-    budget::Budget
-    unknownerror::Bool
-    bareunion::Bool        # defaults: unions are bare values matched in branch order
-    countdatum::Bool
-    branches::Union{Nothing,Vector{Int}}
-    copystrings::Bool      # frozen defaults must materialise fresh caller-owned strings
-end
-
-function JSONContext(budget::Budget, unknownerror::Bool, bareunion::Bool)
-    return JSONContext(budget, unknownerror, bareunion, true, nothing, false)
-end
-
 """
-    Avro.fromjson(schema, json; strict=true, unknown=:ignore, limits=Limits(), names=nothing)
+    Avro.fromjson(schema, json; strict=true, unknown=:ignore, limits=Limits())
     Avro.fromjson(schema, json, T; kw...)
 
 Decode the Avro JSON encoding of one datum (`json` is a string, bytes or an `IO`) into the generic value
 model, or into `T` through the semantic StructUtils route. `strict=false` additionally accepts the bare
 tokens `NaN`/`Infinity`/`-Infinity`; `unknown=:error` rejects unknown record members (ignored by
-default, like Java).
+default). The document is bounded by `limits.max_bytes` and `limits.max_depth`.
 """
-function fromjson(s::Schema, src::Union{AbstractString,AbstractVector{UInt8},IO}; strict::Bool=true, unknown::Symbol=:ignore,
-                  limits::Limits=Limits(), names=nothing)
+function fromjson(s::Schema, src::Union{AbstractString,AbstractVector{UInt8},IO}; strict::Bool=true,
+                  unknown::Symbol=:ignore, limits::Limits=Limits())
     graphinfo(s).repaired_names &&
         throw(ArgumentError("fromjson rejects a schema parsed with allow_invalid_names=true"))
     unknown in (:ignore, :error) || throw(ArgumentError("unknown must be :ignore or :error"))
-    admission(names)
-    return withbudget(limits) do budget
-        bytes = sourcebytes(src, limits.max_datum_bytes, budget, DataError)
-        addinput!(budget, length(bytes))
-        errfn = (msg, pos) -> throw(DataError(msg, pos))
-        limitfn = (limit, observed, value) -> throw(LimitError(limit, observed, value, limit, :decode))
-        j = parsejson(bytes; maxbytes=limits.max_datum_bytes, maxdepth=limits.max_json_depth, errfn=errfn, budget=budget,
-                      limitfn=limitfn, bytelimit=:max_datum_bytes, depthlimit=:max_json_depth, lenient=!strict)
-        return jsontovalue(s, j, JSONContext(budget, unknown === :error, false), 1)
-    end
+    bytes = sourcebytes(src, limits.max_bytes)
+    j = parsejson(bytes; limits=limits, errfn=(msg, pos) -> throw(DataError(msg, pos)), lenient=!strict)
+    return jsondatum(s, j, unknown === :error)
 end
 
-function fromjson(s::Schema, src, ::Type{T}; names=nothing, kw...) where {T}
-    v = fromjson(s, src; names=names, kw...)
+function fromjson(s::Schema, src, ::Type{T}; kw...) where {T}
+    v = fromjson(s, src; kw...)
     (T === Any || v isa T) && return v
-    return semanticvalue(T, v, admission(names), s)
+    return semanticvalue(T, v, s)
 end
 
-"""
-    jsonvalue(schema, json, budget) -> value
-
-Convert a frozen JSON tree parsed in *default* context (bare unions, the recursive record rule) into the
-generic value model — used for field defaults under resolution.
-"""
-function jsonvalue(s::Schema, j, budget::Budget)
-    return jsonvalue(s, j, budget, 0)
+function jsonfail(parts...)
+    throw(DataError(string(parts...), 0))
 end
 
-function jsonvalue(s::Schema, j, budget::Budget, branch::Int)
-    work = defaultwork(s, j, branch, budget)
-    try
-        return jsonvalue(s, j, budget, branch, work.branches, true)
-    finally
-        bytes = defaultbranchbytes(work.branches)
-        bytes > 0 && release!(budget, bytes)
-    end
+# A JSON-quoted string for an error message, truncated when long.
+function describejson(j)
+    j === nothing && return "null"
+    j isa Bool && return string(j)
+    j isa Int64 && return string("the integer ", j)
+    j isa JSONNumber && return string("the number ", quoted(j.text))
+    j isa Float64 && return string("the number ", j)
+    j isa String && return quoted(j)
+    return j isa Vector{Any} ? "an array" : "an object"
 end
 
-function jsonvalue(plan::DefaultPlan, budget::Budget; countdatum::Bool=true,
-                   depth::Int=1)
-    return jsonvalue(plan.schema, plan.json, budget, plan.branch, plan.branches,
-                     countdatum, depth)
-end
-
-function jsonvalue(s::Schema, j, budget::Budget, branch::Int,
-                   branches::Vector{Int}, countdatum::Bool, depth::Int=1)
-    if branch != 0 && s isa UnionSchema
-        isempty(branches) &&
-            throw(DataError(diagnosticstring(budget,
-                                             "resolved default branch tape is empty"), 0))
-        branches[1] == branch ||
-            throw(DataError(diagnosticstring(budget,
-                                             "resolved default branch tape does not match its root"), 0))
-    end
-    position = budget.default_position
-    budget.default_position = 1
-    countdatum || beginworkdefer!(budget)
-    try
-        ctx = JSONContext(budget, false, true, countdatum, branches, true)
-        value = jsontovalue(s, j, ctx, depth)
-        budget.default_position == length(branches) + 1 ||
-            jsonerror(ctx, "resolved default branch tape has trailing entries")
-        return value
-    finally
-        countdatum || endworkdefer!(budget)
-        budget.default_position = position
-    end
-end
-
-function jsonerror(ctx::JSONContext, parts...)
-    throw(DataError(diagnosticstring(ctx.budget, parts...), 0))
-end
-
-function jsontovalue(s::Schema, j, ctx::JSONContext, depth::Int)
-    if ctx.countdatum
-        countvalues!(ctx.budget)
-    else
-        addresolution!(ctx.budget)
-    end
-    return jsonkind(s, j, ctx, depth)
-end
-
-function jsontovalue(s::Schema, j, ctx::JSONContext, depth::Int, branch::Int)
-    ctx.branches === nothing || return jsontovalue(s, j, ctx, depth)
-    (branch == 0 || !(s isa UnionSchema)) && return jsontovalue(s, j, ctx, depth)
-    1 <= branch <= length(s.branches) ||
-        throw(DataError(diagnosticstring(ctx.budget,
-                                         "invalid default union branch ", branch), 0))
-    countvalues!(ctx.budget)                          # the union root omitted by the selected-branch call
-    v = jsontovalue(s.branches[branch], j, ctx, depth)
-    return nullablebranch(s) != 0 ? v : chargedunion(branch, v, ctx)
-end
-
-function jsonkind(::NullSchema, j, ctx, depth)
-    return j === nothing ? missing :
-           jsonerror(ctx, "expected null, got ", describejson(j))
-end
-
-function jsonkind(::BooleanSchema, j, ctx, depth)
-    return j isa Bool ? j :
-           jsonerror(ctx, "expected a boolean, got ", describejson(j))
-end
-
-function jsonkind(s::IntSchema, j, ctx, depth)
-    j isa Int64 || jsonerror(ctx, "expected an integer, got ", describejson(j))
-    typemin(Int32) <= j <= typemax(Int32) ||
-        jsonerror(ctx, "integer ", j, " does not fit int")
-    l = s.logical
-    l isa DateLogical && return DATE_EPOCH + Day(j)
-    if l isa TimeMillis
-        0 <= j < 86_400_000 ||
-            jsonerror(ctx, "time-millis ", j, " is outside one day")
-        return Time(Nanosecond(j * 1_000_000))
-    end
-    return Int32(j)
-end
-
-function jsonkind(s::LongSchema, j, ctx, depth)
-    j isa Int64 || jsonerror(ctx, "expected an integer, got ", describejson(j))
-    l = s.logical
-    if l isa TimeMicros
-        0 <= j < 86_400_000_000 ||
-            jsonerror(ctx, "time-micros ", j, " is outside one day")
-        return Time(Nanosecond(j * 1_000))
-    end
-    l isa TimestampMillis && return Timestamp{Millisecond}(j)
-    l isa TimestampMicros && return Timestamp{Microsecond}(j)
-    l isa TimestampNanos && return Timestamp{Nanosecond}(j)
-    l isa LocalTimestampMillis && return LocalTimestamp{Millisecond}(j)
-    l isa LocalTimestampMicros && return LocalTimestamp{Microsecond}(j)
-    l isa LocalTimestampNanos && return LocalTimestamp{Nanosecond}(j)
-    return j
-end
-
-function jsonkind(::FloatSchema, j, ctx, depth)
-    return jsonfloat(Float32, j, ctx)
-end
-
-function jsonkind(::DoubleSchema, j, ctx, depth)
-    return jsonfloat(Float64, j, ctx)
-end
-
-function jsonfloat(::Type{T}, j, ctx::JSONContext) where {T}
-    j isa Int64 && return T(j)
-    j isa Float64 && return T(j)                 # lenient non-finite tokens
-    j isa JSONNumber && return parsefloat(T, j.text)
-    if j isa String
-        j == "NaN" && return T(NaN)
-        j == "Infinity" && return T(Inf)
-        j == "-Infinity" && return T(-Inf)
-    end
-    return jsonerror(ctx,
-                     "expected a number (or \"NaN\"/\"Infinity\"/\"-Infinity\"), got ",
-                     describejson(j))
-end
-
-function jsonkind(s::BytesSchema, j, ctx, depth)
-    bytes = bytesfromjson(j, -1, ctx)
-    l = s.logical
-    if l isa DecimalLogical
-        try
-            return decimalfromvector(bytes, l, ctx)
-        finally
-            release!(ctx.budget, bytesbytes(length(bytes)))
-        end
-    end
-    return bytes
-end
-
-function jsonkind(s::FixedSchema, j, ctx, depth)
-    bytes = bytesfromjson(j, s.size, ctx)
-    l = s.logical
-    if l isa Union{DecimalLogical,UUIDLogical,DurationLogical}
-        try
-            l isa DecimalLogical && return decimalfromvector(bytes, l, ctx)
-            l isa UUIDLogical && return uuidfrombytes(bytes)
-            l isa DurationLogical && return Duration(le32(bytes, 1), le32(bytes, 5), le32(bytes, 9))
-        finally
-            release!(ctx.budget, bytesbytes(length(bytes)))
-        end
-    end
-    reserve!(ctx.budget, STORAGE[].fixed)
-    value = Fixed(s, bytes, Val(:unchecked))
-    return value
-end
-
-function jsonkind(s::StringSchema, j, ctx, depth)
-    j isa String || jsonerror(ctx, "expected a string, got ", describejson(j))
-    checkvaluebytes(ctx.budget, sizeof(j))
-    isstrictutf8(j) ||
-        jsonerror(ctx, "string is not valid UTF-8 (lone surrogate escape)")
-    if s.logical isa UUIDLogical
-        u = tryparseuuid(j)
-        u === nothing &&
-            jsonerror(ctx, "not an RFC 4122 uuid string: ", boundedquoted(j))
-        return u
-    end
-    if ctx.copystrings
-        return ownedstringcopy(j, ctx.budget)
-    end
-    return j                                           # transfer the parser-owned immutable string
-end
-
-function jsonkind(s::EnumSchema, j, ctx, depth)
-    j isa String ||
-        jsonerror(ctx, "expected an enum symbol string, got ", describejson(j))
-    haskey(s.symbolindex, j) ||
-        jsonerror(ctx, boundedquoted(j), " is not a symbol of enum ", s.name)
-    reserve!(ctx.budget, enumvaluebytes())
-    v = EnumValue(s, Int32(getindex(s.symbolindex, j)), Val(:unchecked))
+# A leaf takes the same JSON values as a schema default; `unknown` says whether a record member that
+# names no field is an error.
+function jsondatum(s::Union{PrimitiveSchema,FixedSchema,EnumSchema}, j, unknown::Bool)
+    v = defaultvalue(s, j)
+    v === nothing && jsonfail("expected ", schemalabel(s), ", got ", describejson(j))
     return v
 end
 
-function jsonkind(s::ArraySchema, j, ctx, depth)
-    j isa JSONArray || jsonerror(ctx, "expected an array, got ", describejson(j))
-    checkdepth(ctx.budget, depth)
-    E = elementtype(s.items)
-    n = length(j)
-    reserve!(ctx.budget, vectorbytes(E, n))
-    out = Vector{E}(undef, n)
-    for i in 1:n
-        out[i] = jsontovalue(s.items, j[i], ctx, depth + 1)
+function jsondatum(s::ArraySchema, j, unknown::Bool)
+    j isa Vector{Any} || jsonfail("expected an array, got ", describejson(j))
+    out = Vector{elementtype(s.items)}(undef, length(j))
+    for i in eachindex(j)
+        out[i] = jsondatum(s.items, j[i], unknown)
     end
     return out
 end
 
-function jsonkind(s::MapSchema, j, ctx, depth)
-    j isa JSONObject || jsonerror(ctx, "expected an object, got ", describejson(j))
-    checkdepth(ctx.budget, depth)
-    V = elementtype(s.values)
-    ks = j.order.data
-    n = length(ks)
-    reserve!(ctx.budget, vectorbytes(String, n) + vectorbytes(V, n))   # buildmap charges the struct and permutation
-    keys = Vector{String}(undef, n)
-    vals = Vector{V}(undef, n)
-    for i in 1:n
-        k = ks[i]
-        checkvaluebytes(ctx.budget, sizeof(k))
-        isstrictutf8(k) ||
-            jsonerror(ctx, "map key is not valid UTF-8 (lone surrogate escape)")
-        if ctx.copystrings
-            keys[i] = ownedstringcopy(k, ctx.budget)
-        else
-            keys[i] = k
-        end
-        vals[i] = jsontovalue(s.values,
-            getindex(j.members, k), ctx, depth + 1)
+function jsondatum(s::MapSchema, j, unknown::Bool)
+    j isa JSON.Object || jsonfail("expected an object, got ", describejson(j))
+    out = Dict{String,elementtype(s.values)}()
+    for (k, v) in j
+        isstrictutf8(k) || jsonfail("map key is not valid UTF-8 (lone surrogate escape)")
+        out[k] = jsondatum(s.values, v, unknown)
     end
-    return buildmap(V, keys, vals, ctx.budget)
+    return out
 end
 
-function jsonkind(s::RecordSchema, j, ctx, depth)
-    j isa JSONObject ||
-        jsonerror(ctx, "expected an object for record ", s.name,
-                  ", got ", describejson(j))
-    checkdepth(ctx.budget, depth)
-    n = length(s.fields)
-    if ctx.unknownerror
-        for k in j.order
-            haskey(s.fieldindex, k) ||
-                jsonerror(ctx, "unknown member ", boundedquoted(k),
-                          " of record ", s.name)
+function jsondatum(s::RecordSchema, j, unknown::Bool)
+    j isa JSON.Object || jsonfail("expected an object for record ", fullname(s), ", got ", describejson(j))
+    if unknown
+        names = Set(f.name for f in s.fields)
+        for k in keys(j)
+            k in names || jsonfail("unknown member ", quoted(k), " of record ", fullname(s))
         end
     end
-    reserve!(ctx.budget, recordbytes(n))
-    vals = Vector{Any}(undef, n)
+    members = memberlookup(j)
+    values = Vector{Any}(undef, length(s.fields))
     for (i, f) in enumerate(s.fields)
-        b = boxcharge(juliatype(f.schema))
-        b > 0 && reserve!(ctx.budget, b)                                # before the assignment can box
-        if haskey(j.members, f.name)
-            vals[i] = jsontovalue(f.schema,
-                getindex(j.members, f.name), ctx, depth + 1)
-        elseif ctx.bareunion && f.default isa DefaultValue
-            default = f.default
-            vals[i] = jsontovalue(f.schema, default.json, ctx, depth + 1,
-                                  default.branch)                            # recursive default rule
-        else
-            jsonerror(ctx, "missing field ", boundedquoted(f.name),
-                      " of record ", s.name)
-        end
+        member = get(() -> jsonfail("missing field ", quoted(f.name), " of record ", fullname(s)), members, f.name)
+        values[i] = jsondatum(f.schema, member, unknown)
     end
-    r = Record(s, vals, Val(:unchecked))
-    return r
+    return Record(s, values, Val(:unchecked))
 end
 
-# A `UnionValue` wrapper charged under the JSON decode budget (shell plus the box an
-# isbits payload takes on assignment into the wrapper's Any field).
-function chargedunion(i::Int, v, ctx)
-    box = isbits(v) ? boxbytes(typeof(v)) : 0
-    reserve!(ctx.budget, unionvaluebytes() + box)
-    u = UnionValue(i, v)
-    return u
-end
-
-function jsonkind(s::UnionSchema, j, ctx, depth)
-    nb = nullablebranch(s)
-    if ctx.branches !== nothing
-        position = ctx.budget.default_position
-        position <= length(ctx.branches) ||
-            jsonerror(ctx, "resolved default branch tape is exhausted")
-        i = ctx.branches[position]
-        1 <= i <= length(s.branches) ||
-            jsonerror(ctx, "resolved default branch tape has an out-of-range entry")
-        ctx.budget.default_position = position + 1
-        v = jsontovalue(s.branches[i], j, ctx, depth)
-        return nb != 0 ? v : chargedunion(i, v, ctx)
-    end
-    if ctx.bareunion
-        for (i, b) in enumerate(s.branches)
-            checkpoint = budgetcheckpoint(ctx.budget)
-            v = try
-                countvalues!(ctx.budget)
-                jsonkind(b, j, ctx, depth)
-            catch e
-                e isa DataError || rethrow()
-                rollbackreservations!(ctx.budget, checkpoint)
-                continue
-            end
-            return nb != 0 ? v : chargedunion(i, v, ctx)
-        end
-        jsonerror(ctx, "no union branch accepts the default ", describejson(j))
-    end
+function jsondatum(s::UnionSchema, j, unknown::Bool)
     if j === nothing
-        i = findfirst(b -> b isa NullSchema, s.branches)
-        i === nothing && jsonerror(ctx, "union has no null branch")
-        countvalues!(ctx.budget)
-        return nb != 0 ? missing : chargedunion(i, missing, ctx)
+        any(b -> b isa NullSchema, s.branches) || jsonfail("union has no null branch")
+        return missing
     end
-    (j isa JSONObject && length(j) == 1) ||
-        jsonerror(ctx, "expected null or a one-member object for a union, got ",
-                  describejson(j))
-    label = j.order[1]
+    (j isa JSON.Object && length(j) == 1) ||
+        jsonfail("expected null or a one-member object for a union, got ", describejson(j))
+    label, value = first(j)
     i = branchbylabel(s, label)
-    i == 0 && jsonerror(ctx, boundedquoted(label),
-                        " names no branch of the union")
-    i == -1 && jsonerror(ctx, "union label ", boundedquoted(label),
-                         " is ambiguous (a named type and a kind share it)")
-    v = jsontovalue(s.branches[i],
-        getindex(j.members, label), ctx, depth)
-    return nb != 0 ? v : chargedunion(i, v, ctx)
-end
-
-function describejson(j)
-    return j === nothing ? "null" : j isa Bool ? "a boolean" : j isa Int64 ? "an integer" : j isa Union{JSONNumber,Float64} ? "a number" :
-           j isa String ? "a string" : j isa JSONArray ? "an array" : "an object"
-end
-
-function bytesfromjson(j, size::Int, ctx::JSONContext)
-    j isa String || jsonerror(ctx, "expected a byte string, got ", describejson(j))
-    isbytestring(j) || jsonerror(ctx, "byte string has code points above U+00FF")
-    n = length(j)
-    size < 0 || n == size ||
-        jsonerror(ctx, "fixed of size ", size, " given ", n, " bytes")
-    checkvaluebytes(ctx.budget, n)
-    reserve!(ctx.budget, bytesbytes(n))
-    out = Vector{UInt8}(undef, n)
-    for (i, c) in enumerate(j)
-        out[i] = UInt8(c)
-    end
-    return out
-end
-
-function decimalfromvector(bytes::Vector{UInt8}, l::DecimalLogical, ctx::JSONContext)
-    isempty(bytes) && jsonerror(ctx, "empty decimal payload")
-    d = Decoder(bytes, ctx.budget)
-    return decimalfrombytes(d, DecimalPlan(0, l.precision, l.scale, l.precision > 38), 1, length(bytes))
-end
-
-function uuidfrombytes(bytes::Vector{UInt8})
-    v = UInt128(0)
-    for b in bytes
-        v = (v << 8) | UInt128(b)
-    end
-    return UUID(v)
-end
-
-function le32(bytes::Vector{UInt8}, i::Int)
-    return UInt32(bytes[i]) | (UInt32(bytes[i + 1]) << 8) | (UInt32(bytes[i + 2]) << 16) | (UInt32(bytes[i + 3]) << 24)
-end
-
-function printkind(out::JSONOut, s::BytesSchema, v::DataDecimals.AbstractDecimal, depth, budget)
-    return printkind(out, s, _decimalinput(v), depth, budget)
+    i == 0 && jsonfail(quoted(label), " names no branch of the union")
+    i == -1 && jsonfail("union label ", quoted(label), " is ambiguous (a named type and a kind share it)")
+    return jsondatum(s.branches[i], value, unknown)
 end
