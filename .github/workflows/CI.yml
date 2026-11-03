@@ -89,6 +89,28 @@ jobs:
         env:
           AVRO_QUALITY_GATES: 'true'
           AVRO_SMOKE: 'true'
+  arrow:
+    # Informational while Arrow.jl 3.0 is unreleased: Arrow and ArrowTypes install from its development branch.
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
+    name: Arrow.jl 3.0 interop (informational)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: '1'
+      - uses: julia-actions/cache@v2
+      - name: Install Arrow.jl 3.0
+        shell: julia --color=yes --project=arrow-env {0}
+        run: |
+          using Pkg
+          url = "https://github.com/apache/arrow-julia"
+          Pkg.add([PackageSpec(; url, rev="core-rewrite", subdir="src/ArrowTypes"), PackageSpec(; url, rev="core-rewrite")])
+          Pkg.develop(PackageSpec(path=pwd()))
+          Pkg.add(["CSV", "DataDecimals", "DataFrames", "Durations", "Tables", "Test"])
+      - name: Run the Arrow tests
+        run: julia --color=yes --project=arrow-env test/arrow.jl
   interop:
     if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
     name: Interop (Java 1.12.2 + fastavro 1.12.2)
