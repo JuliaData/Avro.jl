@@ -278,7 +278,7 @@ function Reader(src; limits::Limits=Limits(), legacy::Union{Nothing,Symbol}=noth
 end
 
 # The finalizer of a reader nobody closed.
-function closeunclosed!(r::Reader)
+@noinline function closeunclosed!(r::Reader)
     r.closed && return nothing
     source = r.source
     r.source = nothing

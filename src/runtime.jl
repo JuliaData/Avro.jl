@@ -28,7 +28,8 @@ end
 const TRIM_CALL_EDGE = Ref(false)
 
 # Run `f(x)` when `x` is collected. `Base.finalizer` takes its function `@nospecialize`, which `juliac --trim`
-# cannot resolve, so this registers it with the runtime directly.
+# cannot resolve, so this registers it with the runtime directly. `f` must be `@noinline`: the runtime calls
+# its compiled method, which an inlined call edge would not leave behind.
 function addfinalizer(f::F, x) where {F}
     TRIM_CALL_EDGE[] && f(x)
     ccall(:jl_gc_add_finalizer_th, Cvoid, (Ptr{Cvoid}, Any, Any), Core.getptls(), x, f)
