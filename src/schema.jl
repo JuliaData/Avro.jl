@@ -293,30 +293,23 @@ function formatpath(path)
     return String(take!(io))
 end
 
-function schemaerror(ctx::ParseContext, msg::AbstractString, segments...)
-    append!(ctx.path, segments)
+# A parse error at the current JSON path extended by `segments`. A parse that throws drops its context, so
+# the parsers push path segments without restoring them on the way out of an error.
+function schemaerror(ctx::ParseContext, msg::AbstractString, segments::Vararg{Union{String,Int},N}) where {N}
+    for segment in segments
+        push!(ctx.path, segment)
+    end
     throw(SchemaError(String(msg), formatpath(ctx.path)))
 end
 
-"Run `f` with `segments` pushed on the JSON path (popped on the way out, exceptions included)."
-function withpath(f, ctx::ParseContext, segments...)
-    n = length(ctx.path)
-    append!(ctx.path, segments)
-    try
-        return f()
-    finally
-        resize!(ctx.path, n)
-    end
-end
-
-const SCHEMA_GRAMMAR = Dict{Symbol,Tuple{Vararg{String}}}(
-    :null => ("type",), :boolean => ("type",), :int => ("type",), :long => ("type",), :float => ("type",),
-    :double => ("type",), :bytes => ("type",), :string => ("type",),
-    :array => ("type", "items"), :map => ("type", "values"),
-    :record => ("type", "name", "namespace", "aliases", "doc", "fields"),
-    :error => ("type", "name", "namespace", "aliases", "doc", "fields"),
-    :enum => ("type", "name", "namespace", "aliases", "doc", "symbols", "default"),
-    :fixed => ("type", "name", "namespace", "aliases", "size"),
+const SCHEMA_GRAMMAR = Dict{Symbol,Vector{String}}(
+    :null => ["type"], :boolean => ["type"], :int => ["type"], :long => ["type"], :float => ["type"],
+    :double => ["type"], :bytes => ["type"], :string => ["type"],
+    :array => ["type", "items"], :map => ["type", "values"],
+    :record => ["type", "name", "namespace", "aliases", "doc", "fields"],
+    :error => ["type", "name", "namespace", "aliases", "doc", "fields"],
+    :enum => ["type", "name", "namespace", "aliases", "doc", "symbols", "default"],
+    :fixed => ["type", "name", "namespace", "aliases", "size"],
 )
 const FIELD_GRAMMAR = ("name", "type", "doc", "default", "order", "aliases")
 
@@ -324,7 +317,7 @@ const FIELD_GRAMMAR = ("name", "type", "doc", "default", "order", "aliases")
 function collectprops(obj::Props, grammar)
     members = Pair{String,Any}[]
     for (k, v) in obj
-        k in grammar || push!(members, k => v)
+        k in grammar || push!(members, member(k, v))
     end
     return isempty(members) ? Props() : Props(members)
 end
@@ -348,14 +341,14 @@ function stringarrayattr(ctx::ParseContext, obj::Props, key::String; required::B
     return out
 end
 
-function checkname(ctx::ParseContext, s::AbstractString, what::AbstractString, segments...)
+function checkname(ctx::ParseContext, s::AbstractString, what::AbstractString, segments::Vararg{Union{String,Int},N}) where {N}
     isvalidname(s) && return nothing
     ctx.allow_invalid_names || schemaerror(ctx, "invalid $what $(quoted(s)) (must match [A-Za-z_][A-Za-z0-9_]*)", segments...)
     ctx.repaired_names = true
     return nothing
 end
 
-function checknamespace(ctx::ParseContext, s::AbstractString, segments...)
+function checknamespace(ctx::ParseContext, s::AbstractString, segments::Vararg{Union{String,Int},N}) where {N}
     isvalidnamespace(s) && return nothing
     ctx.allow_invalid_names || schemaerror(ctx, "invalid namespace $(quoted(s))", segments...)
     ctx.repaired_names = true
@@ -432,20 +425,23 @@ function sourcebytes(io::IO, maxbytes::Int)
     return out
 end
 
-function parsenode(ctx::ParseContext, node, enclosing::String)
+function parsenode(ctx::ParseContext, @nospecialize(node), enclosing::String)
     node isa String && return parsereference(ctx, node, enclosing)
     node isa Vector{Any} && return parseunion(ctx, node, enclosing)
     node isa Props && return parseobjectschema(ctx, node, enclosing)
     schemaerror(ctx, "a schema must be a JSON string, object or array")
 end
 
-function parsenode(ctx::ParseContext, node, enclosing::String, key::String)
-    return withpath(() -> parsenode(ctx, node, enclosing), ctx, key)
+function parsenode(ctx::ParseContext, @nospecialize(node), enclosing::String, key::String)
+    push!(ctx.path, key)
+    s = parsenode(ctx, node, enclosing)
+    pop!(ctx.path)
+    return s
 end
 
 function parsereference(ctx::ParseContext, name::String, enclosing::String)
     name in PRIMITIVE_NAMES && return primitive(ctx, name, Props())
-    dotted = findlast('.', name) !== nothing
+    dotted = lastdot(name) !== nothing
     key = dotted || isempty(enclosing) ? name : string(enclosing, ".", name)
     s = get(ctx.named, key, nothing)
     s === nothing && !isempty(enclosing) &&
@@ -467,15 +463,12 @@ function primitive(ctx::ParseContext, name::String, p::Props)
 end
 
 "A union branch's identity: named branches by fullname, every other branch by its kind."
-function branchidentity(s::Schema)
+function branchidentity(@nospecialize(s::Schema))
     return (s isa NamedSchema, branchidentitylabel(s))
 end
 
-function branchidentitylabel(s::NamedSchema)
-    return fullname(s)
-end
-
-function branchidentitylabel(s::Schema)
+function branchidentitylabel(@nospecialize(s::Schema))
+    s isa NamedSchema && return fullname(s)
     return string(kind(s))
 end
 
@@ -483,15 +476,15 @@ function parseunion(ctx::ParseContext, arr::Vector{Any}, enclosing::String)
     branches = Schema[]
     seen = Set{Tuple{Bool,String}}()
     for (i, b) in enumerate(arr)
-        withpath(ctx, i - 1) do
-            b isa Vector{Any} && schemaerror(ctx, "unions may not immediately contain other unions")
-            s = parsenode(ctx, b, enclosing)
-            s isa UnionSchema && schemaerror(ctx, "unions may not immediately contain other unions")
-            identity = branchidentity(s)
-            identity in seen && schemaerror(ctx, "duplicate union branch $(branchidentitylabel(s))")
-            push!(seen, identity)
-            push!(branches, s)
-        end
+        push!(ctx.path, i - 1)
+        b isa Vector{Any} && schemaerror(ctx, "unions may not immediately contain other unions")
+        s = parsenode(ctx, b, enclosing)
+        s isa UnionSchema && schemaerror(ctx, "unions may not immediately contain other unions")
+        identity = branchidentity(s)
+        identity in seen && schemaerror(ctx, "duplicate union branch $(branchidentitylabel(s))")
+        push!(seen, identity)
+        push!(branches, s)
+        pop!(ctx.path)
     end
     return UnionSchema(branches, newmeta!(ctx))
 end
@@ -522,15 +515,24 @@ end
 
 "The fullname algorithm: a dotted name splits at its last dot; otherwise the namespace attribute, then the enclosing one."
 function resolvefullname(name::AbstractString, namespace::Union{Nothing,AbstractString}, enclosing::AbstractString)
-    dot = findlast('.', name)
+    dot = lastdot(name)
     dot === nothing && return FullName(String(name), String(namespace === nothing ? enclosing : namespace))
     return FullName(String(SubString(name, nextind(name, dot))), String(SubString(name, firstindex(name), prevind(name, dot))))
 end
 
 "An alias normalised against the type's namespace (a dotted alias is already a fullname)."
 function normalizedalias(alias::String, namespace::String)
-    (findlast('.', alias) !== nothing || isempty(namespace)) && return alias
+    (lastdot(alias) !== nothing || isempty(namespace)) && return alias
     return string(namespace, ".", alias)
+end
+
+# `findlast('.', s)` without Base's unspecialised predicate, which `--trim` cannot resolve. A dot is one code
+# unit in every string encoding.
+function lastdot(s::AbstractString)
+    for i in ncodeunits(s):-1:1
+        codeunit(s, i) == UInt8('.') && return i
+    end
+    return nothing
 end
 
 "Normalise `raw` aliases: drop the type's own name and duplicates, keep declaration order."
@@ -596,8 +598,9 @@ function parsefixed(ctx::ParseContext, obj::Props, enclosing::String)
     haskey(obj, "size") || schemaerror(ctx, "fixed schema without \"size\"")
     sz = obj["size"]
     sz isa Int64 && sz >= 0 || schemaerror(ctx, "fixed \"size\" must be a non-negative JSON integer", "size")
+    size = Int(sz::Int64)
     p = collectprops(obj, SCHEMA_GRAMMAR[:fixed])
-    return register!(ctx, FixedSchema(full, aliases, raw, Int(sz), evaluatelogical(:fixed, Int(sz), p), p, newmeta!(ctx)))
+    return register!(ctx, FixedSchema(full, aliases, raw, size, evaluatelogical(:fixed, size, p), p, newmeta!(ctx)))
 end
 
 function parseenum(ctx::ParseContext, obj::Props, enclosing::String)
@@ -635,10 +638,12 @@ function parserecord(ctx::ParseContext, obj::Props, enclosing::String, iserror::
     register!(ctx, rec)                            # register before filling so self-references resolve
     push!(ctx.pending, rec)
     for (i, f) in enumerate(farr)
-        withpath(ctx, "fields", i - 1) do
-            f isa Props || schemaerror(ctx, "each field must be a JSON object")
-            push!(rec.fields, parsefield(ctx, f, full.namespace))
-        end
+        push!(ctx.path, "fields")
+        push!(ctx.path, i - 1)
+        f isa Props || schemaerror(ctx, "each field must be a JSON object")
+        push!(rec.fields, parsefield(ctx, f, full.namespace))
+        pop!(ctx.path)
+        pop!(ctx.path)
     end
     indexfields!(rec, (i, msg, key) -> schemaerror(ctx, msg, "fields", i - 1, key))
     pop!(ctx.pending)
@@ -681,7 +686,7 @@ function parsefield(ctx::ParseContext, obj::Props, ns::String)
     if haskey(obj, "order")
         o = obj["order"]
         o isa String && o in ("ascending", "descending", "ignore") || schemaerror(ctx, "\"order\" must be \"ascending\", \"descending\" or \"ignore\"", "order")
-        order = Symbol(o)
+        order = Symbol(o::String)
     end
     raw = stringarrayattr(ctx, obj, "aliases")
     aliases = raw === nothing ? String[] : fieldaliases(raw, name)
@@ -709,7 +714,7 @@ fields that have their own defaults and ignore unknown members; every other kind
 JSON encoding of a datum. `memo` keeps the work linear however many paths reach a pair. A pair reached
 again while it is being checked is a recursive default with no finite expansion, so it does not match.
 """
-function validatedefault(schema::Schema, json, memo::DefaultMemo=DefaultMemo())
+function validatedefault(@nospecialize(schema::Schema), @nospecialize(json), memo::DefaultMemo=DefaultMemo())
     json isa Union{Props,Vector{Any}} || return checkdefault(schema, json, memo)
     key = (objectid(schema), objectid(json))
     known = get(memo, key, nothing)
@@ -720,39 +725,38 @@ function validatedefault(schema::Schema, json, memo::DefaultMemo=DefaultMemo())
     return result
 end
 
-function checkdefault(schema::Schema, json, memo::DefaultMemo)
-    return (defaultvalue(schema, json) !== nothing, 0)       # a leaf default is valid when it converts
-end
-
-function checkdefault(schema::UnionSchema, json, memo::DefaultMemo)
-    for (i, b) in enumerate(schema.branches)
-        first(validatedefault(b, json, memo)) && return (true, i)
-    end
-    return (false, 0)
-end
-
-function checkdefault(s::ArraySchema, json, memo::DefaultMemo)
-    json isa Vector{Any} || return (false, 0)
-    return (all(x -> first(validatedefault(s.items, x, memo)), json), 0)
-end
-
-function checkdefault(s::MapSchema, json, memo::DefaultMemo)
-    json isa Props || return (false, 0)
-    return (all(kv -> isstrictutf8(kv.first) && first(validatedefault(s.values, kv.second, memo)), json), 0)
-end
-
-function checkdefault(s::RecordSchema, json, memo::DefaultMemo)
-    json isa Props || return (false, 0)
-    members = memberlookup(json)
-    for f in s.fields
-        child = get(members, f.name, nodefault)
-        if child === nodefault                     # unknown members are ignored; omitted fields take their own default
-            f.default isa DefaultValue || return (false, 0)
-            child = f.default.json
+function checkdefault(@nospecialize(schema::Schema), @nospecialize(json), memo::DefaultMemo)
+    if schema isa UnionSchema
+        for (i, b) in enumerate(schema.branches)
+            first(validatedefault(b, json, memo)) && return (true, i)
         end
-        first(validatedefault(f.schema, child, memo)) || return (false, 0)
+        return (false, 0)
+    elseif schema isa ArraySchema
+        json isa Vector{Any} || return (false, 0)
+        for x in json
+            first(validatedefault(schema.items, x, memo)) || return (false, 0)
+        end
+        return (true, 0)
+    elseif schema isa MapSchema
+        json isa Props || return (false, 0)
+        for (k, v) in json
+            isstrictutf8(k) && first(validatedefault(schema.values, v, memo)) || return (false, 0)
+        end
+        return (true, 0)
+    elseif schema isa RecordSchema
+        json isa Props || return (false, 0)
+        members = memberlookup(json)
+        for f in schema.fields
+            child = get(members, f.name, nodefault)
+            if child === nodefault                     # unknown members are ignored; omitted fields take their own default
+                f.default isa DefaultValue || return (false, 0)
+                child = f.default.json
+            end
+            first(validatedefault(f.schema, child, memo)) || return (false, 0)
+        end
+        return (true, 0)
     end
-    return (true, 0)
+    return (defaultvalue(schema, json) !== nothing, 0)       # a leaf default is valid when it converts
 end
 
 # JSON objects scan their members, so looking up many fields goes through an index.
@@ -781,12 +785,12 @@ function invalidgraphdefault!(::Nothing, record::RecordSchema, field::Field)
 end
 
 # Once every record is filled, check each field default and record its union branch.
-function validategraphdefaults!(root::Schema, nodes::Int, ctx::Union{Nothing,ParseContext})
+function validategraphdefaults!(@nospecialize(root::Schema), nodes::Int, ctx::Union{Nothing,ParseContext})
     validategraphdefaultnode!(root, falses(nodes), DefaultMemo(), ctx)
     return root
 end
 
-function validategraphdefaultnode!(schema::Schema, seen::BitVector, memo::DefaultMemo, ctx::Union{Nothing,ParseContext})
+function validategraphdefaultnode!(@nospecialize(schema::Schema), seen::BitVector, memo::DefaultMemo, ctx::Union{Nothing,ParseContext})
     index = Int(nodeid(schema)) + 1
     seen[index] && return nothing
     seen[index] = true
@@ -795,7 +799,9 @@ function validategraphdefaultnode!(schema::Schema, seen::BitVector, memo::Defaul
     elseif schema isa MapSchema
         validategraphdefaultnode!(schema.values, seen, memo, ctx)
     elseif schema isa UnionSchema
-        foreach(branch -> validategraphdefaultnode!(branch, seen, memo, ctx), schema.branches)
+        for branch in schema.branches
+            validategraphdefaultnode!(branch, seen, memo, ctx)
+        end
     elseif schema isa RecordSchema
         for (i, field) in enumerate(schema.fields)
             if field.default isa DefaultValue
@@ -811,7 +817,7 @@ end
 
 # How deep a parsed schema nests as JSON, following references (the edge closing a cycle adds nothing);
 # props and defaults are not counted. Recursive walks of a parsed graph stay within this depth.
-function nesteddepth(s::Schema, known::Vector{Int}, depth::Int, limit::Int)
+function nesteddepth(@nospecialize(s::Schema), known::Vector{Int}, depth::Int, limit::Int)
     i = Int(nodeid(s)) + 1
     known[i] >= 0 && return known[i]
     known[i] = 0
@@ -819,9 +825,13 @@ function nesteddepth(s::Schema, known::Vector{Int}, depth::Int, limit::Int)
     depth + levels > limit && throw(LimitError(:max_depth, depth + levels, limit))
     below = 0
     if s isa RecordSchema
-        below = maximum(f -> nesteddepth(f.schema, known, depth + levels, limit), s.fields; init=0)
+        for f in s.fields
+            below = max(below, nesteddepth(f.schema, known, depth + levels, limit))
+        end
     elseif s isa UnionSchema
-        below = maximum(b -> nesteddepth(b, known, depth + levels, limit), s.branches; init=0)
+        for b in s.branches
+            below = max(below, nesteddepth(b, known, depth + levels, limit))
+        end
     elseif s isa ArraySchema
         below = nesteddepth(s.items, known, depth + levels, limit)
     elseif s isa MapSchema
@@ -834,7 +844,7 @@ end
 
 # ---- finalisation: ids, graph info, least sizes ---------------------------------------------------
 
-function finalize!(ctx::ParseContext, root::Schema)
+function finalize!(ctx::ParseContext, @nospecialize(root::Schema))
     for (i, m) in enumerate(ctx.metas)
         m.id = Int32(i - 1)
     end
@@ -844,7 +854,7 @@ function finalize!(ctx::ParseContext, root::Schema)
 end
 
 # Give every node of the graph at `root` its shared `info`, then its least encoded size.
-function sealgraph!(root::Schema, metas::Vector{NodeMeta}, info::GraphInfo)
+function sealgraph!(@nospecialize(root::Schema), metas::Vector{NodeMeta}, info::GraphInfo)
     for m in metas
         m.graph = info
     end
