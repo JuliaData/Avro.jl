@@ -25,7 +25,6 @@ include("sharedvalues.jl")
     include("jsonencoding.jl")
     include("singleobject.jl")
     include("bytesources.jl")
-    include("arrow.jl")
     include("codecs.jl")
     include("container.jl")
     include("tables.jl")
@@ -58,5 +57,8 @@ include("sharedvalues.jl")
     end
     if get(ENV, "AVRO_SMOKE", "false") == "true"
         include("smoke.jl")
+    end
+    if get(ENV, "AVRO_ARROW", "false") == "true"
+        include("arrow.jl")
     end
 end
