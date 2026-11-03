@@ -851,9 +851,6 @@ function writeblock!(w::Writer, count::Int, compressed::Vector{UInt8}, rawlength
     return nothing
 end
 
-# Never true and not foldable. `juliac --trim` compiles a task body only through a static call to it.
-const TRIM_CALL_EDGE = Ref(false)
-
 "The compression of one emitted block, run as a task body; the finished job is the task's result."
 mutable struct CompressJob
     const codec::WriterCodec
