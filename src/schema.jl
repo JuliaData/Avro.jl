@@ -128,7 +128,7 @@ const PrimitiveSchema = Union{NullSchema,BooleanSchema,IntSchema,LongSchema,Floa
 function schemalabel(s::Schema)
     s isa NamedSchema && return string(kind(s), " ", fullname(s))
     l = s isa Union{IntSchema,LongSchema,BytesSchema,StringSchema} ? s.logical : nothing
-    return l === nothing ? string(kind(s)) : logicalname(l)
+    return l === nothing ? string(kind(s)) : logicalname(l)::String
 end
 
 function kind(s::Schema)
@@ -1075,7 +1075,9 @@ function makeprops(propsin, structural, logical)
         push!(members, ks => tojsonvalue(v))
     end
     if logical !== nothing
-        push!(members, "logicalType" => logicalname(logical))
+        name = logicalname(logical)
+        name === nothing && throw(ArgumentError("no logical type name for $logical"))
+        push!(members, "logicalType" => name)
         if logical isa DecimalLogical
             push!(members, "precision" => Int64(logical.precision))
             push!(members, "scale" => Int64(logical.scale))

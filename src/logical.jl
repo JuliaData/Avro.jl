@@ -39,34 +39,44 @@ struct UnknownLogical <: LogicalType
     name::String
 end
 
-function logicalname(::DecimalLogical)
-    return "decimal"
+"""
+    logicalname(l) -> Union{String,Nothing}
+
+The `logicalType` name of `l`, one of Avro's logical types, or `nothing` for any other `LogicalType`. A
+call with a concrete `l` folds to the name.
+"""
+@inline function logicalname(@nospecialize(l::LogicalType))
+    l isa DecimalLogical && return "decimal"
+    l isa UnknownLogical && return l.name
+    l isa UUIDLogical && return "uuid"
+    l isa DateLogical && return "date"
+    l isa TimeMillis && return "time-millis"
+    l isa TimeMicros && return "time-micros"
+    l isa TimestampMillis && return "timestamp-millis"
+    l isa TimestampMicros && return "timestamp-micros"
+    l isa TimestampNanos && return "timestamp-nanos"
+    l isa LocalTimestampMillis && return "local-timestamp-millis"
+    l isa LocalTimestampMicros && return "local-timestamp-micros"
+    l isa LocalTimestampNanos && return "local-timestamp-nanos"
+    l isa DurationLogical && return "duration"
+    return nothing
 end
 
-function logicalname(l::UnknownLogical)
-    return l.name
-end
-
-function logicalname(l::LogicalType)
-    for (name, (logical, _)) in SIMPLE_LOGICALS
-        logical === l && return name
-    end
-    throw(ArgumentError("no logical type name for $l"))
-end
-
-const SIMPLE_LOGICALS = Dict{String,Tuple{LogicalType,Tuple{Vararg{Symbol}}}}(
-    "uuid" => (UUIDLogical(), (:string, :fixed)),
-    "date" => (DateLogical(), (:int,)),
-    "time-millis" => (TimeMillis(), (:int,)),
-    "time-micros" => (TimeMicros(), (:long,)),
-    "timestamp-millis" => (TimestampMillis(), (:long,)),
-    "timestamp-micros" => (TimestampMicros(), (:long,)),
-    "timestamp-nanos" => (TimestampNanos(), (:long,)),
-    "local-timestamp-millis" => (LocalTimestampMillis(), (:long,)),
-    "local-timestamp-micros" => (LocalTimestampMicros(), (:long,)),
-    "local-timestamp-nanos" => (LocalTimestampNanos(), (:long,)),
-    "duration" => (DurationLogical(), (:fixed,)),
-)
+# The logical types without parameters, by name, with the kinds each may annotate.
+const SIMPLE_LOGICALS = Dict{String,Tuple{LogicalType,Vector{Symbol}}}(
+    logicalname(l)::String => (l, kinds) for (l, kinds) in (
+        (UUIDLogical(), [:string, :fixed]),
+        (DateLogical(), [:int]),
+        (TimeMillis(), [:int]),
+        (TimeMicros(), [:long]),
+        (TimestampMillis(), [:long]),
+        (TimestampMicros(), [:long]),
+        (TimestampNanos(), [:long]),
+        (LocalTimestampMillis(), [:long]),
+        (LocalTimestampMicros(), [:long]),
+        (LocalTimestampNanos(), [:long]),
+        (DurationLogical(), [:fixed]),
+    ))
 
 const LOG10_2_192_HI = UInt64(0x4d104d427de7fbcc)
 const LOG10_2_192_MID = UInt64(0x47c4acd605be48bc)
@@ -109,12 +119,8 @@ function maxdecimalprecision(size::Int)
     return Int(lower)
 end
 
-function jsonint(x::Int64)
-    return x
-end
-
-function jsonint(x)
-    return nothing   # raw (overflowing) tokens and non-integers are not JSON integers that fit Int64
+function jsonint(@nospecialize(x))
+    return x isa Int64 ? x : nothing   # raw (overflowing) tokens and non-integers are not JSON integers that fit Int64
 end
 
 """
