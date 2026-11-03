@@ -292,11 +292,11 @@ end
 
 # ---- recursive descent ---------------------------------------------------------------------------
 
-mutable struct JSONReader{B<:AbstractVector{UInt8}}
+mutable struct JSONReader{B<:AbstractVector{UInt8},F}
     const buf::B
     const n::Int
     const maxdepth::Int
-    const errfn::Any
+    const errfn::F
     pos::Int
     depth::Int
     const lenient::Bool      # accept the non-JSON tokens NaN / Infinity / -Infinity
@@ -431,7 +431,7 @@ function parseobject!(r::JSONReader)
         (r.pos <= r.n && r.buf[r.pos] == UInt8(':')) || r.errfn("expected ':' after object key", r.pos)
         r.pos += 1
         skipws!(r)
-        push!(members, k => parsevalue!(r))
+        push!(members, Pair{String,Any}(k, parsevalue!(r)))
         skipws!(r)
         r.pos <= r.n || r.errfn("unterminated object", r.pos)
         b = r.buf[r.pos]
