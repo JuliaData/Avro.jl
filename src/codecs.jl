@@ -46,7 +46,9 @@ end
 # ---- decompression ----------------------------------------------------------------------------------
 
 function codecmessage(err::TranscodingStreams.Error)
-    return TranscodingStreams.haserror(err) ? sprint(showerror, err[]) : "codec failure"
+    TranscodingStreams.haserror(err) || return "codec failure"
+    e = err[]
+    return e isa ErrorException ? e.msg : "codec failure"
 end
 
 # An exact allocation: `resize!` may reserve more than `cap`.

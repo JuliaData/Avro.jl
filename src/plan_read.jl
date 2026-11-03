@@ -47,18 +47,24 @@ struct ArrayPlan <: Plan
     empty::Vector
 end
 
-function ArrayPlan(items::Plan, eltype::Type, minsize::Int)
-    return ArrayPlan(items, minsize, Vector{eltype}())
+function ArrayPlan(items::Plan, @nospecialize(eltype::Type), minsize::Int)
+    return ArrayPlan(items, minsize, emptyvector(eltype))
 end
 
 struct MapPlan <: Plan
     values::Plan
     minsize::Int
-    empty::Dict{String}
+    empty::Vector             # of the value type, which the decoded `Dict{String,V}` takes
 end
 
-function MapPlan(values::Plan, eltype::Type, minsize::Int)
-    return MapPlan(values, minsize, Dict{String,eltype}())
+function MapPlan(values::Plan, @nospecialize(eltype::Type), minsize::Int)
+    return MapPlan(values, minsize, emptyvector(eltype))
+end
+
+# An empty `Vector{E}` for an `E` known at run time, allocated by the runtime (a `Vector{E}()` call would
+# dispatch on `E`).
+function emptyvector(@nospecialize(E::Type))
+    return ccall(:jl_alloc_array_1d, Any, (Any, Csize_t), Vector{E}, 0)::Vector
 end
 
 struct UnionPlan <: Plan
@@ -359,7 +365,7 @@ function decodemap(p::MapPlan, d::Decoder)
 end
 
 # A function barrier like `decodeitems`; a repeated key keeps its last value.
-function decodeentries(::Dict{String,V}, @nospecialize(values::Plan), minsize::Int, d::Decoder) where {V}
+function decodeentries(::Vector{V}, @nospecialize(values::Plan), minsize::Int, d::Decoder) where {V}
     out = Dict{String,V}()
     return eachblockitem(out, d, satadd(minsize, 1), "map") do dd
         k = readstring(dd)

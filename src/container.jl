@@ -214,7 +214,7 @@ function readheader(s::BlockSource, limits::Limits; legacy, allow_invalid_names:
         (sourceeof(s) || sourcebyte(s) != m) && throw(DataError("not an Avro object container file (bad magic)", position(s)))
     end
     metadata = readmetadata(s, limits)
-    sync = ntuple(_ -> sourcebyte(s), 16)
+    sync = ntuple(_ -> sourcebyte(s), Val(16))
     schemabytes = get(metadata, "avro.schema", nothing)
     schemabytes === nothing && throw(DataError("the container has no avro.schema", position(s)))
     schema = parseschemaimpl(schemabytes, legacy === :avrojl1; allow_invalid_names=allow_invalid_names,

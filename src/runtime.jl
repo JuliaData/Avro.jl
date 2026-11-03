@@ -5,7 +5,10 @@
 # `f(args...)` dispatched when called. `juliac --trim` neither compiles nor verifies such a call, so the code
 # it reaches stays out of trimmed programs, where it raises a `MethodError` for `f` instead (`notcompiled`).
 Base.@nospecializeinfer function runtimecall(f, @nospecialize(args...))
-    argv = Any[args...]
+    argv = Vector{Any}(undef, length(args))
+    for i in eachindex(argv)
+        argv[i] = args[i]
+    end
     return GC.@preserve argv ccall(:jl_apply_generic, Any, (Any, Ptr{Any}, UInt32), f, pointer(argv), UInt32(length(argv)))
 end
 
@@ -13,12 +16,11 @@ function notcompiled(err, f)
     return err isa MethodError && err.f === f
 end
 
-# `f(io, args...)` for the stream types programs mostly read and write (files, in-memory buffers, pipes);
-# other `IO` types dispatch at run time.
+# `f(io, args...)` for the stream types programs mostly read and write (files and in-memory buffers); other
+# `IO` types dispatch at run time.
 @inline function streamcall(f::F, io::IO, args...) where {F}
     io isa IOStream && return f(io, args...)
     io isa IOBuffer && return f(io, args...)
-    io isa Base.PipeEndpoint && return f(io, args...)
     return runtimecall(f, io, args...)
 end
 
