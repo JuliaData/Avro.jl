@@ -405,8 +405,9 @@ Avro.lookup(c::LyingStore, ::UInt64) = c.schema
         io = IOBuffer()
         Arrow.write(io, Tables.partitioner([(a=[1, 2],), (a=[3],)]))
         @test Avro.Table(Avro.tobuffer(Arrow.Stream(take!(io)))).a == [1, 2, 3]
-        chunks = CSV.Chunks(IOBuffer("a,b\n1,x\n2,y\n"); ntasks=1)
-        @test Avro.Table(Avro.tobuffer(chunks)).b == ["x", "y"]
+        csvrows = 1:200                                          # CSV 0.10 checks 30 rows past each chunk start
+        chunks = CSV.Chunks(IOBuffer("a,b\n" * join(("$i,x$i\n" for i in csvrows))); ntasks=2)
+        @test Avro.Table(Avro.tobuffer(chunks)).b == ["x$i" for i in csvrows]
         # a row whose properties are its columns
         @test Avro.decode(person, Avro.encode(person, df[2, :])).name == "b"
         counter = DataFrames.DataFrame(rownumber=[100, 200])

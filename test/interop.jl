@@ -189,12 +189,8 @@ end
         return a isa Bool || b isa Bool ? isequal(a, b) : (isequal(a, b) || a == b)
     end
 
-    function looseeq(a::Avro.EnumValue, b::AbstractString)
-        return String(a) == b
-    end
-
-    function looseeq(a::AbstractString, b::Avro.EnumValue)
-        return a == String(b)
+    function looseeq(a::AbstractString, b::AbstractString)       # an `Avro.EnumValue` against its symbol
+        return String(a) == String(b)
     end
 
     function looseeq(a::AbstractVector, b::AbstractVector)
