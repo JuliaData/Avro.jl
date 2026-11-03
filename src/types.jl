@@ -16,6 +16,8 @@ The Avro name and namespace derived for a Julia type (overridable). Default: `na
 module path as namespace; parametric types append `_` and the sanitised parameter spelling
 (`Box{Int64}` → `Box_Int64`, `Dict{String,Vector{Int64}}` → `Dict_String_Vector_Int64`; names over 128
 bytes keep their first 100 characters and append `_` plus 16 hex digits of the SHA-256 of `string(T)`).
+Deriving the parameter spelling needs run-time type printing, which `juliac --trim` does not compile. A
+trimmed program overrides `avroname` for the parametric types it derives schemas for.
 """
 function avroname(::Type{T}) where {T}
     base = string(nameof(T))
@@ -51,7 +53,14 @@ function sanitize(s::String)
 end
 
 function modulepath(m::Module)
-    return join(string.(Base.fullname(m)), ".")
+    io = IOBuffer()
+    dot = false
+    for part in Base.fullname(m)
+        dot && print(io, '.')
+        print(io, part)
+        dot = true
+    end
+    return String(take!(io))
 end
 
 """
@@ -64,7 +73,7 @@ function avrosymbol(::Type{E}, x::E) where {E<:Base.Enum}
 end
 
 "A bounded spelling of a type for error messages: long parameter lists keep 100 characters plus a digest."
-function typedescription(::Type{T}) where {T}
+function typedescription(@nospecialize(T::Type))
     s = string(T)
     sizeof(s) <= 128 && return s
     return string(first(s, 100), "#", bytes2hex(SHA.sha256(s))[1:16])
@@ -114,11 +123,33 @@ function schema(::Type{T}; name=nothing, namespace=nothing) where {T}
     return finalizepublic!(derive(ctx, T, name, namespace))
 end
 
-const LOGICAL_LONG = Dict{Type,LogicalType}(
-    Timestamp{Millisecond} => TimestampMillis(), Timestamp{Microsecond} => TimestampMicros(), Timestamp{Nanosecond} => TimestampNanos(),
-    LocalTimestamp{Millisecond} => LocalTimestampMillis(), LocalTimestamp{Microsecond} => LocalTimestampMicros(),
-    LocalTimestamp{Nanosecond} => LocalTimestampNanos(),
-)
+# The `long` logical type of a timestamp type, or `nothing`. Every concrete `Durations.ZonedTimestamp` is an
+# instant. The result is a constant for a constant `T`.
+function timestamplogical(::Type{T}) where {T}
+    T === LocalTimestamp{Millisecond} && return LocalTimestampMillis()
+    T === LocalTimestamp{Microsecond} && return LocalTimestampMicros()
+    T === LocalTimestamp{Nanosecond} && return LocalTimestampNanos()
+    (T <: Durations.ZonedTimestamp && isconcretetype(T)) || return nothing
+    P = T.parameters[1]
+    P === Millisecond && return TimestampMillis()
+    P === Microsecond && return TimestampMicros()
+    P === Nanosecond && return TimestampNanos()
+    return nothing
+end
+
+# Calls `f(name, FT)` for each field of `T` in declaration order, with the field type as a constant. A loop
+# over `fieldtypes(T)` would derive each field's schema from a type known only at run time.
+@generated function foreachfield(f::F, ::Type{T}) where {F,T}
+    calls = [:(f($(QuoteNode(fieldname(T, i))), $(fieldtype(T, i)))) for i in 1:fieldcount(T)]
+    return Expr(:block, calls..., nothing)
+end
+
+# Calls `f(i, M)` for the `i`th member type `M` of the union `U` in `Base.uniontypes` order, with `M` as a
+# constant.
+@generated function foreachuniontype(f::F, ::Type{U}) where {F,U}
+    calls = [:(f($i, $M)) for (i, M) in enumerate(Base.uniontypes(U))]
+    return Expr(:block, calls..., nothing)
+end
 
 function derive(ctx::DeriveContext, ::Type{T}, name, namespace) where {T}
     existing = get(ctx.derived, T, nothing)
@@ -144,9 +175,8 @@ function deriveimpl(ctx::DeriveContext, ::Type{T}, name, namespace) where {T}
     T === Date && return logicalprimitive(IntSchema, DateLogical())
     T === Time && return logicalprimitive(LongSchema, TimeMicros())
     T === DateTime && return logicalprimitive(LongSchema, LocalTimestampMillis())
-    haskey(LOGICAL_LONG, T) && return logicalprimitive(LongSchema, LOGICAL_LONG[T])
-    T <: Durations.ZonedTimestamp && isconcretetype(T) && haskey(LOGICAL_LONG, Timestamp{T.parameters[1]}) &&
-        return logicalprimitive(LongSchema, LOGICAL_LONG[Timestamp{T.parameters[1]}])
+    tl = timestamplogical(T)
+    tl === nothing || return logicalprimitive(LongSchema, tl)
     T <: DataDecimals.Decimal && return BytesSchema(; logical=DecimalLogical(precision(T), DataDecimals.scale(T)))
     (T === Durations.Duration || T === Duration) &&
         return namedfixed(ctx, "Duration", namespace === nothing ? "" : namespace, 12, DurationLogical(), T)
@@ -190,7 +220,7 @@ end
 function namedfixed(ctx::DeriveContext, name::AbstractString, namespace::AbstractString, size::Int, logical, ::Type{T}) where {T}
     full = FullName(checkderivedname(name, "name", "pass an explicit schema"), checkderivednamespace(namespace))
     existing = get(ctx.named, fullname(full), nothing)
-    existing === nothing || return registerderived!(ctx, existing, T)
+    existing === nothing || return registerderived!(ctx, existing::NamedSchema, T)
     p = makeprops((;), SCHEMA_GRAMMAR[:fixed], logical)
     return registerderived!(ctx, FixedSchema(full, String[], String[], size, logical, p, NodeMeta()), T)
 end
@@ -208,7 +238,7 @@ end
 function deriveenum(ctx::DeriveContext, ::Type{E}, name, namespace) where {E<:Base.Enum}
     full = derivedname(E, name, namespace)
     existing = get(ctx.named, fullname(full), nothing)
-    existing === nothing || return registerderived!(ctx, existing, E)
+    existing === nothing || return registerderived!(ctx, existing::NamedSchema, E)
     syms = String[]
     index = Dict{String,Int}()
     for inst in instances(E)
@@ -223,21 +253,22 @@ end
 
 function deriveunion(ctx::DeriveContext, ::Type{U}, namespace) where {U}
     members = Base.uniontypes(U)
-    if length(members) == 2 && Missing in members && !(Nothing in members)
-        other = members[1] === Missing ? members[2] : members[1]
-        return UnionSchema(Schema[derive(ctx, Missing, nothing, namespace), derive(ctx, other, nothing, namespace)], NodeMeta())
+    if length(members) == 2 && any(m -> m === Missing, members) && !any(m -> m === Nothing, members)
+        return UnionSchema(Schema[derive(ctx, Missing, nothing, namespace), derive(ctx, Base.nonmissingtype(U), nothing, namespace)], NodeMeta())
     end
     bs = Schema[]
     seen = Dict{Tuple{Bool,String},Int}()
-    for (i, m) in enumerate(members)
-        s = derive(ctx, m, nothing, namespace)
-        s isa UnionSchema && throw(ArgumentError("union member $(typedescription(m)) derives a union; Avro unions cannot nest"))
+    branch! = function (i::Int, ::Type{M}) where {M}
+        s = derive(ctx, M, nothing, namespace)
+        s isa UnionSchema && throw(ArgumentError("union member $(typedescription(M)) derives a union; Avro unions cannot nest"))
         identity = branchidentity(s)
         previous = get(seen, identity, 0)
-        previous == 0 || throw(ArgumentError("union members $(typedescription(members[previous])) and $(typedescription(m)) both map to the Avro branch \"$(branchidentitylabel(s))\"; Avro unions cannot repeat a kind — use a named type or an explicit `schema=`"))
+        previous == 0 || throw(ArgumentError("union members $(typedescription(members[previous]::Type)) and $(typedescription(M)) both map to the Avro branch \"$(branchidentitylabel(s))\"; Avro unions cannot repeat a kind — use a named type or an explicit `schema=`"))
         seen[identity] = i
         push!(bs, s)
+        return nothing
     end
+    foreachuniontype(branch!, U)
     return UnionSchema(bs, NodeMeta())
 end
 
@@ -250,10 +281,12 @@ function derivenamedtuple(ctx::DeriveContext, ::Type{T}, name, namespace) where 
     haskey(ctx.named, fullname(full)) && throw(ArgumentError("the Avro name \"$(fullname(full))\" is derived twice"))
     rec = RecordSchema(full, String[], String[], nothing, false, Props(), NodeMeta())
     registerderived!(ctx, rec, T)
-    for (fname, ftype) in zip(fieldnames(T), fieldtypes(T))
+    field! = function (fname::Symbol, ::Type{FT}) where {FT}
         fn = checkderivedname(fname, "field name", "rename the field")
-        push!(rec.fields, Field(fn, derive(ctx, ftype, nothing, full.namespace), nothing, nodefault, :ascending, String[], Props()))
+        push!(rec.fields, Field(fn, derive(ctx, FT, nothing, full.namespace), nothing, nodefault, :ascending, String[], Props()))
+        return nothing
     end
+    foreachfield(field!, T)
     return indexfields!(rec, (i, msg, key) -> throw(ArgumentError(msg)))
 end
 
@@ -270,23 +303,25 @@ end
 function derivestruct(ctx::DeriveContext, ::Type{T}, name, namespace) where {T}
     full = derivedname(T, name, namespace)
     existing = get(ctx.named, fullname(full), nothing)
-    existing === nothing || return registerderived!(ctx, existing, T)
+    existing === nothing || return registerderived!(ctx, existing::NamedSchema, T)
     tags = StructUtils.fieldtags(AvroStyle(), T)
     defaults = StructUtils.fielddefaults(AvroStyle(), T)
     rec = RecordSchema(full, String[], String[], nothing, false, Props(), NodeMeta())
     registerderived!(ctx, rec, T)
-    for (i, fname) in enumerate(fieldnames(T))
+    field! = function (fname::Symbol, ::Type{FT}) where {FT}
         tagged = fieldtag(tags, fname, :name)
         fn = checkderivedname(tagged === nothing ? fname : tagged, "field name", "tag the field with `&(avro=(name=\"…\",),)`")
-        fs = derive(ctx, fieldtype(T, i), nothing, full.namespace)
+        fs = derive(ctx, FT, nothing, full.namespace)
         d = structdefault(T, fname, fs, fieldtag(tags, fname, :default), defaults)
         push!(rec.fields, Field(fn, fs, nothing, d, :ascending, String[], Props()))
+        return nothing
     end
+    foreachfield(field!, T)
     return indexfields!(rec, (i, msg, key) -> throw(ArgumentError(msg)))
 end
 
 "A struct field's default: the `avro=(default=…,)` tag first, then the StructUtils field default."
-function structdefault(::Type{T}, fname::Symbol, fs::Schema, tagdefault, defaults) where {T}
+function structdefault(::Type{T}, fname::Symbol, @nospecialize(fs::Schema), tagdefault, defaults) where {T}
     if tagdefault !== nothing
         j = tojsonvalue(tagdefault)
         ok, branch = validatedefault(fs, j)
