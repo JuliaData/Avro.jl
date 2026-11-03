@@ -191,3 +191,24 @@ end
     @info "compile-cost gate" specializations=before new=after - before rss_growth_mb=round(growth; digits=1)
     @test growth < 50
 end
+
+# Allocation counts do not depend on the host, so these gates run everywhere; the timing gates stay opt-in in
+# test/perf.jl. Each measurement runs in its own function, so the testset compiles none of it.
+function parseallocations(json::String)
+    Avro.parseschema(json)
+    return @allocations Avro.parseschema(json)
+end
+
+function decodeallocations(reader, bytes::Vector{UInt8})
+    reader(bytes)
+    return @allocations reader(bytes)
+end
+
+@testset "allocation gates" begin
+    avsc = read(joinpath(FIXTURES, "apache", "interop.avsc"), String)
+    @test parseallocations(avsc) <= 1000                                    # 792 on Julia 1.12
+    s = Avro.parseschema("""{"type":"record","name":"Bench","fields":[{"name":"id","type":"long"},
+        {"name":"x","type":"double"},{"name":"name","type":"string"},{"name":"flag","type":"boolean"}]}""")
+    T = @NamedTuple{id::Int64, x::Float64, name::String, flag::Bool}
+    @test decodeallocations(Avro.DatumReader(s, T), Avro.encode(s, (id=1, x=2.0, name="abcd", flag=true))) <= 1   # the string
+end
