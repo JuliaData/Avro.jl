@@ -62,8 +62,8 @@ value = Avro.decode(s, bytes)
 * **Natural values**: maps are `Dict`s, nullable unions are `Union{Missing,T}`, other unions decode to
   the bare branch value, enum values are strings, fixed values are byte vectors, and timestamps are exact
   Durations.jl date-times (`Durations.ZonedTimestamp{P,:UTC}` for instants, `Durations.Timestamp{P}` for
-  local times) that round-trip through Arrow.jl natively. Nested records write as Arrow struct columns, and
-  `TimeZones.ZonedDateTime` reads and writes as an instant.
+  local times) that round-trip through Arrow.jl 3 natively. Nested records write as Arrow struct columns typed
+  by their schema, and `TimeZones.ZonedDateTime` reads and writes as an instant.
 * **Parallel decoding**: `Avro.Table(src; ntasks=…)` decodes blocks straight into preallocated columns;
   results and errors match `ntasks=1`.
 * **Safety by default**: claimed lengths and counts are checked against the input before allocation,

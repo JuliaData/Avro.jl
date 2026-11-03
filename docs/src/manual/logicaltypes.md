@@ -29,20 +29,18 @@ of another unit converts exactly or raises `Avro.ConversionError`.
 
 ## Arrow integration
 
-Durations.jl's own Arrow extension writes these timestamps as native Arrow timestamp columns in their
-original unit: global instants with the `UTC` time zone, local timestamps without one. Other Arrow
-implementations see ordinary timestamp columns; Julia readers with Durations loaded get the same types
-back:
+Arrow.jl 3 writes these timestamps as Arrow timestamp columns in their own unit: global instants with the
+time zone `UTC`, local timestamps without one. It reads them back as the same Durations.jl types, and other
+Arrow readers see ordinary timestamp columns:
 
 ```julia
 using Avro, Arrow
 Arrow.write("events.arrow", Avro.Table("events.avro"))
 ```
 
-Nested records become Arrow struct columns, enums become strings and fixed values become byte lists, and
-they all read back as those plain Arrow types. Decimals and durations become struct columns of their fields,
-and a UUID nested in a record becomes its text. Arrow.jl cannot store a [`Avro.WideDecimal`](@ref), which holds
-a `BigInt`, or a top-level column of maps whose values are not leaves, so convert those first.
+Dates, times, UUIDs and durations have Arrow types of their own, and a decimal inside a record becomes an
+Arrow decimal of its schema's precision and scale. [Arrow.jl](@ref arrow-jl) lists the Arrow type of each Avro
+type.
 
 Deviations from other implementations, in favour of the specification, are recorded in
 [Limits and security](limits-and-security.md): decimal precision is validated on decode as well as

@@ -33,8 +33,9 @@ logical type is preserved as an unknown annotation and is deferred.
   may be strings; a table column the schema lacks is an error rather than a silent drop.
 - `Avro.SingleObjectReader` and `Avro.SingleObjectWriter`: prepared single-object codecs for message streams.
 - `references=` on `Avro.parseschema`, for named types shared across schema files.
-- With Arrow.jl loaded, nested `Avro.Record` columns write as Arrow struct columns; with TimeZones.jl loaded,
-  `ZonedDateTime` reads and writes as an instant.
+- With Arrow.jl 3 loaded, nested `Avro.Record` columns write as Arrow struct columns typed by their schema, with
+  their decimals as Arrow decimals; `Avro.Duration` values write as Arrow intervals.
+- With TimeZones.jl loaded, `ZonedDateTime` reads and writes as an instant.
 - Projection pushdown: `select=` on `Avro.Table` and `Avro.Rows` skips unselected fields and derives
   an effective schema that `Avro.write` round-trips.
 - Parallel container decoding: `Avro.Table(src; ntasks=…)` decodes blocks straight into preallocated

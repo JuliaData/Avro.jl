@@ -28,9 +28,11 @@ use `Avro.schema(t)` and `Avro.metadata(t)` to inspect file information.
 
 `close(rows)` releases the source (do-block form available). `Avro.write(dst, Avro.Rows(src))` re-encodes
 one block at a time with bounded memory. `Tables.partitions(rows)` yields one `Avro.Table` per block when
-the schema fixes every column's value types, so `Arrow.write(path, Avro.Rows(src))` streams too. A union of
-several kinds or a nested record leaves a column's types to its values, and a sink such as Arrow.jl needs
-every batch to agree, so such rows are one partition, read fully when the sink asks for columns.
+the schema fixes every column's value types, so `Arrow.write(path, Avro.Rows(src))` streams too, one record
+batch per block. Arrow.jl then declares every field nullable, as it does for any source that may have several
+partitions, so those columns read back as `Union{Missing,T}`. A union of several kinds or a nested record
+leaves a column's types to its values, and a sink such as Arrow.jl needs every batch to agree, so such rows
+are one partition, read fully when the sink asks for columns.
 Rows are consumed once. For bytes and memory-mapped files, `length(rows)` reports the number still
 available; it decreases as rows or partitions are consumed. Streamed sources have no known length.
 
@@ -69,17 +71,12 @@ overheads amortise.
 df = DataFrame(Avro.Table("data.avro"))      # file metadata travels as DataFrame metadata
 Avro.write("out.avro", df; schema=Avro.schema(Avro.Table("data.avro")))
 Avro.write("out.avro", CSV.File("data.csv"); codec=:zstandard)
-Arrow.write("data.arrow", Avro.Table("data.avro"))
-Avro.write("out.avro", Arrow.Table("data.arrow"))
 rows = Tables.rowtable(Avro.Table("data.avro"))
 ```
 
 Most decoded values fit those packages without conversion. An [`Avro.EnumValue`](@ref) is a string, so
 `row.suit == "HEARTS"` holds, and `JSON.json` and `CSV.write` give the symbol. An [`Avro.Fixed`](@ref) is a byte
-vector: `JSON.json` gives its bytes. With Arrow.jl loaded, a nested [`Avro.Record`](@ref) column is written as an
-Arrow struct column whose type comes from the record's schema. A recursive record, a column mixing two record
-types, and a top-level map whose values are maps, arrays or unions have no Arrow type, so Arrow.jl raises an
-error for them.
+vector: `JSON.json` gives its bytes. [Arrow.jl](@ref arrow-jl) lists the Arrow type of each Avro type.
 
 A table's schema derives from its column types. An abstract column type such as `Any` becomes the union of
 the types its values hold, and rows of differing types become the union of what each column holds. A column of
@@ -91,3 +88,53 @@ With TimeZones.jl loaded, `ZonedDateTime` is an instant of millisecond resolutio
 `timestamp-millis` and it encodes under any `timestamp-*` schema. It is also a typed target, as in
 `Avro.Rows(src, @NamedTuple{at::ZonedDateTime})`, which gives the time in UTC, floored to milliseconds like
 a `DateTime` target.
+
+## [Arrow.jl](@id arrow-jl)
+
+Avro.jl works with Arrow.jl 3. `Arrow.write` takes an `Avro.Table` or an `Avro.Rows`, and `Avro.write` takes an
+`Arrow.Table` or an `Arrow.Stream`:
+
+```julia
+Arrow.write("data.arrow", Avro.Table("data.avro"))
+Avro.write("out.avro", Arrow.Table("data.arrow"))
+```
+
+With Arrow.jl loaded, Avro.jl gives each nested [`Avro.Record`](@ref) the struct type its schema describes, so a
+record column has one Arrow type in every row. Each Avro type writes as one Arrow type:
+
+| Avro type | Arrow type |
+|---|---|
+| `null` | Null |
+| `boolean`, `int`, `long`, `float`, `double` | Bool, Int32, Int64, Float32, Float64 |
+| `string`, `enum` | Utf8 |
+| `bytes`, `fixed` | Binary |
+| `uuid` | the canonical `arrow.uuid` extension type |
+| `date` | Date32 |
+| `time-millis`, `time-micros` | Time64 in nanoseconds |
+| `timestamp-millis`, `-micros`, `-nanos` | Timestamp in the same unit, with the time zone `UTC` |
+| `local-timestamp-millis`, `-micros`, `-nanos` | Timestamp in the same unit, without a time zone |
+| `duration` | Interval in months, days and nanoseconds |
+| `decimal` inside a record | Decimal128 of the schema's precision and scale, or Decimal256 above 38 digits |
+| `array` | List |
+| `map` | Map with Utf8 keys |
+| `record` | Struct of the schema's fields |
+| `["null", T]` | the Arrow type of `T`, nullable |
+| another union inside a record | a dense Union of its branches' Arrow types, or the one type they share |
+
+A top-level column of unions with several kinds, or of arrays or maps that hold arrays, maps or unions, takes its
+Arrow type from the values it holds. Values of one kind write as that kind's Arrow type, and values of several
+kinds as a dense Union of them.
+
+A decimal outside a record is an `Avro.Decimal` or an `Avro.WideDecimal`, which carries a scale but no
+precision. Arrow.jl writes an `Avro.Decimal` as a struct of its unscaled value and scale. To write an Arrow
+decimal instead, give the column a precision first, as in `DataDecimals.Decimal{9,2}.(t.price)`.
+
+Arrow.jl raises an error for a value that has no Arrow type:
+
+* a decimal of more than 76 digits, or an `Avro.WideDecimal` outside a record;
+* a duration of more than 2,147,483,647 months or days;
+* a recursive record;
+* a column that takes its Arrow type from its values but holds none to type it, as in an empty file.
+
+Arrow.jl reads these columns back as its own types, and `Avro.write` derives a schema from them, so timestamps,
+dates, times, UUIDs, decimals and durations keep their logical types on the way back to Avro.
