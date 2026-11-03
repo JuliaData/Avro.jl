@@ -9,6 +9,7 @@ import DataDecimals
 
 const FIXTURES = joinpath(@__DIR__, "fixtures")
 include("valuegen.jl")
+include("helpers.jl")
 
 include("sharedvalues.jl")
 

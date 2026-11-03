@@ -58,7 +58,7 @@ function checkorderable(s::Schema, visited::Vector{Bool}=schemaseen(s))
     return nothing
 end
 
-function comparevalue(s::Schema, p::ReadPlan, da::Decoder, db::Decoder)
+function comparevalue(s::Schema, p::Plan, da::Decoder, db::Decoder)
     countvalue!(da)
     countvalue!(db)
     return comparekind(s, p, da, db)

@@ -117,7 +117,7 @@ creating a result vector per call; `writer(e::Avro.Encoder, x)` appends to a cal
 form fixes the datum type `T`, which is the fastest path when `T` is a NamedTuple or struct whose fields
 align with the record schema. Reused buffers may still grow when a larger value is written.
 """
-mutable struct DatumWriter{P<:WritePlan,T,FP}
+mutable struct DatumWriter{P<:Plan,T,FP}
     const schema::Schema
     const plan::P
     const encoder::Encoder

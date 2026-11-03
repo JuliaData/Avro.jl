@@ -11,14 +11,14 @@ struct Projection
 end
 
 # A kept field decoded by its plan `P` into `data`, whose first `len` rows are filled.
-mutable struct TypedColumn{E,P<:ReadPlan} <: ColumnBuilder
+mutable struct TypedColumn{E,P<:Plan} <: ColumnBuilder
     const plan::P
     data::Vector{E}
     len::Int
 end
 
 # A field that is not kept: skipped (and checked) by its concrete plan.
-struct SkipColumn{P<:ReadPlan} <: ColumnBuilder
+struct SkipColumn{P<:Plan} <: ColumnBuilder
     plan::P
 end
 
@@ -26,7 +26,7 @@ end
 # check and its values counted in bulk; otherwise each member is skipped through the closed leaf
 # instruction set (`SKIP_FALLBACK` skips through the member's plan).
 struct SkipRun <: ColumnBuilder
-    plans::Vector{ReadPlan}
+    plans::Vector{Plan}
     kinds::Vector{UInt8}
     width::Int              # the run's total fixed width, or -1 when a member is not fixed-width
 end
@@ -40,7 +40,7 @@ const SKIP_BOOL = UInt8(5)
 const SKIP_FLOAT = UInt8(6)
 const SKIP_NULL = UInt8(7)
 
-function skipkind(@nospecialize(p::ReadPlan))
+function skipkind(@nospecialize(p::Plan))
     return p isa Union{StringPlan,BytesPlan} ? SKIP_LENGTH :
         p isa DoublePlan ? SKIP_DOUBLE :
         p isa Union{LongPlan,TimestampPlan,LocalTimestampPlan} ? SKIP_LONG :
@@ -51,7 +51,7 @@ function skipkind(@nospecialize(p::ReadPlan))
 end
 
 # The fixed encoded width of a skipped leaf, or -1 (varints, length-prefixed and nested values).
-function skipwidth(@nospecialize(p::ReadPlan))
+function skipwidth(@nospecialize(p::Plan))
     return p isa NullPlan ? 0 :
         p isa FloatPlan ? 4 :
         p isa DoublePlan ? 8 :
@@ -72,7 +72,7 @@ function fuseskips(cols::Vector{ColumnBuilder})
             j += 1
         end
         if j - i >= 2
-            plans = ReadPlan[(cols[k]::SkipColumn).plan for k in i:j - 1]
+            plans = Plan[(cols[k]::SkipColumn).plan for k in i:j - 1]
             width = 0
             for p in plans
                 w = skipwidth(p)
@@ -95,7 +95,7 @@ end
 
 # One builder per output field: a `TypedColumn` with room for `capacity` rows for every field the
 # projection keeps (`nothing` keeps all), a `SkipColumn` otherwise.
-function columnbuilders(p::ReadPlan, projection::Union{Nothing,Projection}, capacity::Int)
+function columnbuilders(p::Plan, projection::Union{Nothing,Projection}, capacity::Int)
     capacity >= 0 || throw(ArgumentError("capacity must be non-negative"))
     plans = slotplans(p)
     cols = Vector{ColumnBuilder}(undef, length(plans))
@@ -111,7 +111,7 @@ end
 
 # Builders that decode blocks straight into preallocated final columns: `finals[k]` is projected column `k`,
 # and each block's rows land after the row its builders' `len` is set to.
-function directbuilders(p::ReadPlan, projection::Union{Nothing,Projection}, finals::Vector{AbstractVector})
+function directbuilders(p::Plan, projection::Union{Nothing,Projection}, finals::Vector{AbstractVector})
     plans = slotplans(p)
     cols = Vector{ColumnBuilder}(undef, length(plans))
     for (i, plan) in enumerate(plans)

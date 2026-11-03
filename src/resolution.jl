@@ -12,7 +12,7 @@ struct ResolvedSchema
     writer::Schema
     reader::Schema
     union_resolution::Symbol
-    plan::ReadPlan
+    plan::Plan
 end
 
 function Base.show(io::IO, r::ResolvedSchema)
@@ -22,14 +22,14 @@ end
 # ---- resolving plan nodes ---------------------------------------------------------------------------
 
 # A promotable writer leaf decoded as its raw primitive and interpreted by the reader's leaf plan.
-struct PromotePlan <: ReadPlan
+struct PromotePlan <: Plan
     writer::Symbol        # :int, :long, :float, :double, :bytes or :string
-    reader::ReadPlan
+    reader::Plan
 end
 
 # A reader-only field: its default built once into the generic value model (`value`), copied afresh for
 # every record.
-struct DefaultPlan <: ReadPlan
+struct DefaultPlan <: Plan
     schema::Schema
     json::Any
     branch::Int
@@ -43,7 +43,7 @@ function DefaultPlan(schema::Schema, json, branch::Int)
 end
 
 # Writer enum positions remapped to the reader's (0 = absent: the reader default, else an error).
-struct EnumRemapPlan <: ReadPlan
+struct EnumRemapPlan <: Plan
     reader::EnumSchema
     map::Vector{Int32}
     default::Int32
@@ -52,32 +52,32 @@ struct EnumRemapPlan <: ReadPlan
 end
 
 # A writer union branch with no resolving reader branch: raises when a datum selects it, even when skipped.
-struct UnresolvableBranch <: ReadPlan
+struct UnresolvableBranch <: Plan
     msg::String
     writerpath::String
     readerpath::String
 end
 
 # A writer union resolved branch by branch into the reader's (bare) values.
-struct UnionResolvePlan <: ReadPlan
-    branches::Vector{ReadPlan}
+struct UnionResolvePlan <: Plan
+    branches::Vector{Plan}
     readerindex::Vector{Int}    # the reader branch per writer branch (0 for a non-union reader)
 end
 
 # A non-union writer resolved against the selected reader union branch.
-struct WrapPlan <: ReadPlan
-    inner::ReadPlan
+struct WrapPlan <: Plan
+    inner::Plan
     readerindex::Int
 end
 
 # A record resolved field by field: writer-ordered steps into reader slots (0 = skip), then the defaults.
-mutable struct ResolvedRecordPlan <: ReadPlan
+mutable struct ResolvedRecordPlan <: Plan
     const schema::RecordSchema                   # the reader record
-    const steps::Vector{Pair{Int,ReadPlan}}
+    const steps::Vector{Pair{Int,Plan}}
     const defaults::Vector{Pair{Int,DefaultPlan}}
 end
 
-function isresolving(::ReadPlan)
+function isresolving(::Plan)
     return false
 end
 
@@ -92,12 +92,12 @@ const MemoKey = Tuple{Int32,Int32,Bool}          # (writer node id, reader node 
 struct ResolveContext
     policy::Symbol
     little::Bool
-    memo::Dict{MemoKey,ReadPlan}
+    memo::Dict{MemoKey,Plan}
     inserted::Vector{MemoKey}                    # memo insertions, undone when a union branch attempt fails
     softmatches::Dict{NTuple{2,Int32},Bool}      # Java's structural record matches decided or assumed so far
     softtrail::Vector{NTuple{2,Int32}}           # the matches that hold only while the attempts in progress do
-    readermemo::Vector{Union{Nothing,ReadPlan}}
-    writermemo::Vector{Union{Nothing,ReadPlan}}
+    readermemo::Vector{Union{Nothing,Plan}}
+    writermemo::Vector{Union{Nothing,Plan}}
 end
 
 """
@@ -120,10 +120,10 @@ end
 # The read plan decoding data written with `writer` into values of `reader`.
 function resolvingplan(writer::Schema, reader::Schema; union_resolution::Symbol=:spec, little::Bool=false)
     union_resolution in (:spec, :java) || throw(ArgumentError("union_resolution must be :spec or :java"))
-    ctx = ResolveContext(union_resolution, little, Dict{MemoKey,ReadPlan}(), MemoKey[],
+    ctx = ResolveContext(union_resolution, little, Dict{MemoKey,Plan}(), MemoKey[],
                          Dict{NTuple{2,Int32},Bool}(), NTuple{2,Int32}[],
-                         Vector{Union{Nothing,ReadPlan}}(nothing, graphinfo(reader).nodes),
-                         Vector{Union{Nothing,ReadPlan}}(nothing, graphinfo(writer).nodes))
+                         Vector{Union{Nothing,Plan}}(nothing, graphinfo(reader).nodes),
+                         Vector{Union{Nothing,Plan}}(nothing, graphinfo(writer).nodes))
     return resolvenode(ctx, writer, reader, Union{String,Int,Symbol}[], Union{String,Int,Symbol}[])
 end
 
@@ -139,7 +139,7 @@ function writerplan(ctx::ResolveContext, s::Schema)
     return readplan(s, ctx.writermemo, ctx.little ? :little : :standard)
 end
 
-function memostore!(ctx::ResolveContext, key::MemoKey, p::ReadPlan)
+function memostore!(ctx::ResolveContext, key::MemoKey, p::Plan)
     haskey(ctx.memo, key) || push!(ctx.inserted, key)
     ctx.memo[key] = p
     return p
@@ -383,7 +383,7 @@ function resolvebranch(ctx::ResolveContext, w::Schema, r::Schema, wp, rp, javaso
 end
 
 function resolvewriterunion(ctx::ResolveContext, w::UnionSchema, r::Schema, wp, rp, javasoft::Bool)
-    branches = ReadPlan[]
+    branches = Plan[]
     rindex = Int[]
     for (i, b) in enumerate(w.branches)
         push!(wp, i - 1)
@@ -425,7 +425,7 @@ function resolveenum(ctx::ResolveContext, w::EnumSchema, r::EnumSchema, wp, rp)
 end
 
 function resolverecord(ctx::ResolveContext, w::RecordSchema, r::RecordSchema, wp, rp, javasoft::Bool)
-    plan = ResolvedRecordPlan(r, Pair{Int,ReadPlan}[], Pair{Int,DefaultPlan}[])
+    plan = ResolvedRecordPlan(r, Pair{Int,Plan}[], Pair{Int,DefaultPlan}[])
     memostore!(ctx, (nodeid(w), nodeid(r), javasoft), plan)    # before the fields, so recursive references resolve
     cand = zeros(Int, length(r.fields))                         # the writer field each reader field refers to
     viaalias = falses(length(r.fields))
@@ -713,7 +713,7 @@ function fromraw(p::DecimalPlan, d::Decoder, raw::String)
     return decimalfrombytes(Decoder(bytes, d.limits), p, 1, length(bytes))
 end
 
-function fromraw(p::ReadPlan, d::Decoder, raw)
+function fromraw(p::Plan, d::Decoder, raw)
     return dataerror(d, "internal error: no promotion of $(typeof(raw)) into $(typeof(p))")
 end
 
@@ -800,12 +800,12 @@ end
 
 # A writer union resolved into a reader record has no fields of its own to decode into columns: each row
 # decodes whole and its values go to the columns.
-struct WholeRecordPlan{P<:ReadPlan} <: ReadPlan
+struct WholeRecordPlan{P<:Plan} <: Plan
     schema::RecordSchema
     plan::P
 end
 
-function recordrowplan(plan::ReadPlan, effective::RecordSchema)
+function recordrowplan(plan::Plan, effective::RecordSchema)
     return plan isa Union{RecordPlan,ResolvedRecordPlan} ? plan : WholeRecordPlan(effective, plan)
 end
 
@@ -814,7 +814,7 @@ function decodevalue(p::WholeRecordPlan, d::Decoder)
 end
 
 function slotplans(p::WholeRecordPlan)
-    return ReadPlan[p.plan for _ in p.schema.fields]
+    return Plan[p.plan for _ in p.schema.fields]
 end
 
 function decoderow!(cols::Vector{ColumnBuilder}, d::Decoder, p::WholeRecordPlan)
@@ -826,7 +826,7 @@ function decoderow!(cols::Vector{ColumnBuilder}, d::Decoder, p::WholeRecordPlan)
 end
 
 function slotplans(p::ResolvedRecordPlan)
-    plans = Vector{ReadPlan}(undef, length(p.schema.fields))
+    plans = Vector{Plan}(undef, length(p.schema.fields))
     for (slot, plan) in p.steps
         slot == 0 || (plans[slot] = plan)
     end

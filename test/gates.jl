@@ -1,4 +1,4 @@
-# Compile-cost gate: after a warm-up covering every member of the closed value set E, decoding
+# Compile-cost gate: after a warm-up covering every member of the closed generic value set, decoding
 # random heterogeneous schemas through the generic and column paths creates no new method instances for
 # Avro's functions and bounded RSS growth. Value generators: test/valuegen.jl.
 

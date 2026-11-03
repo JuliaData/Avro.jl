@@ -2,25 +2,25 @@
 # structs, Tables rows, dictionaries and iterables; each value is checked against its schema node, and
 # a union's branch is chosen from the value.
 
-struct WArray <: WritePlan
+struct WArray <: Plan
     schema::ArraySchema
-    items::WritePlan
+    items::Plan
 end
-struct WMap <: WritePlan
+struct WMap <: Plan
     schema::MapSchema
-    values::WritePlan
+    values::Plan
 end
 
 # `Q` is the concrete plan of a nullable union's value branch (`Nothing` for other unions), so that
 # branch encodes without dynamic dispatch; `reprtypes` holds each branch's `juliatype` for exact matches.
-struct WUnion{Q} <: WritePlan
+struct WUnion{Q} <: Plan
     schema::UnionSchema
-    branches::Vector{WritePlan}
+    branches::Vector{Plan}
     nullable::Int
     reprtypes::Vector{Any}
 end
 
-function WUnion(schema::UnionSchema, branches::Vector{WritePlan}, nullable::Int, reprtypes::Vector{Any})
+function WUnion(schema::UnionSchema, branches::Vector{Plan}, nullable::Int, reprtypes::Vector{Any})
     Q = nullable == 0 ? Nothing : typeof(branches[3 - nullable])
     return WUnion{Q}(schema, branches, nullable, reprtypes)
 end
@@ -35,23 +35,23 @@ struct RecordLayout
     properties::Bool
 end
 
-mutable struct WRecord <: WritePlan
+mutable struct WRecord <: Plan
     const schema::RecordSchema
-    const fields::Vector{WritePlan}
+    const fields::Vector{Plan}
     @atomic layout::Union{Nothing,RecordLayout}   # the layout of the last record type encoded
 end
 
-function WRecord(schema::RecordSchema, fields::Vector{WritePlan})
+function WRecord(schema::RecordSchema, fields::Vector{Plan})
     return WRecord(schema, fields, nothing)
 end
 
 # One plan node per schema node, memoised by node id; a record is memoised before its fields are built
 # so recursive schemas terminate.
 function writeplan(s::Schema)
-    return writeplan(s, Vector{Union{Nothing,WritePlan}}(nothing, graphinfo(s).nodes))
+    return writeplan(s, Vector{Union{Nothing,Plan}}(nothing, graphinfo(s).nodes))
 end
 
-function writeplan(s::Schema, memo::Vector{Union{Nothing,WritePlan}})
+function writeplan(s::Schema, memo::Vector{Union{Nothing,Plan}})
     id = Int(nodeid(s)) + 1
     p = memo[id]
     p === nothing || return p
@@ -73,12 +73,12 @@ function buildwriteplan(s::MapSchema, memo)
 end
 
 function buildwriteplan(s::UnionSchema, memo)
-    branches = WritePlan[writeplan(b, memo) for b in s.branches]
+    branches = Plan[writeplan(b, memo) for b in s.branches]
     return WUnion(s, branches, nullablebranch(s), Any[juliatype(b) for b in s.branches])
 end
 
 function buildwriteplan(s::RecordSchema, memo)
-    p = WRecord(s, WritePlan[])
+    p = WRecord(s, Plan[])
     memo[Int(nodeid(s)) + 1] = p
     for f in s.fields
         push!(p.fields, writeplan(f.schema, memo))
@@ -94,7 +94,7 @@ end
 
 # Encode `x` under `p` as one counted value. Frames below the root leave the value path and expected
 # schema in place when something throws: the root frame reads them for the error, then restores them.
-function encode(p::WritePlan, e::Encoder, x)
+function encode(p::Plan, e::Encoder, x)
     countvalue!(e)
     encodevalue(p, e, x)
     return nothing
@@ -102,7 +102,7 @@ end
 
 # One statically typed value with its path frame.
 @inline function encodeframed(plan::P, e::Encoder, value::T, schema::Schema, kind::UInt8,
-                              name::Union{Nothing,AbstractString,Symbol}) where {P<:WritePlan,T}
+                              name::Union{Nothing,AbstractString,Symbol}) where {P<:Plan,T}
     previous = e.expected
     pushencodepath!(e, kind, name, 0)
     e.expected = schema
@@ -114,7 +114,7 @@ end
 
 # One root datum: the value path starts empty, `schema` is the expected schema, and an `EncodeError` raised
 # below leaves with the path and schema of the value that raised it.
-function encodedatum!(plan::WritePlan, e::Encoder, x, schema::Schema)
+function encodedatum!(plan::Plan, e::Encoder, x, schema::Schema)
     previous = e.expected
     depth = e.depth
     empty!(e.path)
@@ -134,12 +134,12 @@ end
 
 # ---- scalars ---------------------------------------------------------------------------------------------
 
-function encodevalue(p::WritePlan, e::Encoder, x)
+function encodevalue(p::Plan, e::Encoder, x)
     return encodeerror(expected(p), x)
 end
 
 # What a leaf plan accepts, for the error on any other value.
-function expected(p::WritePlan)
+function expected(p::Plan)
     p isa NullPlan && return "expected null (missing or nothing)"
     p isa BoolPlan && return "expected a Bool"
     p isa Union{IntPlan,LongPlan} && return "expected an integer"
@@ -466,7 +466,7 @@ end
 
 # A function barrier on the concrete item plan and the caller's collection, so items encode without
 # dynamic dispatch. Sized collections write one block; others write one block per item.
-function encodeitems!(plan::WritePlan, e::Encoder, items, schema::ArraySchema)
+function encodeitems!(plan::Plan, e::Encoder, items, schema::ArraySchema)
     if Base.IteratorSize(typeof(items)) isa Union{Base.HasLength,Base.HasShape}
         n = length(items)
         n > 0 && writelong!(e, Int64(n))
@@ -541,7 +541,7 @@ function encodevalue(p::WMap, e::Encoder, x)
 end
 
 # A function barrier like `encodeitems!`.
-function encodeentries!(plan::WritePlan, e::Encoder, entries, n::Int, schema::Schema)
+function encodeentries!(plan::Plan, e::Encoder, entries, n::Int, schema::Schema)
     seen = distinctkeys(entries) ? nothing : Set{String}()
     i = 0
     for (k, v) in entries
@@ -971,7 +971,7 @@ end
 
 # The record's field plans as a tuple when `T` is a NamedTuple or struct aligned with the record;
 # `nothing` otherwise.
-function alignedplans(p::WritePlan, ::Type{T}) where {T}
+function alignedplans(p::Plan, ::Type{T}) where {T}
     (p isa WRecord && isconcretetype(T) && isrecordtype(T)) || return nothing
     return recordlayout(p, T).plans
 end
@@ -1022,18 +1022,18 @@ end
 
 abstract type WriteCell end
 
-struct ColumnCell{P<:WritePlan,C<:AbstractVector} <: WriteCell
+struct ColumnCell{P<:Plan,C<:AbstractVector} <: WriteCell
     plan::P
     column::C
 end
 
-struct RowCell{P<:WritePlan,T,R<:AbstractVector} <: WriteCell
+struct RowCell{P<:Plan,T,R<:AbstractVector} <: WriteCell
     plan::P
     rows::R
     field::Int
 end
 
-function RowCell(plan::P, rows::R, field::Int) where {P<:WritePlan,R<:AbstractVector}
+function RowCell(plan::P, rows::R, field::Int) where {P<:Plan,R<:AbstractVector}
     return RowCell{P,fieldtype(eltype(R), field),R}(plan, rows, field)
 end
 
@@ -1083,7 +1083,7 @@ end
 
 # The failure of an aligned row raised again with its value path: the fast path carries none, so the
 # row is encoded once more with path frames into `scratch`.
-@noinline function replayaligned!(plan::WritePlan, scratch::Encoder, x, schema::RecordSchema)
+@noinline function replayaligned!(plan::Plan, scratch::Encoder, x, schema::RecordSchema)
     reset!(scratch)
     try
         encodedatum!(plan, scratch, x, schema)

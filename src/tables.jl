@@ -275,7 +275,7 @@ mutable struct Rows
     const mode::Symbol                     # :generic, :typed or :nonrecord
     const effective::Schema
     const outschema::Union{Nothing,RecordSchema}
-    const plan::Any                        # ReadPlan or TypedPlan
+    const plan::Any                        # Plan or TypedPlan
     const T::Any
     const select::Union{Nothing,Projection}
     const decoder::Decoder{Vector{UInt8}}  # rebound to each block
@@ -404,23 +404,10 @@ function Base.IteratorEltype(::Type{Rows})
 end
 
 function Base.iterate(rows::Rows, ::Nothing=nothing)
-    r = rows.reader
-    checkopen(r)
-    d = rows.decoder
-    while rows.remaining == 0
-        blk = nextblock!(r)
-        blk === nothing && return nothing
-        rows.remaining = blk[1]
-        reset!(d, blk[2], 1)
-        rows.remaining == 0 && checkconsumed(d)
-    end
-    left = rows.remaining - 1
-    rows.remaining = 0                                 # a row that fails takes the rest of its block with it
-    v = decoderow(rows, d)
-    left == 0 && checkconsumed(d)
-    rows.remaining = left
+    v = nextdatum!(d -> decoderow(rows, d), rows)
+    v === nothing && return nothing
     consumedrows!(rows, 1)
-    return (v, nothing)
+    return (something(v), nothing)
 end
 
 function decoderow(rows::Rows, d::Decoder)

@@ -2,29 +2,29 @@
 # of a closed set of types, so untrusted schemas never drive compilation; children are dispatched behind a
 # function barrier.
 
-abstract type ReadPlan end
-const WritePlan = ReadPlan   # leaf plans read and write; composites have one node type each way
+# Leaf plans serve reading and writing; composites have one node type each way.
+abstract type Plan end
 
-struct NullPlan <: ReadPlan end
-struct BoolPlan <: ReadPlan end
-struct IntPlan <: ReadPlan end
-struct LongPlan <: ReadPlan end
-struct FloatPlan <: ReadPlan end
-struct DoublePlan <: ReadPlan end
-struct BytesPlan <: ReadPlan end
-struct StringPlan <: ReadPlan end
-struct FixedPlan <: ReadPlan
+struct NullPlan <: Plan end
+struct BoolPlan <: Plan end
+struct IntPlan <: Plan end
+struct LongPlan <: Plan end
+struct FloatPlan <: Plan end
+struct DoublePlan <: Plan end
+struct BytesPlan <: Plan end
+struct StringPlan <: Plan end
+struct FixedPlan <: Plan
     schema::FixedSchema
 end
-struct EnumPlan <: ReadPlan
+struct EnumPlan <: Plan
     schema::EnumSchema
 end
-struct DatePlan <: ReadPlan end
-struct TimeMillisPlan <: ReadPlan end
-struct TimeMicrosPlan <: ReadPlan end
-struct TimestampPlan{P} <: ReadPlan end
-struct LocalTimestampPlan{P} <: ReadPlan end
-struct DecimalPlan <: ReadPlan
+struct DatePlan <: Plan end
+struct TimeMillisPlan <: Plan end
+struct TimeMicrosPlan <: Plan end
+struct TimestampPlan{P} <: Plan end
+struct LocalTimestampPlan{P} <: Plan end
+struct DecimalPlan <: Plan
     fixedsize::Int       # 0 for `bytes`
     precision::Int
     scale::Int
@@ -36,55 +36,55 @@ function DecimalPlan(fixedsize::Int, precision::Int, scale::Int, wide::Bool)
     return DecimalPlan(fixedsize, precision, scale, wide, false)
 end
 
-struct UUIDStringPlan <: ReadPlan end
-struct UUIDFixedPlan <: ReadPlan end
-struct DurationPlan <: ReadPlan end
+struct UUIDStringPlan <: Plan end
+struct UUIDFixedPlan <: Plan end
+struct DurationPlan <: Plan end
 # `empty` (and `MapPlan.empty`) is a never-mutated empty container of the element type: decoding dispatches
 # on its type, because applying a runtime `eltype` per container costs microseconds for `Union` types.
-struct ArrayPlan <: ReadPlan
-    items::ReadPlan
+struct ArrayPlan <: Plan
+    items::Plan
     minsize::Int
     empty::Vector
 end
 
-function ArrayPlan(items::ReadPlan, eltype::Type, minsize::Int)
+function ArrayPlan(items::Plan, eltype::Type, minsize::Int)
     return ArrayPlan(items, minsize, Vector{eltype}())
 end
 
-struct MapPlan <: ReadPlan
-    values::ReadPlan
+struct MapPlan <: Plan
+    values::Plan
     minsize::Int
     empty::Dict{String}
 end
 
-function MapPlan(values::ReadPlan, eltype::Type, minsize::Int)
+function MapPlan(values::Plan, eltype::Type, minsize::Int)
     return MapPlan(values, minsize, Dict{String,eltype}())
 end
 
 # `Q` is the concrete plan type of a nullable union's non-null branch (`Nothing` for other unions).
-struct UnionPlan{Q} <: ReadPlan
-    branches::Vector{ReadPlan}
+struct UnionPlan{Q} <: Plan
+    branches::Vector{Plan}
     nullable::Int        # position of the null branch in the two-branch nullable form; 0 otherwise
 end
 
-function UnionPlan(branches::Vector{ReadPlan}, nullable::Int)
+function UnionPlan(branches::Vector{Plan}, nullable::Int)
     Q = nullable == 0 ? Nothing : typeof(branches[3 - nullable])
     return UnionPlan{Q}(branches, nullable)
 end
 
-mutable struct RecordPlan <: ReadPlan
+mutable struct RecordPlan <: Plan
     const schema::RecordSchema
-    const fields::Vector{ReadPlan}   # filled after memoisation so recursive references resolve
+    const fields::Vector{Plan}   # filled after memoisation so recursive references resolve
 end
 
 # The generic read plan of a schema, memoised per node id so recursive records share one `RecordPlan`.
 # `mode`: `:little` reads legacy little-endian decimals; `:framing` reads every logical type as its
 # underlying encoding, so only the framing of a datum is checked (`Avro.inspect`).
 function readplan(s::Schema; mode::Symbol=:standard)
-    return readplan(s, Vector{Union{Nothing,ReadPlan}}(nothing, graphinfo(s).nodes), mode)
+    return readplan(s, Vector{Union{Nothing,Plan}}(nothing, graphinfo(s).nodes), mode)
 end
 
-function readplan(s::Schema, memo::Vector{Union{Nothing,ReadPlan}}, mode::Symbol)
+function readplan(s::Schema, memo::Vector{Union{Nothing,Plan}}, mode::Symbol)
     id = Int(nodeid(s)) + 1
     p = memo[id]
     p === nothing || return p
@@ -164,12 +164,12 @@ function buildreadplan(s::MapSchema, memo, mode)
 end
 
 function buildreadplan(s::UnionSchema, memo, mode)
-    branches = ReadPlan[readplan(b, memo, mode) for b in s.branches]
+    branches = Plan[readplan(b, memo, mode) for b in s.branches]
     return UnionPlan(branches, nullablebranch(s))
 end
 
 function buildreadplan(s::RecordSchema, memo, mode)
-    p = RecordPlan(s, ReadPlan[])
+    p = RecordPlan(s, Plan[])
     memo[Int(nodeid(s)) + 1] = p
     for f in s.fields
         push!(p.fields, readplan(f.schema, memo, mode))
@@ -180,7 +180,7 @@ end
 # ---- decoding ---------------------------------------------------------------------------------------
 
 # One value of `p` in the generic value model, counted against the decoder's value cap.
-function decode(p::ReadPlan, d::Decoder)
+function decode(p::Plan, d::Decoder)
     countvalue!(d)
     return decodevalue(p, d)
 end
@@ -349,7 +349,7 @@ end
 
 # A function barrier on the element type and the concrete item plan, so items decode without dynamic
 # dispatch or boxing (both range over the closed plan and value sets).
-function decodeitems!(::Vector{T}, items::ReadPlan, p::ArrayPlan, d::Decoder) where {T}
+function decodeitems!(::Vector{T}, items::Plan, p::ArrayPlan, d::Decoder) where {T}
     out = T[]
     while true
         count, size = readblockcount(d)
@@ -374,7 +374,7 @@ function decodevalue(p::MapPlan, d::Decoder)
 end
 
 # A function barrier like `decodeitems!`; a repeated key keeps its last value.
-function decodeentries!(::Dict{String,V}, values::ReadPlan, p::MapPlan, d::Decoder) where {V}
+function decodeentries!(::Dict{String,V}, values::Plan, p::MapPlan, d::Decoder) where {V}
     out = Dict{String,V}()
     while true
         count, size = readblockcount(d)
@@ -394,7 +394,7 @@ end
 
 # A nullable union decodes its non-null branch through the concrete `Q` (counting the branch value as
 # `decode` does); calling `decode` here would dispatch on the abstract branch and lose that type.
-function decodevalue(p::UnionPlan{Q}, d::Decoder) where {Q<:ReadPlan}
+function decodevalue(p::UnionPlan{Q}, d::Decoder) where {Q<:Plan}
     i = readindex(d, 2)
     countvalue!(d)
     i == p.nullable && return missing
@@ -421,13 +421,13 @@ end
 
 # Skip one value, validating it as a decode would, except that skipped strings are length-checked but not
 # UTF-8-checked and sized array/map blocks are jumped by their byte size (their declared items counted).
-function skip(p::ReadPlan, d::Decoder)
+function skip(p::Plan, d::Decoder)
     countvalue!(d)
     return skipvalue(p, d)
 end
 
 # Leaves whose decoded value costs nothing skip by decoding it.
-function skipvalue(p::ReadPlan, d::Decoder)
+function skipvalue(p::Plan, d::Decoder)
     decodevalue(p, d)
     return nothing
 end
@@ -486,7 +486,7 @@ function skipvalue(p::MapPlan, d::Decoder)
     return nothing
 end
 
-function skipvalue(p::UnionPlan{Q}, d::Decoder) where {Q<:ReadPlan}
+function skipvalue(p::UnionPlan{Q}, d::Decoder) where {Q<:Plan}
     i = readindex(d, 2)
     countvalue!(d)
     i == p.nullable && return nothing

@@ -227,7 +227,7 @@ fallback). `legacy=:avrojl1` tolerates the Avro.jl ≤ 1.1.2 container defects (
 mutable struct Reader
     source::Union{Nothing,BlockSource}
     const schema::Schema
-    const plan::ReadPlan
+    const plan::Plan
     const codecname::Symbol
     const metadata::Dict{String,Vector{UInt8}}
     const sync::NTuple{16,UInt8}
@@ -412,6 +412,14 @@ function Base.IteratorSize(::Type{EachDatum})
 end
 
 function Base.iterate(it::EachDatum, ::Nothing=nothing)
+    v = nextdatum!(d -> decode(it.reader.plan, d), it)
+    return v === nothing ? nothing : (something(v), nothing)
+end
+
+# The next datum of a datum cursor (`EachDatum`, `Rows`: a `reader`, its block `decoder`, and the datums
+# `remaining` in the current block) decoded by `decodeone`, or `nothing` at a clean end. A datum that
+# fails takes the rest of its block with it, so iterating again continues with the next block.
+function nextdatum!(decodeone::F, it) where {F}
     checkopen(it.reader)
     d = it.decoder
     while it.remaining == 0
@@ -422,11 +430,11 @@ function Base.iterate(it::EachDatum, ::Nothing=nothing)
         it.remaining == 0 && checkconsumed(d)
     end
     left = it.remaining - 1
-    it.remaining = 0                                   # a datum that fails takes the rest of its block with it
-    v = decode(it.reader.plan, d)
+    it.remaining = 0
+    v = decodeone(d)
     left == 0 && checkconsumed(d)
     it.remaining = left
-    return (v, nothing)
+    return Some(v)
 end
 
 # ---- Writer -----------------------------------------------------------------------------------------
@@ -489,7 +497,7 @@ mutable struct Writer
     const path::Union{Nothing,String}
     const temppath::Union{Nothing,String}
     const schema::Schema
-    const plan::WritePlan
+    const plan::Plan
     const wcodec::WriterCodec
     const syncmarker::NTuple{16,UInt8}
     const limits::Limits

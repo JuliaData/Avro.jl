@@ -6,18 +6,18 @@
 abstract type TypedPlan end
 
 # The target is `Any` or the schema node's generic type.
-struct GenericTarget{P<:ReadPlan} <: TypedPlan
+struct GenericTarget{P<:Plan} <: TypedPlan
     plan::P
 end
 
 # Decode generically, then convert through StructUtils (`AvroStyle`).
 struct SemanticTarget{T} <: TypedPlan
-    plan::ReadPlan
+    plan::Plan
     schema::Schema
 end
 
 # A leaf converted from its generic representation (`convertleaf`).
-struct LeafTarget{T,P<:ReadPlan} <: TypedPlan
+struct LeafTarget{T,P<:Plan} <: TypedPlan
     plan::P
 end
 
@@ -25,7 +25,7 @@ end
 struct SymbolTarget <: TypedPlan end
 
 # An enum by reader symbol position into `String`, `Symbol` or a `Base.Enum` (`nothing`: no member).
-struct EnumTarget{T,P<:ReadPlan} <: TypedPlan
+struct EnumTarget{T,P<:Plan} <: TypedPlan
     plan::P                                    # `EnumPlan`, or `EnumRemapPlan` under resolution
     schema::EnumSchema                         # the reader enum
     members::Vector{Union{Nothing,T}}
@@ -54,7 +54,7 @@ struct UnionTarget{T} <: TypedPlan
 end
 
 # A schema field the target type does not have.
-struct SkipTarget{P<:ReadPlan} <: TypedPlan
+struct SkipTarget{P<:Plan} <: TypedPlan
     plan::P
 end
 
@@ -64,7 +64,7 @@ mutable struct RefTarget{T} <: TypedPlan
 end
 
 # A non-union writer `null` resolved to the target's nullable convention.
-struct ResolvedNullTarget{N,P<:ReadPlan} <: TypedPlan
+struct ResolvedNullTarget{N,P<:Plan} <: TypedPlan
     plan::P
 end
 
@@ -89,21 +89,21 @@ end
 # inside a union-member or record attempt that later fell back to the semantic route.
 const TypedMemo = IdDict{Any,TypedPlan}
 
-function memolookup(memo::TypedMemo, p::ReadPlan, ::Type{T}) where {T}
+function memolookup(memo::TypedMemo, p::Plan, ::Type{T}) where {T}
     return get(memo, (p, T), nothing)
 end
 
-function memostore!(memo::TypedMemo, p::ReadPlan, ::Type{T}, t::TypedPlan) where {T}
+function memostore!(memo::TypedMemo, p::Plan, ::Type{T}, t::TypedPlan) where {T}
     memo[(p, T)] = t
     return t
 end
 
 # The typed plan decoding `plan` (the generic or resolving plan of `reader`) into `T`.
-function typedplan(::Type{T}, reader::Schema, plan::ReadPlan) where {T}
+function typedplan(::Type{T}, reader::Schema, plan::Plan) where {T}
     return buildtyped(T, reader, plan, TypedMemo())
 end
 
-function buildtyped(::Type{T}, s::Schema, p::ReadPlan, memo::TypedMemo) where {T}
+function buildtyped(::Type{T}, s::Schema, p::Plan, memo::TypedMemo) where {T}
     (T === Any || T === juliatype(s)) && return GenericTarget(p)
     customhooks(T) && return SemanticTarget{T}(p, s)
     if isresolving(p)
@@ -224,7 +224,7 @@ function branchtargets(::Type{T}, s::UnionSchema, p::UnionPlan, memo::TypedMemo)
 end
 
 # The first member that decodes branch `b` directly: the branch's own Julia type first, then `Base.uniontypes` order.
-function membertarget(members::Vector{Any}, b::Schema, bp::ReadPlan, memo::TypedMemo)
+function membertarget(members::Vector{Any}, b::Schema, bp::Plan, memo::TypedMemo)
     natural = juliatype(b)
     for m in (natural in members ? Any[natural; filter(!=(natural), members)] : members)
         tp = buildtyped(m, b, bp, memo)
@@ -247,7 +247,7 @@ function isdirect(tp::TypedPlan, seen::Base.IdSet{Any}=Base.IdSet{Any}())
     return all(c -> isdirect(c, seen), children)
 end
 
-function buildleaftarget(::Type{T}, s::Schema, p::ReadPlan) where {T}
+function buildleaftarget(::Type{T}, s::Schema, p::Plan) where {T}
     T === Symbol && p isa StringPlan && return SymbolTarget()
     p isa EnumPlan && s isa EnumSchema && isenumtarget(T) && return EnumTarget(T, s, p)
     leafcompatible(T, p) && return LeafTarget{T,typeof(p)}(p)
@@ -258,7 +258,7 @@ function isenumtarget(::Type{T}) where {T}
     return T === String || T === Symbol || T <: Base.Enum
 end
 
-function EnumTarget(::Type{T}, s::EnumSchema, p::ReadPlan) where {T}
+function EnumTarget(::Type{T}, s::EnumSchema, p::Plan) where {T}
     return EnumTarget{T,typeof(p)}(p, s, enummembers(T, s))
 end
 
@@ -297,7 +297,7 @@ function leafcompatible(::Type{T}, ::Union{TimestampPlan,LocalTimestampPlan}) wh
     return T === DateTime
 end
 
-function leafcompatible(::Type{T}, ::ReadPlan) where {T}
+function leafcompatible(::Type{T}, ::Plan) where {T}
     return false
 end
 
@@ -379,7 +379,7 @@ end
 # Promotions, enum remaps and resolved records decode straight into `T`; a writer resolved into a
 # two-branch nullable reader union goes through a wrapped or per-writer-branch target. `nothing` when
 # the semantic route must convert.
-function buildresolvedtyped(::Type{T}, s::Schema, p::ReadPlan, memo::TypedMemo) where {T}
+function buildresolvedtyped(::Type{T}, s::Schema, p::Plan, memo::TypedMemo) where {T}
     p isa PromotePlan && return buildleaftarget(T, s, p)
     p isa EnumRemapPlan && return s isa EnumSchema && isenumtarget(T) ? EnumTarget(T, s, p) : nothing
     p isa ResolvedRecordPlan && s isa RecordSchema && return buildrecordtarget(T, s, p, memo)
@@ -415,7 +415,7 @@ function resolvednullable(::Type{N}, ::Type{X}, s::UnionSchema, p::UnionResolveP
 end
 
 function recordsteps(p::RecordPlan)
-    return Pair{Int,ReadPlan}[i => f for (i, f) in enumerate(p.fields)]
+    return Pair{Int,Plan}[i => f for (i, f) in enumerate(p.fields)]
 end
 
 function recordsteps(p::ResolvedRecordPlan)
