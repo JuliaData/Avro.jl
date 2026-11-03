@@ -13,6 +13,12 @@ function ArrowTypes.ArrowType(::Type{Avro.Record})
     return NamedTuple
 end
 
+# A record's storage type comes from its schema, which `Avro.Record` does not carry, so a column with no
+# records has no typed placeholder and ArrowTypes writes it as nulls.
+function ArrowTypes.default(::Type{Avro.Record})
+    return missing
+end
+
 # ponytail: the struct type is rebuilt for every record; cache it per schema if record columns write too slowly.
 function ArrowTypes.toarrow(r::Avro.Record)
     s = Avro.schema(r)
