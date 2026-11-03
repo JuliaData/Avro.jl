@@ -1146,23 +1146,33 @@ function makeprops(propsin, structural, logical)
     for (k, v) in (propsin isa NamedTuple ? pairs(propsin) : propsin)
         k isa Union{AbstractString,Symbol} || throw(ArgumentError("`props` keys must be strings or symbols"))
         ks = String(k)
-        ks in structural && throw(ArgumentError("`props` key \"$ks\" collides with a structural attribute emitted by this constructor"))
-        logical !== nothing && ks in ("logicalType", "precision", "scale") &&
-            throw(ArgumentError("`props` key \"$ks\" is synthesised by `logical=`"))
-        ks in seen && throw(ArgumentError("duplicate `props` key \"$ks\""))
+        checkpropskey(ks, structural, logical !== nothing, seen)
         push!(seen, ks)
-        push!(members, ks => tojsonvalue(v))
+        push!(members, member(ks, tojsonvalue(v)))
     end
     if logical !== nothing
         name = logicalname(logical)
         name === nothing && throw(ArgumentError("no logical type name for $logical"))
-        push!(members, "logicalType" => name)
+        push!(members, member("logicalType", name))
         if logical isa DecimalLogical
-            push!(members, "precision" => Int64(logical.precision))
-            push!(members, "scale" => Int64(logical.scale))
+            push!(members, member("precision", Int64(logical.precision)))
+            push!(members, member("scale", Int64(logical.scale)))
         end
     end
     return isempty(members) ? Props() : Props(members)
+end
+
+# The key checks run out of line. A NamedTuple's keys are compile-time constants, and `string` of three or more
+# constant pieces compiles to a call `--trim` cannot resolve.
+@noinline function checkpropskey(ks::String, structural, haslogical::Bool, seen::Set{String})
+    ks in structural && throw(ArgumentError("`props` key \"$ks\" collides with a structural attribute emitted by this constructor"))
+    haslogical && ks in ("logicalType", "precision", "scale") && throw(ArgumentError("`props` key \"$ks\" is synthesised by `logical=`"))
+    ks in seen && throw(ArgumentError("duplicate `props` key \"$ks\""))
+    return nothing
+end
+
+@noinline function duplicatekeyerror(ks::String)
+    throw(ArgumentError("duplicate key \"$ks\""))
 end
 
 "A Julia value as a schema JSON value (`nothing`, `Bool`, `Int64`, `JSONNumber`, `String`, `Vector{Any}`, `Props`)."
@@ -1197,9 +1207,9 @@ function tojsonvalue(x::Union{AbstractDict,NamedTuple})
     for (k, v) in pairs(x)
         k isa Union{AbstractString,Symbol} || throw(ArgumentError("JSON object keys must be strings or symbols"))
         ks = String(k)
-        ks in seen && throw(ArgumentError("duplicate key \"$ks\""))
+        ks in seen && duplicatekeyerror(ks)
         push!(seen, ks)
-        push!(members, ks => tojsonvalue(v))
+        push!(members, member(ks, tojsonvalue(v)))
     end
     return Props(members)
 end
@@ -1208,19 +1218,26 @@ end
 # no ids) until the outermost record closes.
 const FILLING = Int32(-2)
 
-function reachesfilling(s::Schema, seen::Base.IdSet{Schema}=Base.IdSet{Schema}())
+function reachesfilling(@nospecialize(s::Schema), seen::Base.IdSet{Schema}=Base.IdSet{Schema}())
     (isfinalized(s) || s in seen) && return false
     push!(seen, s)
     nodemeta(s).id == FILLING && return true
     s isa ArraySchema && return reachesfilling(s.items, seen)
     s isa MapSchema && return reachesfilling(s.values, seen)
-    s isa UnionSchema && return any(b -> reachesfilling(b, seen), s.branches)
-    s isa RecordSchema && return any(f -> reachesfilling(f.schema, seen), s.fields)
+    if s isa UnionSchema
+        for b in s.branches
+            reachesfilling(b, seen) && return true
+        end
+    elseif s isa RecordSchema
+        for f in s.fields
+            reachesfilling(f.schema, seen) && return true
+        end
+    end
     return false
 end
 
 "Finalise a constructed graph: dense ids, named-type uniqueness, the complete-graph default pass."
-function finalizepublic!(draft::Schema)
+function finalizepublic!(@nospecialize(draft::Schema))
     reachesfilling(draft) && return draft
     s = deepcopyschema(draft, IdDict{Schema,Schema}())   # every graph owns its nodes; a child passed twice is one definition
     metas = NodeMeta[]
@@ -1231,7 +1248,7 @@ function finalizepublic!(draft::Schema)
     return sealgraph!(s, metas, GraphInfo(false, false, length(metas), length(named)))
 end
 
-function collectmetas!(s::Schema, metas::Vector{NodeMeta}, named::Dict{String,Schema}, identities::Dict{String,Schema})
+function collectmetas!(@nospecialize(s::Schema), metas::Vector{NodeMeta}, named::Dict{String,Schema}, identities::Dict{String,Schema})
     m = nodemeta(s)
     m.id >= 0 && return nothing
     m.id = Int32(length(metas))
@@ -1249,10 +1266,19 @@ function collectmetas!(s::Schema, metas::Vector{NodeMeta}, named::Dict{String,Sc
             identities[alias] = s
         end
     end
-    s isa ArraySchema && collectmetas!(s.items, metas, named, identities)
-    s isa MapSchema && collectmetas!(s.values, metas, named, identities)
-    s isa UnionSchema && foreach(b -> collectmetas!(b, metas, named, identities), s.branches)
-    s isa RecordSchema && foreach(f -> collectmetas!(f.schema, metas, named, identities), s.fields)
+    if s isa ArraySchema
+        collectmetas!(s.items, metas, named, identities)
+    elseif s isa MapSchema
+        collectmetas!(s.values, metas, named, identities)
+    elseif s isa UnionSchema
+        for b in s.branches
+            collectmetas!(b, metas, named, identities)
+        end
+    elseif s isa RecordSchema
+        for f in s.fields
+            collectmetas!(f.schema, metas, named, identities)
+        end
+    end
     return nothing
 end
 
@@ -1312,11 +1338,11 @@ end
 """
     Avro.ArraySchema(items; props=(;)) / Avro.MapSchema(values; props=(;))
 """
-function ArraySchema(items::Schema; props=(;))
+function ArraySchema(@nospecialize(items::Schema); props=(;))
     return finalizepublic!(ArraySchema(items, makeprops(props, SCHEMA_GRAMMAR[:array], nothing), NodeMeta()))
 end
 
-function MapSchema(values::Schema; props=(;))
+function MapSchema(@nospecialize(values::Schema); props=(;))
     return finalizepublic!(MapSchema(values, makeprops(props, SCHEMA_GRAMMAR[:map], nothing), NodeMeta()))
 end
 
@@ -1343,7 +1369,7 @@ end
 A record field; `default` is a Julia value converted to JSON (`nothing`/`missing` → `null`) and
 validated against `schema` with the recursive default rule.
 """
-function Field(name::AbstractString, schema::Schema; default=nodefault, order::Symbol=:ascending, aliases=String[], doc=nothing, props=(;))
+function Field(name::AbstractString, @nospecialize(schema::Schema); default=nodefault, order::Symbol=:ascending, aliases=String[], doc=nothing, props=(;))
     checkpublicname(name, "field name")
     order in (:ascending, :descending, :ignore) || throw(ArgumentError("order must be :ascending, :descending or :ignore"))
     raw = publicaliases(aliases)
@@ -1385,23 +1411,36 @@ end
 
 # Named nodes are copied once per `memo` (references stay references); unnamed nodes form a tree
 # and are copied per occurrence.
-function deepcopyschema(s::Schema, memo::IdDict{Schema,Schema})
+function deepcopyschema(@nospecialize(s::Schema), memo::IdDict{Schema,Schema})
     s isa NamedSchema && haskey(memo, s) && return memo[s]
     meta = NodeMeta()
-    s isa Union{IntSchema,LongSchema,BytesSchema,StringSchema} && return typeof(s)(s.logical, s.props, meta)
-    s isa Union{NullSchema,BooleanSchema,FloatSchema,DoubleSchema} && return typeof(s)(s.props, meta)
+    s isa IntSchema && return IntSchema(s.logical, s.props, meta)
+    s isa LongSchema && return LongSchema(s.logical, s.props, meta)
+    s isa BytesSchema && return BytesSchema(s.logical, s.props, meta)
+    s isa StringSchema && return StringSchema(s.logical, s.props, meta)
+    s isa NullSchema && return NullSchema(s.props, meta)
+    s isa BooleanSchema && return BooleanSchema(s.props, meta)
+    s isa FloatSchema && return FloatSchema(s.props, meta)
+    s isa DoubleSchema && return DoubleSchema(s.props, meta)
     s isa ArraySchema && return ArraySchema(deepcopyschema(s.items, memo), s.props, meta)
     s isa MapSchema && return MapSchema(deepcopyschema(s.values, memo), s.props, meta)
-    s isa UnionSchema && return UnionSchema(Schema[deepcopyschema(b, memo) for b in s.branches], meta)
+    if s isa UnionSchema
+        branches = Vector{Schema}(undef, length(s.branches))
+        for (i, b) in enumerate(s.branches)
+            branches[i] = deepcopyschema(b, memo)
+        end
+        return UnionSchema(branches, meta)
+    end
     s isa FixedSchema && return (memo[s] = FixedSchema(s.name, s.aliases, s.rawaliases, s.size, s.logical, s.props, meta))
     s isa EnumSchema && return (memo[s] = EnumSchema(s.name, s.aliases, s.rawaliases, s.doc, s.symbols, s.default, s.symbolindex, s.props, meta))
-    rec = RecordSchema(s.name, s.aliases, s.rawaliases, s.doc, s.iserror, s.props, meta)
-    memo[s] = rec                                  # before the fields, so self-references resolve to the copy
-    for f in s.fields
+    r = s::RecordSchema
+    rec = RecordSchema(r.name, r.aliases, r.rawaliases, r.doc, r.iserror, r.props, meta)
+    memo[r] = rec                                  # before the fields, so self-references resolve to the copy
+    for f in r.fields
         push!(rec.fields, Field(f.name, deepcopyschema(f.schema, memo), f.doc, f.default, f.order, f.aliases, f.props))
     end
-    append!(rec.fieldnames, s.fieldnames)
-    merge!(rec.fieldindex, s.fieldindex)
+    append!(rec.fieldnames, r.fieldnames)
+    merge!(rec.fieldindex, r.fieldindex)
     return rec
 end
 
@@ -1435,14 +1474,14 @@ end
 The minimal encoded size in bytes of a datum of `schema` (`typemax(Int)` when no finite datum exists,
 e.g. an empty union, an empty enum, or a required recursive cycle without a nullable/array/map escape).
 """
-function minsize(s::Schema)
+function minsize(@nospecialize(s::Schema))
     return nodemeta(s).minsize
 end
 
 # A fixed point from above: after k passes a node holds the least size of any datum of nesting ≤ k, so the
 # iteration stops once every node has reached its least finite datum or stayed infinite. Children follow
 # their parents in `reached`, so walking it backwards settles everything but cycles in one pass.
-function computeminsizes!(root::Schema, nodes::Int)
+function computeminsizes!(@nospecialize(root::Schema), nodes::Int)
     reached = Schema[]
     collectnodes!(reached, root, falses(nodes))
     best = fill(INFINITE, nodes)
@@ -1462,20 +1501,29 @@ function computeminsizes!(root::Schema, nodes::Int)
     return nothing
 end
 
-function collectnodes!(nodes::Vector{Schema}, s::Schema, seen::BitVector)
+function collectnodes!(nodes::Vector{Schema}, @nospecialize(s::Schema), seen::BitVector)
     seen[nodeid(s) + 1] && return nothing
     seen[nodeid(s) + 1] = true
     push!(nodes, s)
-    s isa ArraySchema && collectnodes!(nodes, s.items, seen)
-    s isa MapSchema && collectnodes!(nodes, s.values, seen)
-    s isa UnionSchema && foreach(b -> collectnodes!(nodes, b, seen), s.branches)
-    s isa RecordSchema && foreach(f -> collectnodes!(nodes, f.schema, seen), s.fields)
+    if s isa ArraySchema
+        collectnodes!(nodes, s.items, seen)
+    elseif s isa MapSchema
+        collectnodes!(nodes, s.values, seen)
+    elseif s isa UnionSchema
+        for b in s.branches
+            collectnodes!(nodes, b, seen)
+        end
+    elseif s isa RecordSchema
+        for f in s.fields
+            collectnodes!(nodes, f.schema, seen)
+        end
+    end
     return nothing
 end
 
 # The least encoded size of `s` given `best`, the least sizes found so far for its children; one `isa`
 # chain, so the fixed point over a graph's nodes dispatches statically.
-function minsizeof(s::Schema, best::Vector{Int})
+function minsizeof(@nospecialize(s::Schema), best::Vector{Int})
     if s isa RecordSchema
         total = 0
         for f in s.fields
