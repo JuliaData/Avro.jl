@@ -493,22 +493,37 @@ function defaultvalue(s::UnionSchema, j)
     return nothing
 end
 
-function defaultvalue(::NullSchema, j)
+# The value of a default for a leaf schema.
+function leafdefault(@nospecialize(s::Schema), @nospecialize(j))
+    s isa NullSchema && return defaultvalue(s, j)
+    s isa BooleanSchema && return defaultvalue(s, j)
+    s isa IntSchema && return defaultvalue(s, j)
+    s isa LongSchema && return defaultvalue(s, j)
+    s isa FloatSchema && return defaultvalue(s, j)
+    s isa DoubleSchema && return defaultvalue(s, j)
+    s isa BytesSchema && return defaultvalue(s, j)
+    s isa StringSchema && return defaultvalue(s, j)
+    s isa FixedSchema && return defaultvalue(s, j)
+    return defaultvalue(s::EnumSchema, j)
+end
+
+function defaultvalue(::NullSchema, @nospecialize(j))
     return j === nothing ? missing : nothing
 end
 
-function defaultvalue(::BooleanSchema, j)
+function defaultvalue(::BooleanSchema, @nospecialize(j))
     return j isa Bool ? j : nothing
 end
 
-function defaultvalue(s::IntSchema, j)
-    (j isa Int64 && typemin(Int32) <= j <= typemax(Int32)) || return nothing
+function defaultvalue(s::IntSchema, @nospecialize(j))
+    j isa Int64 || return nothing
+    typemin(Int32) <= j <= typemax(Int32) || return nothing
     s.logical isa DateLogical && return DATE_EPOCH + Day(j)
     s.logical isa TimeMillis || return Int32(j)
     return 0 <= j < 86_400_000 ? Time(Nanosecond(j * 1_000_000)) : nothing
 end
 
-function defaultvalue(s::LongSchema, j)
+function defaultvalue(s::LongSchema, @nospecialize(j))
     j isa Int64 || return nothing
     l = s.logical
     l isa TimeMicros && return 0 <= j < 86_400_000_000 ? Time(Nanosecond(j * 1_000)) : nothing
@@ -521,17 +536,18 @@ function defaultvalue(s::LongSchema, j)
     return j
 end
 
-function defaultvalue(::FloatSchema, j)
+function defaultvalue(::FloatSchema, @nospecialize(j))
     return defaultfloat(Float32, j)
 end
 
-function defaultvalue(::DoubleSchema, j)
+function defaultvalue(::DoubleSchema, @nospecialize(j))
     return defaultfloat(Float64, j)
 end
 
-function defaultfloat(::Type{T}, j) where {T}
+function defaultfloat(::Type{T}, @nospecialize(j)) where {T}
     j isa Union{Int64,Float64} && return T(j)
     j isa JSONNumber && return parsefloat(T, j.text)
+    j isa String || return nothing
     j == "NaN" && return T(NaN)
     j == "Infinity" && return T(Inf)
     j == "-Infinity" && return T(-Inf)
@@ -539,18 +555,19 @@ function defaultfloat(::Type{T}, j) where {T}
 end
 
 # The bytes of a `bytes`/`fixed` default: a string of code points ≤ U+00FF.
-function defaultbytes(j)
-    (j isa String && isstrictutf8(j) && all(c -> UInt32(c) <= 0xff, j)) || return nothing
+function defaultbytes(@nospecialize(j))
+    j isa String || return nothing
+    (isstrictutf8(j) && all(c -> UInt32(c) <= 0xff, j)) || return nothing
     return UInt8[UInt8(c) for c in j]
 end
 
-function defaultvalue(s::BytesSchema, j)
+function defaultvalue(s::BytesSchema, @nospecialize(j))
     bytes = defaultbytes(j)
     (bytes === nothing || !(s.logical isa DecimalLogical)) && return bytes
     return defaultdecimal(s.logical, bytes)
 end
 
-function defaultvalue(s::FixedSchema, j)
+function defaultvalue(s::FixedSchema, @nospecialize(j))
     bytes = defaultbytes(j)
     (bytes === nothing || length(bytes) != s.size) && return nothing
     l = s.logical
@@ -570,12 +587,13 @@ function defaultdecimal(l::DecimalLogical, bytes::Vector{UInt8})
     end
 end
 
-function defaultvalue(s::StringSchema, j)
-    (j isa String && isstrictutf8(j)) || return nothing
+function defaultvalue(s::StringSchema, @nospecialize(j))
+    j isa String || return nothing
+    isstrictutf8(j) || return nothing
     return s.logical isa UUIDLogical ? tryparse(UUID, j) : j
 end
 
-function defaultvalue(s::EnumSchema, j)
+function defaultvalue(s::EnumSchema, @nospecialize(j))
     i = j isa String ? get(s.symbolindex, j, 0) : 0
     return i == 0 ? nothing : EnumValue(s, Int32(i), Val(:unchecked))
 end

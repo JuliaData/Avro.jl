@@ -756,7 +756,7 @@ function checkdefault(@nospecialize(schema::Schema), @nospecialize(json), memo::
         end
         return (true, 0)
     end
-    return (defaultvalue(schema, json) !== nothing, 0)       # a leaf default is valid when it converts
+    return (leafdefault(schema, json) !== nothing, 0)        # a leaf default is valid when it converts
 end
 
 # JSON objects scan their members, so looking up many fields goes through an index.
