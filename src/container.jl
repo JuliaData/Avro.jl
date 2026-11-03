@@ -469,11 +469,16 @@ function writevarint(io::IO, n::Integer)
         b = UInt8(v & 0x7f)
         v >>= 7
         if v == 0
-            Base.write(io, b)
+            sinkwrite(io, b)
             break
         end
-        Base.write(io, b | 0x80)
+        sinkwrite(io, b | 0x80)
     end
+    return nothing
+end
+
+function sinkwrite(io::IO, x)
+    streamcall(Base.write, io, x)
     return nothing
 end
 
@@ -578,18 +583,18 @@ end
 "Write the container magic, the metadata block and the sync marker to the sink."
 function writecontainerheader!(sink, entries, syncmarker)
     for m in MAGIC
-        Base.write(sink, m)
+        sinkwrite(sink, m)
     end
     writevarint(sink, length(entries))
     for (k, v) in entries
         writevarint(sink, sizeof(k))
-        Base.write(sink, codeunits(k))
+        sinkwrite(sink, codeunits(k))
         writevarint(sink, length(v))
-        Base.write(sink, v)
+        sinkwrite(sink, v)
     end
-    Base.write(sink, 0x00)
+    sinkwrite(sink, 0x00)
     for b in syncmarker
-        Base.write(sink, b)
+        sinkwrite(sink, b)
     end
     return nothing
 end
@@ -678,14 +683,15 @@ function Writer(dst::Union{AbstractString,IO}, schema::Schema; codec::Union{Noth
         abortcleanup(w; suppress=true)
         rethrow()
     end
-    finalizer(w) do x                                # the blocks of an unclosed append stay, as a crash would leave them
-        if !x.closed
-            x.closed = true
-            cleanupwritersink(x.sink, x.temppath, x.ownsink; suppress=true)
-        end
-        return nothing
-    end
-    return w
+    return addfinalizer(abandonunclosed!, w)
+end
+
+# The finalizer of a writer nobody closed: its temp file goes, and the blocks of an unclosed append stay, as a
+# crash would leave them.
+@noinline function abandonunclosed!(w::Writer)
+    w.closed && return nothing
+    w.closed = true
+    return cleanupwritersink(w.sink, w.temppath, w.ownsink; suppress=true)
 end
 
 function Base.show(io::IO, w::Writer)
@@ -721,7 +727,7 @@ end
 function cleanupwritersink(sink, temppath, ownsink::Bool; suppress::Bool=false)
     failure = nothing
     try
-        ownsink && close(sink)
+        ownsink && streamcall(close, sink)
     catch err
         failure = err
     end
@@ -740,8 +746,8 @@ function abortcleanup(w::Writer; suppress::Bool=false)
     discardinflight!(w)
     if w.appendstart >= 0
         try
-            flush(w.sink)
-            filesize(w.path) <= w.appendlength && Base.truncate(w.sink, w.appendstart)
+            streamcall(flush, w.sink)
+            filesize(w.path) <= w.appendlength && streamcall(Base.truncate, w.sink, w.appendstart)
         catch
             suppress || rethrow()
         end
@@ -838,9 +844,9 @@ function writeblock!(w::Writer, count::Int, compressed::Vector{UInt8}, rawlength
     w.appendlength += varintlength(count) + varintlength(length(compressed)) + length(compressed) + 16
     writevarint(w.sink, count)
     writevarint(w.sink, length(compressed))
-    Base.write(w.sink, compressed)
+    sinkwrite(w.sink, compressed)
     for b in w.syncmarker
-        Base.write(w.sink, b)
+        sinkwrite(w.sink, b)
     end
     return nothing
 end
@@ -936,7 +942,7 @@ function Base.flush(w::Writer)
     flushblock!(w)
     try
         drainblocks!(w)
-        flush(w.sink)
+        streamcall(flush, w.sink)
     catch e
         poison!(w, e)
         rethrow()
@@ -945,7 +951,7 @@ function Base.flush(w::Writer)
 end
 
 function syncfile(io::IO)
-    flush(io)
+    streamcall(flush, io)
     io isa IOStream || return nothing
     @static if Sys.iswindows()
         result = ccall(:_commit, Cint, (Cint,), fd(io))
@@ -966,9 +972,9 @@ function Base.close(w::Writer; abort::Bool=false)
     try
         flushblock!(w)
         drainblocks!(w)
-        w.fsync ? syncfile(w.sink) : flush(w.sink)
+        w.fsync ? syncfile(w.sink) : streamcall(flush, w.sink)
         if w.path !== nothing
-            w.ownsink && close(w.sink)
+            w.ownsink && streamcall(close, w.sink)
             if w.temppath !== nothing
                 chmod(w.temppath, publishmode(w.path))          # mktemp creates owner-only files
                 Base.Filesystem.rename(w.temppath, w.path)
