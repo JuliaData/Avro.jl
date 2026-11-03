@@ -1,3 +1,5 @@
+import CodecZlib
+
 # a sink that fails after a fixed number of bytes (writer failure injection)
 mutable struct FailIO <: IO
     const io::IOBuffer
@@ -212,6 +214,35 @@ function oneblockcontainer(codec::Symbol)
     push!(writer, missing)
     close(writer)
     return take!(io)
+end
+
+# A deflate codec for writer tests. Each compression holds for `TEST_COMPRESS_DELAY[]` seconds, counted in
+# `TEST_COMPRESSING` meanwhile, and the `TEST_COMPRESS_FAILAT[]`-th one throws.
+struct InjectedCompressionError <: Exception end
+const TEST_COMPRESS_DELAY = Ref(0.0)
+const TEST_COMPRESS_FAILAT = Ref(0)
+const TEST_COMPRESSIONS = Threads.Atomic{Int}(0)
+const TEST_COMPRESSING = Threads.Atomic{Int}(0)
+const TEST_COMPRESSING_PEAK = Threads.Atomic{Int}(0)
+
+function testcompressor()
+    n = Threads.atomic_add!(TEST_COMPRESSIONS, 1) + 1
+    Threads.atomic_max!(TEST_COMPRESSING_PEAK, Threads.atomic_add!(TEST_COMPRESSING, 1) + 1)
+    try
+        TEST_COMPRESS_DELAY[] > 0 && sleep(TEST_COMPRESS_DELAY[])
+        n == TEST_COMPRESS_FAILAT[] && throw(InjectedCompressionError())
+    finally
+        Threads.atomic_sub!(TEST_COMPRESSING, 1)
+    end
+    return CodecZlib.DeflateCompressor()
+end
+
+function resettestcompressor!(; delay=0.0, failat=0)
+    TEST_COMPRESS_DELAY[] = delay
+    TEST_COMPRESS_FAILAT[] = failat
+    TEST_COMPRESSIONS[] = 0
+    TEST_COMPRESSING_PEAK[] = 0
+    return nothing
 end
 
 @testset "Container files" begin
@@ -1187,6 +1218,169 @@ end
         rep = P("{\"type\":\"record\",\"name\":\"B\",\"fields\":[{\"name\":\"bad-name\",\"type\":\"int\"}]}"; allow_invalid_names=true)
         @test_throws ArgumentError Avro.Writer(IOBuffer(), rep)
         @test Avro.Writer(IOBuffer(), rep; allow_invalid_names=true) isa Avro.Writer
+    end
+    @testset "parallel block compression" begin
+        # ntasks > 1 compresses on other tasks only when Julia runs with more than one thread; files are
+        # the same either way.
+        parallel = Threads.nthreads() > 1
+        rows = [(id=Int64(i), x=i / 3, name="name-$(i % 97)", flag=isodd(i)) for i in 1:3000]
+        s = Avro.schema(eltype(rows))
+        sync = collect(UInt8(1):UInt8(16))
+        @test_throws ArgumentError Avro.Writer(IOBuffer(), s; ntasks=0)
+        for codec in Avro.codecs()
+            sequential = take!(Avro.tobuffer(rows; codec, sync, block_bytes=512, ntasks=1))
+            @test Avro.inspect(sequential).blocks >= 100               # crosses the 2 × ntasks in-flight window many times
+            for ntasks in (2, 4, 64)
+                @test take!(Avro.tobuffer(rows; codec, sync, block_bytes=512, ntasks)) == sequential
+            end
+            streamed = map((1, 4)) do ntasks
+                io = IOBuffer()
+                Avro.Writer(io, s; codec, sync, block_bytes=512, ntasks) do w
+                    for (i, row) in enumerate(rows)
+                        push!(w, row)
+                        i % 700 == 0 && flush(w)
+                    end
+                end
+                return take!(io)
+            end
+            @test streamed[1] == streamed[2]
+        end
+
+        flushedio = IOBuffer()
+        flushedwriter = Avro.Writer(flushedio, s; codec=:zstandard, block_bytes=512, ntasks=4)
+        foreach(row -> push!(flushedwriter, row), rows[1:2000])
+        flush(flushedwriter)
+        seekstart(flushedio)
+        @test [v.id for v in readall(read(flushedio))] == 1:2000                # every block pushed so far
+        push!(flushedwriter, rows[2001])
+        close(flushedwriter)
+        seekstart(flushedio)
+        @test [v.id for v in readall(read(flushedio))] == 1:2001
+
+        mktempdir() do dir
+            base = joinpath(dir, "base.avro")
+            Avro.write(base, rows[1:100]; codec=:deflate, block_bytes=512)
+            original = read(base)
+            appended = map((1, 4)) do ntasks
+                path = joinpath(dir, "appended-$ntasks.avro")
+                cp(base, path)
+                Avro.write(path, rows[101:end]; append=true, block_bytes=512, ntasks)
+                return read(path)
+            end
+            @test appended[1] == appended[2]
+            @test Avro.Table(appended[2]).id == 1:length(rows)
+            aborted = joinpath(dir, "aborted.avro")
+            cp(base, aborted)
+            abortedwriter = Avro.Writer(aborted, s; append=true, block_bytes=512, ntasks=4)
+            foreach(row -> push!(abortedwriter, row), rows)
+            close(abortedwriter; abort=true)
+            @test read(aborted) == original
+        end
+
+        # A block over max_bytes once compressed raises from the call that writes it. That is the push! that
+        # emits it when compressing on the caller's task, and a later push! or flush otherwise.
+        function firstfailure(w, datums)
+            for (i, datum) in enumerate(datums)
+                try
+                    push!(w, datum)
+                catch err
+                    return (i, err)
+                end
+            end
+            try
+                flush(w)
+            catch err
+                return (:flush, err)
+            end
+            return (nothing, nothing)
+        end
+        noise = rand(Random.Xoshiro(7), UInt8, 4094)                  # a 4096-byte datum every codec expands
+        small = zeros(UInt8, 100)
+        for codec in filter(!=(:null), Avro.codecs())
+            for (datums, raisedby) in (([fill(small, 100); [noise]; fill(small, 10)], step -> step == (parallel ? :flush : 101)),
+                                       (vcat([noise], fill(small, 4000)), step -> parallel ? step isa Int && step > 1 : step == 1))
+                mktempdir() do dir
+                    dest = joinpath(dir, "out.avro")
+                    write(dest, "old")
+                    w = Avro.Writer(dest, Avro.BytesSchema(); codec, block_bytes=4096, ntasks=4, limits=Avro.Limits(max_bytes=4096))
+                    step, err = firstfailure(w, datums)
+                    @test raisedby(step)
+                    @test err isa Avro.LimitError && err.limit === :max_bytes && err.value == 4096 && err.observed > 4096
+                    followup = try
+                        push!(w, small)
+                        nothing
+                    catch e
+                        e
+                    end
+                    @test followup isa Avro.WriterClosedError && followup.cause === err
+                    close(w)
+                    @test read(dest, String) == "old"
+                    @test readdir(dir) == ["out.avro"]
+                end
+            end
+        end
+
+        Avro.registercodec!(:testdeflate, (writer=level -> Avro.WriterCodec(:testdeflate, testcompressor),))
+        try
+            mktempdir() do dir
+                dest = joinpath(dir, "out.avro")
+                write(dest, "old")
+                resettestcompressor!(failat=3)
+                w = Avro.Writer(dest, s; codec=:testdeflate, block_bytes=512, ntasks=4)
+                failure = try
+                    foreach(row -> push!(w, row), rows)
+                    close(w)
+                    nothing
+                catch err
+                    err
+                end
+                close(w)
+                @test failure isa InjectedCompressionError                     # the codec's own error, not a task wrapper
+                @test read(dest, String) == "old"
+                @test readdir(dir) == ["out.avro"]
+
+                # Aborting waits for the blocks still compressing, and at most ntasks compress at once.
+                function pushthenfail(w)
+                    foreach(row -> push!(w, row), rows[1:300])
+                    return error("stop")
+                end
+                for doblock in (false, true)
+                    resettestcompressor!(delay=0.02)
+                    if doblock
+                        @test_throws ErrorException Avro.Writer(pushthenfail, dest, s; codec=:testdeflate, block_bytes=512, ntasks=2)
+                    else
+                        w = Avro.Writer(dest, s; codec=:testdeflate, block_bytes=512, ntasks=2)
+                        foreach(row -> push!(w, row), rows[1:300])
+                        close(w; abort=true)
+                    end
+                    @test TEST_COMPRESSIONS[] >= 5
+                    @test TEST_COMPRESSING[] == 0
+                    @test TEST_COMPRESSING_PEAK[] <= 2
+                    @test read(dest, String) == "old"
+                    @test readdir(dir) == ["out.avro"]
+                end
+
+                # An interrupt while the caller waits on a compression poisons the writer; close still waits.
+                resettestcompressor!(delay=0.05)
+                w = Avro.Writer(dest, s; codec=:testdeflate, block_bytes=512, ntasks=2)
+                pusher = @async try
+                    foreach(row -> push!(w, row), rows)
+                    nothing
+                catch err
+                    err
+                end
+                sleep(0.01)                                   # the pusher runs until it blocks on a compression
+                schedule(pusher, InterruptException(); error=true)
+                @test fetch(pusher) isa InterruptException
+                close(w)
+                @test TEST_COMPRESSING[] == 0
+                @test read(dest, String) == "old"
+                @test readdir(dir) == ["out.avro"]
+            end
+        finally
+            delete!(Avro.EXTENSION_CODECS, :testdeflate)
+            resettestcompressor!()
+        end
     end
     @testset "a million empty strings in one datum" begin
         arr = P("{\"type\":\"array\",\"items\":\"string\"}")

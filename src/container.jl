@@ -494,8 +494,8 @@ end
 
 """
     Avro.Writer(dst, schema; codec=nothing, level=nothing, metadata=Dict(), sync=nothing, block_bytes=64*1024,
-                atomic=true, append=false, fsync=false, allow_invalid_names=false, allow_invalid_defaults=false,
-                limits=Limits())
+                ntasks=Threads.nthreads(), atomic=true, append=false, fsync=false, allow_invalid_names=false,
+                allow_invalid_defaults=false, limits=Limits())
 
 A container writer to a path (atomic by default: a sibling temp file renamed into place on `close`) or a
 caller-owned `IO` (flushed, never closed). The path's parent directory, including parent symbolic links,
@@ -504,11 +504,16 @@ is resolved when the writer opens. Changing the working directory later does not
 `:snappy`, `:zstandard` (`level` 1–22, default 3), or `:bzip2`/`:xz` once `CodecBzip2`/`CodecXz` is loaded.
 Datums are encoded into the current block, which is emitted at `block_bytes`, before a datum would push
 it past `max_bytes` or its value cap, or on `flush`/`close`; a datum that exceeds either bound on its own
-is a `LimitError`. The first failure poisons the writer, including a rejected datum from `push!`;
+is a `LimitError`. With a compressing codec and more than one thread, up to `ntasks` emitted blocks compress
+at once on other tasks while the caller encodes the next block. At most `2 × ntasks` blocks wait to be
+written, and `ntasks=1` compresses on the caller's task. The caller's task writes every block in order, so
+the file is the same at every `ntasks`. The first failure poisons the writer, including a rejected datum
+from `push!`. A failed compression raises from the `push!`, `flush` or `close` that writes its block.
 `WriterClosedError` carries the original cause. With `atomic=true`, the temp file is removed and the
 destination is untouched; `atomic=false` and caller-owned streams can retain partial output.
-`close(w; abort=true)` discards the buffered block. The do-block form closes on success and aborts on
-error; a finalizer aborts an unclosed writer without closing caller-owned I/O.
+`close(w; abort=true)` waits for the compression tasks, then discards the buffered block and every block not
+yet written. The do-block form closes on success and aborts on error; a finalizer aborts an unclosed writer
+without closing caller-owned I/O.
 
 `append=true` adds blocks to the existing file at path `dst` in place, keeping its codec (`codec` must be
 `nothing` or match it), metadata and sync marker (a missing or empty file is created as usual). `schema` must equal the file's schema and the file must
@@ -526,6 +531,9 @@ mutable struct Writer
     const syncmarker::NTuple{16,UInt8}
     const limits::Limits
     const blockbytes::Int
+    const workers::Int                      # blocks compressing at once on other tasks; 1 compresses on the caller's task
+    const permits::Base.Semaphore           # caps the compressing tasks at `workers`
+    const inflight::Vector{Task}            # compression tasks, oldest block first
     const fsync::Bool
     const ownsink::Bool
     const encoder::Encoder
@@ -636,9 +644,10 @@ end
 
 function Writer(dst::Union{AbstractString,IO}, schema::Schema; codec::Union{Nothing,Symbol}=nothing, level=nothing,
                 metadata=Dict{String,Vector{UInt8}}(), sync=nothing, block_bytes::Integer=64 * 1024,
-                atomic::Bool=true, append::Bool=false, fsync::Bool=false, allow_invalid_names::Bool=false,
-                allow_invalid_defaults::Bool=false, limits::Limits=Limits())
+                ntasks::Integer=Threads.nthreads(), atomic::Bool=true, append::Bool=false, fsync::Bool=false,
+                allow_invalid_names::Bool=false, allow_invalid_defaults::Bool=false, limits::Limits=Limits())
     block_bytes > 0 || throw(ArgumentError("block_bytes must be positive, got $block_bytes"))
+    1 <= ntasks <= typemax(Int) || throw(ArgumentError("ntasks must be in 1:$(typemax(Int)), got $ntasks"))
     gi = graphinfo(schema)
     gi.repaired_names && !allow_invalid_names && throw(ArgumentError("the schema contains invalid names; pass allow_invalid_names=true to write it"))
     gi.repaired_defaults && !allow_invalid_defaults && throw(ArgumentError("the schema contains invalid defaults; pass allow_invalid_defaults=true to write it"))
@@ -658,8 +667,10 @@ function Writer(dst::Union{AbstractString,IO}, schema::Schema; codec::Union{Noth
         appendstart = -1
         sink, temppath, ownsink = openwritersink(path === nothing ? dst : path, atomic)
     end
+    workers = wcodec.name === :null ? 1 : min(Int(ntasks), Threads.nthreads())
     w = Writer(sink, path, atomic ? temppath : nothing, schema, writeplan(schema), wcodec, syncmarker, limits,
-               min(Int(block_bytes), limits.max_bytes), fsync, ownsink, Encoder(limits), Encoder(limits), appendstart, appendstart, 0, false, nothing, 0, 0)
+               min(Int(block_bytes), limits.max_bytes), workers, Base.Semaphore(workers), Task[], fsync, ownsink,
+               Encoder(limits), Encoder(limits), appendstart, appendstart, 0, false, nothing, 0, 0)
     try
         entries === nothing || writecontainerheader!(sink, entries, syncmarker)
     catch e
@@ -726,6 +737,7 @@ end
 # An aborted append removes its own blocks, unless the file has since grown past them: what follows them is
 # another writer's.
 function abortcleanup(w::Writer; suppress::Bool=false)
+    discardinflight!(w)
     if w.appendstart >= 0
         try
             flush(w.sink)
@@ -816,22 +828,100 @@ function commitdatum!(w::Writer, start::Int, values::Int)
     return w
 end
 
+"Write one compressed block to the sink and count it toward the file's length and a reader's inflation budget."
+function writeblock!(w::Writer, count::Int, compressed::Vector{UInt8}, rawlength::Int)
+    length(compressed) <= w.limits.max_bytes || throw(LimitError(:max_bytes, length(compressed), w.limits.max_bytes))
+    w.compressed = satadd(w.compressed, length(compressed))
+    w.decompressed = satadd(w.decompressed, rawlength)
+    cap = inflationcap(w.limits, w.compressed)
+    w.decompressed <= cap || throw(LimitError(:max_inflation, w.decompressed, cap))
+    w.appendlength += varintlength(count) + varintlength(length(compressed)) + length(compressed) + 16
+    writevarint(w.sink, count)
+    writevarint(w.sink, length(compressed))
+    Base.write(w.sink, compressed)
+    for b in w.syncmarker
+        Base.write(w.sink, b)
+    end
+    return nothing
+end
+
+# Never true and not foldable. `juliac --trim` compiles a task body only through a static call to it.
+const TRIM_CALL_EDGE = Ref(false)
+
+"The compression of one emitted block, run as a task body; the finished job is the task's result."
+mutable struct CompressJob
+    const codec::WriterCodec
+    const permits::Base.Semaphore
+    const count::Int
+    const rawlength::Int
+    bytes::Vector{UInt8}                    # the encoded block, then its compressed payload
+    error::Union{Nothing,Exception}
+end
+
+@noinline function (job::CompressJob)()
+    Base.acquire(job.permits)
+    try
+        job.bytes = compressblock(job.codec, job.bytes)
+    catch e
+        job.error = e::Exception
+    finally
+        Base.release(job.permits)
+    end
+    return job
+end
+
+# `Threads.@spawn` would wrap `job` in a closure that the call edge cannot reach.
+function spawncompression(job::CompressJob)
+    TRIM_CALL_EDGE[] && job()
+    task = Task(job)
+    task.sticky = false
+    Threads._spawn_set_thrpool(task, :default)
+    schedule(task)
+    return task
+end
+
+"Wait for the oldest in-flight block and write it; a failed compression raises here."
+function writeoldest!(w::Writer)
+    job = fetch(first(w.inflight))::CompressJob
+    popfirst!(w.inflight)                    # after the wait, so an interrupted wait leaves the task for an abort
+    err = job.error
+    err === nothing || throw(err)
+    return writeblock!(w, job.count, job.bytes, job.rawlength)
+end
+
+function drainblocks!(w::Writer)
+    while !isempty(w.inflight)
+        writeoldest!(w)
+    end
+    return nothing
+end
+
+# Waits out every compression task, even through an interrupt, so none outlives the sink; their blocks are dropped.
+function discardinflight!(w::Writer)
+    for task in w.inflight
+        try
+            wait(task)
+        catch
+        end
+    end
+    empty!(w.inflight)
+    return nothing
+end
+
+"""
+End the current block by compressing and writing it, or by handing it to a compression task after writing
+the oldest block when `2 × workers` are in flight.
+"""
 function flushblock!(w::Writer)
     w.pendingcount == 0 && return nothing
     try
         raw = take!(w.encoder)
-        compressed = compressblock(w.wcodec, raw)
-        length(compressed) <= w.limits.max_bytes || throw(LimitError(:max_bytes, length(compressed), w.limits.max_bytes))
-        w.compressed = satadd(w.compressed, length(compressed))     # readers charge this block's inflation
-        w.decompressed = satadd(w.decompressed, length(raw))
-        cap = inflationcap(w.limits, w.compressed)
-        w.decompressed <= cap || throw(LimitError(:max_inflation, w.decompressed, cap))
-        w.appendlength += varintlength(w.pendingcount) + varintlength(length(compressed)) + length(compressed) + 16
-        writevarint(w.sink, w.pendingcount)
-        writevarint(w.sink, length(compressed))
-        Base.write(w.sink, compressed)
-        for b in w.syncmarker
-            Base.write(w.sink, b)
+        if w.workers == 1
+            writeblock!(w, w.pendingcount, compressblock(w.wcodec, raw), length(raw))
+        else
+            length(w.inflight) >= 2 * w.workers && writeoldest!(w)
+            job = CompressJob(w.wcodec, w.permits, w.pendingcount, length(raw), raw, nothing)
+            push!(w.inflight, spawncompression(job))
         end
     catch e
         poison!(w, e)
@@ -845,6 +935,7 @@ function Base.flush(w::Writer)
     checkwritable(w)
     flushblock!(w)
     try
+        drainblocks!(w)
         flush(w.sink)
     catch e
         poison!(w, e)
@@ -874,6 +965,7 @@ function Base.close(w::Writer; abort::Bool=false)
     end
     try
         flushblock!(w)
+        drainblocks!(w)
         w.fsync ? syncfile(w.sink) : flush(w.sink)
         if w.path !== nothing
             w.ownsink && close(w.sink)
@@ -900,8 +992,8 @@ end
 
 """
     Avro.write(dst, source; schema=nothing, codec=nothing, level=nothing, metadata=nothing, block_bytes=64*1024,
-               name=nothing, namespace=nothing, append=false, sync=nothing, atomic=true, fsync=false,
-               allow_invalid_names=false, allow_invalid_defaults=false, limits=Limits()) -> dst
+               ntasks=Threads.nthreads(), name=nothing, namespace=nothing, append=false, sync=nothing, atomic=true,
+               fsync=false, allow_invalid_names=false, allow_invalid_defaults=false, limits=Limits()) -> dst
 
 Write a container file from a Tables.jl source (a `DataFrame`, a vector of `NamedTuple`s, a column table,
 `Avro.Table`, `Avro.Rows`) or a collection of datums (a vector or generator of structs or plain values;
@@ -911,8 +1003,9 @@ the schema an Avro source retains, the schema of the file being appended to, els
 (a record named `name`, default `"Record"`), narrowing abstract column types to the types of the values they
 hold. A table column the schema has no field for is an `ArgumentError`. `metadata` defaults to the user
 metadata an Avro source retains, so a rewrite keeps it. `Tables.partitions` become block boundaries (each
-non-empty partition ends a block). `append=true` adds blocks to the existing file at path `dst` (see
-`Avro.Writer`).
+non-empty partition ends a block). With a compressing codec, up to `ntasks` blocks compress at once on other
+tasks, and the file is the same at every `ntasks`. `append=true` adds blocks to the existing file at path
+`dst` (see `Avro.Writer`).
 """
 function write(dst::Union{AbstractString,IO}, table; schema::Union{Nothing,Schema}=nothing,
                name::Union{Nothing,AbstractString}=nothing, namespace::Union{Nothing,AbstractString}=nothing,
