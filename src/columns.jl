@@ -151,10 +151,17 @@ function typedcolumn(data::Vector{E}, @nospecialize(plan::Union{Nothing,Plan})) 
     return NodeColumn{E,typeof(node)}(node, data, 0)
 end
 
-# The typed node of a column of a plain leaf, or of a nullable union whose other branch is one; `nothing`
-# for other columns, which decode generically.
+# The typed node of a column of a plain leaf, an array or map of one, or a nullable union whose other branch
+# is a plain leaf; `nothing` for other columns, which decode generically.
 function columnnode(::Type{E}, @nospecialize(p::Plan)) where {E}
     isleaftype(E) && plainleaf(p) && return LeafNode{E}(p)
+    if p isa ArrayPlan
+        X = eltype(E)
+        return isleaftype(X) && plainleaf(p.items) ? ArrayNode{E,X}(LeafNode{X}(p.items), p.minsize) : nothing
+    elseif p isa MapPlan
+        V = valtype(E)
+        return isleaftype(V) && plainleaf(p.values) ? MapNode{E,String,V}(LeafNode{V}(p.values), p.minsize) : nothing
+    end
     E isa Union && p isa UnionPlan && p.nullable != 0 || return nothing
     X = Base.nonmissingtype(E)
     inner = p.branches[3 - p.nullable]
@@ -200,6 +207,16 @@ const NullableColumn{X} = NodeColumn{Union{Missing,X},NullableNode{Union{Missing
 function decodecell!(c::LeafColumn{E}, d::Decoder) where {E}
     countvalue!(d)
     return appendcell!(c, leafvalue(c.node, d))
+end
+
+function decodecell!(c::NodeColumn{E,ArrayNode{E,X}}, d::Decoder) where {E,X}
+    countvalue!(d)
+    return appendcell!(c, arrayvalue(c.node, d))
+end
+
+function decodecell!(c::NodeColumn{E,MapNode{E,String,V}}, d::Decoder) where {E,V}
+    countvalue!(d)
+    return appendcell!(c, mapvalue(c.node, d))
 end
 
 # A nullable union counts its branch value as `decode` does.

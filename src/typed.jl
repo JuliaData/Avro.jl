@@ -609,22 +609,22 @@ end
     return body
 end
 
+# The item closures capture the node, not its abstract child: a closure's type follows the run-time types of
+# what it captures, so capturing the child would build and dispatch a new closure type per value.
 function arrayvalue(node::ArrayNode{T,E}, d::Decoder) where {T,E}
     enter!(d)
-    items = node.items
     out = E[]
-    eachblockitem(dd -> push!(out, decodenode(E, items, dd)), out, d, node.minsize, "array")
+    eachblockitem(dd -> push!(out, decodenode(E, node.items, dd)), out, d, node.minsize, "array")
     leave!(d)
     return out
 end
 
 function mapvalue(node::MapNode{T,K,V}, d::Decoder) where {T,K,V}
     enter!(d)
-    values = node.values
     out = Dict{K,V}()
     eachblockitem(out, d, satadd(node.minsize, 1), "map") do dd
         key = readstring(dd)
-        out[K === Symbol ? targetsymbol(key) : key] = decodenode(V, values, dd)
+        out[K === Symbol ? targetsymbol(key) : key] = decodenode(V, node.values, dd)
     end
     leave!(d)
     return out

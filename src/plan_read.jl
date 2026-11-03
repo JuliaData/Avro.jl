@@ -345,21 +345,34 @@ end
 
 function decodearray(p::ArrayPlan, d::Decoder)
     enter!(d)
-    out = decodeitems(p.empty, p.items, p.minsize, d)
+    e = p.empty
+    out = e isa Vector{Int64} ? decodeitems(e, p.items, p.minsize, d) :
+          e isa Vector{String} ? decodeitems(e, p.items, p.minsize, d) :
+          e isa Vector{Float64} ? decodeitems(e, p.items, p.minsize, d) :
+          e isa Vector{Any} ? decodeitems(e, p.items, p.minsize, d) : decodeitems(e, p.items, p.minsize, d)
     leave!(d)
     return out
 end
 
 # A function barrier on the element type, so items are stored without boxing (the element types range over
-# the closed value set).
+# the closed value set); leaf items decode through their typed leaf decoder. The item closures capture
+# concrete wrappers of the plan: a closure's type follows the run-time types of what it captures.
 function decodeitems(::Vector{T}, @nospecialize(items::Plan), minsize::Int, d::Decoder) where {T}
     out = T[]
-    return eachblockitem(dd -> push!(out, decode(items, dd)), out, d, minsize, "array")
+    if isleaftype(T)
+        leaf = LeafNode{T}(items)
+        return eachblockitem(dd -> push!(out, (countvalue!(dd); leafvalue(leaf, dd))), out, d, minsize, "array")
+    end
+    generic = GenericNode{Any}(items)
+    return eachblockitem(dd -> push!(out, decode(generic.plan, dd)), out, d, minsize, "array")
 end
 
 function decodemap(p::MapPlan, d::Decoder)
     enter!(d)
-    out = decodeentries(p.empty, p.values, p.minsize, d)
+    e = p.empty
+    out = e isa Vector{String} ? decodeentries(e, p.values, p.minsize, d) :
+          e isa Vector{Int64} ? decodeentries(e, p.values, p.minsize, d) :
+          e isa Vector{Any} ? decodeentries(e, p.values, p.minsize, d) : decodeentries(e, p.values, p.minsize, d)
     leave!(d)
     return out
 end
@@ -367,9 +380,18 @@ end
 # A function barrier like `decodeitems`; a repeated key keeps its last value.
 function decodeentries(::Vector{V}, @nospecialize(values::Plan), minsize::Int, d::Decoder) where {V}
     out = Dict{String,V}()
+    if isleaftype(V)
+        leaf = LeafNode{V}(values)
+        return eachblockitem(out, d, satadd(minsize, 1), "map") do dd
+            k = readstring(dd)
+            countvalue!(dd)
+            out[k] = leafvalue(leaf, dd)
+        end
+    end
+    generic = GenericNode{Any}(values)
     return eachblockitem(out, d, satadd(minsize, 1), "map") do dd
         k = readstring(dd)
-        out[k] = decode(values, dd)
+        out[k] = decode(generic.plan, dd)
     end
 end
 
