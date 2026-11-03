@@ -48,7 +48,8 @@ end
 function codecmessage(err::TranscodingStreams.Error)
     TranscodingStreams.haserror(err) || return "codec failure"
     e = err[]
-    return e isa ErrorException ? e.msg : "codec failure"
+    msg = e isa ErrorException ? e.msg : nothing           # `msg` is declared `AbstractString`
+    return msg isa String ? msg : "codec failure"
 end
 
 # An exact allocation: `resize!` may reserve more than `cap`.
