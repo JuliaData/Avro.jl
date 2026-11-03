@@ -497,9 +497,10 @@ end
 
 # ---- decoding ---------------------------------------------------------------------------------------
 
-# One typed value, counted like `decode`.
+# One typed value, counted like `decode`. A leaf decodes in line; other nodes go through `nodevalue`.
 @inline function decodenode(::Type{T}, @nospecialize(node::TypedNode), d::Decoder) where {T}
     countvalue!(d)
+    leaftarget(T) && node isa LeafNode{T} && return leafvalue(node, d)
     return nodevalue(T, node, d)
 end
 
@@ -552,7 +553,7 @@ end
 
 # The leaf node's plan decoded into `T`, through the plans whose generic value is a `T` or converts to one.
 @generated function leafvalue(node::LeafNode{T}, d::Decoder) where {T}
-    body = Expr(:block, :(p = node.plan))
+    body = Expr(:block, Expr(:meta, :inline), :(p = node.plan))
     for (P, V) in LEAF_PLAN_VALUES
         if V === T
             push!(body.args, :(p isa $P && return decodeleaf(p::$P, d)::$T))
@@ -643,7 +644,7 @@ end
     n = fieldcount(T)
     names = [Symbol(:f, k) for k in 1:n]
     types = [fieldtype(T, k) for k in 1:n]
-    assign(k, j) = :($(names[k]) = decodenode($(types[k]), node.nodes[$j]::TypedNode, d))
+    assign(k, j) = :($(names[k]) = decodenode($(types[k]), childnode(node.nodes, $j), d))
     function stepto(lo, hi)
         lo == hi && return assign(lo, :j)
         mid = (lo + hi) >>> 1
@@ -664,6 +665,14 @@ end
         end
         return $construct
     end
+end
+
+# A record step's node. The `nothing` check narrows the element to `TypedNode`; asserting that abstract
+# parametric type instead would run a subtype check per field.
+@inline function childnode(nodes::Vector{Union{Nothing,TypedNode}}, j::Int)
+    node = @inbounds nodes[j]
+    node === nothing && nodeerror()
+    return node
 end
 
 # The semantic route: a generic decode converted through StructUtils, dispatched at run time (and compiled

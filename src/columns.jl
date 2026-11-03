@@ -1,7 +1,7 @@
 # Column builders: a record's fields decoded straight into typed column vectors. Builders live in a
-# schema-independent `Vector{ColumnBuilder}` driven by one loop with a function barrier per cell; every
-# column's element type is a member of the closed value set (`valuetypes()`), so untrusted schemas never
-# create new method instances.
+# schema-independent `Vector{ColumnBuilder}` driven by one loop that decodes each cell through a closed chain
+# over the common column kinds (and a function barrier for the rest); every column's element type is a member
+# of the closed value set (`valuetypes()`), so untrusted schemas never create new method instances.
 
 abstract type ColumnBuilder end
 

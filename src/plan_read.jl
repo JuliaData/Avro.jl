@@ -39,8 +39,8 @@ end
 struct UUIDStringPlan <: Plan end
 struct UUIDFixedPlan <: Plan end
 struct DurationPlan <: Plan end
-# `empty` (and `MapPlan.empty`) is a never-mutated empty container of the element type: decoding dispatches
-# on its type, because applying a runtime `eltype` per container costs microseconds for `Union` types.
+# `empty` (and `MapPlan.empty`) is a never-mutated empty vector of the element type: decoding dispatches on
+# its type, because applying a runtime `eltype` per container costs microseconds for `Union` types.
 struct ArrayPlan <: Plan
     items::Plan
     minsize::Int
