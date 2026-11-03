@@ -560,7 +560,7 @@ end
         rows = [(x=Int64(i),) for i in 1:100]
         buffered = Avro.tobuffer(rows)
         buffered_reader = Avro.Reader(buffered)
-        @test buffered_reader.source.buf === buffered.data
+        @test pointer(buffered_reader.source.buf) == pointer(buffered.data)     # the buffer's bytes, not a copy
         @test buffered_reader.source.stop == buffered.size
         @test [v.x for v in Avro.eachdatum(buffered_reader)] == collect(1:100)
         close(buffered_reader)

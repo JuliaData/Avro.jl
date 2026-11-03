@@ -15,10 +15,10 @@ construction and safe to share across tasks.
 Positions are one-based byte offsets from the start of the input, including when its array indices
 start elsewhere.
 """
-mutable struct DatumReader{T,P}
+mutable struct DatumReader{T}
     const writer::Schema
     const reader::Schema
-    const plan::P                                         # concrete, so prepared calls dispatch statically
+    const node::TypedNode
     const limits::Limits
     @atomic scratch::Union{Nothing,Decoder{Vector{UInt8}}}   # one pooled decoder, taken and returned lock-free
 end
@@ -26,20 +26,20 @@ end
 function Base.show(io::IO, r::DatumReader{T}) where {T}
     return print(io, "Avro.DatumReader(", schemalabel(r.writer), T === Any ? "" : ", $T", ")")
 end
-function datumreaderplan(writer::Schema, reader::Union{Nothing,Schema}, union_resolution::Symbol)
+function datumreaderplan(@nospecialize(writer::Schema), @nospecialize(reader::Union{Nothing,Schema}), union_resolution::Symbol)
     reader === nothing && return readplan(writer)
     return resolvingplan(writer, reader; union_resolution=union_resolution)
 end
 
-function DatumReader(writer::Schema; kw...)
+function DatumReader(@nospecialize(writer::Schema); kw...)
     return DatumReader(writer, Any; kw...)
 end
 
-function DatumReader(writer::Schema, ::Type{T}; reader_schema::Union{Nothing,Schema}=nothing,
+function DatumReader(@nospecialize(writer::Schema), ::Type{T}; reader_schema::Union{Nothing,Schema}=nothing,
                      union_resolution::Symbol=:spec, limits::Limits=Limits()) where {T}
     reader = something(reader_schema, writer)
-    plan = typedplan(T, reader, datumreaderplan(writer, reader_schema, union_resolution))
-    return DatumReader{T,typeof(plan)}(writer, reader, plan, limits, nothing)
+    node = typednode(T, reader, datumreaderplan(writer, reader_schema, union_resolution))
+    return DatumReader{T}(writer, reader, node, limits, nothing)
 end
 
 const EMPTY_BYTES = UInt8[]   # shared and never written: what an idle decoder holds instead of a caller's bytes
@@ -47,12 +47,11 @@ const EMPTY_BYTES = UInt8[]   # shared and never written: what an idle decoder h
 function (r::DatumReader)(bytes::AbstractVector{UInt8})
     v, next = decodeat(r, bytes, 1)
     next == length(bytes) + 1 || throw(DataError("trailing bytes after the datum", next))
-    return finishtyped(r.plan, v)
+    return v
 end
 
 function (r::DatumReader)(bytes::AbstractVector{UInt8}, pos::Integer)
-    v, next = decodeat(r, bytes, Int(pos))
-    return (finishtyped(r.plan, v), next)
+    return decodeat(r, bytes, Int(pos))
 end
 
 function (r::DatumReader)(io::IO)
@@ -61,23 +60,23 @@ end
 
 # The datum at `pos` and the position after it. A `Vector` reuses the pooled decoder; a failed call drops
 # the decoder instead of returning it.
-function decodeat(r::DatumReader, bytes::Vector{UInt8}, pos::Int)
+function decodeat(r::DatumReader{T}, bytes::Vector{UInt8}, pos::Int) where {T}
     d = @atomicswap r.scratch = nothing
     if d === nothing
         d = Decoder(bytes, r.limits; pos=pos)
     else
         reset!(d, bytes, pos, length(bytes))
     end
-    v = decoderoot(r.plan, d)
+    v = decodenode(T, r.node, d)
     next = d.pos
     d.buf = EMPTY_BYTES
     @atomic r.scratch = d
     return (v, next)
 end
 
-function decodeat(r::DatumReader, bytes::AbstractVector{UInt8}, pos::Int)
+function decodeat(r::DatumReader{T}, bytes::AbstractVector{UInt8}, pos::Int) where {T}
     d = Decoder(onebased(bytes), r.limits; pos=pos)
-    return (decoderoot(r.plan, d), d.pos)
+    return (decodenode(T, r.node, d), d.pos)
 end
 
 """
@@ -88,19 +87,19 @@ end
 One-shot decoding of one datum from bytes (trailing bytes rejected), from `bytes` at `pos`, or from an
 `IO`; `T` selects a typed target. Use a `DatumReader` for repeated work.
 """
-function decode(writer::Schema, src::Union{AbstractVector{UInt8},IO}; kw...)
+function decode(@nospecialize(writer::Schema), src::Union{AbstractVector{UInt8},IO}; kw...)
     return DatumReader(writer; kw...)(src)
 end
 
-function decode(writer::Schema, src::Union{AbstractVector{UInt8},IO}, ::Type{T}; kw...) where {T}
+function decode(@nospecialize(writer::Schema), src::Union{AbstractVector{UInt8},IO}, ::Type{T}; kw...) where {T}
     return DatumReader(writer, T; kw...)(src)
 end
 
-function decode(writer::Schema, bytes::AbstractVector{UInt8}, pos::Integer; kw...)
+function decode(@nospecialize(writer::Schema), bytes::AbstractVector{UInt8}, pos::Integer; kw...)
     return DatumReader(writer; kw...)(bytes, pos)
 end
 
-function decode(writer::Schema, bytes::AbstractVector{UInt8}, pos::Integer, ::Type{T}; kw...) where {T}
+function decode(@nospecialize(writer::Schema), bytes::AbstractVector{UInt8}, pos::Integer, ::Type{T}; kw...) where {T}
     return DatumReader(writer, T; kw...)(bytes, pos)
 end
 

@@ -89,7 +89,7 @@ Avro.lookup(c::LyingStore, ::UInt64) = c.schema
         t = Avro.Table(buf)
         @test Avro.fullname(Avro.schema(t)) == "Main.InterfacePerson" || endswith(Avro.fullname(Avro.schema(t)), ".InterfacePerson")
         @test t.id == [1, 2] && t.name == ["a", "b"]
-        @test collect(Avro.Rows(seekstart(buf); T=InterfacePerson)) == people
+        @test collect(Avro.Rows(seekstart(buf), InterfacePerson)) == people
         @test Avro.fullname(Avro.schema(Avro.Table(Avro.tobuffer(people; name="Q", namespace="n")))) == "n.Q"
         @test Avro.Table(Avro.tobuffer(people; schema=person)).id == [1, 2]
         @test length(Avro.Table(Avro.tobuffer(InterfacePerson[]))) == 0
@@ -171,7 +171,7 @@ Avro.lookup(c::LyingStore, ::UInt64) = c.schema
         @test Tables.rowtable(Avro.Rows(buf)) == [(a=1, b="x")]
         @test collect(Tables.namedtupleiterator(Avro.Table(buf))) == [(a=1, b="x")]
         @test sprint(show, Avro.Rows(buf)) == "Avro.Rows(1 rows: a, b)"
-        @test sprint(show, Avro.Rows(buf; T=NamedTuple{(:a, :b),Tuple{Int,String}})) == "Avro.Rows(1 rows: @NamedTuple{a::Int64, b::String})"
+        @test sprint(show, Avro.Rows(buf, NamedTuple{(:a, :b),Tuple{Int,String}})) == "Avro.Rows(1 rows: @NamedTuple{a::Int64, b::String})"
         @test sprint(show, Avro.Rows(take!(Avro.tobuffer([1])))) == "Avro.Rows(1 rows: long)"
         @test sprint(show, Avro.Rows(IOBuffer(buf))) == "Avro.Rows(1 rows: a, b)"
         s = Avro.schema(Avro.Table(buf))
@@ -301,7 +301,7 @@ Avro.lookup(c::LyingStore, ::UInt64) = c.schema
         r = Avro.SingleObjectReader(store)
         @test r(msg).id == 5 && r(IOBuffer(msg)).name == "five" && r(view(msg, 1:length(msg))).id == 5
         @test Avro.SingleObjectReader(store, T)(msg) === value
-        @test Avro.decodesingle(msg, store; T=T) === value && Avro.decodesingle(msg, store).id == 5
+        @test Avro.decodesingle(msg, store, T) === value && Avro.decodesingle(msg, store).id == 5
         wider = P("""{"type":"record","name":"Person","fields":[{"name":"id","type":"long"},{"name":"name","type":"string"},
                       {"name":"age","type":"int","default":7}]}""")
         @test Avro.SingleObjectReader(store; reader_schema=wider)(msg).age == 7
@@ -618,10 +618,10 @@ Avro.lookup(c::LyingStore, ::UInt64) = c.schema
         t = Avro.Table(buf)
         @test Avro.schema(t).fields[1].schema.logical isa Avro.TimestampMillis
         @test t.at[1] == Avro.timestamp(Millisecond, DateTime(2024, 1, 2, 10))
-        got = collect(Avro.Rows(buf; T=NamedTuple{(:at,),Tuple{ZonedDateTime}}))[1].at
+        got = collect(Avro.Rows(buf, NamedTuple{(:at,),Tuple{ZonedDateTime}}))[1].at
         @test got == denver && got == utc && TimeZones.timezone(got) == tz"UTC"
         optional = take!(Avro.tobuffer([(at=denver,), (at=missing,)]))
-        typed = collect(Avro.Rows(optional; T=NamedTuple{(:at,),Tuple{Union{Missing,ZonedDateTime}}}))
+        typed = collect(Avro.Rows(optional, NamedTuple{(:at,),Tuple{Union{Missing,ZonedDateTime}}}))
         @test typed[1].at == denver && ismissing(typed[2].at)
         for (logical, ticks) in (("timestamp-millis", 1704189600000), ("timestamp-micros", 1704189600000000), ("timestamp-nanos", 1704189600000000000))
             s = P("""{"type":"long","logicalType":"$logical"}""")

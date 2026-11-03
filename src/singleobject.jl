@@ -123,13 +123,13 @@ schema (rejecting a mismatch), resolves against `reader_schema` when given and d
 (trailing bytes are a `DataError`). The first message of each fingerprint does the schema work once; later
 ones only decode. `T` selects a typed target. Safe to share across tasks.
 """
-mutable struct SingleObjectReader{T}
-    const store::SchemaStore
+mutable struct SingleObjectReader{T,S<:SchemaStore}
+    const store::S
     const reader_schema::Union{Nothing,Schema}
     const union_resolution::Symbol
     const limits::Limits
     const lock::ReentrantLock
-    @atomic readers::Dict{UInt64,DatumReader}    # replaced, never mutated, so a lookup takes no lock
+    @atomic readers::Dict{UInt64,DatumReader{T}}    # replaced, never mutated, so a lookup takes no lock
 end
 
 function Base.show(io::IO, r::SingleObjectReader{T}) where {T}
@@ -140,9 +140,9 @@ function SingleObjectReader(store::SchemaStore; kw...)
     return SingleObjectReader(store, Any; kw...)
 end
 
-function SingleObjectReader(store::SchemaStore, ::Type{T}; reader_schema::Union{Nothing,Schema}=nothing,
-                            union_resolution::Symbol=:spec, limits::Limits=Limits()) where {T}
-    return SingleObjectReader{T}(store, reader_schema, union_resolution, limits, ReentrantLock(), Dict{UInt64,DatumReader}())
+function SingleObjectReader(store::S, ::Type{T}; reader_schema::Union{Nothing,Schema}=nothing,
+                            union_resolution::Symbol=:spec, limits::Limits=Limits()) where {T,S<:SchemaStore}
+    return SingleObjectReader{T,S}(store, reader_schema, union_resolution, limits, ReentrantLock(), Dict{UInt64,DatumReader{T}}())
 end
 
 function datumreader(r::SingleObjectReader{T}, fp::UInt64) where {T}
@@ -154,7 +154,7 @@ function datumreader(r::SingleObjectReader{T}, fp::UInt64) where {T}
     actual == fp || throw(DataError("the schema store returned a schema with fingerprint $(string(actual; base=16)) for $(string(fp; base=16))", 3))
     kw = (reader_schema=r.reader_schema, union_resolution=r.union_resolution, limits=r.limits)
     prepared = DatumReader(writer, T; kw...)
-    lock(r.lock) do
+    Base.@lock r.lock begin
         readers = copy(@atomic r.readers)
         readers[fp] = prepared
         @atomic r.readers = readers
@@ -181,12 +181,16 @@ function (r::SingleObjectReader)(io::IO)
 end
 
 """
-    Avro.decodesingle(src, store; reader_schema=nothing, union_resolution=:spec, limits=Limits(), T=nothing)
+    Avro.decodesingle(src, store; reader_schema=nothing, union_resolution=:spec, limits=Limits())
+    Avro.decodesingle(src, store, T; kw...)
 
-One-shot single-object decoding of the message in `src` (use a `SingleObjectReader` for repeated work).
+One-shot single-object decoding of the message in `src`, optionally into the typed target `T` (use a
+`SingleObjectReader` for repeated work).
 """
-function decodesingle(src::Union{AbstractVector{UInt8},IO}, store::SchemaStore; T=nothing, kw...)
-    T === nothing && return SingleObjectReader(store; kw...)(src)
-    T isa Type || throw(ArgumentError("T must be a type or nothing"))
+function decodesingle(src::Union{AbstractVector{UInt8},IO}, store::SchemaStore; kw...)
+    return SingleObjectReader(store; kw...)(src)
+end
+
+function decodesingle(src::Union{AbstractVector{UInt8},IO}, store::SchemaStore, ::Type{T}; kw...) where {T}
     return SingleObjectReader(store, T; kw...)(src)
 end

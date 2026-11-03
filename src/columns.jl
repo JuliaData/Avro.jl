@@ -10,16 +10,27 @@ struct Projection
     slots::Vector{Int}         # source field position -> projected slot (0 means skipped)
 end
 
-# A kept field decoded by its plan `P` into `data`, whose first `len` rows are filled.
-mutable struct TypedColumn{E,P<:Plan} <: ColumnBuilder
-    const plan::P
+# A kept leaf field, or a nullable union of a leaf, decoded by its typed node `N` into `data`, whose first
+# `len` rows are filled.
+mutable struct NodeColumn{E,N<:TypedNode} <: ColumnBuilder
+    const node::N
     data::Vector{E}
     len::Int
 end
 
-# A field that is not kept: skipped (and checked) by its concrete plan.
-struct SkipColumn{P<:Plan} <: ColumnBuilder
-    plan::P
+# Any other kept field, decoded generically by its plan; `nothing` when the row plan fills the column (a reader
+# default, or a whole record's values).
+mutable struct PlanColumn{E} <: ColumnBuilder
+    const plan::Union{Nothing,Plan}
+    data::Vector{E}
+    len::Int
+end
+
+const TypedColumn = Union{NodeColumn,PlanColumn}
+
+# A field that is not kept: skipped (and checked) by its plan.
+struct SkipColumn <: ColumnBuilder
+    plan::Plan
 end
 
 # Consecutive skipped fields fused into one cell: a run of fixed-width leaves is jumped with one bounds
@@ -88,37 +99,73 @@ function fuseskips(cols::Vector{ColumnBuilder})
     return cells
 end
 
-# The plan producing each output field of a record plan, in field order.
-function slotplans(p::RecordPlan)
-    return p.fields
+# The plan producing each output field of a record row plan, in field order (a whole record's plan for
+# each of its fields).
+function slotplans(@nospecialize(p::Plan))
+    p isa RecordPlan && return p.fields
+    p isa WholeRecordPlan && return Plan[p.plan for _ in p.schema.fields]
+    plans = Vector{Plan}(undef, length(p.schema.fields))
+    for (slot, plan) in (p::ResolvedRecordPlan).steps
+        slot == 0 || (plans[slot] = plan)
+    end
+    for (slot, dp) in p.defaults
+        plans[slot] = dp
+    end
+    return plans
 end
 
 # One builder per output field: a `TypedColumn` with room for `capacity` rows for every field the
 # projection keeps (`nothing` keeps all), a `SkipColumn` otherwise.
-function columnbuilders(p::Plan, projection::Union{Nothing,Projection}, capacity::Int)
+function columnbuilders(@nospecialize(p::Plan), projection::Union{Nothing,Projection}, capacity::Int)
     capacity >= 0 || throw(ArgumentError("capacity must be non-negative"))
+    fields = p.schema.fields
+    return directbuilders(p, projection, AbstractVector[Vector{juliatype(fields[i].schema)}(undef, capacity)
+                                                        for i in keptslots(projection, length(fields))])
+end
+
+function keptslots(projection::Union{Nothing,Projection}, n::Int)
+    return projection === nothing ? (1:n) : projection.indices
+end
+
+# Builders that decode blocks straight into final columns: `finals[k]` is projected column `k`, and each
+# block's rows land after the row its builders' `len` is set to.
+function directbuilders(@nospecialize(p::Plan), projection::Union{Nothing,Projection}, finals::Vector{AbstractVector})
     plans = slotplans(p)
+    fields = p.schema.fields
     cols = Vector{ColumnBuilder}(undef, length(plans))
     for (i, plan) in enumerate(plans)
-        if projection === nothing || projection.slots[i] != 0
-            cols[i] = TypedColumn(plan, Vector{juliatype(p.schema.fields[i].schema)}(undef, capacity), 0)
-        else
+        k = projection === nothing ? i : projection.slots[i]
+        if k == 0
             cols[i] = SkipColumn(plan)
+        else
+            filled = p isa WholeRecordPlan || plan isa DefaultPlan       # by the row plan
+            cols[i] = typedcolumn(finals[k], filled ? nothing : plan)
         end
     end
     return cols
 end
 
-# Builders that decode blocks straight into preallocated final columns: `finals[k]` is projected column `k`,
-# and each block's rows land after the row its builders' `len` is set to.
-function directbuilders(p::Plan, projection::Union{Nothing,Projection}, finals::Vector{AbstractVector})
-    plans = slotplans(p)
-    cols = Vector{ColumnBuilder}(undef, length(plans))
-    for (i, plan) in enumerate(plans)
-        k = projection === nothing ? i : projection.slots[i]
-        cols[i] = k == 0 ? SkipColumn(plan) : TypedColumn(plan, finals[k], 0)
-    end
-    return cols
+function typedcolumn(data::Vector{E}, @nospecialize(plan::Union{Nothing,Plan})) where {E}
+    node = plan === nothing ? nothing : columnnode(E, plan)
+    node === nothing && return PlanColumn{E}(plan, data, 0)
+    return NodeColumn{E,typeof(node)}(node, data, 0)
+end
+
+# The typed node of a column of a plain leaf, or of a nullable union whose other branch is one; `nothing`
+# for other columns, which decode generically.
+function columnnode(::Type{E}, @nospecialize(p::Plan)) where {E}
+    isleaftype(E) && plainleaf(p) && return LeafNode{E}(p)
+    E isa Union && p isa UnionPlan && p.nullable != 0 || return nothing
+    X = Base.nonmissingtype(E)
+    inner = p.branches[3 - p.nullable]
+    (isleaftype(X) && plainleaf(inner)) || return nothing
+    branches = Union{Nothing,TypedNode}[LeafNode{X}(inner), LeafNode{X}(inner)]
+    branches[p.nullable] = nothing
+    return NullableNode{E,X}(copy(p.branches), branches)
+end
+
+function plainleaf(@nospecialize(p::Plan))
+    return !(p isa Union{RecordPlan,ArrayPlan,MapPlan,UnionPlan,WholeRecordPlan}) && !isresolving(p)
 end
 
 # One record row in wire order: the record value is counted, then each cell is decoded.
@@ -126,14 +173,46 @@ function decoderow!(cells::Vector{ColumnBuilder}, d::Decoder)
     countvalue!(d)
     enter!(d)
     for c in cells
-        decodecell!(c, d)
+        anycell!(c, d)
     end
     leave!(d)
     return nothing
 end
 
-function decodecell!(c::TypedColumn, d::Decoder)
-    return appendcell!(c, decode(c.plan, d))
+# One cell through a closed chain over the common column kinds; the others dispatch at run time.
+function anycell!(@nospecialize(c::ColumnBuilder), d::Decoder)
+    c isa LeafColumn{Int64} && return decodecell!(c, d)
+    c isa LeafColumn{String} && return decodecell!(c, d)
+    c isa LeafColumn{Float64} && return decodecell!(c, d)
+    c isa NullableColumn{String} && return decodecell!(c, d)
+    c isa NullableColumn{Int64} && return decodecell!(c, d)
+    c isa NullableColumn{Float64} && return decodecell!(c, d)
+    c isa LeafColumn{Int32} && return decodecell!(c, d)
+    c isa LeafColumn{Bool} && return decodecell!(c, d)
+    c isa SkipColumn && return decodecell!(c, d)
+    c isa SkipRun && return decodecell!(c, d)
+    return decodecell!(c, d)
+end
+
+const LeafColumn{E} = NodeColumn{E,LeafNode{E}}
+const NullableColumn{X} = NodeColumn{Union{Missing,X},NullableNode{Union{Missing,X},X}}
+
+function decodecell!(c::LeafColumn{E}, d::Decoder) where {E}
+    countvalue!(d)
+    return appendcell!(c, leafvalue(c.node, d))
+end
+
+# A nullable union counts its branch value as `decode` does.
+function decodecell!(c::NodeColumn{E,NullableNode{E,X}}, d::Decoder) where {E,X}
+    countvalue!(d)
+    branches = c.node.branches
+    b = branches[readindex(d, length(branches))]
+    countvalue!(d)
+    return appendcell!(c, b === nothing ? missing : leafvalue(b::LeafNode{X}, d))
+end
+
+function decodecell!(c::PlanColumn, d::Decoder)
+    return appendcell!(c, decode(c.plan::Plan, d))
 end
 
 function decodecell!(c::SkipColumn, d::Decoder)
@@ -184,4 +263,40 @@ end
 # The column trimmed to its filled rows.
 function finishcolumn!(c::TypedColumn)
     return resize!(c.data, c.len)
+end
+
+# ---- column builders over resolved records ------------------------------------------------------------
+
+# A writer union resolved into a reader record has no fields of its own to decode into columns: each row
+# decodes whole and its values go to the columns.
+struct WholeRecordPlan <: Plan
+    schema::RecordSchema
+    plan::Plan
+end
+
+function recordrowplan(plan::Plan, effective::RecordSchema)
+    return plan isa Union{RecordPlan,ResolvedRecordPlan} ? plan : WholeRecordPlan(effective, plan)
+end
+
+function decoderow!(cols::Vector{ColumnBuilder}, d::Decoder, p::WholeRecordPlan)
+    values = getfield(decode(p.plan, d)::Record, :values)
+    for (c, v) in zip(cols, values)
+        c isa TypedColumn && appendcell!(c, v)
+    end
+    return nothing
+end
+
+# One resolved record row into its reader-slot builders (unfused): the writer-ordered steps, then the defaults.
+function decoderow!(cols::Vector{ColumnBuilder}, d::Decoder, p::ResolvedRecordPlan)
+    countvalue!(d)
+    enter!(d)
+    for (slot, plan) in p.steps
+        slot == 0 ? skip(plan, d) : anycell!(cols[slot], d)
+    end
+    for (slot, dp) in p.defaults
+        c = cols[slot]
+        c isa TypedColumn && appendcell!(c, freshvalue(dp.value))
+    end
+    leave!(d)
+    return nothing
 end

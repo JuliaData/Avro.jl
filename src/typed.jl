@@ -1,141 +1,139 @@
-# Typed decoding. A typed plan specialises a read plan on a caller-supplied target type `T`. The fast
-# route builds plain data types straight from their decoded fields through their positional constructors,
-# in a function generated for the compile-time `T`. Everything the fast route does not cover decodes
-# generically and is converted afterwards through `StructUtils.make(T, generic, AvroStyle())`.
+# Typed decoding: a typed node decodes one schema node into a caller-supplied Julia type `T`. Node types are
+# parametric only on target types, so a typed reader's type follows from `T` alone and its code compiles
+# once per target type, whatever the schema; nodes reach their plans through closed `isa` chains. Plain
+# data types are built straight from their decoded fields through their positional constructors; other
+# targets decode generically and convert through `StructUtils.make(T, generic, AvroStyle())`, which runs
+# through run-time dispatch (`runtimecall`) and so is left out of `juliac --trim` programs.
 
-abstract type TypedPlan end
+abstract type TypedNode{T} end
 
-# The target is `Any` or the schema node's generic type.
-struct GenericTarget{P<:Plan} <: TypedPlan
-    plan::P
+# The generic value: `T` is `Any`, or `Record` for a record schema.
+struct GenericNode{T} <: TypedNode{T}
+    plan::Plan
 end
 
 # Decode generically, then convert through StructUtils (`AvroStyle`).
-struct SemanticTarget{T} <: TypedPlan
+struct SemanticNode{T} <: TypedNode{T}
     plan::Plan
     schema::Schema
 end
 
-# A leaf converted from its generic representation (`convertleaf`).
-struct LeafTarget{T,P<:Plan} <: TypedPlan
-    plan::P
+# A leaf whose generic value is a `T` or converts to one (`convertleaf`).
+struct LeafNode{T} <: TypedNode{T}
+    plan::Plan
 end
 
 # A `string` interned as a `Symbol`.
-struct SymbolTarget <: TypedPlan end
+struct SymbolNode <: TypedNode{Symbol} end
 
 # An enum by reader symbol position into `String`, `Symbol` or a `Base.Enum` (`nothing`: no member).
-struct EnumTarget{T,P<:Plan} <: TypedPlan
-    plan::P                                    # `EnumPlan`, or `EnumRemapPlan` under resolution
+struct EnumNode{T} <: TypedNode{T}
+    plan::Plan                                 # `EnumPlan`, or `EnumRemapPlan` under resolution
     schema::EnumSchema                         # the reader enum
     members::Vector{Union{Nothing,T}}
 end
 
-struct ArrayTarget{E,P<:TypedPlan} <: TypedPlan
-    items::P
+# An array into `Vector{E}`.
+struct ArrayNode{T,E} <: TypedNode{T}
+    items::TypedNode
     minsize::Int
 end
 
-# A map into `Dict{K,V}` with `K` `String` or `Symbol`.
-struct MapTarget{K,V,P<:TypedPlan} <: TypedPlan
-    values::P
+# A map into `Dict{K,V}`, `K` `String` or `Symbol`.
+struct MapNode{T,K,V} <: TypedNode{T}
+    values::TypedNode
     minsize::Int
 end
 
-# A two-branch nullable union into `Union{N,…}`: `N` is `Missing`, `Nothing`, or `Union{}` when null is rejected.
-struct NullableTarget{N,P<:TypedPlan} <: TypedPlan
-    inner::P
-    nullpos::Int
+# A union whose branches are null or decode into `X`, the non-null member of `T` (or `T` itself, which then
+# rejects a null with a `ConversionError`): a two-branch nullable union, or a writer union resolved into one
+# branch by branch. `branches[i]` decodes branch `i`; `nothing` marks a null (`plans[i]` a `NullPlan`) or a
+# writer branch the reader cannot resolve (an `UnresolvableBranch`).
+struct NullableNode{T,X} <: TypedNode{T}
+    plans::Vector{Plan}
+    branches::Vector{Union{Nothing,TypedNode}}
 end
 
-# Any other union into a Julia `Union` whose members map to the branches.
-struct UnionTarget{T} <: TypedPlan
-    branches::Vector{TypedPlan}
+# Any other union into a Julia type whose members decode the branches: branch `i` decodes into member
+# `members[i]` of `Base.uniontypes(T)`.
+struct UnionNode{T} <: TypedNode{T}
+    branches::Vector{TypedNode}
+    members::Vector{Int}
 end
 
-# A schema field the target type does not have.
-struct SkipTarget{P<:Plan} <: TypedPlan
-    plan::P
-end
-
-# Recursion through the caller's own recursive types (filled once the record is built; a function barrier).
-mutable struct RefTarget{T} <: TypedPlan
-    plan::Union{Nothing,TypedPlan}
-end
-
-# A non-union writer `null` resolved to the target's nullable convention.
-struct ResolvedNullTarget{N,P<:Plan} <: TypedPlan
-    plan::P
-end
-
-# A writer union resolved into a two-branch nullable reader union, typed per writer branch.
-struct ResolvedNullableTarget{N,BS<:Tuple} <: TypedPlan
-    branches::BS
-    isnull::Vector{Bool}
-end
-
-# A record decoded in wire order straight into a `NamedTuple` or plain struct: `SLOTMAP[j]` is the target
-# field of step `j` (0: skipped); `defaults[k]` fills target fields no step fills. Heap identity: an inline
-# immutable would re-box on every `plan` field load.
-mutable struct RecordTarget{T,PS<:Tuple,SLOTMAP} <: TypedPlan
-    const plans::PS
-    const defaults::Vector{Any}                # a reader `DefaultPlan` (fresh per record), `missing` or `nothing`
+# A record decoded in wire order straight into a `NamedTuple` or plain struct. Wire step `j` fills target
+# field `slots[j]` through `nodes[j]`, or is skipped through `plans[j]` when `slots[j] == 0`; a target field
+# no step fills (`!filled[k]`) takes a fresh copy of `defaults[k]`, a value of the field's type. Mutable, so
+# a recursive record refers to its own node while it is built.
+mutable struct RecordNode{T} <: TypedNode{T}
+    const plans::Vector{Plan}
+    const nodes::Vector{Union{Nothing,TypedNode}}
+    const slots::Vector{Int}
+    const filled::Vector{Bool}
+    const defaults::Vector{Any}
+    aligned::Bool                              # step `k` fills field `k` for every field, and there are no others
 end
 
 # ---- construction -----------------------------------------------------------------------------------
 
-# The record targets built so far by (read plan, target type); a reader record resolved against two
-# writer records has two read plans. Each entry stays a complete plan for its key, including one built
-# inside a union-member or record attempt that later fell back to the semantic route.
-const TypedMemo = IdDict{Any,TypedPlan}
-
-function memolookup(memo::TypedMemo, p::Plan, ::Type{T}) where {T}
-    return get(memo, (p, T), nothing)
+# The name of `T` for messages, built when the method compiles.
+@generated function typestring(::Type{T}) where {T}
+    return string(T)
 end
 
-function memostore!(memo::TypedMemo, p::Plan, ::Type{T}, t::TypedPlan) where {T}
-    memo[(p, T)] = t
-    return t
+# The record nodes built so far by (read plan, target type); a reader record resolved against two writer
+# records has two read plans. An entry stays complete for its key, including one built inside a union-member
+# or record attempt that later fell back to the semantic route.
+const TypedMemo = IdDict{Any,TypedNode}
+
+"The typed node decoding `plan` (the generic or resolving plan of `reader`) into `T`."
+Base.@nospecializeinfer function typednode(::Type{T}, @nospecialize(reader::Schema), @nospecialize(plan::Plan)) where {T}
+    return buildnode(T, reader, plan, TypedMemo())
 end
 
-# The typed plan decoding `plan` (the generic or resolving plan of `reader`) into `T`.
-function typedplan(::Type{T}, reader::Schema, plan::Plan) where {T}
-    return buildtyped(T, reader, plan, TypedMemo())
-end
-
-function buildtyped(::Type{T}, s::Schema, p::Plan, memo::TypedMemo) where {T}
-    (T === Any || T === juliatype(s)) && return GenericTarget(p)
-    customhooks(T) && return SemanticTarget{T}(p, s)
+Base.@nospecializeinfer function buildnode(::Type{T}, @nospecialize(s::Schema), @nospecialize(p::Plan), memo::TypedMemo) where {T}
+    T === Any && return GenericNode{Any}(p)
+    if !(s isa Union{UnionSchema,ArraySchema,MapSchema}) && T === juliatype(s)
+        return T === Record ? GenericNode{Record}(p) : LeafNode{T}(p)
+    end
+    customhooks(T) && return SemanticNode{T}(p, s)
     if isresolving(p)
-        t = buildresolvedtyped(T, s, p, memo)
-        return t === nothing ? SemanticTarget{T}(p, s) : t
+        node = runtimecall(buildresolvednode, T, s, p, memo)     # compiled when a reader schema first needs it
+        return node === nothing ? SemanticNode{T}(p, s) : node::TypedNode
     end
-    s isa UnionSchema && return builduniontarget(T, s, p::UnionPlan, memo)
+    s isa UnionSchema && return buildunionnode(T, s, p::UnionPlan, memo)
     if T isa Union
-        nulltype, inner = splitoptional(T)
-        s isa NullSchema && nulltype !== Union{} && return buildtyped(nulltype, s, p, memo)
-        inner === nothing && return SemanticTarget{T}(p, s)
-        return buildtyped(inner, s, p, memo)      # a non-null schema never produces the null member
+        N, X = splitoptional(T)
+        s isa NullSchema && N !== Union{} && return LeafNode{N}(p)
+        X === nothing && return SemanticNode{T}(p, s)
+        return buildnode(X, s, p, memo)          # a non-null schema never produces the null member
     end
-    s isa RecordSchema && return buildrecordtarget(T, s, p::RecordPlan, memo)
-    s isa ArraySchema && return buildarraytarget(T, s, p::ArrayPlan, memo)
-    s isa MapSchema && return builddicttarget(T, s, p::MapPlan, memo)
-    return buildleaftarget(T, s, p)
+    recordlike(T) && s isa RecordSchema && return buildrecordnode(T, s, p, memo)
+    T <: Vector && s isa ArraySchema && return buildarraynode(T, s, p::ArrayPlan, memo)
+    T <: Dict && s isa MapSchema && return buildmapnode(T, s, p::MapPlan, memo)
+    return buildleafnode(T, s, p)        # the semantic node when `T` cannot hold the schema's values directly
 end
 
-# `Union{Missing,X}` → `(Missing, X)`, `Union{Nothing,X}` → `(Nothing, X)`; `inner === nothing` when `T`
-# is not of that shape (several members, both null kinds, or not a union).
-function splitoptional(::Type{T}) where {T}
+# `Union{Missing,X}` → `(Missing, X)`, `Union{Nothing,X}` → `(Nothing, X)`; `X === nothing` when `T` is not of
+# that shape (several members, both null kinds, or not a union). Generated, so both are constants where
+# `T` is.
+@generated function splitoptional(::Type{T}) where {T}
     if Missing <: T
-        inner = Base.nonmissingtype(T)
-        (inner === Union{} || inner isa Union) && return (Missing, nothing)
-        return (Missing, inner)
+        X = Base.nonmissingtype(T)
+        return (X === Union{} || X isa Union) ? :((Missing, nothing)) : :((Missing, $X))
     elseif Nothing <: T
-        inner = Base.nonnothingtype(T)
-        (inner === Union{} || inner isa Union) && return (Nothing, nothing)
-        return (Nothing, inner)
+        X = Base.nonnothingtype(T)
+        return (X === Union{} || X isa Union) ? :((Nothing, nothing)) : :((Nothing, $X))
     end
-    return (Union{}, nothing)
+    return :((Union{}, nothing))
+end
+
+# The schema node and plan a node is built for. Generated builders take it whole: a generated function
+# specializes on every argument's run-time type, and this one is concrete.
+struct NodeSite
+    schema::Schema
+    plan::Plan
+    memo::TypedMemo
 end
 
 const HOOK_MODULES = (StructUtils, @__MODULE__)
@@ -150,20 +148,29 @@ end
 # Process-wide; at most `HOOK_CACHE_SIZE` types each, emptied when full or when any method is defined.
 const HOOK_CACHE = HookCache(ReentrantLock(), UInt(0), IdDict{Any,Bool}())
 const PROPERTY_CACHE = HookCache(ReentrantLock(), UInt(0), IdDict{Any,Bool}())
+const FIELD_DEFAULTS_CACHE = HookCache(ReentrantLock(), UInt(0), IdDict{Any,Bool}())
 const HOOK_CACHE_SIZE = 1024
 
-function cachedanswer(f, cache::HookCache, @nospecialize(T::Type))
+# The answer of the method query `f(T)`. Queries run through `runtimecall`: trimmed programs, which leave
+# method-table reflection out, answer `false`, so they never consult StructUtils hooks or overridden
+# `propertynames`.
+Base.@nospecializeinfer function cachedanswer(f::F, cache::HookCache, @nospecialize(T::Type)) where {F}
     world = Base.get_world_counter()
-    @lock cache.lock begin
+    Base.@lock cache.lock begin
         if cache.world != world
             empty!(cache.answers)
             cache.world = world
         end
         answer = get(cache.answers, T, nothing)
-        answer === nothing || return answer
+        answer === nothing || return answer::Bool
     end
-    answer = f(T)::Bool                                # outside the lock: the query may compile
-    @lock cache.lock begin
+    answer = try                                       # outside the lock: the query may compile
+        runtimecall(f, T)::Bool
+    catch err
+        notcompiled(err, f) || rethrow()
+        false
+    end
+    Base.@lock cache.lock begin
         if cache.world == world                        # unless a newer world emptied the cache meanwhile
             length(cache.answers) >= HOOK_CACHE_SIZE && empty!(cache.answers)
             cache.answers[T] = answer
@@ -174,14 +181,18 @@ end
 
 # Whether a `StructUtils.make` or `StructUtils.lift` method outside StructUtils and Avro applies to `T`
 # under `AvroStyle` (such targets always take the semantic route).
-function customhooks(@nospecialize(T::Type))
+Base.@nospecializeinfer function customhooks(@nospecialize(T::Type))
     return cachedanswer(methodhooks, HOOK_CACHE, T)
 end
 
 # Whether `T` overrides `propertynames` (a DataFrame row, say), so that its properties are its columns.
-function usesproperties(@nospecialize(T::Type))
+Base.@nospecializeinfer function usesproperties(@nospecialize(T::Type))
     T <: NamedTuple && return false
-    return cachedanswer(S -> which(propertynames, Tuple{S}).module !== Base, PROPERTY_CACHE, T)
+    return cachedanswer(overridespropertynames, PROPERTY_CACHE, T)
+end
+
+function overridespropertynames(@nospecialize(T::Type))
+    return which(propertynames, Tuple{T}).module !== Base
 end
 
 function methodhooks(@nospecialize(T::Type))
@@ -198,68 +209,91 @@ function methodhooks(@nospecialize(T::Type))
     return false
 end
 
-function builduniontarget(::Type{T}, s::UnionSchema, p::UnionPlan, memo::TypedMemo) where {T}
+# Default factories run per value on the semantic route, including defaults that depend on other fields.
+Base.@nospecializeinfer function customfielddefaults(@nospecialize(T::Type))
+    return cachedanswer(methodfielddefaults, FIELD_DEFAULTS_CACHE, T)
+end
+
+function methodfielddefaults(@nospecialize(T::Type))
+    for signature in (Tuple{AvroStyle,Type{T}}, Tuple{AvroStyle,Type{T},Any})
+        for method in methods(StructUtils.fielddefaults, signature)
+            method.module in HOOK_MODULES || return true
+        end
+    end
+    return false
+end
+
+function buildunionnode(::Type{T}, s::UnionSchema, p::UnionPlan, memo::TypedMemo) where {T}
     nb = nullablebranch(s)
-    target = nb == 0 ? branchtargets(T, s, p, memo) : nullabletarget(T, s, p, nb, memo)
-    return target === nothing ? SemanticTarget{T}(p, s) : target
+    node = nb == 0 ? branchnodes(T, s, p, memo) : nullablenode(T, s, p, nb, memo)
+    return node === nothing ? SemanticNode{T}(p, s) : node
 end
 
-function nullabletarget(::Type{T}, s::UnionSchema, p::UnionPlan, nb::Int, memo::TypedMemo) where {T}
-    N, inner = T isa Union ? splitoptional(T) : (Union{}, T)
-    inner === nothing && return nothing
-    ip = buildtyped(inner, s.branches[3 - nb], p.branches[3 - nb], memo)
-    ip isa SemanticTarget && return nothing
-    return NullableTarget{N,typeof(ip)}(ip, nb)
+function nullablenode(::Type{T}, s::UnionSchema, p::UnionPlan, nb::Int, memo::TypedMemo) where {T}
+    X = T isa Union ? splitoptional(T)[2] : T
+    X === nothing && return nothing
+    inner = buildnode(X, s.branches[3 - nb], p.branches[3 - nb], memo)
+    inner isa SemanticNode && return nothing
+    branches = Union{Nothing,TypedNode}[inner, inner]
+    branches[nb] = nothing
+    return NullableNode{T,X}(copy(p.branches), branches)
 end
 
-function branchtargets(::Type{T}, s::UnionSchema, p::UnionPlan, memo::TypedMemo) where {T}
-    members = T isa Union ? Base.uniontypes(T) : Any[T]
-    branches = TypedPlan[]
+function branchnodes(::Type{T}, s::UnionSchema, p::UnionPlan, memo::TypedMemo) where {T}
+    branches = TypedNode[]
+    members = Int[]
     for (b, bp) in zip(s.branches, p.branches)
-        tp = membertarget(members, b, bp, memo)
-        tp === nothing && return nothing
-        push!(branches, tp)
+        found = membernode(T, NodeSite(b, bp, memo))
+        found === nothing && return nothing
+        push!(branches, found.first)
+        push!(members, found.second)
     end
-    return UnionTarget{T}(branches)
+    return UnionNode{T}(branches, members)
 end
 
-# The first member that decodes branch `b` directly: the branch's own Julia type first, then `Base.uniontypes` order.
-function membertarget(members::Vector{Any}, b::Schema, bp::Plan, memo::TypedMemo)
-    natural = juliatype(b)
-    for m in (natural in members ? Any[natural; filter(!=(natural), members)] : members)
-        tp = buildtyped(m, b, bp, memo)
-        isdirect(tp) && return tp
+# The node of the first member of `T` that decodes the site's union branch directly, and that member's
+# position in `Base.uniontypes(T)`: the branch's own Julia type first, then the others in order.
+@generated function membernode(::Type{T}, site::NodeSite) where {T}
+    members = T isa Union ? Base.uniontypes(T) : Any[T]
+    body = Expr(:block, :(natural = juliatype(site.schema)))
+    for pass in (:own, :others), (k, M) in enumerate(members)
+        test = pass === :own ? :(natural === $M) : :(natural !== $M)
+        push!(body.args, :($test && (node = buildnode($M, site.schema, site.plan, site.memo);
+                                     isdirect(node) && return Pair{TypedNode,Int}(node, $k))))
     end
-    return nothing
+    push!(body.args, :(return nothing))
+    return body
 end
 
-# Whether a target decodes with no StructUtils conversion anywhere below it.
-function isdirect(tp::TypedPlan, seen::Base.IdSet{Any}=Base.IdSet{Any}())
-    tp isa SemanticTarget && return false
-    tp in seen && return true
-    push!(seen, tp)
-    children = tp isa RecordTarget ? tp.plans :
-               tp isa ArrayTarget ? (tp.items,) :
-               tp isa MapTarget ? (tp.values,) :
-               tp isa NullableTarget ? (tp.inner,) :
-               tp isa Union{UnionTarget,ResolvedNullableTarget} ? tp.branches :
-               tp isa RefTarget && tp.plan !== nothing ? (tp.plan,) : ()
-    return all(c -> isdirect(c, seen), children)
+# Whether a node decodes with no StructUtils conversion anywhere below it.
+Base.@nospecializeinfer function isdirect(@nospecialize(node::TypedNode), seen::Base.IdSet{Any}=Base.IdSet{Any}())
+    node isa SemanticNode && return false
+    node in seen && return true
+    push!(seen, node)
+    node isa ArrayNode && return isdirect(node.items, seen)
+    node isa MapNode && return isdirect(node.values, seen)
+    node isa UnionNode && return all(c -> isdirect(c, seen), node.branches)
+    children = node isa RecordNode ? node.nodes : node isa NullableNode ? node.branches : nothing
+    children === nothing && return true
+    for c in children
+        c === nothing || isdirect(c, seen) || return false
+    end
+    return true
 end
 
-function buildleaftarget(::Type{T}, s::Schema, p::Plan) where {T}
-    T === Symbol && p isa StringPlan && return SymbolTarget()
-    p isa EnumPlan && s isa EnumSchema && isenumtarget(T) && return EnumTarget(T, s, p)
-    leafcompatible(T, p) && return LeafTarget{T,typeof(p)}(p)
-    return SemanticTarget{T}(p, s)
+Base.@nospecializeinfer function buildleafnode(::Type{T}, @nospecialize(s::Schema), @nospecialize(p::Plan)) where {T}
+    T === Symbol && p isa StringPlan && return SymbolNode()
+    isenumtarget(T) && p isa EnumPlan && s isa EnumSchema && return enumnode(T, s, p)
+    leaftarget(T) && leafcompatible(T, p) && return LeafNode{T}(p)
+    return SemanticNode{T}(p, s)
 end
 
-function isenumtarget(::Type{T}) where {T}
-    return T === String || T === Symbol || T <: Base.Enum
+function isenumtarget(@nospecialize(T))
+    return T === String || T === Symbol || (T isa DataType && T <: Base.Enum)
 end
 
-function EnumTarget(::Type{T}, s::EnumSchema, p::Plan) where {T}
-    return EnumTarget{T,typeof(p)}(p, s, enummembers(T, s))
+Base.@nospecializeinfer function enumnode(::Type{T}, s::EnumSchema, @nospecialize(p::Plan)) where {T}
+    return EnumNode{T}(p, s, enummembers(T, s))
 end
 
 function enummembers(::Type{T}, s::EnumSchema) where {T}
@@ -273,72 +307,80 @@ function enummembers(::Type{T}, s::EnumSchema) where {T}
     return members
 end
 
-function leafcompatible(::Type{T}, ::NullPlan) where {T}
-    return T === Nothing
-end
+# Each leaf plan and the type of its generic value (a decimal plan's is one of two).
+const LEAF_PLAN_VALUES = (
+    (LongPlan, Int64), (StringPlan, String), (DoublePlan, Float64), (IntPlan, Int32), (BoolPlan, Bool),
+    (FloatPlan, Float32), (BytesPlan, Vector{UInt8}), (NullPlan, Missing), (EnumPlan, EnumValue),
+    (FixedPlan, Fixed), (DatePlan, Date), (TimeMillisPlan, Time), (TimeMicrosPlan, Time),
+    (TimestampPlan{Millisecond}, Timestamp{Millisecond}), (TimestampPlan{Microsecond}, Timestamp{Microsecond}),
+    (TimestampPlan{Nanosecond}, Timestamp{Nanosecond}), (LocalTimestampPlan{Millisecond}, LocalTimestamp{Millisecond}),
+    (LocalTimestampPlan{Microsecond}, LocalTimestamp{Microsecond}), (LocalTimestampPlan{Nanosecond}, LocalTimestamp{Nanosecond}),
+    (DecimalPlan, Decimal), (DecimalPlan, WideDecimal), (UUIDStringPlan, UUID), (UUIDFixedPlan, UUID), (DurationPlan, Duration),
+)
 
-function leafcompatible(::Type{T}, ::Union{IntPlan,LongPlan}) where {T}
-    return T <: Integer && T !== Bool && isbitstype(T)
-end
+# The reader leaf types a promotion produces (`promotedvalue`).
+const PROMOTION_TARGETS = (Int64, Float32, Float64, Time, String, UUID, Vector{UInt8}, Decimal, WideDecimal,
+                           Timestamp{Millisecond}, Timestamp{Microsecond}, Timestamp{Nanosecond},
+                           LocalTimestamp{Millisecond}, LocalTimestamp{Microsecond}, LocalTimestamp{Nanosecond})
 
-function leafcompatible(::Type{T}, ::FloatPlan) where {T}
-    return T === Float64 || T === Float16
-end
-
-function leafcompatible(::Type{T}, ::StringPlan) where {T}
-    return T === Char
-end
-
-function leafcompatible(::Type{T}, p::FixedPlan) where {T}
-    return T === Vector{UInt8} || isbytetuple(T, p.schema.size)
-end
-
-function leafcompatible(::Type{T}, ::Union{TimestampPlan,LocalTimestampPlan}) where {T}
-    return T === DateTime
-end
-
-function leafcompatible(::Type{T}, ::Plan) where {T}
+# Whether `convertleaf` converts the generic value of plans of type `P` to `T` (a type other than that
+# value's own); a fixed's size is checked separately.
+Base.@nospecializeinfer function leafconverts(@nospecialize(T), @nospecialize(P))
+    T isa DataType || return false
+    P === NullPlan && return T === Nothing
+    (P === IntPlan || P === LongPlan) && return T <: Integer && T !== Bool && isbitstype(T)
+    P === FloatPlan && return T === Float64 || T === Float16
+    P === StringPlan && return T === Char
+    P === FixedPlan && return T === Vector{UInt8} || (T <: Tuple && all(t -> t === UInt8, T.parameters))
+    (P <: TimestampPlan || P <: LocalTimestampPlan) && return T === DateTime
     return false
+end
+
+Base.@nospecializeinfer function leafcompatible(::Type{T}, @nospecialize(p::Plan)) where {T}
+    leafconverts(T, typeof(p)) || return false
+    return !(p isa FixedPlan) || T === Vector{UInt8} || isbytetuple(T, p.schema.size)
 end
 
 function isbytetuple(::Type{T}, n::Int) where {T}
     return T <: Tuple && length(T.parameters) == n && all(t -> t === UInt8, T.parameters)
 end
 
-function buildarraytarget(::Type{T}, s::ArraySchema, p::ArrayPlan, memo::TypedMemo) where {T}
-    T <: Vector || return SemanticTarget{T}(p, s)
-    ip = buildtyped(eltype(T), s.items, p.items, memo)
-    ip isa SemanticTarget && return SemanticTarget{T}(p, s)
-    return ArrayTarget{eltype(T),typeof(ip)}(ip, p.minsize)
+function buildarraynode(::Type{T}, s::ArraySchema, p::ArrayPlan, memo::TypedMemo) where {T}
+    T <: Vector || return SemanticNode{T}(p, s)
+    items = buildnode(eltype(T), s.items, p.items, memo)
+    items isa SemanticNode && return SemanticNode{T}(p, s)
+    return ArrayNode{T,eltype(T)}(items, p.minsize)
 end
 
-function builddicttarget(::Type{T}, s::MapSchema, p::MapPlan, memo::TypedMemo) where {T}
-    (isconcretetype(T) && T <: Dict && keytype(T) in (String, Symbol)) || return SemanticTarget{T}(p, s)
-    vp = buildtyped(valtype(T), s.values, p.values, memo)
-    vp isa SemanticTarget && return SemanticTarget{T}(p, s)
-    return MapTarget{keytype(T),valtype(T),typeof(vp)}(vp, p.minsize)
+function buildmapnode(::Type{T}, s::MapSchema, p::MapPlan, memo::TypedMemo) where {T}
+    (isconcretetype(T) && T <: Dict && keytype(T) in (String, Symbol)) || return SemanticNode{T}(p, s)
+    values = buildnode(valtype(T), s.values, p.values, memo)
+    values isa SemanticNode && return SemanticNode{T}(p, s)
+    return MapNode{T,keytype(T),valtype(T)}(values, p.minsize)
 end
 
-# Plain and resolved records share the memo and the recursion placeholder; `recordtarget` builds the node.
-function buildrecordtarget(::Type{T}, s::RecordSchema, p::Union{RecordPlan,ResolvedRecordPlan},
-                           memo::TypedMemo) where {T}
-    cached = memolookup(memo, p, T)
+# Plain and resolved records share the memo and the recursion placeholder; `recordnode!` fills the node.
+Base.@nospecializeinfer function buildrecordnode(::Type{T}, s::RecordSchema, @nospecialize(p::Plan), memo::TypedMemo) where {T}
+    cached = get(memo, (p, T), nothing)
     cached === nothing || return cached
-    fastroute(T) || return memostore!(memo, p, T, SemanticTarget{T}(p, s))
-    ref = RefTarget{T}(nothing)
-    memostore!(memo, p, T, ref)
-    built = recordtarget(T, s, p, memo)
-    built === nothing && (built = SemanticTarget{T}(p, s))   # recursive references through `ref` convert where they occur
-    ref.plan = built
-    return memostore!(memo, p, T, built)
+    fastroute(T) || return (memo[(p, T)] = SemanticNode{T}(p, s))
+    n = fieldcount(T)
+    node = RecordNode{T}(Plan[], Union{Nothing,TypedNode}[], Int[], fill(false, n), Vector{Any}(undef, n), false)
+    memo[(p, T)] = node                                # recursive references resolve to this node
+    recordnode!(node, s, p, memo) && return node
+    return (memo[(p, T)] = SemanticNode{T}(p, s))      # recursive references through `node` decode on its route
+end
+
+function recordlike(@nospecialize(T))
+    return T <: NamedTuple || (isstructtype(T) && !(T <: NOT_RECORDLIKE))
 end
 
 # Eligibility for building `T` straight from decoded fields through its positional constructor: a concrete
 # `NamedTuple` or struct that has one, no custom StructUtils hooks under `AvroStyle`, and no field tags other
 # than `name` / `avro=(name, default)`.
 function fastroute(::Type{T}) where {T}
-    isconcretetype(T) || return false
-    (T <: NamedTuple || (isstructtype(T) && !(T <: NOT_RECORDLIKE) && hasmethod(T, Tuple{fieldtypes(T)...}))) || return false
+    (isconcretetype(T) && recordlike(T)) || return false
+    (T <: NamedTuple || hasmethod(T, Tuple{fieldtypes(T)...})) || return false
     customhooks(T) && return false
     tags = StructUtils.fieldtags(AvroStyle(), T)
     for t in values(tags)
@@ -351,159 +393,178 @@ function fastroute(::Type{T}) where {T}
     return true
 end
 
-# Default factories run per value on the semantic route, including defaults that depend on other fields.
-function customfielddefaults(@nospecialize(T::Type))
-    for signature in (Tuple{AvroStyle,Type{T}}, Tuple{AvroStyle,Type{T},Any})
-        for method in methods(StructUtils.fielddefaults, signature)
-            method.module in HOOK_MODULES || return true
+# Promotions, enum remaps and resolved records decode straight into `T`; a writer resolved into a
+# two-branch nullable reader union goes through its non-null node, a null node or a per-writer-branch
+# node. `nothing` when the semantic route must convert.
+Base.@nospecializeinfer function buildresolvednode(::Type{T}, @nospecialize(s::Schema), @nospecialize(p::Plan), memo::TypedMemo) where {T}
+    p isa PromotePlan && return buildleafnode(T, s, p)
+    p isa EnumRemapPlan && return isenumtarget(T) && s isa EnumSchema ? enumnode(T, s, p) : nothing
+    recordlike(T) && p isa ResolvedRecordPlan && s isa RecordSchema && return buildrecordnode(T, s, p, memo)
+    (s isa UnionSchema && nullablebranch(s) != 0) || return nothing
+    N, X = T isa Union ? splitoptional(T) : (Union{}, T)
+    X === nothing && return nothing
+    if p isa WrapPlan
+        p.readerindex == nullablebranch(s) || return buildnode(X, s.branches[p.readerindex], p.inner, memo)
+        return N === Union{} || !(p.inner isa NullPlan) ? nothing : LeafNode{N}(p.inner)
+    end
+    p isa UnionResolvePlan && N !== Union{} && return resolvednullable(T, X, s, p, memo)
+    return nothing
+end
+
+function resolvednullable(::Type{T}, ::Type{X}, s::UnionSchema, p::UnionResolvePlan, memo::TypedMemo) where {T,X}
+    nb = nullablebranch(s)
+    inner = Union{Nothing,TypedNode}[]
+    for (i, bp) in enumerate(p.branches)
+        j = p.readerindex[i]
+        if j == nb || bp isa UnresolvableBranch
+            bp isa Union{NullPlan,UnresolvableBranch} || return nothing
+            push!(inner, nothing)
+            continue
+        end
+        node = buildnode(X, s.branches[j], bp, memo)
+        node isa SemanticNode && return nothing
+        push!(inner, node)
+    end
+    return NullableNode{T,X}(copy(p.branches), inner)
+end
+
+# Fill `node` for record `s` and its plan; `false` when the record must take the semantic route.
+Base.@nospecializeinfer function recordnode!(node::RecordNode{T}, s::RecordSchema, @nospecialize(p::Plan), memo::TypedMemo) where {T}
+    fieldof = recordfieldpositions(s, T)
+    steps = p isa ResolvedRecordPlan ? p.steps : Pair{Int,Plan}[Pair{Int,Plan}(i, f) for (i, f) in enumerate((p::RecordPlan).fields)]
+    for (slot, sp) in steps
+        k = slot == 0 ? 0 : fieldof[slot]
+        push!(node.plans, sp)
+        push!(node.slots, k)
+        push!(node.nodes, k == 0 ? nothing : fieldnode(T, k, NodeSite(s.fields[slot].schema, sp, memo)))
+        k == 0 || (node.filled[k] = true)
+    end
+    covered = copy(node.filled)
+    if p isa ResolvedRecordPlan
+        for (slot, dp) in p.defaults
+            k = fieldof[slot]
+            k == 0 && continue
+            v = typeddefault(fieldtype(T, k), dp)
+            v === nothing && return false
+            node.defaults[k] = something(v)
+            covered[k] = true
         end
     end
-    return false
+    implicitdefaults!(node.defaults, T, covered) || return false
+    node.aligned = node.slots == 1:fieldcount(T)
+    return true
+end
+
+# The node decoding into target field `k`, built for the field's constant type.
+@generated function fieldnode(::Type{T}, k::Int, site::NodeSite) where {T}
+    body = Expr(:block)
+    for j in 1:fieldcount(T)
+        push!(body.args, :(k == $j && return buildnode($(fieldtype(T, j)), site.schema, site.plan, site.memo)))
+    end
+    push!(body.args, :(throw(ArgumentError("internal error: no field $k in the target"))))
+    return body
+end
+
+
+# A reader default as a value of field type `T`: its generic value, or that converted as a leaf would be;
+# `nothing` sends the record to the semantic route, which converts the default itself.
+Base.@nospecializeinfer function typeddefault(@nospecialize(T::Type), dp::DefaultPlan)
+    v = dp.value
+    v isa T && return Some{Any}(v)
+    try
+        x = runtimecall(convertleaf, T, v)
+        return x isa T ? Some{Any}(x) : nothing
+    catch e
+        e isa Union{MethodError,ConversionError} || rethrow()
+        return nothing
+    end
 end
 
 # Fill each target field nothing else covers with `missing` or `nothing`; `false` sends a type with
 # StructUtils defaults to the semantic route.
-function implicitdefaults!(defaults::Vector{Any}, ::Type{T}, covered) where {T}
+function implicitdefaults!(defaults::Vector{Any}, ::Type{T}, covered::Vector{Bool}) where {T}
     all(covered) && return true
     customfielddefaults(T) && return false
     for k in 1:fieldcount(T)
         covered[k] && continue
         ft = fieldtype(T, k)
         (Missing <: ft || Nothing <: ft) || throw(ConversionError(
-            "target type $T has field $(fieldname(T, k)) with no field in the reader record and no default"))
+            "target type $(typestring(T)) has field $(fieldname(T, k)) with no field in the reader record and no default"))
         defaults[k] = Missing <: ft ? missing : nothing
     end
     return true
 end
 
-# Promotions, enum remaps and resolved records decode straight into `T`; a writer resolved into a
-# two-branch nullable reader union goes through a wrapped or per-writer-branch target. `nothing` when
-# the semantic route must convert.
-function buildresolvedtyped(::Type{T}, s::Schema, p::Plan, memo::TypedMemo) where {T}
-    p isa PromotePlan && return buildleaftarget(T, s, p)
-    p isa EnumRemapPlan && return s isa EnumSchema && isenumtarget(T) ? EnumTarget(T, s, p) : nothing
-    p isa ResolvedRecordPlan && s isa RecordSchema && return buildrecordtarget(T, s, p, memo)
-    (s isa UnionSchema && nullablebranch(s) != 0) || return nothing
-    N, inner = T isa Union ? splitoptional(T) : (Union{}, T)
-    inner === nothing && return nothing
-    p isa WrapPlan && return wrappedtarget(N, inner, s, p, memo)
-    p isa UnionResolvePlan && N !== Union{} && return resolvednullable(N, inner, s, p, memo)
-    return nothing
-end
-
-function wrappedtarget(::Type{N}, ::Type{X}, s::UnionSchema, p::WrapPlan, memo::TypedMemo) where {N,X}
-    p.readerindex == nullablebranch(s) || return buildtyped(X, s.branches[p.readerindex], p.inner, memo)
-    N === Union{} && return nothing
-    return ResolvedNullTarget{N,typeof(p.inner)}(p.inner)
-end
-
-function resolvednullable(::Type{N}, ::Type{X}, s::UnionSchema, p::UnionResolvePlan,
-                          memo::TypedMemo) where {N,X}
-    nb = nullablebranch(s)
-    branches = TypedPlan[]
-    isnull = Bool[]
-    for (i, bp) in enumerate(p.branches)
-        j = p.readerindex[i]
-        null = j == nb
-        bt = null || bp isa UnresolvableBranch ? GenericTarget(bp) : buildtyped(X, s.branches[j], bp, memo)
-        bt isa SemanticTarget && return nothing
-        push!(branches, bt)
-        push!(isnull, null)
-    end
-    bs = Tuple(branches)
-    return ResolvedNullableTarget{N,typeof(bs)}(bs, isnull)
-end
-
-function recordsteps(p::RecordPlan)
-    return Pair{Int,Plan}[i => f for (i, f) in enumerate(p.fields)]
-end
-
-function recordsteps(p::ResolvedRecordPlan)
-    return p.steps
-end
-
-function recorddefaults(::RecordPlan)
-    return ()
-end
-
-function recorddefaults(p::ResolvedRecordPlan)
-    return p.defaults
-end
-
-function recordtarget(::Type{T}, s::RecordSchema, p::Union{RecordPlan,ResolvedRecordPlan}, memo::TypedMemo) where {T}
-    fieldof = recordfieldpositions(s, T)
-    steps = recordsteps(p)
-    plans = Vector{TypedPlan}(undef, length(steps))
-    slotmap = zeros(Int, length(steps))
-    for (i, (slot, sp)) in enumerate(steps)
-        k = slot == 0 ? 0 : fieldof[slot]
-        if k == 0
-            plans[i] = SkipTarget(sp)
-            continue
-        end
-        plans[i] = buildtyped(fieldtype(T, k), s.fields[slot].schema, sp, memo)
-        slotmap[i] = k
-    end
-    covered = falses(fieldcount(T))
-    for k in slotmap
-        k == 0 || (covered[k] = true)
-    end
-    defaults = Vector{Any}(undef, fieldcount(T))
-    for (slot, dp) in recorddefaults(p)
-        k = fieldof[slot]
-        k == 0 && continue
-        defaultfits(fieldtype(T, k), dp) || return nothing
-        defaults[k] = dp
-        covered[k] = true
-    end
-    implicitdefaults!(defaults, T, covered) || return nothing
-    ps = Tuple(plans)
-    return RecordTarget{T,typeof(ps),Tuple(slotmap)}(ps, defaults)
-end
-
-# Whether the fast route converts this reader default to `T` (otherwise the semantic route converts it).
-function defaultfits(::Type{T}, dp::DefaultPlan) where {T}
-    dp.value isa T && return true
-    try
-        return convertleaf(T, dp.value) isa T
-    catch e
-        e isa Union{MethodError,ConversionError} || rethrow()
-        return false
-    end
-end
-
 # ---- decoding ---------------------------------------------------------------------------------------
 
 # One typed value, counted like `decode`.
-@inline function decodetyped(p::TypedPlan, d::Decoder)
+@inline function decodenode(::Type{T}, @nospecialize(node::TypedNode), d::Decoder) where {T}
     countvalue!(d)
-    return typedvalue(p, d)
+    return nodevalue(T, node, d)
 end
 
-# One root datum; a semantic root decodes generically for `finishtyped` to convert.
-function decoderoot(p::SemanticTarget, d::Decoder)
-    return decode(p.plan, d)
+# The value of a node for `T`, through the node kinds a target of `T`'s shape can have (the conditions on `T`
+# fold where it compiles). A target with a null member also takes the nodes of its non-null member `X`, which
+# decode schemas that never produce a null.
+function nodevalue(::Type{T}, @nospecialize(node::TypedNode), d::Decoder) where {T}
+    if T === Any
+        node isa GenericNode{Any} && return decodevalue(node.plan, d)
+        nodeerror()
+    end
+    if T isa Union
+        N, X = splitoptional(T)
+        if X !== nothing
+            node isa NullableNode{T,X} && return nullablevalue(node, d)
+            node isa LeafNode{N} && return leafvalue(node, d)
+        end
+        node isa UnionNode{T} && return unionvalue(node, d)
+        node isa SemanticNode{T} && return semanticnodevalue(node, d)::T
+        X === nothing && nodeerror()
+        return nodevalue(X, node, d)
+    end
+    leaftarget(T) && node isa LeafNode{T} && return leafvalue(node, d)
+    if isconcretetype(T)
+        T <: Vector && node isa ArrayNode{T,eltype(T)} && return arrayvalue(node, d)
+        T <: Dict && node isa MapNode{T,keytype(T),valtype(T)} && return mapvalue(node, d)
+        recordlike(T) && node isa RecordNode{T} && return recordvalue(node, d)
+    end
+    T === Symbol && node isa SymbolNode && return targetsymbol(readstring(d))
+    isenumtarget(T) && node isa EnumNode{T} && return enumvalue(node, d)
+    node isa NullableNode{T,T} && return nullablevalue(node, d)
+    node isa UnionNode{T} && return unionvalue(node, d)
+    T === Record && node isa GenericNode{Record} && return decodevalue(node.plan, d)::Record
+    node isa SemanticNode{T} && return semanticnodevalue(node, d)::T
+    nodeerror()
 end
 
-function decoderoot(p::TypedPlan, d::Decoder)
-    return decodetyped(p, d)
+# The types a `LeafNode` decodes into: the generic leaf types and the targets `convertleaf` converts to.
+function leaftarget(@nospecialize(T))
+    T isa DataType || return false
+    isleaftype(T) && return true
+    T <: Integer && return isbitstype(T)
+    T <: Tuple && return all(t -> t === UInt8, T.parameters)
+    return T === Nothing || T === Float16 || T === Char || T === DateTime
 end
 
-function typedvalue(p::GenericTarget, d::Decoder)
-    return decodevalue(p.plan, d)
+@noinline function nodeerror()
+    throw(ArgumentError("internal error: a typed node does not decode its target type"))
 end
 
-# A field (or recursive reference) StructUtils converts: decoded generically, then converted in place.
-function typedvalue(p::SemanticTarget{T}, d::Decoder) where {T}
-    return semanticvalue(T, decodevalue(p.plan, d), p.schema)
-end
-
-function typedvalue(p::LeafTarget{T}, d::Decoder) where {T}
-    return convertleaf(T, decodevalue(p.plan, d))::T
-end
-
-function typedvalue(::SymbolTarget, d::Decoder)
-    return targetsymbol(readstring(d))
+# The leaf node's plan decoded into `T`, through the plans whose generic value is a `T` or converts to one.
+@generated function leafvalue(node::LeafNode{T}, d::Decoder) where {T}
+    body = Expr(:block, :(p = node.plan))
+    for (P, V) in LEAF_PLAN_VALUES
+        if V === T
+            push!(body.args, :(p isa $P && return decodeleaf(p::$P, d)::$T))
+        elseif leafconverts(T, P)
+            push!(body.args, :(p isa $P && return convertleaf($T, decodeleaf(p::$P, d))::$T))
+        end
+    end
+    T in PROMOTION_TARGETS && push!(body.args, :(p isa PromotePlan && return promotedvalue($T, p::PromotePlan, d)))
+    T === EnumValue &&
+        push!(body.args, :(p isa EnumRemapPlan && return EnumValue(p.reader, enumremapindex(p, d), Val(:unchecked))))
+    push!(body.args, :(nodeerror()))
+    return body
 end
 
 function targetsymbol(s::String)
@@ -511,118 +572,115 @@ function targetsymbol(s::String)
     return Symbol(s)
 end
 
-function typedvalue(p::EnumTarget{T}, d::Decoder) where {T}
-    i = Int(decodevalue(p.plan, d).index)
-    m = p.members[i]
-    m === nothing &&
-        throw(ConversionError("target enum $T has no member for $(repr(diagnostictext(p.schema.symbols[i])))"))
+function enumvalue(node::EnumNode{T}, d::Decoder) where {T}
+    p = node.plan
+    i = p isa EnumRemapPlan ? Int(enumremapindex(p, d)) : readindex(d, length(node.schema.symbols))
+    m = node.members[i]
+    m === nothing && throw(ConversionError(
+        "target enum $(typestring(T)) has no member for $(repr(diagnostictext(node.schema.symbols[i])))"))
     return m
 end
 
-function typedvalue(p::RefTarget{T}, d::Decoder) where {T}
-    return typedvalue(p.plan::TypedPlan, d)::T
-end
-
-function typedvalue(p::NullableTarget{N}, d::Decoder) where {N}
-    readindex(d, 2) == p.nullpos || return decodetyped(p.inner, d)
+function nullablevalue(node::NullableNode{T,X}, d::Decoder) where {T,X}
+    i = readindex(d, length(node.branches))
+    b = node.branches[i]
+    b === nothing || return decodenode(X, b, d)
     countvalue!(d)
-    N === Union{} && throw(ConversionError("null is not accepted by the target type"))
-    return N === Missing ? missing : nothing
+    p = node.plans[i]
+    p isa UnresolvableBranch && throw(ResolutionError(p.msg, p.writerpath, p.readerpath))
+    return nullof(T)
 end
 
-function typedvalue(p::UnionTarget{T}, d::Decoder) where {T}
-    n = length(p.branches)
-    n == 0 && dataerror(d, "empty union has no datum")
-    return decodetyped(p.branches[readindex(d, n)], d)::T
+# The null `T` admits.
+function nullof(::Type{T}) where {T}
+    Missing <: T && return missing
+    Nothing <: T && return nothing
+    throw(ConversionError("null is not accepted by the target type"))
 end
 
-function typedvalue(p::ArrayTarget{E}, d::Decoder) where {E}
+@generated function unionvalue(node::UnionNode{T}, d::Decoder) where {T}
+    body = Expr(:block, :(n = length(node.branches)), :(n == 0 && dataerror(d, "empty union has no datum")),
+                :(i = readindex(d, n)), :(b = node.branches[i]), :(m = node.members[i]))
+    for (k, M) in enumerate(T isa Union ? Base.uniontypes(T) : Any[T])
+        push!(body.args, :(m == $k && return decodenode($M, b, d)))
+    end
+    push!(body.args, :(nodeerror()))
+    return body
+end
+
+function arrayvalue(node::ArrayNode{T,E}, d::Decoder) where {T,E}
     enter!(d)
+    items = node.items
     out = E[]
-    while true
-        count, size = readblockcount(d)
-        count == 0 && break
-        checkcount(d, count, p.minsize)
-        isempty(out) && sizehint!(out, min(count, 1024))
-        stop = d.stop
-        size >= 0 && (d.stop = d.pos + size - 1)
-        for _ in 1:count
-            push!(out, decodetyped(p.items, d))
-        end
-        size >= 0 && d.pos != d.stop + 1 && dataerror(d, "sized array block not exactly consumed")
-        d.stop = stop
-    end
+    eachblockitem(dd -> push!(out, decodenode(E, items, dd)), out, d, node.minsize, "array")
     leave!(d)
     return out
 end
 
-function typedvalue(p::MapTarget{K,V}, d::Decoder) where {K,V}
+function mapvalue(node::MapNode{T,K,V}, d::Decoder) where {T,K,V}
     enter!(d)
+    values = node.values
     out = Dict{K,V}()
-    while true
-        count, size = readblockcount(d)
-        count == 0 && break
-        checkcount(d, count, satadd(p.minsize, 1))
-        isempty(out) && sizehint!(out, min(count, 1024))
-        stop = d.stop
-        size >= 0 && (d.stop = d.pos + size - 1)
-        for _ in 1:count
-            key = readstring(d)
-            out[K === Symbol ? targetsymbol(key) : key] = decodetyped(p.values, d)
-        end
-        size >= 0 && d.pos != d.stop + 1 && dataerror(d, "sized map block not exactly consumed")
-        d.stop = stop
+    eachblockitem(out, d, satadd(node.minsize, 1), "map") do dd
+        key = readstring(dd)
+        out[K === Symbol ? targetsymbol(key) : key] = decodenode(V, values, dd)
     end
     leave!(d)
     return out
 end
 
-function typedvalue(p::ResolvedNullTarget{N}, d::Decoder) where {N}
-    decodevalue(p.plan, d)
-    return N === Missing ? missing : nothing
-end
-
-function typedvalue(p::ResolvedNullableTarget{N}, d::Decoder) where {N}
-    i = readindex(d, length(p.branches))
-    v = decodetyped(p.branches[i], d)                  # a null branch still consumes the writer's value
-    p.isnull[i] || return v
-    return N === Missing ? missing : nothing
-end
-
-function typedvalue(p::RecordTarget, d::Decoder)
+function recordvalue(node::RecordNode{T}, d::Decoder) where {T}
     enter!(d)
-    v = recordvalue(p, d)
+    v = recordfields(node, d)
     leave!(d)
     return v
 end
 
-@generated function recordvalue(p::RecordTarget{T,PS,SLOTMAP}, d::Decoder) where {T,PS,SLOTMAP}
-    body = Expr(:block)
-    plantypes = PS.parameters
-    for j in 1:length(plantypes)
-        if plantypes[j] <: SkipTarget
-            push!(body.args, :(skip(p.plans[$j].plan, d)))
+# The record built from its fields: straight-line in field order when the wire steps align with the target's
+# fields, otherwise through the wire steps (a binary decision on each step's target field), skipping and
+# defaulting as the node says.
+@generated function recordfields(node::RecordNode{T}, d::Decoder) where {T}
+    n = fieldcount(T)
+    names = [Symbol(:f, k) for k in 1:n]
+    types = [fieldtype(T, k) for k in 1:n]
+    assign(k, j) = :($(names[k]) = decodenode($(types[k]), node.nodes[$j]::TypedNode, d))
+    function stepto(lo, hi)
+        lo == hi && return assign(lo, :j)
+        mid = (lo + hi) >>> 1
+        return Expr(:if, :(slot <= $mid), stepto(lo, mid), stepto(mid + 1, hi))
+    end
+    step = n == 0 ? :(skip(node.plans[j], d)) : :(slot == 0 ? skip(node.plans[j], d) : $(stepto(1, n)))
+    construct = T <: NamedTuple ? :($T(($(names...),))) : :($T($(names...)))
+    return quote
+        $([:(local $(names[k])::$(types[k])) for k in 1:n]...)
+        if node.aligned
+            $([assign(k, k) for k in 1:n]...)
         else
-            push!(body.args, :($(Symbol("f", SLOTMAP[j])) = decodetyped(p.plans[$j], d)))
+            for j in eachindex(node.slots)
+                slot = node.slots[j]
+                $step
+            end
+            $([:(node.filled[$k] || ($(names[k]) = freshvalue(node.defaults[$k]::$(types[k])))) for k in 1:n]...)
         end
+        return $construct
     end
-    args = []
-    for k in 1:fieldcount(T)
-        ft = fieldtype(T, k)
-        push!(args, k in SLOTMAP ? :($(Symbol("f", k))::$ft) : :(resolveddefault($ft, p.defaults[$k])))
-    end
-    construct = T <: NamedTuple ? :($T(($(args...),))) : :($T($(args...)))
-    push!(body.args, :(return $construct))
-    return body
 end
 
-function resolveddefault(::Type{T}, dp::DefaultPlan) where {T}
-    v = freshvalue(dp.value)
-    return v isa T ? v : convertleaf(T, v)::T
+# The semantic route: a generic decode converted through StructUtils, dispatched at run time (and compiled
+# once, whatever the target).
+Base.@nospecializeinfer function semanticnodevalue(@nospecialize(node::SemanticNode), d::Decoder)
+    try
+        return runtimecall(semanticdecode, node, d)
+    catch err
+        notcompiled(err, semanticdecode) && throw(ArgumentError(
+            "a target here converts through StructUtils, which programs compiled by `juliac --trim` leave out; " *
+            "decode into types whose fields Avro decodes directly"))
+        rethrow()
+    end
 end
 
-function resolveddefault(::Type{T}, x) where {T}
-    return x::T
+function semanticdecode(node::SemanticNode{T}, d::Decoder) where {T}
+    return semanticvalue(T, decodevalue(node.plan, d), node.schema)
 end
 
 # ---- leaf conversions (ConversionError on failure) -------------------------------------------------
@@ -694,14 +752,6 @@ function structutilshookexception(backtrace)
         method.name in (:make, :lift) && return true
     end
     return false
-end
-
-function finishtyped(p::SemanticTarget{T}, v) where {T}
-    return semanticvalue(T, v, p.schema)
-end
-
-function finishtyped(p, v)
-    return v
 end
 
 # StructUtils integration: a `Record` reads as its fields.

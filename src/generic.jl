@@ -215,20 +215,32 @@ end
 
 # ---- the generic Julia type of a schema --------------------------------------------------
 
-function juliatype(::NullSchema)
-    return Missing
+function juliatype(@nospecialize(s::Schema))
+    s isa NullSchema && return Missing
+    s isa BooleanSchema && return Bool
+    s isa IntSchema && return s.logical isa DateLogical ? Date : s.logical isa TimeMillis ? Time : Int32
+    s isa LongSchema && return longjuliatype(s.logical)
+    s isa FloatSchema && return Float32
+    s isa DoubleSchema && return Float64
+    s isa BytesSchema && return s.logical isa DecimalLogical ? decimaltype(s.logical) : Vector{UInt8}
+    s isa StringSchema && return s.logical isa UUIDLogical ? UUID : String
+    if s isa FixedSchema
+        l = s.logical
+        l isa DecimalLogical && return decimaltype(l)
+        l isa UUIDLogical && return UUID
+        l isa DurationLogical && return Duration
+        return Fixed
+    end
+    s isa EnumSchema && return EnumValue
+    s isa RecordSchema && return Record
+    s isa ArraySchema && return Vector{elementtype(s.items)}
+    s isa MapSchema && return Dict{String,elementtype(s.values)}
+    nullable = nullablebranch(s::UnionSchema)
+    nullable == 0 && return Any
+    return Union{Missing,juliatype(s.branches[3 - nullable])}
 end
 
-function juliatype(::BooleanSchema)
-    return Bool
-end
-
-function juliatype(s::IntSchema)
-    return s.logical isa DateLogical ? Date : (s.logical isa TimeMillis ? Time : Int32)
-end
-
-function juliatype(s::LongSchema)
-    l = s.logical
+function longjuliatype(@nospecialize(l))
     l isa TimeMicros && return Time
     l isa TimestampMillis && return Timestamp{Millisecond}
     l isa TimestampMicros && return Timestamp{Microsecond}
@@ -237,37 +249,6 @@ function juliatype(s::LongSchema)
     l isa LocalTimestampMicros && return LocalTimestamp{Microsecond}
     l isa LocalTimestampNanos && return LocalTimestamp{Nanosecond}
     return Int64
-end
-
-function juliatype(::FloatSchema)
-    return Float32
-end
-
-function juliatype(::DoubleSchema)
-    return Float64
-end
-
-function juliatype(s::BytesSchema)
-    return s.logical isa DecimalLogical ? decimaltype(s.logical) : Vector{UInt8}
-end
-
-function juliatype(s::StringSchema)
-    return s.logical isa UUIDLogical ? UUID : String
-end
-
-function juliatype(s::FixedSchema)
-    s.logical isa DecimalLogical && return decimaltype(s.logical)
-    s.logical isa UUIDLogical && return UUID
-    s.logical isa DurationLogical && return Duration
-    return Fixed
-end
-
-function juliatype(::EnumSchema)
-    return EnumValue
-end
-
-function juliatype(::RecordSchema)
-    return Record
 end
 
 function decimaltype(l::DecimalLogical)
@@ -318,27 +299,20 @@ of typed nesting): a leaf, `Record` or `Union{Missing,y}` for a non-missing leaf
 every other type (nested arrays and maps, bare union values, abstract joins) is stored as `Any`.
 """
 function narrowelement(@nospecialize(t::Type))
-    t isa Union || return (t in LEAF_TYPES || t === Record) ? t : Any
+    t isa Union || return (isleaftype(t) || t === Record) ? t : Any
     u = Base.nonmissingtype(t)
-    return (t === Union{Missing,u} && ((u in LEAF_TYPES && u !== Missing) || u === Record)) ? t : Any
+    return (t === Union{Missing,u} && ((isleaftype(u) && u !== Missing) || u === Record)) ? t : Any
 end
 
-function elementtype(s::Schema)
+function isleaftype(@nospecialize(t))
+    for x in LEAF_TYPES
+        x === t && return true
+    end
+    return false
+end
+
+function elementtype(@nospecialize(s::Schema))
     return narrowelement(juliatype(s))
-end
-
-function juliatype(s::ArraySchema)
-    return Vector{elementtype(s.items)}
-end
-
-function juliatype(s::MapSchema)
-    return Dict{String,elementtype(s.values)}
-end
-
-function juliatype(s::UnionSchema)
-    nullable = nullablebranch(s)
-    nullable == 0 && return Any
-    return Union{Missing,juliatype(s.branches[3 - nullable])}
 end
 
 """

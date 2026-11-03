@@ -1,6 +1,6 @@
 # Generic read plans: one plan node per schema node, producing the generic value model. Every node is one
-# of a closed set of types, so untrusted schemas never drive compilation; children are dispatched behind a
-# function barrier.
+# of a closed set of types, and decoding dispatches on them through closed `isa` chains, so untrusted
+# schemas never drive compilation or run-time method lookup.
 
 # Leaf plans serve reading and writing; composites have one node type each way.
 abstract type Plan end
@@ -61,15 +61,9 @@ function MapPlan(values::Plan, eltype::Type, minsize::Int)
     return MapPlan(values, minsize, Dict{String,eltype}())
 end
 
-# `Q` is the concrete plan type of a nullable union's non-null branch (`Nothing` for other unions).
-struct UnionPlan{Q} <: Plan
+struct UnionPlan <: Plan
     branches::Vector{Plan}
     nullable::Int        # position of the null branch in the two-branch nullable form; 0 otherwise
-end
-
-function UnionPlan(branches::Vector{Plan}, nullable::Int)
-    Q = nullable == 0 ? Nothing : typeof(branches[3 - nullable])
-    return UnionPlan{Q}(branches, nullable)
 end
 
 mutable struct RecordPlan <: Plan
@@ -80,11 +74,11 @@ end
 # The generic read plan of a schema, memoised per node id so recursive records share one `RecordPlan`.
 # `mode`: `:little` reads legacy little-endian decimals; `:framing` reads every logical type as its
 # underlying encoding, so only the framing of a datum is checked (`Avro.inspect`).
-function readplan(s::Schema; mode::Symbol=:standard)
+function readplan(@nospecialize(s::Schema); mode::Symbol=:standard)
     return readplan(s, Vector{Union{Nothing,Plan}}(nothing, graphinfo(s).nodes), mode)
 end
 
-function readplan(s::Schema, memo::Vector{Union{Nothing,Plan}}, mode::Symbol)
+function readplan(@nospecialize(s::Schema), memo::Vector{Union{Nothing,Plan}}, mode::Symbol)
     id = Int(nodeid(s)) + 1
     p = memo[id]
     p === nothing || return p
@@ -93,85 +87,56 @@ function readplan(s::Schema, memo::Vector{Union{Nothing,Plan}}, mode::Symbol)
     return p
 end
 
-function buildreadplan(::NullSchema, memo, mode)
-    return NullPlan()
-end
-
-function buildreadplan(::BooleanSchema, memo, mode)
-    return BoolPlan()
-end
-
-function buildreadplan(s::IntSchema, memo, mode)
-    mode === :framing && return IntPlan()
-    s.logical isa DateLogical && return DatePlan()
-    s.logical isa TimeMillis && return TimeMillisPlan()
-    return IntPlan()
-end
-
-function buildreadplan(s::LongSchema, memo, mode)
-    mode === :framing && return LongPlan()
-    l = s.logical
-    l isa TimeMicros && return TimeMicrosPlan()
-    l isa TimestampMillis && return TimestampPlan{Millisecond}()
-    l isa TimestampMicros && return TimestampPlan{Microsecond}()
-    l isa TimestampNanos && return TimestampPlan{Nanosecond}()
-    l isa LocalTimestampMillis && return LocalTimestampPlan{Millisecond}()
-    l isa LocalTimestampMicros && return LocalTimestampPlan{Microsecond}()
-    l isa LocalTimestampNanos && return LocalTimestampPlan{Nanosecond}()
-    return LongPlan()
-end
-
-function buildreadplan(::FloatSchema, memo, mode)
-    return FloatPlan()
-end
-
-function buildreadplan(::DoubleSchema, memo, mode)
-    return DoublePlan()
-end
-
-function buildreadplan(s::BytesSchema, memo, mode)
-    mode === :framing && return BytesPlan()
-    l = s.logical
-    l isa DecimalLogical && return DecimalPlan(0, l.precision, l.scale, l.precision > 38, mode === :little)
-    return BytesPlan()
-end
-
-function buildreadplan(s::StringSchema, memo, mode)
-    mode === :framing && return StringPlan()
-    s.logical isa UUIDLogical && return UUIDStringPlan()
-    return StringPlan()
-end
-
-function buildreadplan(s::FixedSchema, memo, mode)
-    mode === :framing && return FixedPlan(s)
-    l = s.logical
-    l isa DecimalLogical && return DecimalPlan(s.size, l.precision, l.scale, l.precision > 38, mode === :little)
-    l isa UUIDLogical && return UUIDFixedPlan()
-    l isa DurationLogical && return DurationPlan()
-    return FixedPlan(s)
-end
-
-function buildreadplan(s::EnumSchema, memo, mode)
-    return EnumPlan(s)
-end
-
-function buildreadplan(s::ArraySchema, memo, mode)
-    return ArrayPlan(readplan(s.items, memo, mode), elementtype(s.items), minsize(s.items))
-end
-
-function buildreadplan(s::MapSchema, memo, mode)
-    return MapPlan(readplan(s.values, memo, mode), elementtype(s.values), minsize(s.values))
-end
-
-function buildreadplan(s::UnionSchema, memo, mode)
-    branches = Plan[readplan(b, memo, mode) for b in s.branches]
-    return UnionPlan(branches, nullablebranch(s))
-end
-
-function buildreadplan(s::RecordSchema, memo, mode)
-    p = RecordPlan(s, Plan[])
-    memo[Int(nodeid(s)) + 1] = p
-    for f in s.fields
+function buildreadplan(@nospecialize(s::Schema), memo::Vector{Union{Nothing,Plan}}, mode::Symbol)
+    s isa NullSchema && return NullPlan()
+    s isa BooleanSchema && return BoolPlan()
+    s isa FloatSchema && return FloatPlan()
+    s isa DoubleSchema && return DoublePlan()
+    if s isa IntSchema
+        mode === :framing && return IntPlan()
+        s.logical isa DateLogical && return DatePlan()
+        s.logical isa TimeMillis && return TimeMillisPlan()
+        return IntPlan()
+    elseif s isa LongSchema
+        mode === :framing && return LongPlan()
+        l = s.logical
+        l isa TimeMicros && return TimeMicrosPlan()
+        l isa TimestampMillis && return TimestampPlan{Millisecond}()
+        l isa TimestampMicros && return TimestampPlan{Microsecond}()
+        l isa TimestampNanos && return TimestampPlan{Nanosecond}()
+        l isa LocalTimestampMillis && return LocalTimestampPlan{Millisecond}()
+        l isa LocalTimestampMicros && return LocalTimestampPlan{Microsecond}()
+        l isa LocalTimestampNanos && return LocalTimestampPlan{Nanosecond}()
+        return LongPlan()
+    elseif s isa BytesSchema
+        mode === :framing && return BytesPlan()
+        l = s.logical
+        l isa DecimalLogical && return DecimalPlan(0, l.precision, l.scale, l.precision > 38, mode === :little)
+        return BytesPlan()
+    elseif s isa StringSchema
+        mode === :framing && return StringPlan()
+        s.logical isa UUIDLogical && return UUIDStringPlan()
+        return StringPlan()
+    elseif s isa FixedSchema
+        mode === :framing && return FixedPlan(s)
+        l = s.logical
+        l isa DecimalLogical && return DecimalPlan(s.size, l.precision, l.scale, l.precision > 38, mode === :little)
+        l isa UUIDLogical && return UUIDFixedPlan()
+        l isa DurationLogical && return DurationPlan()
+        return FixedPlan(s)
+    elseif s isa EnumSchema
+        return EnumPlan(s)
+    elseif s isa ArraySchema
+        return ArrayPlan(readplan(s.items, memo, mode), elementtype(s.items), minsize(s.items))
+    elseif s isa MapSchema
+        return MapPlan(readplan(s.values, memo, mode), elementtype(s.values), minsize(s.values))
+    elseif s isa UnionSchema
+        return UnionPlan(Plan[readplan(b, memo, mode) for b in s.branches], nullablebranch(s))
+    end
+    r = s::RecordSchema
+    p = RecordPlan(r, Plan[])
+    memo[Int(nodeid(r)) + 1] = p
+    for f in r.fields
         push!(p.fields, readplan(f.schema, memo, mode))
     end
     return p
@@ -179,79 +144,93 @@ end
 
 # ---- decoding ---------------------------------------------------------------------------------------
 
-# One value of `p` in the generic value model, counted against the decoder's value cap.
-function decode(p::Plan, d::Decoder)
+# One value of `p` in the generic value model, counted against the decoder's value cap. A reader default
+# consumes no input and is not counted: it comes from the caller's reader schema, not the file.
+function decode(@nospecialize(p::Plan), d::Decoder)
+    p isa DefaultPlan && return freshvalue(p.value)
     countvalue!(d)
     return decodevalue(p, d)
 end
 
-function decodevalue(::NullPlan, d::Decoder)
-    return missing
+# The generic value of `p`, through a closed `isa` chain over the plan node types (the most common first).
+function decodevalue(@nospecialize(p::Plan), d::Decoder)
+    p isa LongPlan && return decodeleaf(p, d)
+    p isa StringPlan && return decodeleaf(p, d)
+    p isa UnionPlan && return decodeunion(p, d)
+    p isa DoublePlan && return decodeleaf(p, d)
+    p isa IntPlan && return decodeleaf(p, d)
+    p isa BoolPlan && return decodeleaf(p, d)
+    p isa RecordPlan && return decoderecord(p, d)
+    p isa ArrayPlan && return decodearray(p, d)
+    p isa MapPlan && return decodemap(p, d)
+    p isa NullPlan && return decodeleaf(p, d)
+    p isa FloatPlan && return decodeleaf(p, d)
+    p isa BytesPlan && return decodeleaf(p, d)
+    p isa EnumPlan && return decodeleaf(p, d)
+    p isa FixedPlan && return decodeleaf(p, d)
+    p isa DatePlan && return decodeleaf(p, d)
+    p isa TimestampPlan{Millisecond} && return decodeleaf(p, d)
+    p isa TimestampPlan{Microsecond} && return decodeleaf(p, d)
+    p isa TimestampPlan{Nanosecond} && return decodeleaf(p, d)
+    p isa LocalTimestampPlan{Millisecond} && return decodeleaf(p, d)
+    p isa LocalTimestampPlan{Microsecond} && return decodeleaf(p, d)
+    p isa LocalTimestampPlan{Nanosecond} && return decodeleaf(p, d)
+    p isa TimeMillisPlan && return decodeleaf(p, d)
+    p isa TimeMicrosPlan && return decodeleaf(p, d)
+    p isa DecimalPlan && return decodeleaf(p, d)
+    p isa UUIDStringPlan && return decodeleaf(p, d)
+    p isa UUIDFixedPlan && return decodeleaf(p, d)
+    p isa DurationPlan && return decodeleaf(p, d)
+    return decoderesolving(p, d)
 end
 
-function decodevalue(::BoolPlan, d::Decoder)
-    return readbool(d)
-end
+decodeleaf(::NullPlan, d::Decoder) = missing
+decodeleaf(::BoolPlan, d::Decoder) = readbool(d)
+decodeleaf(::IntPlan, d::Decoder) = readint(d)
+decodeleaf(::LongPlan, d::Decoder) = readlong(d)
+decodeleaf(::FloatPlan, d::Decoder) = readfloat(d)
+decodeleaf(::DoublePlan, d::Decoder) = readdouble(d)
+decodeleaf(::BytesPlan, d::Decoder) = readbytes(d)
+decodeleaf(::StringPlan, d::Decoder) = readstring(d)
 
-function decodevalue(::IntPlan, d::Decoder)
-    return readint(d)
-end
-
-function decodevalue(::LongPlan, d::Decoder)
-    return readlong(d)
-end
-
-function decodevalue(::FloatPlan, d::Decoder)
-    return readfloat(d)
-end
-
-function decodevalue(::DoublePlan, d::Decoder)
-    return readdouble(d)
-end
-
-function decodevalue(::BytesPlan, d::Decoder)
-    return readbytes(d)
-end
-
-function decodevalue(::StringPlan, d::Decoder)
-    return readstring(d)
-end
-
-function decodevalue(p::FixedPlan, d::Decoder)
+function decodeleaf(p::FixedPlan, d::Decoder)
     return Fixed(p.schema, readfixed(d, p.schema.size), Val(:unchecked))
 end
 
-function decodevalue(p::EnumPlan, d::Decoder)
+function decodeleaf(p::EnumPlan, d::Decoder)
     return EnumValue(p.schema, Int32(readindex(d, length(p.schema.symbols))), Val(:unchecked))
 end
 
 const DATE_EPOCH = Date(1970, 1, 1)
 
-function decodevalue(::DatePlan, d::Decoder)
+function decodeleaf(::DatePlan, d::Decoder)
     return DATE_EPOCH + Day(readint(d))
 end
 
-function decodevalue(::TimeMillisPlan, d::Decoder)
+function decodeleaf(::TimeMillisPlan, d::Decoder)
     v = readint(d)
     0 <= v < 86_400_000 || dataerror(d, "time-millis value $v out of range")
     return Time(Nanosecond(Int64(v) * 1_000_000))
 end
 
-function decodevalue(::TimeMicrosPlan, d::Decoder)
-    v = readlong(d)
+function decodeleaf(::TimeMicrosPlan, d::Decoder)
+    return timemicros(d, readlong(d))
+end
+
+function timemicros(d::Decoder, v::Int64)
     0 <= v < 86_400_000_000 || dataerror(d, "time-micros value $v out of range")
     return Time(Nanosecond(v * 1_000))
 end
 
-function decodevalue(::TimestampPlan{P}, d::Decoder) where {P}
+function decodeleaf(::TimestampPlan{P}, d::Decoder) where {P}
     return timestamp(P, readlong(d))
 end
 
-function decodevalue(::LocalTimestampPlan{P}, d::Decoder) where {P}
+function decodeleaf(::LocalTimestampPlan{P}, d::Decoder) where {P}
     return localtimestamp(P, readlong(d))
 end
 
-function decodevalue(p::DecimalPlan, d::Decoder)
+function decodeleaf(p::DecimalPlan, d::Decoder)
     n = p.fixedsize == 0 ? readlen(d) : p.fixedsize
     n == 0 && dataerror(d, "empty decimal payload")
     skipfixed(d, n)
@@ -287,7 +266,7 @@ function decimalunscaled(d::Decoder, p::DecimalPlan, start::Int, n::Int)
     return p.wide ? big : Int128(big)
 end
 
-function decodevalue(::UUIDStringPlan, d::Decoder)
+function decodeleaf(::UUIDStringPlan, d::Decoder)
     n = readlen(d)
     p = d.pos
     validuuid(d.buf, p, n) || dataerror(d, "invalid uuid string ($n bytes)")
@@ -322,7 +301,7 @@ function uuidfrombuffer(buf::AbstractVector{UInt8}, from::Int)
     return UUID(v)
 end
 
-function decodevalue(::UUIDFixedPlan, d::Decoder)
+function decodeleaf(::UUIDFixedPlan, d::Decoder)
     skipfixed(d, 16)
     v = UInt128(0)
     @inbounds for i in 0:15
@@ -331,7 +310,7 @@ function decodevalue(::UUIDFixedPlan, d::Decoder)
     return UUID(v)
 end
 
-function decodevalue(::DurationPlan, d::Decoder)
+function decodeleaf(::DurationPlan, d::Decoder)
     skipfixed(d, 12)
     p = d.pos - 12
     function le32(i)
@@ -340,74 +319,64 @@ function decodevalue(::DurationPlan, d::Decoder)
     return Duration(le32(0), le32(4), le32(8))
 end
 
-function decodevalue(p::ArrayPlan, d::Decoder)
-    enter!(d)
-    out = decodeitems!(p.empty, p.items, p, d)
-    leave!(d)
-    return out
-end
-
-# A function barrier on the element type and the concrete item plan, so items decode without dynamic
-# dispatch or boxing (both range over the closed plan and value sets).
-function decodeitems!(::Vector{T}, items::Plan, p::ArrayPlan, d::Decoder) where {T}
-    out = T[]
+# The items of one array or map value, `item(d)` decoding each: a count is a claim the remaining bytes must
+# be able to hold, and a sized block must be consumed exactly.
+@inline function eachblockitem(item::F, out, d::Decoder, minsize::Int, what::String) where {F}
     while true
         count, size = readblockcount(d)
         count == 0 && return out
-        checkcount(d, count, p.minsize)
+        checkcount(d, count, minsize)
         isempty(out) && sizehint!(out, min(count, 1024))                           # a count is a claim until decoded
         outer = d.stop
         size >= 0 && (d.stop = d.pos + size - 1)
         for _ in 1:count
-            push!(out, decode(items, d))
+            item(d)
         end
-        size >= 0 && (d.pos == d.stop + 1 || dataerror(d, "sized array block not exactly consumed"))
+        size >= 0 && (d.pos == d.stop + 1 || dataerror(d, "sized $what block not exactly consumed"))
         d.stop = outer
     end
 end
 
-function decodevalue(p::MapPlan, d::Decoder)
+function decodearray(p::ArrayPlan, d::Decoder)
     enter!(d)
-    out = decodeentries!(p.empty, p.values, p, d)
+    out = decodeitems(p.empty, p.items, p.minsize, d)
     leave!(d)
     return out
 end
 
-# A function barrier like `decodeitems!`; a repeated key keeps its last value.
-function decodeentries!(::Dict{String,V}, values::Plan, p::MapPlan, d::Decoder) where {V}
+# A function barrier on the element type, so items are stored without boxing (the element types range over
+# the closed value set).
+function decodeitems(::Vector{T}, @nospecialize(items::Plan), minsize::Int, d::Decoder) where {T}
+    out = T[]
+    return eachblockitem(dd -> push!(out, decode(items, dd)), out, d, minsize, "array")
+end
+
+function decodemap(p::MapPlan, d::Decoder)
+    enter!(d)
+    out = decodeentries(p.empty, p.values, p.minsize, d)
+    leave!(d)
+    return out
+end
+
+# A function barrier like `decodeitems`; a repeated key keeps its last value.
+function decodeentries(::Dict{String,V}, @nospecialize(values::Plan), minsize::Int, d::Decoder) where {V}
     out = Dict{String,V}()
-    while true
-        count, size = readblockcount(d)
-        count == 0 && return out
-        checkcount(d, count, satadd(p.minsize, 1))
-        isempty(out) && sizehint!(out, min(count, 1024))
-        outer = d.stop
-        size >= 0 && (d.stop = d.pos + size - 1)
-        for _ in 1:count
-            k = readstring(d)
-            out[k] = decode(values, d)
-        end
-        size >= 0 && (d.pos == d.stop + 1 || dataerror(d, "sized map block not exactly consumed"))
-        d.stop = outer
+    return eachblockitem(out, d, satadd(minsize, 1), "map") do dd
+        k = readstring(dd)
+        out[k] = decode(values, dd)
     end
 end
 
-# A nullable union decodes its non-null branch through the concrete `Q` (counting the branch value as
-# `decode` does); calling `decode` here would dispatch on the abstract branch and lose that type.
-function decodevalue(p::UnionPlan{Q}, d::Decoder) where {Q<:Plan}
-    i = readindex(d, 2)
-    countvalue!(d)
-    i == p.nullable && return missing
-    return decodevalue(p.branches[i]::Q, d)
-end
-
-function decodevalue(p::UnionPlan{Nothing}, d::Decoder)
+# A nullable union counts its non-null branch value as `decode` would.
+function decodeunion(p::UnionPlan, d::Decoder)
     n = length(p.branches)
     n == 0 && dataerror(d, "empty union has no datum")
-    return decode(p.branches[readindex(d, n)], d)
+    i = readindex(d, n)
+    p.nullable == 0 || i != p.nullable || (countvalue!(d); return missing)
+    return decode(p.branches[i], d)
 end
 
-function decodevalue(p::RecordPlan, d::Decoder)
+function decoderecord(p::RecordPlan, d::Decoder)
     enter!(d)
     vals = Vector{Any}(undef, length(p.fields))
     for i in eachindex(vals)
@@ -421,44 +390,69 @@ end
 
 # Skip one value, validating it as a decode would, except that skipped strings are length-checked but not
 # UTF-8-checked and sized array/map blocks are jumped by their byte size (their declared items counted).
-function skip(p::Plan, d::Decoder)
+function skip(@nospecialize(p::Plan), d::Decoder)
+    p isa DefaultPlan && return nothing
     countvalue!(d)
     return skipvalue(p, d)
 end
 
-# Leaves whose decoded value costs nothing skip by decoding it.
-function skipvalue(p::Plan, d::Decoder)
-    decodevalue(p, d)
-    return nothing
+function skipvalue(@nospecialize(p::Plan), d::Decoder)
+    p isa Union{StringPlan,BytesPlan} && return skiplen(d)
+    p isa LongPlan && return (readlong(d); nothing)
+    p isa UnionPlan && return skipunion(p, d)
+    p isa DoublePlan && return (readdouble(d); nothing)
+    p isa IntPlan && return (readint(d); nothing)
+    p isa BoolPlan && return (readbool(d); nothing)
+    p isa NullPlan && return nothing
+    p isa RecordPlan && return skiprecord(p, d)
+    p isa ArrayPlan && return skipblocks(p.items, p.minsize, d)
+    p isa MapPlan && return skipblocks(p.values, satadd(p.minsize, 1), d, true)
+    p isa FloatPlan && return (readfloat(d); nothing)
+    p isa FixedPlan && return skipfixed(d, p.schema.size)
+    p isa UUIDStringPlan && return skipuuid(d)
+    p isa WrapPlan && return skipvalue(p.inner, d)
+    p isa UnionResolvePlan && return skipresolvedunion(p, d)
+    p isa ResolvedRecordPlan && return skipresolved(p, d)
+    return skipleaf(p, d)
 end
 
-function skipvalue(::Union{BytesPlan,StringPlan}, d::Decoder)
-    return skiplen(d)
+# The other leaves are skipped by decoding them, which validates them as a decode would.
+function skipleaf(@nospecialize(p::Plan), d::Decoder)
+    p isa EnumPlan && return (readindex(d, length(p.schema.symbols)); nothing)
+    p isa DatePlan && return (readint(d); nothing)
+    p isa Union{TimestampPlan,LocalTimestampPlan} && return (readlong(d); nothing)
+    p isa TimeMillisPlan && return (decodeleaf(p, d); nothing)
+    p isa TimeMicrosPlan && return (decodeleaf(p, d); nothing)
+    p isa DecimalPlan && return (decodeleaf(p, d); nothing)
+    p isa UUIDFixedPlan && return skipfixed(d, 16)
+    p isa DurationPlan && return skipfixed(d, 12)
+    p isa PromotePlan && return (decodepromoted(p, d); nothing)
+    p isa EnumRemapPlan && return (enumremapindex(p, d); nothing)
+    p isa UnresolvableBranch && throw(ResolutionError(p.msg, p.writerpath, p.readerpath))
+    throw(ArgumentError("internal error: a plan without a skip"))
 end
 
-function skipvalue(::UUIDStringPlan, d::Decoder)
+function skipuuid(d::Decoder)
     n = readlen(d)
     validuuid(d.buf, d.pos, n) || dataerror(d, "invalid uuid string ($n bytes)")
     d.pos += n
     return nothing
 end
 
-function skipvalue(p::FixedPlan, d::Decoder)
-    return skipfixed(d, p.schema.size)
-end
-
-function skipvalue(p::ArrayPlan, d::Decoder)
+# Array (`keyed=false`) or map blocks: sized blocks are jumped, their declared items counted.
+function skipblocks(@nospecialize(item::Plan), minsize::Int, d::Decoder, keyed::Bool=false)
     enter!(d)
     while true
         count, size = readblockcount(d)
         count == 0 && break
-        checkcount(d, count, p.minsize)
+        checkcount(d, count, minsize)
         if size >= 0
             countvalues!(d, count)
             d.pos += size
         else
             for _ in 1:count
-                skip(p.items, d)
+                keyed && skiplen(d)
+                skip(item, d)
             end
         end
     end
@@ -466,40 +460,15 @@ function skipvalue(p::ArrayPlan, d::Decoder)
     return nothing
 end
 
-function skipvalue(p::MapPlan, d::Decoder)
-    enter!(d)
-    while true
-        count, size = readblockcount(d)
-        count == 0 && break
-        checkcount(d, count, satadd(p.minsize, 1))
-        if size >= 0
-            countvalues!(d, count)
-            d.pos += size
-        else
-            for _ in 1:count
-                skiplen(d)
-                skip(p.values, d)
-            end
-        end
-    end
-    leave!(d)
-    return nothing
-end
-
-function skipvalue(p::UnionPlan{Q}, d::Decoder) where {Q<:Plan}
-    i = readindex(d, 2)
-    countvalue!(d)
-    i == p.nullable && return nothing
-    return skipvalue(p.branches[i]::Q, d)
-end
-
-function skipvalue(p::UnionPlan{Nothing}, d::Decoder)
+function skipunion(p::UnionPlan, d::Decoder)
     n = length(p.branches)
     n == 0 && dataerror(d, "empty union has no datum")
-    return skip(p.branches[readindex(d, n)], d)
+    i = readindex(d, n)
+    p.nullable == 0 || i != p.nullable || (countvalue!(d); return nothing)
+    return skip(p.branches[i], d)
 end
 
-function skipvalue(p::RecordPlan, d::Decoder)
+function skiprecord(p::RecordPlan, d::Decoder)
     enter!(d)
     for f in p.fields
         skip(f, d)

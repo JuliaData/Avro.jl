@@ -25,13 +25,16 @@ The container codecs this process can read and write (`:bzip2` and `:xz` appear 
 packages are loaded).
 """
 function codecs()
-    return Symbol[BUILTIN_CODECS..., sort!(collect(keys(EXTENSION_CODECS)))...]
+    return append!(collect(Symbol, BUILTIN_CODECS), sort!(collect(keys(EXTENSION_CODECS))))
 end
 
 "The canonical name of the codec named in `avro.codec` (`legacy=:avrojl1` reads `zstd` as zstandard)."
 function readercodec(name::AbstractString, legacy::Union{Nothing,Symbol})
     legacy === :avrojl1 && name == "zstd" && return :zstandard
-    for candidate in (BUILTIN_CODECS..., keys(EXTENSION_CODECS)...)
+    for candidate in BUILTIN_CODECS
+        name == String(candidate) && return candidate
+    end
+    for candidate in keys(EXTENSION_CODECS)
         name == String(candidate) && return candidate
     end
     for (candidate, package) in EXTENSION_PACKAGES
@@ -105,7 +108,11 @@ function decompressblock(name::Symbol, payload::AbstractVector{UInt8}, limits::L
     # libzstd consumes a skippable frame itself and ends it as an empty member.
     name === :zstandard && return transcodemembers(:zstandard, ZstdDecompressor(), payload, limits.max_bytes)
     name === :snappy && return snappydecompress(payload, limits)
-    return EXTENSION_CODECS[name].decompress(payload, limits)
+    return runtimecall(extensiondecompress, name, payload, limits)::Vector{UInt8}
+end
+
+function extensiondecompress(name::Symbol, payload::AbstractVector{UInt8}, limits::Limits)
+    return EXTENSION_CODECS[name].decompress(payload, limits)::Vector{UInt8}
 end
 
 function snappydecompress(payload::AbstractVector{UInt8}, limits::Limits)
@@ -128,10 +135,15 @@ end
 
 # ---- compression ------------------------------------------------------------------------------------
 
-"A validated writer codec: `factory()` makes its TranscodingStreams compressor (`nothing` for null and snappy)."
+"A validated writer codec: a built-in codec's level, or an extension codec's compressor `factory()`."
 struct WriterCodec
     name::Symbol
-    factory::Union{Nothing,Function}
+    level::Int
+    factory::Any
+end
+
+function WriterCodec(name::Symbol, factory)
+    return WriterCodec(name, 0, factory)
 end
 
 "Validate `level` for writing with codec `name` (`nothing` selects the codec's default level)."
@@ -142,24 +154,37 @@ function writercodec(name::Symbol, level)
     elseif name === :deflate
         lvl = level === nothing ? 6 : Int(level)
         0 <= lvl <= 9 || throw(ArgumentError("the deflate level must be 0–9, got $lvl"))
-        return WriterCodec(:deflate, () -> DeflateCompressor(level=lvl))
+        return WriterCodec(:deflate, lvl, nothing)
     elseif name === :zstandard
         lvl = level === nothing ? 3 : Int(level)
         1 <= lvl <= 22 || throw(ArgumentError("the zstandard level must be 1–22, got $lvl"))
-        return WriterCodec(:zstandard, () -> ZstdCompressor(level=lvl))
+        return WriterCodec(:zstandard, lvl, nothing)
     end
-    haskey(EXTENSION_CODECS, name) && return EXTENSION_CODECS[name].writer(level)::WriterCodec
+    haskey(EXTENSION_CODECS, name) && return runtimecall(extensionwriter, name, level)::WriterCodec
     throw(UnsupportedCodecError(String(name), get(EXTENSION_PACKAGES, name, nothing)))
+end
+
+function extensionwriter(name::Symbol, level)
+    return EXTENSION_CODECS[name].writer(level)::WriterCodec
 end
 
 "Compress one block's encoded bytes (the null codec returns `bytes` itself)."
 function compressblock(w::WriterCodec, bytes::Vector{UInt8})
     w.name === :null && return bytes
     w.name === :snappy && return snappycompress(bytes)
-    codec = w.factory()
+    w.name === :deflate && return transcodeblock(DeflateCompressor(level=w.level), bytes)
+    w.name === :zstandard && return transcodeblock(ZstdCompressor(level=w.level), bytes)
+    return runtimecall(extensioncompress, w, bytes)::Vector{UInt8}
+end
+
+function extensioncompress(w::WriterCodec, bytes::Vector{UInt8})
+    return transcodeblock(w.factory(), bytes)
+end
+
+function transcodeblock(codec::TranscodingStreams.Codec, bytes::Vector{UInt8})
     TranscodingStreams.initialize(codec)
     try
-        return transcode(codec, bytes)
+        return transcode(codec, bytes)::Vector{UInt8}
     finally
         TranscodingStreams.finalize(codec)
     end

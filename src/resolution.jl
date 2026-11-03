@@ -77,12 +77,8 @@ mutable struct ResolvedRecordPlan <: Plan
     const defaults::Vector{Pair{Int,DefaultPlan}}
 end
 
-function isresolving(::Plan)
-    return false
-end
-
-function isresolving(::Union{PromotePlan,DefaultPlan,EnumRemapPlan,UnresolvableBranch,UnionResolvePlan,WrapPlan,ResolvedRecordPlan})
-    return true
+function isresolving(@nospecialize(p::Plan))
+    return p isa Union{PromotePlan,DefaultPlan,EnumRemapPlan,UnresolvableBranch,UnionResolvePlan,WrapPlan,ResolvedRecordPlan}
 end
 
 # ---- the resolver -----------------------------------------------------------------------------------
@@ -653,85 +649,97 @@ end
 
 # ---- decoding and skipping --------------------------------------------------------------------------
 
-function readraw(kind::Symbol, d::Decoder)
-    kind === :int && return readint(d)
-    kind === :long && return readlong(d)
-    kind === :float && return readfloat(d)
-    kind === :double && return readdouble(d)
-    kind === :string && return readstring(d)
-    return readbytes(d)
+# The generic value of a resolving plan (`decodevalue`'s chain continued).
+function decoderesolving(@nospecialize(p::Plan), d::Decoder)
+    p isa ResolvedRecordPlan && return decoderesolvedrecord(p, d)
+    p isa WrapPlan && return decodevalue(p.inner, d)
+    p isa UnionResolvePlan && return decode(p.branches[readindex(d, unionsize(p, d))], d)
+    p isa PromotePlan && return decodepromoted(p, d)
+    p isa EnumRemapPlan && return EnumValue(p.reader, enumremapindex(p, d), Val(:unchecked))
+    p isa DefaultPlan && return freshvalue(p.value)
+    p isa UnresolvableBranch && throw(ResolutionError(p.msg, p.writerpath, p.readerpath))
+    p isa WholeRecordPlan && return decodevalue(p.plan, d)
+    throw(ArgumentError("internal error: a plan without a decoder"))
 end
 
-function decodevalue(p::PromotePlan, d::Decoder)
-    return fromraw(p.reader, d, readraw(p.writer, d))
+function unionsize(p::UnionResolvePlan, d::Decoder)
+    n = length(p.branches)
+    n == 0 && dataerror(d, "empty union has no datum")
+    return n
 end
 
-# The reader's interpretation of a promoted raw value.
-function fromraw(::LongPlan, d::Decoder, raw::Int32)
-    return Int64(raw)
+# A promoted writer leaf in the generic value of the reader's leaf plan.
+function decodepromoted(p::PromotePlan, d::Decoder)
+    r = p.reader
+    r isa LongPlan && return promotedvalue(Int64, p, d)
+    r isa DoublePlan && return promotedvalue(Float64, p, d)
+    r isa FloatPlan && return promotedvalue(Float32, p, d)
+    r isa StringPlan && return promotedvalue(String, p, d)
+    r isa BytesPlan && return promotedvalue(Vector{UInt8}, p, d)
+    r isa UUIDStringPlan && return promotedvalue(UUID, p, d)
+    r isa TimeMicrosPlan && return promotedvalue(Time, p, d)
+    r isa DecimalPlan && return r.wide ? promotedvalue(WideDecimal, p, d) : promotedvalue(Decimal, p, d)
+    r isa TimestampPlan{Millisecond} && return promotedvalue(Timestamp{Millisecond}, p, d)
+    r isa TimestampPlan{Microsecond} && return promotedvalue(Timestamp{Microsecond}, p, d)
+    r isa TimestampPlan{Nanosecond} && return promotedvalue(Timestamp{Nanosecond}, p, d)
+    r isa LocalTimestampPlan{Millisecond} && return promotedvalue(LocalTimestamp{Millisecond}, p, d)
+    r isa LocalTimestampPlan{Microsecond} && return promotedvalue(LocalTimestamp{Microsecond}, p, d)
+    r isa LocalTimestampPlan{Nanosecond} && return promotedvalue(LocalTimestamp{Nanosecond}, p, d)
+    return dataerror(d, "internal error: a promotion into a plan without one")
 end
 
-function fromraw(::FloatPlan, d::Decoder, raw::Union{Int32,Int64})
-    return Float32(raw)
+# A promoted writer leaf decoded as its raw primitive and interpreted as the reader's leaf type `T` (the
+# generic value type of the reader's leaf plan).
+function promotedvalue(::Type{T}, p::PromotePlan, d::Decoder) where {T}
+    w = p.writer
+    if T === Int64
+        w === :int && return Int64(readint(d))
+    elseif T === Float32
+        w === :int && return Float32(readint(d))
+        w === :long && return Float32(readlong(d))
+    elseif T === Float64
+        w === :int && return Float64(readint(d))
+        w === :long && return Float64(readlong(d))
+        w === :float && return Float64(readfloat(d))
+    elseif T === Time
+        w === :int && return timemicros(d, Int64(readint(d)))
+    elseif T <: Union{Timestamp,LocalTimestamp}
+        w === :int && return promotedtimestamp(T, readint(d))
+    elseif T === String
+        w === :bytes && return utf8string(d, readbytes(d))
+    elseif T === UUID
+        w === :bytes && return uuidfrombytes(d, readbytes(d))
+    elseif T === Vector{UInt8}
+        w === :string && return Vector{UInt8}(codeunits(readstring(d)))
+    elseif T === Decimal || T === WideDecimal
+        r = p.reader
+        w === :string && r isa DecimalPlan && return decimalfromstring(d, r, readstring(d))::T
+    end
+    return dataerror(d, "internal error: a promotion its reader type does not take")
 end
 
-function fromraw(::DoublePlan, d::Decoder, raw::Union{Int32,Int64,Float32})
-    return Float64(raw)
-end
-
-function fromraw(::TimeMicrosPlan, d::Decoder, raw::Int32)
-    v = Int64(raw)
-    0 <= v < 86_400_000_000 || dataerror(d, "time-micros value $v out of range")
-    return Time(Nanosecond(v * 1_000))
-end
-
-function fromraw(::TimestampPlan{P}, d::Decoder, raw::Int32) where {P}
+function promotedtimestamp(::Type{Timestamp{P}}, raw::Int32) where {P}
     return timestamp(P, raw)
 end
 
-function fromraw(::LocalTimestampPlan{P}, d::Decoder, raw::Int32) where {P}
+function promotedtimestamp(::Type{LocalTimestamp{P}}, raw::Int32) where {P}
     return localtimestamp(P, raw)
 end
 
-function fromraw(::StringPlan, d::Decoder, raw::Vector{UInt8})
+function utf8string(d::Decoder, raw::Vector{UInt8})
     isstrictutf8(raw) || dataerror(d, "invalid UTF-8 in string")
     return String(raw)
 end
 
-function fromraw(::UUIDStringPlan, d::Decoder, raw::Vector{UInt8})
+function uuidfrombytes(d::Decoder, raw::Vector{UInt8})
     validuuid(raw, 1, length(raw)) || dataerror(d, "invalid uuid string")
     return uuidfrombuffer(raw, 1)
 end
 
-function fromraw(::BytesPlan, d::Decoder, raw::String)
-    return Vector{UInt8}(codeunits(raw))
-end
-
-function fromraw(p::DecimalPlan, d::Decoder, raw::String)
+function decimalfromstring(d::Decoder, p::DecimalPlan, raw::String)
     bytes = Vector{UInt8}(codeunits(raw))
     isempty(bytes) && dataerror(d, "empty decimal payload")
     return decimalfrombytes(Decoder(bytes, d.limits), p, 1, length(bytes))
-end
-
-function fromraw(p::Plan, d::Decoder, raw)
-    return dataerror(d, "internal error: no promotion of $(typeof(raw)) into $(typeof(p))")
-end
-
-# A default consumes no input: decoding returns a fresh copy of its value and skipping it does nothing.
-function decode(p::DefaultPlan, d::Decoder)
-    return freshvalue(p.value)
-end
-
-function decodevalue(p::DefaultPlan, d::Decoder)
-    return freshvalue(p.value)
-end
-
-function skip(::DefaultPlan, d::Decoder)
-    return nothing
-end
-
-function skipvalue(::DefaultPlan, d::Decoder)
-    return nothing
 end
 
 function enumremapindex(p::EnumRemapPlan, d::Decoder)
@@ -742,35 +750,11 @@ function enumremapindex(p::EnumRemapPlan, d::Decoder)
     return p.default
 end
 
-function decodevalue(p::EnumRemapPlan, d::Decoder)
-    return EnumValue(p.reader, enumremapindex(p, d), Val(:unchecked))
+function skipresolvedunion(p::UnionResolvePlan, d::Decoder)
+    return skip(p.branches[readindex(d, unionsize(p, d))], d)
 end
 
-function decodevalue(p::UnresolvableBranch, d::Decoder)
-    throw(ResolutionError(p.msg, p.writerpath, p.readerpath))
-end
-
-function decodevalue(p::UnionResolvePlan, d::Decoder)
-    n = length(p.branches)
-    n == 0 && dataerror(d, "empty union has no datum")
-    return decode(p.branches[readindex(d, n)], d)
-end
-
-function skipvalue(p::UnionResolvePlan, d::Decoder)
-    n = length(p.branches)
-    n == 0 && dataerror(d, "empty union has no datum")
-    return skip(p.branches[readindex(d, n)], d)
-end
-
-function decodevalue(p::WrapPlan, d::Decoder)
-    return decodevalue(p.inner, d)
-end
-
-function skipvalue(p::WrapPlan, d::Decoder)
-    return skipvalue(p.inner, d)
-end
-
-function decodevalue(p::ResolvedRecordPlan, d::Decoder)
+function decoderesolvedrecord(p::ResolvedRecordPlan, d::Decoder)
     enter!(d)
     vals = Vector{Any}(undef, length(p.schema.fields))
     for (slot, plan) in p.steps
@@ -787,64 +771,10 @@ function decodevalue(p::ResolvedRecordPlan, d::Decoder)
     return Record(p.schema, vals, Val(:unchecked))
 end
 
-function skipvalue(p::ResolvedRecordPlan, d::Decoder)
+function skipresolved(p::ResolvedRecordPlan, d::Decoder)
     enter!(d)
     for (_, plan) in p.steps
         skip(plan, d)
-    end
-    leave!(d)
-    return nothing
-end
-
-# ---- column builders over resolved records ------------------------------------------------------------
-
-# A writer union resolved into a reader record has no fields of its own to decode into columns: each row
-# decodes whole and its values go to the columns.
-struct WholeRecordPlan{P<:Plan} <: Plan
-    schema::RecordSchema
-    plan::P
-end
-
-function recordrowplan(plan::Plan, effective::RecordSchema)
-    return plan isa Union{RecordPlan,ResolvedRecordPlan} ? plan : WholeRecordPlan(effective, plan)
-end
-
-function decodevalue(p::WholeRecordPlan, d::Decoder)
-    return decodevalue(p.plan, d)
-end
-
-function slotplans(p::WholeRecordPlan)
-    return Plan[p.plan for _ in p.schema.fields]
-end
-
-function decoderow!(cols::Vector{ColumnBuilder}, d::Decoder, p::WholeRecordPlan)
-    values = getfield(decode(p.plan, d)::Record, :values)
-    for (c, v) in zip(cols, values)
-        c isa TypedColumn && appendcell!(c, v)
-    end
-    return nothing
-end
-
-function slotplans(p::ResolvedRecordPlan)
-    plans = Vector{Plan}(undef, length(p.schema.fields))
-    for (slot, plan) in p.steps
-        slot == 0 || (plans[slot] = plan)
-    end
-    for (slot, dp) in p.defaults
-        plans[slot] = dp
-    end
-    return plans
-end
-
-# One resolved record row into its reader-slot builders (unfused): the writer-ordered steps, then the defaults.
-function decoderow!(cols::Vector{ColumnBuilder}, d::Decoder, p::ResolvedRecordPlan)
-    countvalue!(d)
-    enter!(d)
-    for (slot, plan) in p.steps
-        slot == 0 ? skip(plan, d) : decodecell!(cols[slot], d)
-    end
-    for (slot, _) in p.defaults
-        decodecell!(cols[slot], d)
     end
     leave!(d)
     return nothing

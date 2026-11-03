@@ -98,12 +98,12 @@ import DataAPI
         close(r2)
         rec = Avro.decode(s, Avro.encode(s, rows[1]))
         @test rec isa Tables.AbstractRow && rec.a === Int64(1)
-        rt = Avro.Rows(buf(); T=NamedTuple{(:a, :b, :c, :e),Tuple{Int64,String,Union{Missing,Float64},String}})
+        rt = Avro.Rows(buf(), NamedTuple{(:a, :b, :c, :e),Tuple{Int64,String,Union{Missing,Float64},String}})
         @test !Tables.istable(rt)
         vals = collect(rt)
         close(rt)
         @test length(vals) == 250 && vals[1].a == 1 && vals[1].e == "X" && vals[2].e == "Y"
-        rt2 = Avro.Rows(buf(); T=NamedTuple{(:a,),Tuple{Int64}})
+        rt2 = Avro.Rows(buf(), NamedTuple{(:a,),Tuple{Int64}})
         @test_throws ArgumentError Tables.partitions(rt2)
         @test_throws ArgumentError Tables.columns(rt2)
         close(rt2)
@@ -152,7 +152,7 @@ import DataAPI
         fixed_tuple_data = take!(Avro.tobuffer([(f=UInt8[1, 2, 3, 4],)];
                                                schema=fixed_tuple_schema, codec=:null))
         FixedTupleRow = @NamedTuple{f::NTuple{4,UInt8}}
-        fixed_tuple_rows = Avro.Rows(fixed_tuple_data; T=FixedTupleRow)
+        fixed_tuple_rows = Avro.Rows(fixed_tuple_data, FixedTupleRow)
         @test collect(fixed_tuple_rows) == [(f=(0x01, 0x02, 0x03, 0x04),)]
         close(fixed_tuple_rows)
         @test Avro.Rows(rr -> sum(row.a for row in rr), buf()) == sum(1:250)

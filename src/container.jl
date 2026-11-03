@@ -8,14 +8,14 @@ const MAGIC = (UInt8('O'), UInt8('b'), UInt8('j'), 0x01)
 
 # ---- sources ----------------------------------------------------------------------------------------
 
-mutable struct BytesSource{B<:AbstractVector{UInt8}}
-    const buf::B
+mutable struct BytesSource
+    const buf::Vector{UInt8}
     pos::Int
     const stop::Int
     const mapped::Bool       # `buf` is this source's own memory map
 end
 
-function BytesSource(buf::AbstractVector{UInt8}, pos::Int, stop::Int=length(buf))
+function BytesSource(buf::Vector{UInt8}, pos::Int, stop::Int=length(buf))
     return BytesSource(buf, pos, stop, false)
 end
 
@@ -36,7 +36,7 @@ function sourceeof(s::BytesSource)
 end
 
 function sourceeof(s::StreamSource)
-    return eof(s.io)
+    return streamcall(eof, s.io)::Bool
 end
 
 function sourcebyte(s::BytesSource)
@@ -47,8 +47,8 @@ function sourcebyte(s::BytesSource)
 end
 
 function sourcebyte(s::StreamSource)
-    eof(s.io) && throw(DataError("truncated file", s.pos))
-    byte = Base.read(s.io, UInt8)
+    sourceeof(s) && throw(DataError("truncated file", s.pos))
+    byte = streamcall(Base.read, s.io, UInt8)::UInt8
     s.pos += 1
     return byte
 end
@@ -86,7 +86,7 @@ end
 
 function sourcepayload(s::StreamSource, n::Int)
     out = Vector{UInt8}(undef, n)
-    consumed = readbytes!(s.io, out, n)
+    consumed = streamcall(readbytes!, s.io, out, n)::Int
     s.pos += consumed
     consumed == n || throw(DataError("truncated file", s.pos))
     return out
@@ -113,7 +113,8 @@ function closesource(s::BytesSource)
 end
 
 function closesource(s::StreamSource)
-    return s.owned ? close(s.io) : nothing
+    s.owned && streamcall(close, s.io)
+    return nothing
 end
 
 function opensource(src::Vector{UInt8}; mmap::Bool=true)
@@ -125,7 +126,17 @@ function opensource(src::AbstractVector{UInt8}; mmap::Bool=true)
 end
 
 function opensource(src::IOBuffer; mmap::Bool=true)
-    return BytesSource(src.data, iobufferstart(src), src.size)
+    return BytesSource(bytevector(src.data), iobufferstart(src), src.size)
+end
+
+function bytevector(v::Vector{UInt8})
+    return v
+end
+
+@static if isdefined(Base, :Memory)
+    function bytevector(m::Memory{UInt8})               # an IOBuffer's storage on Julia 1.11+, shared
+        return Base.wrap(Array, m, length(m))
+    end
 end
 
 # On Julia 1.11+ an IOBuffer over a Vector with a memory offset starts after index 1 of `data`.
@@ -263,16 +274,16 @@ function Reader(src; limits::Limits=Limits(), legacy::Union{Nothing,Symbol}=noth
         closereaderresources(source; suppress=true)
         rethrow()
     end
-    finalizer(r) do x
-        if !x.closed
-            source = x.source
-            x.source = nothing
-            x.closed = true
-            closereaderresources(source; suppress=true)
-        end
-        return nothing
-    end
-    return r
+    return addfinalizer(closeunclosed!, r)
+end
+
+# The finalizer of a reader nobody closed.
+function closeunclosed!(r::Reader)
+    r.closed && return nothing
+    source = r.source
+    r.source = nothing
+    r.closed = true
+    return closereaderresources(source; suppress=true)
 end
 
 function Base.show(io::IO, r::Reader)

@@ -257,26 +257,26 @@ end
 # ---- Avro.Rows --------------------------------------------------------------------------------------
 
 """
-    Avro.Rows(src; T=nothing, reader_schema=nothing, union_resolution=:spec, limits=Limits(),
-              legacy=nothing, allow_invalid_names=false, allow_invalid_defaults=false, mmap=true,
-              select=nothing)
+    Avro.Rows(src; reader_schema=nothing, union_resolution=:spec, limits=Limits(), legacy=nothing,
+              allow_invalid_names=false, allow_invalid_defaults=false, mmap=true, select=nothing)
+    Avro.Rows(src, T; kw...)
 
 Stream a container file's datums. **Generic record mode** (record root, no `T`): a Tables.jl row source
 yielding `Avro.Record`, with one `Tables.partitions` entry per block when the schema fixes every column's
-value types. **Typed mode** (`T`): a plain iterator of `T`
-(no Tables interface). **Non-record mode**: a plain iterator of the generic values. `select=` applies to
-the generic record mode only. `close(rows)` is idempotent; the do-block form closes on exit. Byte and
-memory-mapped sources report the number of rows their block headers still claim with `length`; streamed
-sources have no known length. All modes are single-pass iterators. A bad row or payload ends its block, and
-iterating again continues with the next block; damaged block framing ends the stream.
+value types. **Typed mode** (`T`): a plain iterator of `T` (no Tables interface). **Non-record mode**: a
+plain iterator of the generic values. `select=` applies to the generic record mode only. `close(rows)` is
+idempotent; the do-block form closes on exit. Byte and memory-mapped sources report the number of rows
+their block headers still claim with `length`; streamed sources have no known length. All modes are
+single-pass iterators. A bad row or payload ends its block, and iterating again continues with the next
+block; damaged block framing ends the stream.
 """
-mutable struct Rows
+mutable struct Rows{T}
     const reader::Reader
     const mode::Symbol                     # :generic, :typed or :nonrecord
     const effective::Schema
     const outschema::Union{Nothing,RecordSchema}
-    const plan::Any                        # Plan or TypedPlan
-    const T::Any
+    const plan::Plan                       # the row plan of the generic record mode's projections and columns
+    const node::TypedNode                  # decodes a whole row into `T`
     const select::Union{Nothing,Projection}
     const decoder::Decoder{Vector{UInt8}}  # rebound to each block
     nrows::Int                             # datums the block headers of a byte source still claim, or -1
@@ -284,33 +284,55 @@ mutable struct Rows
     remaining::Int                         # datums left in the current block
 end
 
-function Rows(src; T=nothing, reader_schema::Union{Nothing,Schema}=nothing, union_resolution::Symbol=:spec,
+const RowsSource = Union{AbstractString,IO,AbstractVector{UInt8}}
+
+function Rows(src::RowsSource, ::Type{T}; reader_schema::Union{Nothing,Schema}=nothing, union_resolution::Symbol=:spec,
               limits::Limits=Limits(), legacy::Union{Nothing,Symbol}=nothing, allow_invalid_names::Bool=false,
-              allow_invalid_defaults::Bool=false, mmap::Bool=true, select=nothing)
+              allow_invalid_defaults::Bool=false, mmap::Bool=true) where {T}
     r = Reader(src; limits=limits, legacy=legacy, allow_invalid_names=allow_invalid_names,
                allow_invalid_defaults=allow_invalid_defaults, mmap=mmap)
     try
         effective, plan = effectiveplan(r, reader_schema, union_resolution)
-        mode = T !== nothing ? :typed : effective isa RecordSchema ? :generic : :nonrecord
-        select !== nothing && mode !== :generic &&
-            throw(ArgumentError("select= applies to the generic record mode only (no typed T, record root)"))
-        projection = select === nothing ? nothing : selectindices(effective, select)
-        outschema = mode === :generic ? (projection === nothing ? effective : projectschema(effective, projection.indices)) : nothing
-        rowplan = mode === :typed ? typedplan(T, effective, plan) : mode === :generic ? recordrowplan(plan, effective) : plan
-        nrows = -1
-        if r.source isa BytesSource
-            pre = prescanblocks(r)
-            pre.pending === nothing && (nrows = pre.totalrows)   # a structural error leaves `length` unknown,
-        end                                                       # as for a streamed source
-        return Rows(r, mode, effective, outschema, rowplan, T, projection, Decoder(UInt8[], limits), nrows, nothing, 0)
+        node = typednode(T, effective, plan)
+        return Rows{T}(r, :typed, effective, nothing, plan, node, nothing, Decoder(UInt8[], limits), claimedrows(r), nothing, 0)
     catch
         close(r)
         rethrow()
     end
 end
 
-function Rows(f::Function, src; kw...)
-    rows = Rows(src; kw...)
+function Rows(src; reader_schema::Union{Nothing,Schema}=nothing, union_resolution::Symbol=:spec, limits::Limits=Limits(),
+              legacy::Union{Nothing,Symbol}=nothing, allow_invalid_names::Bool=false, allow_invalid_defaults::Bool=false,
+              mmap::Bool=true, select=nothing)
+    r = Reader(src; limits=limits, legacy=legacy, allow_invalid_names=allow_invalid_names,
+               allow_invalid_defaults=allow_invalid_defaults, mmap=mmap)
+    try
+        effective, plan = effectiveplan(r, reader_schema, union_resolution)
+        decoder = Decoder(UInt8[], limits)
+        if !(effective isa RecordSchema)
+            select === nothing || throw(ArgumentError("select= applies to the generic record mode only (no typed T, record root)"))
+            return Rows{Any}(r, :nonrecord, effective, nothing, plan, GenericNode{Any}(plan), nothing, decoder, claimedrows(r), nothing, 0)
+        end
+        projection = select === nothing ? nothing : selectindices(effective, select)
+        outschema = projection === nothing ? effective : projectschema(effective, projection.indices)
+        return Rows{Record}(r, :generic, effective, outschema, recordrowplan(plan, effective), GenericNode{Record}(plan),
+                            projection, decoder, claimedrows(r), nothing, 0)
+    catch
+        close(r)
+        rethrow()
+    end
+end
+
+# The datums the block headers of a byte source claim, or -1 (a streamed source, or a structural error
+# that leaves `length` unknown as for a streamed source).
+function claimedrows(r::Reader)
+    r.source isa BytesSource || return -1
+    pre = prescanblocks(r)
+    return pre.pending === nothing ? pre.totalrows : -1
+end
+
+function Rows(f::Function, src, args...; kw...)
+    rows = Rows(src, args...; kw...)
     try
         return f(rows)
     finally
@@ -318,13 +340,13 @@ function Rows(f::Function, src; kw...)
     end
 end
 
-function Base.show(io::IO, rows::Rows)
+function Base.show(io::IO, rows::Rows{T}) where {T}
     print(io, "Avro.Rows(")
     rows.nrows >= 0 && print(io, rows.nrows, " rows: ")
     if rows.mode === :generic
         join(io, (rows.outschema::RecordSchema).fieldnames, ", ")
     else
-        print(io, rows.mode === :typed ? rows.T : kind(rows.effective))
+        print(io, rows.mode === :typed ? T : kind(rows.effective))
     end
     return print(io, ")")
 end
@@ -385,7 +407,7 @@ function Tables.columnnames(rows::Rows)
 end
 
 # A row count from block headers is a claim, so `collect` and friends grow as rows decode rather than trust it.
-function Base.IteratorSize(::Type{Rows})
+function Base.IteratorSize(::Type{<:Rows})
     return Base.SizeUnknown()
 end
 
@@ -399,7 +421,7 @@ function consumedrows!(rows::Rows, count::Int)
     return nothing
 end
 
-function Base.IteratorEltype(::Type{Rows})
+function Base.IteratorEltype(::Type{<:Rows})
     return Base.EltypeUnknown()
 end
 
@@ -410,15 +432,13 @@ function Base.iterate(rows::Rows, ::Nothing=nothing)
     return (something(v), nothing)
 end
 
-function decoderow(rows::Rows, d::Decoder)
-    plan = rows.plan
-    if rows.mode === :typed
-        v = decoderoot(plan, d)
-        return finishtyped(plan, v)                      # semantic conversion in caller space
+function decoderow(rows::Rows{T}, d::Decoder) where {T}
+    if T === Record
+        projection = rows.select
+        projection === nothing ||
+            return Record(rows.outschema::RecordSchema, projectrow(rows.plan, d, projection), Val(:unchecked))
     end
-    projection = rows.select
-    projection === nothing || return Record(rows.outschema::RecordSchema, projectrow(plan, d, projection), Val(:unchecked))
-    return decode(plan, d)
+    return decodenode(T, rows.node, d)
 end
 
 function projectrow(p::WholeRecordPlan, d::Decoder, projection::Projection)

@@ -11,6 +11,14 @@ struct PrecompiledRow                                  # a representative plain 
     flag::Bool
 end
 
+# A value of each common field type: their typed read nodes compile here, so a record of them compiles only
+# its own record node.
+const PRECOMPILED_FIELDS = (Int64(1), Int32(1), 1.0, 1.0f0, true, "a", :a, UInt8[1], Date(2020, 1, 1),
+    DateTime(2020, 1, 1), Time(1), UUID(UInt128(1)), Union{Missing,Int64}[missing], Union{Missing,Int32}[missing],
+    Union{Missing,Float64}[missing], Union{Missing,Bool}[missing], Union{Missing,String}[missing],
+    Union{Missing,Date}[missing], Union{Missing,DateTime}[missing], ["a"], Int64[1], Float64[1.0], Int32[1],
+    Dict("a" => "b"), Dict("a" => Int64(1)), Dict("a" => 1.0))
+
 @setup_workload begin
     prows = [(id=Int64(1), name="a", score=1.0, flag=true), (id=Int64(2), name="b", score=2.0, flag=false)]
     pjson = """{"type":"record","name":"PC","fields":[{"name":"id","type":"long"},{"name":"name","type":"string"},{"name":"score","type":"double"},{"name":"flag","type":"boolean"}]}"""
@@ -37,6 +45,13 @@ end
             for row in Rows(tobuffer(prows; schema=s, codec=c))
                 row isa Record
             end
+        end
+        foreach(identity, Rows(tobuffer(prows; schema=s), typeof(prows[1])))
+        foreach(identity, Rows(tobuffer(prows; schema=s), PrecompiledRow))
+        for x in PRECOMPILED_FIELDS
+            fs = schema(typeof(x))
+            DatumReader(fs, typeof(x))(encode(fs, x))
+            x isa Vector && !(x isa Vector{UInt8}) && (es = schema(eltype(x)); DatumReader(es, eltype(x))(encode(es, first(x))))
         end
         Tables.columntable(Table(tobuffer(prows; schema=s); select=(:id,)))
         Tables.columntable(Table(tobuffer(prows)))           # the schema derived from the rows

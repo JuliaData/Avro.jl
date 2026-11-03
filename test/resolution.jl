@@ -430,7 +430,7 @@
         @test length(first(Avro.Rows(container; reader_schema=reader, limits=containerlimits)).added) == 1000
         @test length(Avro.Table(container; reader_schema=reader, limits=containerlimits).added[1]) == 1000
         typed = NamedTuple{(:added,),Tuple{Vector{Missing}}}
-        @test length(first(Avro.Rows(container; T=typed, reader_schema=reader, limits=containerlimits)).added) == 1000
+        @test length(first(Avro.Rows(container, typed; reader_schema=reader, limits=containerlimits)).added) == 1000
         # many added fields over small rows, under the default limits
         small = P("""{"type":"record","name":"S","fields":[{"name":"a","type":"boolean"}]}""")
         added = join(("{\"name\":\"f$i\",\"type\":\"long\",\"default\":$i}" for i in 1:40), ",")

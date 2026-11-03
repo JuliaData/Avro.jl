@@ -23,7 +23,7 @@ use `Avro.schema(t)` and `Avro.metadata(t)` to inspect file information.
 
 * **Generic record mode** (record root): a Tables.jl row source yielding [`Avro.Record`](@ref)s, which
   are `Tables.AbstractRow`s (`row.id`, `row[:id]`, `Tables.columnnames(row)`).
-* **Typed mode** (`T=`): a plain iterator of `T` values.
+* **Typed mode** (`Avro.Rows(src, T)`): a plain iterator of `T` values.
 * **Non-record mode**: a plain iterator of the generic values.
 
 `close(rows)` releases the source (do-block form available). `Avro.write(dst, Avro.Rows(src))` re-encodes
@@ -89,5 +89,5 @@ field for is an `ArgumentError`, not a silent drop, so select the columns to wri
 
 With TimeZones.jl loaded, `ZonedDateTime` is an instant of millisecond resolution: its columns derive
 `timestamp-millis` and it encodes under any `timestamp-*` schema. It is also a typed target, as in
-`Avro.Rows(src; T=@NamedTuple{at::ZonedDateTime})`, which gives the time in UTC, floored to milliseconds like
+`Avro.Rows(src, @NamedTuple{at::ZonedDateTime})`, which gives the time in UTC, floored to milliseconds like
 a `DateTime` target.
