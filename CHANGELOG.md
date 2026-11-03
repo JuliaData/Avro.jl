@@ -26,8 +26,8 @@ logical type is preserved as an unknown annotation and is deferred.
 - `Avro.Table`: a column table with DataAPI metadata, direct column access through `table.name`,
   `table[:name]` and `table[index]`, and a stored `Tables.Schema` (names and eltypes never become type
   parameters); `Tables.rowtable` builds typed rows from it on request.
-- `Avro.Rows`: bounded-memory streaming of `Avro.Record`s (Tables.jl rows), typed values `T`, or plain
-  values, with per-block `Tables.partitions`.
+- `Avro.Rows`: bounded-memory streaming of `Avro.Record`s (Tables.jl rows), typed values
+  (`Avro.Rows(src, T)`), or plain values, with per-block `Tables.partitions`.
 - `Avro.write` takes generators and vectors of structs or plain values as well as Tables.jl sources;
   `append=true` adds to an existing file; a rewrite keeps the source's user metadata; `metadata=` values
   may be strings; a table column the schema lacks is an error rather than a silent drop.
@@ -42,9 +42,10 @@ logical type is preserved as an unknown annotation and is deferred.
   columns; results, acceptance and errors are identical at every `ntasks`.
 - Parallel block compression: with a compressing codec, `Avro.write` and `Avro.Writer` compress up to
   `ntasks=` blocks at once while the caller encodes; the file is byte-identical at every `ntasks`.
-- Resource limits (`Avro.Limits`): nesting depth, the largest materialised buffer, and the number of
-  values a block or datum may decode per input byte; every claimed length and count is checked against
-  the remaining input before allocation.
+- Resource limits (`Avro.Limits`): nesting depth, the largest materialised buffer, the number of values a
+  block or datum may decode per input byte, and how far one read may decompress its input
+  (`max_inflation`); every claimed length and count is checked against the remaining input before
+  allocation.
 - Writer safety: atomic file replacement, failure poisoning, and the reader's limits enforced at write
   time, so every successfully written file is readable under identical limits.
 - Codecs: `zstandard`, `snappy`, `deflate`, `null` built in; `bzip2` and `xz` via package extensions
@@ -54,7 +55,9 @@ logical type is preserved as an unknown annotation and is deferred.
 - Legacy support for files written by Avro.jl ≤ 1.1.2: `legacy=:avrojl1` (padded null-codec blocks,
   the `zstd` codec name, unnamed fixed schemas, native-endian fixed-16 decimals).
 - Prepared codecs: `Avro.DatumReader(schema[, T])` and `Avro.DatumWriter(schema[, T])` reuse plans
-  across calls; writers return a fresh byte vector or append to an `IO`.
+  across calls; writers return a fresh byte vector or append to an `IO`. Typed targets compile once per
+  Julia type, whatever the schema, and every typed API takes the type positionally
+  (`Avro.decode(schema, bytes, T)`, `Avro.Rows(src, T)`, `Avro.decodesingle(src, store, T)`).
 - Exact timestamps: `timestamp-*` values are `Durations.ZonedTimestamp{P,:UTC}` and `local-timestamp-*`
   values are `Durations.Timestamp{P}` (the `Dates.Timestamp` of Julia 1.14), so microsecond and
   nanosecond precision survives decoding and Arrow.jl writes them as native timestamp columns.
