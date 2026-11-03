@@ -108,8 +108,15 @@ end
 # Decoded values never alias a source's bytes, so a map is released now rather than at some later collection:
 # maps are a scarce OS resource, and on Windows one blocks replacing or truncating its file.
 function closesource(s::BytesSource)
-    s.mapped && finalize(s.buf)
+    s.mapped && finalize(mappedmemory(s.buf))
     return nothing
+end
+
+# The object `Mmap.mmap` attaches its unmapping finalizer to: on Julia 1.11+ the array's `Memory`.
+@static if isdefined(Base, :Memory)
+    mappedmemory(map::Vector{UInt8}) = map.ref.mem
+else
+    mappedmemory(map::Vector{UInt8}) = map
 end
 
 function closesource(s::StreamSource)

@@ -588,6 +588,15 @@ end
         end
     end
     @testset "sources: path, mmap=false stream, IO, bytes" begin
+        if isfile("/proc/self/maps")                     # Linux lists the process's mapped files
+            mapped(path) = occursin(realpath(path), read("/proc/self/maps", String))
+            mapfile = joinpath(mktempdir(), "mapped.avro")
+            Avro.write(mapfile, [(x=Int64(1),)])
+            r = Avro.Reader(mapfile)
+            @test mapped(mapfile)
+            close(r)
+            @test !mapped(mapfile)                       # released on close, not at a later collection
+        end
         rows = [(x=Int64(i),) for i in 1:100]
         buffered = Avro.tobuffer(rows)
         buffered_reader = Avro.Reader(buffered)
