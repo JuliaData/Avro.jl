@@ -49,6 +49,13 @@ end
 close(w)
 ```
 
+With a compressing codec and more than one Julia thread, `Avro.write` and `Avro.Writer` compress up to
+`ntasks` blocks at once (default `Threads.nthreads()`) while the caller's task encodes the next block. The
+caller's task writes every block in order, so the file is byte-identical at every `ntasks`. At most
+`2 × ntasks` blocks wait in memory to be written. `ntasks=1` compresses on the caller's task. A failed
+compression poisons the writer and raises from the `push!`, `flush` or `close` that writes its block.
+`flush`, `close` and `close(w; abort=true)` wait for the blocks still compressing.
+
 A `Writer` enforces the reader's limits as it writes, so **everything a successfully closed writer emits
 is accepted by `Reader`, `Rows` and `Table` under identical limits** (see
 [Limits and security](limits-and-security.md)). The first failure poisons the writer, including a

@@ -39,6 +39,8 @@ logical type is preserved as an unknown annotation and is deferred.
   an effective schema that `Avro.write` round-trips.
 - Parallel container decoding: `Avro.Table(src; ntasks=…)` decodes blocks straight into preallocated
   columns; results, acceptance and errors are identical at every `ntasks`.
+- Parallel block compression: with a compressing codec, `Avro.write` and `Avro.Writer` compress up to
+  `ntasks=` blocks at once while the caller encodes; the file is byte-identical at every `ntasks`.
 - Resource limits (`Avro.Limits`): nesting depth, the largest materialised buffer, and the number of
   values a block or datum may decode per input byte; every claimed length and count is checked against
   the remaining input before allocation.
