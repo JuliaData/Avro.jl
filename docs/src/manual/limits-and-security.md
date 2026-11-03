@@ -2,20 +2,27 @@
 
 Avro.jl reads untrusted files safely by default: malformed or hostile input fails with an
 `Avro.AvroError` instead of exhausting memory, and the memory an operation uses stays proportional to
-the input it reads. Four limits, all raisable, bound that proportion:
+the input it reads. Five limits, all raisable, bound that proportion:
 
 ```julia
-Avro.Limits(; max_depth=1024, max_bytes=256 * 2^20, max_values_per_byte=16, value_allowance=65_536)
+Avro.Limits(; max_depth=1024, max_bytes=256 * 2^20, max_values_per_byte=16, value_allowance=65_536,
+            max_inflation=1024)
 ```
 
 * `max_depth` bounds the nesting of values, of JSON documents and of schemas, following named references.
 * `max_bytes` bounds the largest buffer one operation materialises from its input: a decompressed
   container block, a schema or metadata document, the names a schema's namespaces expand to, or one datum
   read from a stream. A small block that decompresses to gigabytes fails as soon as the output passes the cap.
-* `max_values_per_byte` and `value_allowance` bound how many values one container block or one
-  standalone datum may decode: at most `max_values_per_byte × input_bytes + value_allowance`. Values that
-  take no input bytes (nulls, empty records) are legal in Avro; this rule keeps a few bytes from standing for
-  billions of them. Defaults from a reader schema are the caller's values, so they do not count.
+* `max_values_per_byte` and `value_allowance` bound how many values a standalone datum may decode, at most
+  `max_values_per_byte × input_bytes + value_allowance`, and how many a container block may decode:
+  `max_values_per_byte` per decompressed byte plus an allowance of at most `value_allowance` and at most
+  `max_values_per_byte` per byte of the block, counting its 18 bytes of framing. Values that take no input bytes
+  (nulls, empty records) are legal in Avro; these rules keep a few bytes from standing for billions of them, and
+  keep many small blocks from adding up their allowances. Defaults from a reader schema are the caller's values,
+  so they do not count.
+* `max_inflation` bounds decompression across one read of a container file: its blocks may decompress to at
+  most `max_bytes + max_inflation × the compressed bytes read`. Any file up to `max_bytes` of decompressed data
+  reads whatever its compression ratio; a larger one needs an average ratio of at most `max_inflation`.
 
 Exceeding a limit raises [`Avro.LimitError`](@ref), which names the limit, the observed value and the
 keyword to raise. Pass `limits=` to the readers (`Avro.Table`, `Avro.Rows`, `Avro.Reader`,
@@ -45,10 +52,11 @@ in parallel into preallocated columns when the file's block headers claim no mor
 `max(256 MiB, 256 × the file's size)`; larger claims are decoded block by block and checked as they
 arrive, so a tiny file cannot make the reader allocate gigabytes before its first block is verified.
 
-Decoded values take more memory than their encoded bytes, a compressed block can expand up to `max_bytes`, and
-the value limits apply per block. So `Avro.Table` output has no ceiling of its own: a kilobyte of well-formed
-compressed input can decode to hundreds of megabytes. For input from an untrusted source, stream with `Avro.Rows`,
-which holds one block at a time, and lower `max_bytes` and `max_values_per_byte`.
+`Avro.Table` output is proportional to the file it reads: at most `max_bytes + max_inflation × the file's
+compressed bytes` decompress, and each decompressed byte decodes to a bounded number of values. Decoded values
+still take more memory than their encoded bytes (a one-byte `long` becomes an 8-byte `Int64`, a nested record a
+heap object), so a hostile kilobyte can still expand to many megabytes. For input from an untrusted source,
+stream with `Avro.Rows`, which holds one block at a time, and lower `max_bytes` and `max_inflation`.
 
 Column names and typed `Symbol` values are interned, and Julia never frees a `Symbol`. A file's names are bounded
 by its schema and so by `max_bytes`, but a long-running service that reads schemas from untrusted sources

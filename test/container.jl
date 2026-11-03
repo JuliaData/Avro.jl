@@ -780,7 +780,7 @@ end
         end
         @test hugeerr isa Avro.LimitError
         @test hugeerr.limit === :max_values_per_byte
-        @test hugeerr.value == Avro.Limits().value_allowance   # an empty block allows only the flat allowance
+        @test hugeerr.value == Avro.blockvaluecap(Avro.Limits(), 0)   # an empty block allows 16 values per byte of its framing
 
         denseocfschema = Avro.UnionSchema([Avro.ArraySchema(Avro.NullSchema()),
                                            Avro.BytesSchema()])
@@ -831,8 +831,9 @@ end
         staticgood = take!(staticio)
         staticbad = copy(staticgood)
         staticbad[end - 16] = 0x02
-        # the second block holds 10 datums of 23 values each in 20 bytes: over 1 × 20 + 50 values, so
-        # every decoding reader stops there, before the corrupt boolean of its last datum
+        # the second block holds 10 datums of 23 values each in 20 bytes: over its cap of 1 × 20 values plus an
+        # allowance of at most 1 × (20 + 18), so every decoding reader stops there, before the corrupt boolean
+        # of its last datum
         staticlimits = Avro.Limits(max_values_per_byte=1, value_allowance=50)
         staticcalls = (
             bytes -> Avro.Table(bytes; limits=staticlimits, ntasks=1),
@@ -849,10 +850,10 @@ end
             end
             @test staticerror isa Avro.LimitError
             @test staticerror.limit == :max_values_per_byte
-            @test staticerror.value == 1 * 20 + 50 && staticerror.observed > staticerror.value
+            @test staticerror.value == Avro.blockvaluecap(staticlimits, 20) == 1 * 20 + 38 && staticerror.observed > staticerror.value
         end
-        @test length(Avro.Table(staticgood; limits=Avro.Limits(max_values_per_byte=1, value_allowance=230))) == 11
-        @test_throws Avro.DataError Avro.Table(staticbad; limits=Avro.Limits(max_values_per_byte=1, value_allowance=230))
+        @test length(Avro.Table(staticgood; limits=Avro.Limits(max_values_per_byte=12))) == 11
+        @test_throws Avro.DataError Avro.Table(staticbad; limits=Avro.Limits(max_values_per_byte=12))
 
         function encodedpair(k, v)
             return vcat(varint(sizeof(k)), Vector{UInt8}(k), varint(length(v)), v)

@@ -206,6 +206,48 @@ end
         @test_throws Avro.SchemaError Avro.Table(take!(Avro.tobuffer([(a=1,)])); select=:b)
     end
 
+    @testset "empty blocks cannot multiply the value allowance" begin
+        varint(n) = Avro.encode(Avro.LongSchema(), Int64(n))
+        nullrecord = P("""{"type":"record","name":"N","fields":[{"name":"n","type":"null"}]}""")
+        io = IOBuffer()
+        close(Avro.Writer(io, nullrecord; sync=zeros(UInt8, 16)))
+        header = take!(io)
+        emptyblock(count) = vcat(varint(count), varint(0), zeros(UInt8, 16))
+        cap = Avro.blockvaluecap(Avro.Limits(), 0)                 # an 18-byte block: 16 values per file byte
+        @test cap == 16 * 18
+        @test length(Avro.Table(vcat(header, emptyblock(cap ÷ 2)))) == cap ÷ 2
+        hostile = vcat(header, repeat(emptyblock(65_536), 64))     # 1 KiB claiming four million zero-byte datums
+        errs = [try; Avro.Table(hostile; ntasks=n); nothing; catch e; e; end for n in (1, 4)]
+        @test all(e -> e isa Avro.LimitError && e.limit === :max_values_per_byte, errs)
+        @test sprint(showerror, errs[1]) == sprint(showerror, errs[2])
+        @test_throws Avro.LimitError collect(Avro.Rows(hostile))
+        # the writer splits zero-byte datums into blocks a default reader accepts
+        many = Avro.tobuffer([(n=missing,) for _ in 1:2_000]; schema=nullrecord)
+        bytes = take!(copy(many))
+        @test all(b -> first(b) <= cap, Avro.Reader(r -> collect(Avro.eachblock(r)), bytes))
+        @test length(Avro.Table(bytes)) == 2_000
+    end
+
+    @testset "a read's decompressed output is bounded by its input" begin
+        s = P("""{"type":"record","name":"Z","fields":[{"name":"z","type":"long"}]}""")
+        zeros_ = [(z=Int64(0),) for _ in 1:2_000_000]                # one byte per row, compresses about 500 times
+        lax = Avro.Limits(max_inflation=typemax(Int))
+        file = take!(Avro.tobuffer(zeros_; schema=s, codec=:deflate, limits=lax))
+        @test length(Avro.Table(file)) == 2_000_000                  # within the default budget
+        tight = Avro.Limits(max_bytes=1 << 20, max_inflation=2)
+        errs = [try; Avro.Table(file; ntasks=n, limits=tight); nothing; catch e; e; end for n in (1, 4)]
+        @test all(e -> e isa Avro.LimitError && e.limit === :max_inflation, errs)
+        @test sprint(showerror, errs[1]) == sprint(showerror, errs[2])
+        @test errs[1].observed > errs[1].value > 1 << 20              # the budget grew with the compressed bytes read
+        @test_throws Avro.LimitError Avro.Table(file; mmap=false, limits=tight)
+        @test_throws Avro.LimitError collect(Avro.Rows(file; limits=tight))
+        @test any(issue -> occursin("max_inflation", issue), Avro.inspect(file; limits=tight).issues)
+        # the writer refuses to emit what its own limits could not read back
+        writeerr = try; Avro.tobuffer(zeros_; schema=s, codec=:deflate, limits=tight); nothing; catch e; e; end
+        @test writeerr isa Avro.LimitError && writeerr.limit === :max_inflation
+        @test_throws ArgumentError Avro.Limits(max_inflation=0)
+    end
+
     @testset "a NUL in a field name matches a dictionary key" begin
         nulfield = P("{\"type\":\"record\",\"name\":\"N\",\"fields\":[{\"name\":\"a\\u0000b\",\"type\":\"long\"}]}";
                      allow_invalid_names=true)

@@ -6,8 +6,8 @@
     Decoder(buf, limits=Limits(); pos=1, stop=length(buf))
 
 A cursor over a contiguous byte buffer: `pos` is the next byte to read and `stop` the last valid byte
-(inclusive). `values` counts the values decoded from the current scope (one container block or one
-standalone datum) against `valuecap(limits, stop - pos + 1)`.
+(inclusive). `values` counts the values decoded from the current scope against `valuecap`: the datum cap
+`valuecap(limits, stop - pos + 1)`, or a container block's cap once `blockcap!` sets it.
 """
 mutable struct Decoder{B<:AbstractVector{UInt8}}
     buf::B
@@ -44,6 +44,12 @@ function reset!(d::Decoder{B}, buf::B, pos::Int, stop::Int=length(buf)) where {B
     d.depth = 0
     d.values = 0
     d.valuecap = valuecap(d.limits, stop - pos + 1)
+    return d
+end
+
+"Give a decoder over one container block's bytes the block's value cap."
+function blockcap!(d::Decoder)
+    d.valuecap = blockvaluecap(d.limits, remaining(d))
     return d
 end
 

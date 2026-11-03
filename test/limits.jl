@@ -3,8 +3,8 @@
     @testset "keywords, defaults, validation and show" begin
         l = Avro.Limits()
         @test l === Avro.Limits()
-        @test fieldnames(Avro.Limits) == (:max_depth, :max_bytes, :max_values_per_byte, :value_allowance)
-        @test (l.max_depth, l.max_bytes, l.max_values_per_byte, l.value_allowance) == (1024, 256 << 20, 16, 65_536)
+        @test fieldnames(Avro.Limits) == (:max_depth, :max_bytes, :max_values_per_byte, :value_allowance, :max_inflation)
+        @test (l.max_depth, l.max_bytes, l.max_values_per_byte, l.value_allowance, l.max_inflation) == (1024, 256 << 20, 16, 65_536, 1024)
         custom = Avro.Limits(max_depth=8)
         @test custom.max_depth == 8 && custom.max_bytes == l.max_bytes && custom.value_allowance == l.value_allowance
         @test Avro.Limits(max_bytes=0, value_allowance=0).max_bytes == 0
@@ -148,8 +148,9 @@
         rows = Avro.Rows(nullfile)
         @test count(Returns(true), rows) == n
         close(rows)
-        # one block of those datums, written under a raised allowance, is over the default cap
-        raised = Avro.Limits(value_allowance=1_000_000)
+        # one block of those datums, written under raised limits, is over the default cap: an empty block
+        # holds at most 16 values per byte of its framing
+        raised = Avro.Limits(max_values_per_byte=1_000_000, value_allowance=1_000_000)
         bigio = IOBuffer()
         bigwriter = Avro.Writer(bigio, Avro.NullSchema(); limits=raised)
         for _ in 1:n
@@ -164,7 +165,8 @@
         catch caught
             caught
         end
-        @test blockerr isa Avro.LimitError && blockerr.limit === :max_values_per_byte && blockerr.value == 65_536
+        @test blockerr isa Avro.LimitError && blockerr.limit === :max_values_per_byte &&
+              blockerr.value == Avro.blockvaluecap(Avro.Limits(), 0) == 16 * 18
         @test Avro.Reader(r -> count(Returns(true), Avro.eachdatum(r)), bigfile; limits=raised) == n
     end
 

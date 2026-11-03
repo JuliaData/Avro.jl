@@ -247,7 +247,7 @@ function decodestreamed!(r::Reader, plan, projection::Union{Nothing,Projection})
     nrows = 0
     while (blk = nextblock!(r)) !== nothing
         count, bytes = blk
-        reset!(d, bytes, 1)
+        blockcap!(reset!(d, bytes, 1))
         decoderows!(plan, cells, d, count)
         nrows += count
     end

@@ -237,6 +237,8 @@ mutable struct Reader
     closed::Bool
     warned::Bool
     failed::Bool                # set while reading a block's framing; left set by an error, since the position is then unknown
+    compressed::Int             # payload bytes of the blocks read so far
+    decompressed::Int           # their decompressed bytes
 end
 
 "Close a reader's source. Explicit close reports the source failure; `suppress=true` swallows it."
@@ -256,7 +258,7 @@ function Reader(src; limits::Limits=Limits(), legacy::Union{Nothing,Symbol}=noth
     r = try
         h = readheader(source, limits; legacy=legacy, allow_invalid_names=allow_invalid_names, allow_invalid_defaults=allow_invalid_defaults)
         Reader(source, h.schema, readplan(h.schema; mode=legacy === :avrojl1 ? :little : :standard), readercodec(h.codecname, legacy), h.metadata, h.sync,
-               limits, legacy, 0, false, false, false)
+               limits, legacy, 0, false, false, false, 0, 0)
     catch
         closereaderresources(source; suppress=true)
         rethrow()
@@ -328,7 +330,7 @@ end
 # declared datums: walk them to find where they end, warn once and drop the padding.
 function exactblock(r::Reader, bytes::Vector{UInt8}, count::Int, index::Int)
     r.legacy === :avrojl1 || return bytes
-    d = Decoder(bytes, r.limits)
+    d = blockcap!(Decoder(bytes, r.limits))
     for _ in 1:count
         skip(r.plan, d)
     end
@@ -355,9 +357,20 @@ function nextblock!(r::Reader)
     payload = sourcepayload(source, Int(size))
     checksync(source, r.sync, r.blockindex)
     r.failed = false                                   # a bad payload below leaves the next block readable
-    bytes = exactblock(r, decompressblock(r.codecname, payload, r.limits), Int(count), r.blockindex)
+    decoded = decompressblock(r.codecname, payload, r.limits)
+    inflate!(r, Int(size), length(decoded))
+    bytes = exactblock(r, decoded, Int(count), r.blockindex)
     count == 0 && !isempty(bytes) && throw(DataError("a zero-count block has a non-empty payload", 1))
     return (Int(count), bytes)
+end
+
+"Charge one block to the read's inflation budget (`max_inflation`)."
+function inflate!(r::Reader, compressed::Int, decompressed::Int)
+    r.compressed = satadd(r.compressed, compressed)
+    r.decompressed = satadd(r.decompressed, decompressed)
+    cap = inflationcap(r.limits, r.compressed)
+    r.decompressed <= cap || throw(LimitError(:max_inflation, r.decompressed, cap))
+    return nothing
 end
 
 function checkconsumed(d::Decoder)
@@ -426,7 +439,7 @@ function nextdatum!(decodeone::F, it) where {F}
         blk = nextblock!(it.reader)
         blk === nothing && return nothing
         it.remaining = blk[1]
-        reset!(d, blk[2], 1)
+        blockcap!(reset!(d, blk[2], 1))
         it.remaining == 0 && checkconsumed(d)
     end
     left = it.remaining - 1
@@ -511,6 +524,8 @@ mutable struct Writer
     pendingcount::Int
     closed::Bool
     poison::Union{Nothing,Exception}
+    compressed::Int                         # payload bytes of the blocks this writer emitted
+    decompressed::Int                       # their encoded bytes before compression
 end
 
 "The writer's 16-byte sync marker: validated caller bytes, or fresh `RandomDevice` bytes."
@@ -633,7 +648,7 @@ function Writer(dst::Union{AbstractString,IO}, schema::Schema; codec::Union{Noth
         sink, temppath, ownsink = openwritersink(path === nothing ? dst : path, atomic)
     end
     w = Writer(sink, path, atomic ? temppath : nothing, schema, writeplan(schema), wcodec, syncmarker, limits,
-               min(Int(block_bytes), limits.max_bytes), fsync, ownsink, Encoder(limits), Encoder(limits), appendstart, appendstart, 0, false, nothing)
+               min(Int(block_bytes), limits.max_bytes), fsync, ownsink, Encoder(limits), Encoder(limits), appendstart, appendstart, 0, false, nothing, 0, 0)
     try
         entries === nothing || writecontainerheader!(sink, entries, syncmarker)
     catch e
@@ -760,7 +775,7 @@ end
 
 "Whether a block of `bytes` bytes holding `values` values exceeds what a reader with these limits accepts."
 function blockexceeds(limits::Limits, bytes::Int, values::Int)
-    return bytes > limits.max_bytes || values > valuecap(limits, bytes)
+    return bytes > limits.max_bytes || values > blockvaluecap(limits, bytes)
 end
 
 "Account the datum encoded since `start`: move it to the next block when it overflows this one, then flush at `block_bytes`."
@@ -783,7 +798,7 @@ function commitdatum!(w::Writer, start::Int, values::Int)
     end
     if blockexceeds(w.limits, e.pos, e.values)
         e.pos > w.limits.max_bytes && throw(LimitError(:max_bytes, e.pos, w.limits.max_bytes))
-        throw(LimitError(:max_values_per_byte, e.values, valuecap(w.limits, e.pos)))
+        throw(LimitError(:max_values_per_byte, e.values, blockvaluecap(w.limits, e.pos)))
     end
     w.pendingcount += 1
     e.pos >= w.blockbytes && flushblock!(w)
@@ -793,8 +808,13 @@ end
 function flushblock!(w::Writer)
     w.pendingcount == 0 && return nothing
     try
-        compressed = compressblock(w.wcodec, take!(w.encoder))
+        raw = take!(w.encoder)
+        compressed = compressblock(w.wcodec, raw)
         length(compressed) <= w.limits.max_bytes || throw(LimitError(:max_bytes, length(compressed), w.limits.max_bytes))
+        w.compressed = satadd(w.compressed, length(compressed))     # readers charge this block's inflation
+        w.decompressed = satadd(w.decompressed, length(raw))
+        cap = inflationcap(w.limits, w.compressed)
+        w.decompressed <= cap || throw(LimitError(:max_inflation, w.decompressed, cap))
         w.appendlength += varintlength(w.pendingcount) + varintlength(length(compressed)) + length(compressed) + 16
         writevarint(w.sink, w.pendingcount)
         writevarint(w.sink, length(compressed))
@@ -1196,6 +1216,8 @@ function inspect(src; limits::Limits=Limits())
     blocks = 0
     datums = 0
     cbytes = 0
+    compressed = 0
+    decompressed = 0
     source = opensource(src)
     try
         h = readheader(source, limits; legacy=:avrojl1, allow_invalid_names=true, allow_invalid_defaults=true)
@@ -1228,8 +1250,12 @@ function inspect(src; limits::Limits=Limits())
                 payload = sourcepayload(source, Int(size))
                 checksync(source, h.sync, blocks + 1)
                 decoded = decompressblock(cname, payload, limits)
+                compressed = satadd(compressed, Int(size))
+                decompressed = satadd(decompressed, length(decoded))
+                decompressed <= inflationcap(limits, compressed) ||
+                    throw(LimitError(:max_inflation, decompressed, inflationcap(limits, compressed)))
                 n = Int(count)
-                decoder = Decoder(decoded, limits)
+                decoder = blockcap!(Decoder(decoded, limits))
                 for _ in 1:n
                     decode(plan, decoder)
                 end
