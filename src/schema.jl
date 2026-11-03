@@ -1,6 +1,10 @@
 # Schema model: immutable schema graphs with dense node ids, the fullname algorithm, the contextual
 # attribute grammar, the recursive default rule, printing and structural equality. Nodes are heap
 # objects (`Record`, `EnumValue` and `Fixed` carry one reference to theirs).
+#
+# Functions taking a `Schema` or a parsed JSON value declare it `@nospecialize`, branch on the concrete
+# types inside, and walk a node's children in plain loops. A call with an abstract argument then dispatches
+# statically, which a program compiled with `juliac --trim` requires.
 
 const Props = JSON.Object{String,Any}   # custom attributes as parsed JSON values (raw number tokens)
 
@@ -125,13 +129,13 @@ const NamedSchema = Union{RecordSchema,EnumSchema,FixedSchema}
 const PrimitiveSchema = Union{NullSchema,BooleanSchema,IntSchema,LongSchema,FloatSchema,DoubleSchema,BytesSchema,StringSchema}
 
 # A short name for messages and display: `record a.B`, `time-millis`, `long`.
-function schemalabel(s::Schema)
+function schemalabel(@nospecialize(s::Schema))
     s isa NamedSchema && return string(kind(s), " ", fullname(s))
     l = s isa Union{IntSchema,LongSchema,BytesSchema,StringSchema} ? s.logical : nothing
     return l === nothing ? string(kind(s)) : logicalname(l)::String
 end
 
-function kind(s::Schema)
+function kind(@nospecialize(s::Schema))
     s isa NullSchema && return :null
     s isa BooleanSchema && return :boolean
     s isa IntSchema && return :int
@@ -148,12 +152,9 @@ function kind(s::Schema)
     return (s::RecordSchema).iserror ? :error : :record
 end
 
-function logical(s::Union{IntSchema,LongSchema,BytesSchema,StringSchema,FixedSchema})
+function logical(@nospecialize(s::Schema))
+    s isa Union{IntSchema,LongSchema,BytesSchema,StringSchema,FixedSchema} || return nothing
     return s.logical
-end
-
-function logical(::Schema)
-    return nothing
 end
 
 """
@@ -165,7 +166,7 @@ end
 
 # A node's `NodeMeta`. Naming each concrete schema type makes the field load static; `s.meta` on the abstract
 # `Schema` is a property lookup at run time.
-function nodemeta(s::Schema)
+function nodemeta(@nospecialize(s::Schema))
     s isa RecordSchema && return s.meta
     s isa UnionSchema && return s.meta
     s isa StringSchema && return s.meta
@@ -182,20 +183,20 @@ function nodemeta(s::Schema)
     return (s::FixedSchema).meta
 end
 
-function nodeid(s::Schema)
+function nodeid(@nospecialize(s::Schema))
     return nodemeta(s).id
 end
 
-function graphinfo(s::Schema)
+function graphinfo(@nospecialize(s::Schema))
     return nodemeta(s).graph::GraphInfo
 end
 
-function isfinalized(s::Schema)
+function isfinalized(@nospecialize(s::Schema))
     return nodemeta(s).graph !== nothing
 end
 
 # Equal schemas print the same canonical form; a hash needs no more than that.
-function Base.hash(s::Schema, h::UInt)
+function Base.hash(@nospecialize(s::Schema), h::UInt)
     return hash(pcfbytes(s), h)
 end
 
@@ -932,20 +933,23 @@ inside the same namespace),
 the namespace attribute only when it differs from the enclosing one, custom `props` and defaults
 re-emitted from their parsed JSON values (number tokens verbatim, strings re-escaped).
 """
-function json(s::Schema; pretty::Bool=false)
+function json(@nospecialize(s::Schema); pretty::Bool=false)
     io = IOBuffer()
     printjson(io, schematree(s, "", schemaseen(s)), pretty, 0)
     return String(take!(io))
 end
 
 "A fresh node-indexed visited table for the schema printers."
-function schemaseen(s::Schema)
+function schemaseen(@nospecialize(s::Schema))
     return fill(false, graphinfo(s).nodes)
 end
 
 function indent(io::IO, pretty::Bool, level::Int)
     pretty || return nothing
-    print(io, '\n', ' '^(2 * level))
+    print(io, '\n')
+    for _ in 1:level
+        print(io, "  ")
+    end
     return nothing
 end
 
@@ -954,7 +958,13 @@ struct OneLine
     value::Any
 end
 
-function printjson(io::IO, x, pretty::Bool, level::Int)
+# A member of a `Vector{Pair{String,Any}}` JSON object. `k => v` would build a `Pair` of `v`'s type and
+# convert it again on the way into the vector, through a call `--trim` cannot resolve.
+function member(k::String, @nospecialize(v))
+    return Pair{String,Any}(k, v)
+end
+
+function printjson(io::IO, @nospecialize(x), pretty::Bool, level::Int)
     if x === nothing
         print(io, "null")
     elseif x isa Bool
@@ -967,86 +977,113 @@ function printjson(io::IO, x, pretty::Bool, level::Int)
         escapejson(io, x)
     elseif x isa OneLine
         printjson(io, x.value, false, 0)
-    elseif x isa Union{Props,Vector{Pair{String,Any}}}
-        print(io, '{')
-        for (i, (k, v)) in enumerate(x)
-            i > 1 && print(io, ',')
-            indent(io, pretty, level + 1)
-            escapejson(io, k)
-            print(io, pretty ? ": " : ":")
-            printjson(io, v, pretty, level + 1)
-        end
-        isempty(x) || indent(io, pretty, level)
-        print(io, '}')
-    elseif x isa Union{Vector{Any},Vector{String}}
-        print(io, '[')
-        for (i, v) in enumerate(x)
-            i > 1 && print(io, ',')
-            indent(io, pretty, level + 1)
-            printjson(io, v, pretty, level + 1)
-        end
-        isempty(x) || indent(io, pretty, level)
-        print(io, ']')
+    elseif x isa Props
+        printobject(io, x, pretty, level)
+    elseif x isa Vector{Pair{String,Any}}
+        printobject(io, x, pretty, level)
+    elseif x isa Vector{Any}
+        printarray(io, x, pretty, level)
+    elseif x isa Vector{String}
+        printarray(io, x, pretty, level)
     else
         throw(ArgumentError("cannot print $(typeof(x)) as JSON"))
     end
     return nothing
 end
 
+# Called with one concrete container type at a time, since a loop over a `Union` of containers iterates a
+# `Union` of iteration states. `enumerate` over a `Props` splats its `Union`-typed state, so this loop counts
+# members itself.
+function printobject(io::IO, x::Union{Props,Vector{Pair{String,Any}}}, pretty::Bool, level::Int)
+    print(io, '{')
+    i = 0
+    for (k, v) in x
+        (i += 1) > 1 && print(io, ',')
+        indent(io, pretty, level + 1)
+        escapejson(io, k)
+        print(io, pretty ? ": " : ":")
+        printjson(io, v, pretty, level + 1)
+    end
+    isempty(x) || indent(io, pretty, level)
+    print(io, '}')
+    return nothing
+end
+
+function printarray(io::IO, x::Union{Vector{Any},Vector{String}}, pretty::Bool, level::Int)
+    print(io, '[')
+    for (i, v) in enumerate(x)
+        i > 1 && print(io, ',')
+        indent(io, pretty, level + 1)
+        printjson(io, v, pretty, level + 1)
+    end
+    isempty(x) || indent(io, pretty, level)
+    print(io, ']')
+    return nothing
+end
+
 function withprops(members::Vector{Pair{String,Any}}, props::Props)
     for (k, v) in props
-        push!(members, k => v)
+        push!(members, member(k, v))
     end
     return members
 end
 
 # The schema's spec JSON as values for `printjson`: the first occurrence of a named type in full, later
 # references by name, the namespace only when it differs from the enclosing one.
-function schematree(s::Schema, enclosing::String, seen::Vector{Bool})
+function schematree(@nospecialize(s::Schema), enclosing::String, seen::Vector{Bool})
     if s isa PrimitiveSchema
         isempty(s.props) && return String(kind(s))
-        return withprops(Pair{String,Any}["type" => String(kind(s))], s.props)
+        return withprops(Pair{String,Any}[member("type", String(kind(s)))], s.props)
     elseif s isa UnionSchema
-        return Any[schematree(b, enclosing, seen) for b in s.branches]
+        branches = Vector{Any}(undef, length(s.branches))
+        for (i, b) in enumerate(s.branches)
+            branches[i] = schematree(b, enclosing, seen)
+        end
+        return branches
     elseif s isa ArraySchema
-        return withprops(Pair{String,Any}["type" => "array", "items" => schematree(s.items, enclosing, seen)], s.props)
+        return withprops(Pair{String,Any}[member("type", "array"), member("items", schematree(s.items, enclosing, seen))], s.props)
     elseif s isa MapSchema
-        return withprops(Pair{String,Any}["type" => "map", "values" => schematree(s.values, enclosing, seen)], s.props)
+        return withprops(Pair{String,Any}[member("type", "map"), member("values", schematree(s.values, enclosing, seen))], s.props)
     end
-    index = Int(nodeid(s)) + 1
-    seen[index] && return s.name.namespace == enclosing ? s.name.name : fullname(s)
+    n = s::NamedSchema
+    index = Int(nodeid(n)) + 1
+    seen[index] && return n.name.namespace == enclosing ? n.name.name : fullname(n)
     seen[index] = true
-    m = Pair{String,Any}["type" => String(kind(s)), "name" => s.name.name]
-    s.name.namespace == enclosing || push!(m, "namespace" => s.name.namespace)
-    isempty(s.rawaliases) || push!(m, "aliases" => OneLine(s.rawaliases))
-    if s isa FixedSchema
-        push!(m, "size" => Int64(s.size))
-        return withprops(m, s.props)
+    m = Pair{String,Any}[member("type", String(kind(n))), member("name", n.name.name)]
+    n.name.namespace == enclosing || push!(m, member("namespace", n.name.namespace))
+    isempty(n.rawaliases) || push!(m, member("aliases", OneLine(n.rawaliases)))
+    if n isa FixedSchema
+        push!(m, member("size", Int64(n.size)))
+        return withprops(m, n.props)
     end
-    s.doc === nothing || push!(m, "doc" => s.doc)
-    if s isa EnumSchema
-        push!(m, "symbols" => OneLine(s.symbols))
-        s.default isa DefaultValue && push!(m, "default" => OneLine(s.default.json))
+    n.doc === nothing || push!(m, member("doc", n.doc))
+    if n isa EnumSchema
+        push!(m, member("symbols", OneLine(n.symbols)))
+        n.default isa DefaultValue && push!(m, member("default", OneLine(n.default.json)))
     else
-        push!(m, "fields" => Any[fieldtree(f, s.name.namespace, seen) for f in s.fields])
+        fields = Vector{Any}(undef, length(n.fields))
+        for (i, f) in enumerate(n.fields)
+            fields[i] = fieldtree(f, n.name.namespace, seen)
+        end
+        push!(m, member("fields", fields))
     end
-    return withprops(m, s.props)
+    return withprops(m, n.props)
 end
 
 function fieldtree(f::Field, namespace::String, seen::Vector{Bool})
-    m = Pair{String,Any}["name" => f.name, "type" => schematree(f.schema, namespace, seen)]
-    f.doc === nothing || push!(m, "doc" => f.doc)
-    f.default isa DefaultValue && push!(m, "default" => OneLine(f.default.json))
-    f.order == :ascending || push!(m, "order" => String(f.order))
-    isempty(f.aliases) || push!(m, "aliases" => OneLine(f.aliases))
+    m = Pair{String,Any}[member("name", f.name), member("type", schematree(f.schema, namespace, seen))]
+    f.doc === nothing || push!(m, member("doc", f.doc))
+    f.default isa DefaultValue && push!(m, member("default", OneLine(f.default.json)))
+    f.order == :ascending || push!(m, member("order", String(f.order)))
+    isempty(f.aliases) || push!(m, member("aliases", OneLine(f.aliases)))
     return withprops(m, f.props)
 end
 
-function Base.show(io::IO, s::Schema)
+function Base.show(io::IO, @nospecialize(s::Schema))
     return print(io, "Avro.Schema(", json(s), ")")
 end
 
-function Base.show(io::IO, ::MIME"text/plain", s::Schema)
+function Base.show(io::IO, ::MIME"text/plain", @nospecialize(s::Schema))
     print(io, "Avro.Schema ", json(s; pretty=true))
     return nothing
 end
