@@ -505,6 +505,14 @@
         # props are unordered maps
         @test P("""{"type":"int","a":1,"b":2}""") == P("""{"type":"int","b":2,"a":1}""")
         @test P("""{"type":"int","a":1}""") != P("""{"type":"int","a":1.0}""")     # raw number tokens differ lexically
+        wide = join(("\"k$i\":$i" for i in 1:12), ",")                              # objects are unordered at any size
+        @test P("""{"type":"int","x":{$wide}}""") == P("""{"type":"int","x":{$(join(("\"k$i\":$i" for i in 12:-1:1), ","))}}""")
+        @test P("""{"type":"int","x":{$wide}}""") != P("""{"type":"int","x":{$(replace(wide, "\"k12\":12" => "\"k12\":13"))}}""")
+        @test P("""{"type":"int","x":[null,"s",false]}""") != P("""{"type":"int","x":[null,"s",true]}""")
+        @test P("""{"type":"int","x":[null,"s"]}""") != P("""{"type":"int","x":[null,"s",null]}""")
+        @test P("""{"type":"int","x":"1"}""") != P("""{"type":"int","x":1}""")
+        @test P("""{"type":"record","name":"R","fields":[{"name":"m","type":{"type":"map","values":"int"},"default":{"a":1}}]}""") !=
+              P("""{"type":"record","name":"R","fields":[{"name":"m","type":{"type":"map","values":"int"},"default":{"a":2}}]}""")
         @test Avro.parsingequivalent(P("""{"type":"int","a":1}"""), P("\"int\""))
     end
 

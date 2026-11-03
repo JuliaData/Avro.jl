@@ -861,11 +861,11 @@ Structural equality: kind, fullname, fields (name, schema, default value and sel
 normalised aliases, doc), symbols, enum default, size, logical type, `iserror`, and `props` as unordered
 maps of JSON values (number tokens compare lexically). Cyclic graphs terminate through a visited-pair set.
 """
-function Base.:(==)(a::Schema, b::Schema)
+function Base.:(==)(@nospecialize(a::Schema), @nospecialize(b::Schema))
     return schemaequal(a, b)
 end
 
-function schemaequal(a::Schema, b::Schema, visited::Set{Tuple{UInt,UInt}}=Set{Tuple{UInt,UInt}}())
+function schemaequal(@nospecialize(a::Schema), @nospecialize(b::Schema), visited::Set{Tuple{UInt,UInt}}=Set{Tuple{UInt,UInt}}())
     a === b && return true
     typeof(a) === typeof(b) || return false
     pair = (objectid(a), objectid(b))
@@ -874,53 +874,85 @@ function schemaequal(a::Schema, b::Schema, visited::Set{Tuple{UInt,UInt}}=Set{Tu
     return structuralequal(a, b, visited)
 end
 
-function structuralequal(a::PrimitiveSchema, b::PrimitiveSchema, visited)
-    return logical(a) == logical(b) && a.props == b.props
+# `a` and `b` have the same concrete type.
+function structuralequal(@nospecialize(a::Schema), @nospecialize(b::Schema), visited::Set{Tuple{UInt,UInt}})
+    if a isa ArraySchema
+        y = b::ArraySchema
+        return jsonequal(a.props, y.props) && schemaequal(a.items, y.items, visited)
+    elseif a isa MapSchema
+        y = b::MapSchema
+        return jsonequal(a.props, y.props) && schemaequal(a.values, y.values, visited)
+    elseif a isa UnionSchema
+        y = b::UnionSchema
+        length(a.branches) == length(y.branches) || return false
+        for i in eachindex(a.branches, y.branches)
+            schemaequal(a.branches[i], y.branches[i], visited) || return false
+        end
+        return true
+    elseif a isa FixedSchema
+        y = b::FixedSchema
+        return a.name == y.name && a.size == y.size && a.aliases == y.aliases && logicalequal(a.logical, y.logical) &&
+            jsonequal(a.props, y.props)
+    elseif a isa EnumSchema
+        y = b::EnumSchema
+        return a.name == y.name && a.symbols == y.symbols && a.aliases == y.aliases && a.doc == y.doc &&
+            defaultequal(a.default, y.default) && jsonequal(a.props, y.props)
+    elseif a isa RecordSchema
+        y = b::RecordSchema
+        a.name == y.name && a.iserror == y.iserror && a.aliases == y.aliases && a.doc == y.doc &&
+            jsonequal(a.props, y.props) || return false
+        length(a.fields) == length(y.fields) || return false
+        for (f, g) in zip(a.fields, y.fields)
+            f.name == g.name && f.order == g.order && f.aliases == g.aliases && f.doc == g.doc &&
+                jsonequal(f.props, g.props) || return false
+            defaultequal(f.default, g.default) || return false
+            schemaequal(f.schema, g.schema, visited) || return false
+        end
+        return true
+    end
+    return logicalequal(logical(a), logical(b)) && jsonequal((a::PrimitiveSchema).props, (b::PrimitiveSchema).props)
 end
 
-function structuralequal(a::ArraySchema, b::ArraySchema, visited)
-    return a.props == b.props && schemaequal(a.items, b.items, visited)
-end
-
-function structuralequal(a::MapSchema, b::MapSchema, visited)
-    return a.props == b.props && schemaequal(a.values, b.values, visited)
-end
-
-function structuralequal(a::UnionSchema, b::UnionSchema, visited)
-    length(a.branches) == length(b.branches) || return false
-    return all(((x, y),) -> schemaequal(x, y, visited), zip(a.branches, b.branches))
-end
-
-function structuralequal(a::FixedSchema, b::FixedSchema, visited)
-    return a.name == b.name && a.size == b.size && a.aliases == b.aliases && a.logical == b.logical && a.props == b.props
-end
-
-function defaultequal(a::NoDefault, b::NoDefault)
-    return true
-end
-
-function defaultequal(a::DefaultValue, b::DefaultValue)
-    return a.valid == b.valid && a.branch == b.branch && a.json == b.json
+function logicalequal(@nospecialize(a::Union{Nothing,LogicalType}), @nospecialize(b::Union{Nothing,LogicalType}))
+    a isa DecimalLogical && return b isa DecimalLogical && a == b
+    a isa UnknownLogical && return b isa UnknownLogical && a == b
+    return a === b
 end
 
 function defaultequal(a::Default, b::Default)
-    return false
+    a isa NoDefault && return b isa NoDefault
+    b isa DefaultValue || return false
+    return a.valid == b.valid && a.branch == b.branch && jsonequal(a.json, b.json)
 end
 
-function structuralequal(a::EnumSchema, b::EnumSchema, visited)
-    return a.name == b.name && a.symbols == b.symbols && a.aliases == b.aliases && a.doc == b.doc &&
-        defaultequal(a.default, b.default) && a.props == b.props
-end
-
-function structuralequal(a::RecordSchema, b::RecordSchema, visited)
-    a.name == b.name && a.iserror == b.iserror && a.aliases == b.aliases && a.doc == b.doc && a.props == b.props || return false
-    length(a.fields) == length(b.fields) || return false
-    for (f, g) in zip(a.fields, b.fields)
-        f.name == g.name && f.order == g.order && f.aliases == g.aliases && f.doc == g.doc && f.props == g.props || return false
-        defaultequal(f.default, g.default) || return false
-        schemaequal(f.schema, g.schema, visited) || return false
+# `==` on parsed JSON values (`nothing`, `Bool`, `Int64`, `JSONNumber`, `String`, `Vector{Any}`, and `Props`
+# as unordered maps), comparing nested values without dispatching on their types at run time.
+function jsonequal(@nospecialize(a), @nospecialize(b))
+    if a isa Props
+        b isa Props || return false
+        length(a) == length(b) || return false
+        members = memberlookup(b)
+        for (k, v) in a
+            w = get(members, k, nodefault)
+            w === nodefault && return false
+            jsonequal(v, w) || return false
+        end
+        return true
+    elseif a isa Vector{Any}
+        b isa Vector{Any} || return false
+        length(a) == length(b) || return false
+        for i in eachindex(a, b)
+            jsonequal(a[i], b[i]) || return false
+        end
+        return true
+    elseif a isa String
+        return b isa String && a == b
+    elseif a isa JSONNumber
+        return b isa JSONNumber && a == b
+    elseif a isa Union{Bool,Int64}
+        return b isa Union{Bool,Int64} && a == b
     end
-    return true
+    return a === b
 end
 
 # ---- printing ---------------------------------------------------------------------------------------
