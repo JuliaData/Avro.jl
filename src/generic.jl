@@ -304,12 +304,8 @@ function narrowelement(@nospecialize(t::Type))
     return (t === Union{Missing,u} && ((isleaftype(u) && u !== Missing) || u === Record)) ? t : Any
 end
 
-function isleaftype(@nospecialize(t))
-    for x in LEAF_TYPES
-        x === t && return true
-    end
-    return false
-end
+# A chain of comparisons rather than a loop, so that it is a constant where `t` is.
+@eval isleaftype(@nospecialize(t)) = $(foldr((x, rest) -> :(t === $x || $rest), LEAF_TYPES; init=false))
 
 function elementtype(@nospecialize(s::Schema))
     return narrowelement(juliatype(s))

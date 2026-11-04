@@ -628,7 +628,7 @@ function nodevalue(::Type{T}, @nospecialize(node::TypedNode), d::Decoder) where 
 end
 
 # The types a `LeafNode` decodes into: the generic leaf types and the targets `convertleaf` converts to.
-function leaftarget(@nospecialize(T))
+@generated function leaftarget(::Type{T}) where {T}
     T isa DataType || return false
     isleaftype(T) && return true
     T <: Integer && return isbitstype(T)
@@ -758,7 +758,10 @@ function fastfieldscode(@nospecialize(T))
     for k in 1:n
         FT = fieldtype(T, k)
         P = naturalplan(FT)
-        if P === nothing
+        if P === nothing && recordlike(FT) && isconcretetype(FT)       # a nested record, with no call in between
+            push!(body.args, :(countvalue!(d)), :(child = childnode(node.nodes, $k)),
+                  :($(names[k]) = child isa RecordNode{$FT} ? recordvalue(child, d) : nodevalue($FT, child, d)))
+        elseif P === nothing
             push!(body.args, :($(names[k]) = decodefield($FT, childnode(node.nodes, $k), d)))
         else
             push!(body.args, :(countvalue!(d)), :($(names[k]) = decodeleaf($P(), d)))
