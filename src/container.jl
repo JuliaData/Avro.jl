@@ -470,7 +470,7 @@ end
 
 # ---- Writer -----------------------------------------------------------------------------------------
 
-function writevarint(io::IO, n::Integer)
+function writevarint(@nospecialize(io::IO), n::Integer)
     v = (reinterpret(UInt64, Int64(n)) << 1) ⊻ reinterpret(UInt64, Int64(n) >> 63)
     while true
         b = UInt8(v & 0x7f)
@@ -484,7 +484,7 @@ function writevarint(io::IO, n::Integer)
     return nothing
 end
 
-function sinkwrite(io::IO, x)
+function sinkwrite(@nospecialize(io::IO), x)
     streamcall(Base.write, io, x)
     return nothing
 end
@@ -561,13 +561,13 @@ end
 
 "The writer's 16-byte sync marker: validated caller bytes, or fresh `RandomDevice` bytes."
 function writersyncmarker(sync)
-    sync === nothing && return ntuple(_ -> rand(RandomDevice(), UInt8), 16)
+    sync === nothing && return ntuple(_ -> rand(RandomDevice(), UInt8), Val(16))
     (sync isa AbstractVector{UInt8} && length(sync) == 16) || throw(ArgumentError("sync must be exactly 16 bytes"))
-    return ntuple(i -> sync[i], 16)
+    return ntuple(i -> sync[i], Val(16))
 end
 
 "The header entries: the schema JSON, the codec name and the validated user metadata."
-function writerheaderentries(schema::Schema, codec::Symbol, metadata, limits::Limits)
+function writerheaderentries(@nospecialize(schema::Schema), codec::Symbol, metadata, limits::Limits)
     schemajson = json(schema)
     parsejson(Vector{UInt8}(codeunits(schemajson)); limits=limits, errfn=(msg, pos) -> throw(ArgumentError(msg)))   # readable under these limits
     codecname = String(codec)
@@ -638,7 +638,7 @@ end
 
 # The codec and sync marker of the container being appended to, after checking the writer's arguments
 # against its header and that the file ends at a block boundary.
-function appendheader(path::String, schema::Schema, codec, metadata, sync, limits::Limits, allow_invalid_names::Bool,
+function appendheader(path::String, @nospecialize(schema::Schema), codec, metadata, sync, limits::Limits, allow_invalid_names::Bool,
                       allow_invalid_defaults::Bool)
     (isempty(metadata) && sync === nothing) || throw(ArgumentError("append=true keeps the file's metadata and sync marker"))
     codecname, syncmarker = Reader(path; mmap=false, limits=limits, allow_invalid_names=allow_invalid_names,
@@ -650,11 +650,11 @@ function appendheader(path::String, schema::Schema, codec, metadata, sync, limit
         return (r.codecname, r.sync)
     end
     tail = open(io -> (seek(io, filesize(path) - 16); Base.read(io, 16)), path)
-    Tuple(tail) == syncmarker || throw(DataError("$path does not end at a block boundary; its last block is torn", filesize(path) + 1))
+    tail == UInt8[syncmarker...] || throw(DataError("$path does not end at a block boundary; its last block is torn", filesize(path) + 1))
     return (codecname, syncmarker)
 end
 
-function Writer(dst::Union{AbstractString,IO}, schema::Schema; codec::Union{Nothing,Symbol}=nothing, level=nothing,
+function Writer(dst::Union{AbstractString,IO}, @nospecialize(schema::Schema); codec::Union{Nothing,Symbol}=nothing, level=nothing,
                 metadata=Dict{String,Vector{UInt8}}(), sync=nothing, block_bytes::Integer=64 * 1024,
                 ntasks::Integer=Threads.nthreads(), atomic::Bool=true, append::Bool=false, fsync::Bool=false,
                 allow_invalid_names::Bool=false, allow_invalid_defaults::Bool=false, limits::Limits=Limits())
@@ -698,14 +698,14 @@ end
 @noinline function abandonunclosed!(w::Writer)
     w.closed && return nothing
     w.closed = true
-    return cleanupwritersink(w.sink, w.temppath, w.ownsink; suppress=true)
+    return cleanupwritersink(w.sink, w.temppath, w.ownsink, true)
 end
 
 function Base.show(io::IO, w::Writer)
     return print(io, "Avro.Writer(", schemalabel(w.schema), ", codec=", w.wcodec.name, w.closed ? ", closed)" : ")")
 end
 
-function Writer(f::Function, dst, schema::Schema; kw...)
+function Writer(f::Function, dst, @nospecialize(schema::Schema); kw...)
     w = Writer(dst, schema; kw...)
     try
         result = f(w)
@@ -731,7 +731,7 @@ function checkwritable(w::Writer)
     return nothing
 end
 
-function cleanupwritersink(sink, temppath, ownsink::Bool; suppress::Bool=false)
+function cleanupwritersink(@nospecialize(sink::IO), temppath::Union{Nothing,String}, ownsink::Bool, suppress::Bool=false)
     failure = nothing
     try
         ownsink && streamcall(close, sink)
@@ -759,7 +759,7 @@ function abortcleanup(w::Writer; suppress::Bool=false)
             suppress || rethrow()
         end
     end
-    return cleanupwritersink(w.sink, w.temppath, w.ownsink; suppress=suppress)
+    return cleanupwritersink(w.sink, w.temppath, w.ownsink, suppress)
 end
 
 function Base.push!(w::Writer, datum)
@@ -954,7 +954,7 @@ function Base.flush(w::Writer)
     return nothing
 end
 
-function syncfile(io::IO)
+function syncfile(@nospecialize(io::IO))
     streamcall(flush, io)
     io isa IOStream || return nothing
     @static if Sys.iswindows()
