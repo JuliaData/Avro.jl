@@ -21,6 +21,19 @@ Base.size(v::TypedWriteSized) = size(v.data)
 Base.getindex(v::TypedWriteSized, i::Int) = v.data[i]
 Base.IteratorSize(::Type{TypedWriteSized}) = Base.SizeUnknown()
 
+# Containers whose iteration does not honor their declared element type.
+struct TypedWriteLyingVector <: AbstractVector{Int64}
+    data::Vector{Any}
+end
+Base.size(v::TypedWriteLyingVector) = size(v.data)
+Base.getindex(v::TypedWriteLyingVector, i::Int) = v.data[i]
+
+struct TypedWriteLyingDict <: AbstractDict{String,Int64}
+    data::Dict{String,Any}
+end
+Base.length(d::TypedWriteLyingDict) = length(d.data)
+Base.iterate(d::TypedWriteLyingDict, state...) = iterate(d.data, state...)
+
 @testset "Typed writes encode as the generic route does" begin
     P = Avro.parseschema
     function generic(s, x)
@@ -77,11 +90,16 @@ Base.IteratorSize(::Type{TypedWriteSized}) = Base.SizeUnknown()
         ("""{"type":"record","name":"Tagged","fields":[{"name":"renamed","type":"long"}]}""", Any[TypedWriteTagged(9)]),
         ("""{"type":"record","name":"Empty","fields":[]}""", Any[(;), (a=1,), missing, (1, 2)]),
         ("""{"type":"array","items":"long"}""", Any[Int64[1, 2], Int32[3], Union{Missing,Int64}[1, missing], Int64[],
-                                                   TypedWriteSized([4, 5]), (1, 2), Set([7]), "abc", ArrayLengthMismatch(2, 1)]),
+                                                   TypedWriteSized([4, 5]), (1, 2), Set([7]), "abc", ArrayLengthMismatch(2, 1),
+                                                   TypedWriteLyingVector(Any[Int32(1), Int64(2)]), TypedWriteLyingVector(Any["x"])]),
+        ("""{"type":"array","items":{"type":"array","items":"long"}}""", Any[Union{}[], [Union{}[]]]),
         ("""{"type":"array","items":["null","long"]}""", Any[Union{Missing,Int64}[1, missing], Any[missing, "bad"]]),
         ("""{"type":"map","values":"long"}""", Any[Dict("a" => Int64(1)), Dict(:a => 2), Dict(SubString("ab", 1) => 3),
                                                   Dict("a" => "bad"), Dict{Any,Int}(:a => 1, "a" => 2), (k=1,), Dict(1 => 2)]),
         ("""{"type":"map","values":["null","long"]}""", Any[Dict("a" => missing, "b" => Int64(1))]),
+        ("""{"type":"map","values":"long"}""", Any[TypedWriteLyingDict(Dict{String,Any}("a" => Int32(1))),
+                                                  TypedWriteLyingDict(Dict{String,Any}("a" => "bad"))]),
+        ("""{"type":"map","values":{"type":"map","values":"long"}}""", Any[Dict{String,Union{}}(), Dict("a" => Dict{String,Union{}}())]),
         ("""{"type":"record","name":"TypedWriteList","fields":[{"name":"value","type":"long"},
             {"name":"next","type":["null","TypedWriteList"]}]}""",
          Any[TypedWriteList(1, TypedWriteList(2, missing)), (value=Int64(1), next=missing)]),

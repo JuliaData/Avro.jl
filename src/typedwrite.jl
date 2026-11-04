@@ -143,6 +143,7 @@ Base.@nospecializeinfer function writenode(::Type{T}, @nospecialize(schema::Sche
 end
 
 Base.@nospecializeinfer function buildwritenode(::Type{T}, @nospecialize(s::Schema), @nospecialize(p::Plan), memo::WriteMemo) where {T}
+    T === Union{} && return GenericWriteNode{T}(p)                  # the element type of an empty `Union{}[]`
     hasnull, X = writesplit(T)
     X === nothing && return GenericWriteNode{T}(p)                 # several members choose a branch by value
     (X === Union{} || isconcretetype(X)) || return GenericWriteNode{T}(p)
@@ -364,18 +365,24 @@ function arrayencode(node::ArrayWriteNode{T}, e::Encoder, x::T) where {T}
         for v in x
             actual += 1
             actual <= n || arraylengtherror(x, n, -1)
-            encodenode(eltype(T), items, e, v)
+            v isa eltype(T) ? encodenode(eltype(T), items, e, v) : untypedencode(node.plan.items, e, v)
         end
         actual == n || arraylengtherror(x, n, actual)
     else
         for v in x
             writelong!(e, Int64(1))
-            encodenode(eltype(T), items, e, v)
+            v isa eltype(T) ? encodenode(eltype(T), items, e, v) : untypedencode(node.plan.items, e, v)
         end
     end
     writelong!(e, Int64(0))
     leave!(e)
     return nothing
+end
+
+# A value a container's iteration produced outside its declared element type, by its run-time type.
+@noinline function untypedencode(@nospecialize(p::Plan), e::Encoder, @nospecialize(x))
+    countvalue!(e)
+    return genericvalue(p, e, x)
 end
 
 @noinline function arraylengtherror(x, n::Int, actual::Int)
@@ -400,7 +407,7 @@ function mapencode(node::MapWriteNode{T}, e::Encoder, x::T) where {T}
                 push!(seen, key)
             end
             writestring!(e, key)
-            encodenode(valtype(T), values, e, v)
+            v isa valtype(T) ? encodenode(valtype(T), values, e, v) : untypedencode(node.plan.values, e, v)
         end
         i == n || encodeerror("map size changed during iteration", x)
     end
