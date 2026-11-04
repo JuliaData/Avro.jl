@@ -4,7 +4,9 @@
 
 # `f(args...)` dispatched when called. `juliac --trim` neither compiles nor verifies such a call, so the code
 # it reaches stays out of trimmed programs, where it raises a `MethodError` for `f` instead (`notcompiled`).
-Base.@nospecializeinfer function runtimecall(f, @nospecialize(args...))
+# Constant propagation into it gains nothing, and with an argument inference knows field by field (a freshly
+# built encoder, say) it trips an assertion in JET's inference cache.
+Base.@constprop :none Base.@nospecializeinfer function runtimecall(f, @nospecialize(args...))
     argv = Vector{Any}(undef, length(args))
     for i in eachindex(argv)
         argv[i] = args[i]

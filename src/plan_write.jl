@@ -637,7 +637,7 @@ function selectbranch(p::WUnion, x)
         for (i, b) in enumerate(p.schema.branches)
             typeof(b) === typeof(s) || continue
             b.name == s.name || continue
-            b isa FixedSchema && b.size != (s::FixedSchema).size && continue
+            b isa FixedSchema && s isa FixedSchema && b.size != s.size && continue
             return i
         end
     end
