@@ -216,12 +216,13 @@ end
     return fastleafcodesof(T)
 end
 
-# The node encoding Julia field `j` of `T`, built for the field's constant type.
+# The node encoding Julia field `j` of `T`, built for the field's constant type. The assertions keep the result
+# typed where inference gives up on a type that refers to itself.
 @generated function fieldwritenode(::Type{T}, j::Int, site::WriteSite) where {T}
     types, index = fieldtypegroups(T)
     body = Expr(:block, :(t = $(Tuple(index))[j]))
     for (t, FT) in enumerate(types)
-        push!(body.args, :(t == $t && return buildwritenode($FT, site.schema, site.plan, site.memo)))
+        push!(body.args, :(t == $t && return buildwritenode($FT, site.schema, site.plan, site.memo)::WriteNode))
     end
     push!(body.args, :(throw(ArgumentError("internal error: no field $j in the value type"))))
     return body

@@ -92,7 +92,9 @@ Base.@nospecializeinfer function typednode(::Type{T}, @nospecialize(reader::Sche
     return buildnode(T, reader, plan, TypedMemo())
 end
 
-Base.@nospecializeinfer function buildnode(::Type{T}, @nospecialize(s::Schema), @nospecialize(p::Plan), memo::TypedMemo) where {T}
+# Not `@nospecializeinfer`: `juliac --trim` on Julia 1.14 leaves a recursive call to such a method unresolved
+# when inference limits it, as it does for a type that refers to itself.
+function buildnode(::Type{T}, @nospecialize(s::Schema), @nospecialize(p::Plan), memo::TypedMemo) where {T}
     T === Any && return GenericNode{Any}(p)
     if !(s isa Union{UnionSchema,ArraySchema,MapSchema}) && T === juliatype(s)
         return T === Record ? GenericNode{Record}(p) : LeafNode{T}(p)
@@ -558,12 +560,13 @@ function fieldtypegroups(@nospecialize(T))
     return types, index
 end
 
-# The node decoding into target field `k`, built for the field's constant type.
+# The node decoding into target field `k`, built for the field's constant type. The assertions keep the result
+# typed where inference gives up on a type that refers to itself.
 @generated function fieldnode(::Type{T}, k::Int, site::NodeSite) where {T}
     types, index = fieldtypegroups(T)
     body = Expr(:block, :(t = $(Tuple(index))[k]))
     for (t, FT) in enumerate(types)
-        push!(body.args, :(t == $t && return buildnode($FT, site.schema, site.plan, site.memo)))
+        push!(body.args, :(t == $t && return buildnode($FT, site.schema, site.plan, site.memo)::TypedNode))
     end
     push!(body.args, :(throw(ArgumentError("internal error: no field $k in the target"))))
     return body
@@ -760,9 +763,9 @@ function fastfieldscode(@nospecialize(T))
         P = naturalplan(FT)
         if P === nothing && recordlike(FT) && isconcretetype(FT)       # a nested record, with no call in between
             push!(body.args, :(countvalue!(d)), :(child = childnode(node.nodes, $k)),
-                  :($(names[k]) = child isa RecordNode{$FT} ? recordvalue(child, d) : nodevalue($FT, child, d)))
+                  :($(names[k]) = (child isa RecordNode{$FT} ? recordvalue(child, d) : nodevalue($FT, child, d))::$FT))
         elseif P === nothing
-            push!(body.args, :($(names[k]) = decodefield($FT, childnode(node.nodes, $k), d)))
+            push!(body.args, :($(names[k]) = decodefield($FT, childnode(node.nodes, $k), d)::$FT))
         else
             push!(body.args, :(countvalue!(d)), :($(names[k]) = decodeleaf($P(), d)))
         end
@@ -773,7 +776,10 @@ end
 
 # A binary decision on the wire step's target field `slot`.
 function stepcode(@nospecialize(T), names::Vector{Symbol}, lo::Int, hi::Int)
-    lo == hi && return :($(names[lo]) = decodefield($(fieldtype(T, lo)), childnode(node.nodes, j), d))
+    if lo == hi
+        FT = fieldtype(T, lo)
+        return :($(names[lo]) = decodefield($FT, childnode(node.nodes, j), d)::$FT)
+    end
     mid = (lo + hi) >>> 1
     return Expr(:if, :(slot <= $mid), stepcode(T, names, lo, mid), stepcode(T, names, mid + 1, hi))
 end
@@ -809,7 +815,8 @@ end
 end
 
 # One field through a call per field type, which every record with a field of that type shares: a record's own
-# code stays small, and the common field types compile with the package.
+# code stays small, and the common field types compile with the package. Callers assert the field's type: for a
+# type that refers to itself, inference can widen this call's result to an abstract type.
 @noinline function decodefield(::Type{T}, @nospecialize(node::TypedNode), d::Decoder) where {T}
     return decodenode(T, node, d)
 end
