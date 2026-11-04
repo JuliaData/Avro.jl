@@ -1124,8 +1124,15 @@ function typedrows(x)
     return fieldcount(R) <= TYPED_ROW_COLUMNS && !opencolumns(R) ? R : nothing
 end
 
+function anyopencolumn(@nospecialize(R))
+    for i in 1:fieldcount(R)
+        isopentype(fieldtype(R, i)) && return true
+    end
+    return false
+end
+
 @generated function opencolumns(::Type{R}) where {R<:NamedTuple}
-    return any(isopentype, fieldtypes(R))
+    return anyopencolumn(R)
 end
 
 # The record schema `Avro.schema(::Tables.Schema)` derives from the columns of `R`, derived from the field types
@@ -1248,23 +1255,46 @@ function pushcolumntable!(w::Writer, cols::NamedTuple)
     return true
 end
 
+function columnrowtypeof(@nospecialize(C))
+    types = Any[]
+    for j in 1:fieldcount(C)
+        push!(types, eltype(fieldtype(C, j)))
+    end
+    return NamedTuple{fieldnames(C),Tuple{types...}}
+end
+
 # The row type of a NamedTuple of columns: their names, and their element types as field types.
 @generated function columnrowtype(::Type{C}) where {C<:NamedTuple}
-    return NamedTuple{fieldnames(C),Tuple{(eltype(fieldtype(C, j)) for j in 1:fieldcount(C))...}}
+    return columnrowtypeof(C)
+end
+
+function allvectorcolumns(@nospecialize(C))
+    for j in 1:fieldcount(C)
+        fieldtype(C, j) <: AbstractVector || return false
+    end
+    return true
 end
 
 @generated function vectorcolumns(cols::C) where {C<:NamedTuple}
-    return all(j -> fieldtype(C, j) <: AbstractVector, 1:fieldcount(C))
+    return allvectorcolumns(C)
 end
 
 @generated function samelengths(cols::C, n::Int) where {C<:NamedTuple}
-    return Expr(:block, (:(length(getfield(cols, $j)) == n || return false) for j in 1:fieldcount(C))..., true)
+    body = Expr(:block)
+    for j in 1:fieldcount(C)
+        push!(body.args, :(length(getfield(cols, $j)) == n || return false))
+    end
+    push!(body.args, true)
+    return body
 end
 
 # Row `i` of the columns, a `columnrowtype`.
 @generated function columnrow(cols::C, i::Int) where {C<:NamedTuple}
-    values = (:(getfield(cols, $j)[firstindex(getfield(cols, $j)) + i - 1]) for j in 1:fieldcount(C))
-    return :($(columnrowtype(C))(($(values...),)))
+    values = Any[]
+    for j in 1:fieldcount(C)
+        push!(values, :(getfield(cols, $j)[firstindex(getfield(cols, $j)) + i - 1]))
+    end
+    return :($(columnrowtypeof(C))(($(values...),)))
 end
 
 # A column of a wide table and the write node of its element type.

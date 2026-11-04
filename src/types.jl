@@ -140,15 +140,23 @@ end
 # Calls `f(name, FT)` for each field of `T` in declaration order, with the field type as a constant. A loop
 # over `fieldtypes(T)` would derive each field's schema from a type known only at run time.
 @generated function foreachfield(f::F, ::Type{T}) where {F,T}
-    calls = [:(f($(QuoteNode(fieldname(T, i))), $(fieldtype(T, i)))) for i in 1:fieldcount(T)]
-    return Expr(:block, calls..., nothing)
+    body = Expr(:block)
+    for i in 1:fieldcount(T)
+        push!(body.args, :(f($(QuoteNode(fieldname(T, i))), $(fieldtype(T, i)))))
+    end
+    push!(body.args, nothing)
+    return body
 end
 
 # Calls `f(i, M)` for the `i`th member type `M` of the union `U` in `Base.uniontypes` order, with `M` as a
 # constant.
 @generated function foreachuniontype(f::F, ::Type{U}) where {F,U}
-    calls = [:(f($i, $M)) for (i, M) in enumerate(Base.uniontypes(U))]
-    return Expr(:block, calls..., nothing)
+    body = Expr(:block)
+    for (i, M) in enumerate(Base.uniontypes(U))
+        push!(body.args, :(f($i, $M)))
+    end
+    push!(body.args, nothing)
+    return body
 end
 
 function derive(ctx::DeriveContext, ::Type{T}, name, namespace) where {T}

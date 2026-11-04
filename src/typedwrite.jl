@@ -89,10 +89,8 @@ end
     return X === Union{} || isconcretetype(X)
 end
 
-# How many plan types a leaf tries inline, and the widest record encoded field by field inline (wider ones make
-# a call per field).
+# How many plan types a leaf tries inline.
 const LEAF_INLINE_PLANS = 1
-const TYPED_RECORD_FIELDS = 32
 
 # The leaf plan types, each value type's own plans first, then those of its kind (`leafplanorder`).
 const LEAF_WRITE_PLANS = (LongPlan, StringPlan, DoublePlan, IntPlan, BoolPlan, FloatPlan, BytesPlan, NullPlan,
@@ -121,20 +119,9 @@ function leafplanorder(@nospecialize(T))
     return order
 end
 
-# The leaf plan types without data, which a record encodes inline from a code alone (`leafcode`).
-const SINGLETON_LEAF_PLANS = (LongPlan, StringPlan, DoublePlan, IntPlan, BoolPlan, FloatPlan, BytesPlan, NullPlan,
-    DatePlan, TimeMillisPlan, TimeMicrosPlan, TimestampPlan{Millisecond}, TimestampPlan{Microsecond},
-    TimestampPlan{Nanosecond}, LocalTimestampPlan{Millisecond}, LocalTimestampPlan{Microsecond},
-    LocalTimestampPlan{Nanosecond}, UUIDStringPlan, UUIDFixedPlan, DurationPlan)
-
-# The position in `SINGLETON_LEAF_PLANS` of a leaf node's plan, or 0.
+# The `plancode` of a leaf node's plan, or 0.
 Base.@nospecializeinfer function leafcode(@nospecialize(node::WriteNode))
-    node isa LeafWriteNode || return 0x00
-    p = node.plan
-    for (i, P) in enumerate(SINGLETON_LEAF_PLANS)
-        p isa P && return UInt8(i)
-    end
-    return 0x00
+    return node isa LeafWriteNode ? plancode(node.plan) : 0x00
 end
 
 # The code and plan type a record field of type `T` checks first, or `nothing` for a type that is not a leaf.
@@ -143,20 +130,6 @@ function leaffastpath(@nospecialize(T))
     P = first(leafplanorder(T))
     i = findfirst(x -> x === P, SINGLETON_LEAF_PLANS)
     return i === nothing ? nothing : (UInt8(i), P)
-end
-
-# The distinct field types of `T`, and the position among them of each field's type: generated code branches
-# on a field's type rather than on the field, so it stays small for a record of many fields of few types.
-function fieldtypegroups(@nospecialize(T))
-    types = Any[]
-    index = Int[]
-    for i in 1:fieldcount(T)
-        ft = fieldtype(T, i)
-        t = findfirst(x -> x === ft, types)
-        t === nothing && (push!(types, ft); t = length(types))
-        push!(index, t)
-    end
-    return types, index
 end
 
 # ---- construction -----------------------------------------------------------------------------------
@@ -194,7 +167,7 @@ Base.@nospecializeinfer function buildwritenode(::Type{T}, @nospecialize(s::Sche
         (T <: AbstractDict && keytype(T) <: Union{AbstractString,Symbol}) || return GenericWriteNode{T}(p)
         return MapWriteNode{T}(p, buildwritenode(valtype(T), (s::MapSchema).values, p.values, memo))
     end
-    return LeafWriteNode{T}(p)
+    return T <: NamedTuple ? GenericWriteNode{T}(p) : LeafWriteNode{T}(p)     # a NamedTuple is no leaf's value
 end
 
 # The schema node and plan a field's node is built for. The generated builder takes it whole: a generated
@@ -205,7 +178,7 @@ struct WriteSite
     memo::WriteMemo
 end
 
-function buildrecordwritenode(::Type{T}, p::WRecord, memo::WriteMemo) where {T}
+Base.@nospecializeinfer function buildrecordwritenode(::Type{T}, p::WRecord, memo::WriteMemo) where {T}
     cached = get(memo, (p, T), nothing)
     cached === nothing || return cached
     positions = recordfieldpositions(p.schema, T)
@@ -215,20 +188,31 @@ function buildrecordwritenode(::Type{T}, p::WRecord, memo::WriteMemo) where {T}
         j = positions[k]
         push!(node.nodes, j == 0 ? GenericWriteNode{Any}(p.fields[k]) : fieldwritenode(T, j, WriteSite(f.schema, p.fields[k], memo)))
     end
-    if node.aligned && fieldcount(T) <= TYPED_RECORD_FIELDS
-        expected = fastleafcodes(T)
-        node.fast = true
-        for k in eachindex(node.nodes)
-            expected[k] == 0x00 || leafcode(node.nodes[k]) == expected[k] || (node.fast = false)
-        end
-    end
+    node.fast = node.aligned && fastwrite(fastleafcodes(T), node.nodes)
     return node
+end
+
+# Whether each field with a `leaffastpath` has that plan.
+function fastwrite(codes::NTuple{N,UInt8}, nodes::Vector{WriteNode}) where {N}
+    N <= TYPED_RECORD_FIELDS || return false
+    for k in 1:N
+        codes[k] == 0x00 || leafcode(nodes[k]) == codes[k] || return false
+    end
+    return true
+end
+
+function fastleafcodesof(@nospecialize(T))
+    codes = UInt8[]
+    for j in 1:fieldcount(T)
+        f = leaffastpath(fieldtype(T, j))
+        push!(codes, f === nothing ? 0x00 : f[1])
+    end
+    return Tuple(codes)
 end
 
 # Each field's `leaffastpath` code (0 for a field type without one), known when the method compiles.
 @generated function fastleafcodes(::Type{T}) where {T}
-    codes = UInt8[(f = leaffastpath(fieldtype(T, j)); f === nothing ? 0x00 : f[1]) for j in 1:fieldcount(T)]
-    return :($(Tuple(codes)))
+    return fastleafcodesof(T)
 end
 
 # The node encoding Julia field `j` of `T`, built for the field's constant type.
@@ -306,7 +290,7 @@ function nodeencode(::Type{T}, @nospecialize(node::WriteNode), e::Encoder, x) wh
         elseif T <: AbstractDict
             node isa MapWriteNode{T} && return mapencode(node, e, x::T)
         end
-        node isa LeafWriteNode{T} && return leafencode(node, e, x::T)
+        T <: NamedTuple || (node isa LeafWriteNode{T} && return leafencode(node, e, x::T))
         node isa NullableWriteNode{T,T} && return nullableencode(node, e, x::T)
     elseif X !== nothing
         node isa NullableWriteNode{T,X} && return nullableencode(node, e, x)
@@ -432,33 +416,55 @@ function recordencode(node::RecordWriteNode{T}, e::Encoder, x::T) where {T}
     return nothing
 end
 
-# The fields of a `fast` record: each leaf field's plan is a constant, as for a schema known when compiling.
-@generated function fastfields(node::RecordWriteNode{T}, e::Encoder, x::T) where {T}
+# The code of the record functions below is built by these functions, which take the type unspecialized, so
+# they compile once with the package rather than once per record type.
+function fastwritecode(@nospecialize(T))
     fieldcount(T) <= TYPED_RECORD_FIELDS || return :(writenodeerror())
-    function known(j)
+    body = Expr(:block, Expr(:meta, :inline), :(nodes = node.nodes))
+    for j in 1:fieldcount(T)
         FT = fieldtype(T, j)
         fast = leaffastpath(FT)
-        fast === nothing && return :(encodenode($FT, @inbounds(nodes[$j]), e, getfield(x, $j)))
-        return :(countvalue!(e); encodevalue($(fast[2])(), e, getfield(x, $j)))
+        if fast === nothing
+            push!(body.args, :(encodefield($FT, @inbounds(nodes[$j]), e, getfield(x, $j))))
+        else
+            push!(body.args, :(countvalue!(e)), :(encodevalue($(fast[2])(), e, getfield(x, $j))))
+        end
     end
-    return quote
-        $(Expr(:meta, :inline))
-        nodes = node.nodes
-        $([known(j) for j in 1:fieldcount(T)]...)
-        return nothing
+    push!(body.args, :(return nothing))
+    return body
+end
+
+function slowwritecode(@nospecialize(T))
+    body = Expr(:block, Expr(:meta, :noinline), :(node.aligned || return fieldsbyposition(node, e, x)), :(nodes = node.nodes))
+    for j in 1:fieldcount(T)
+        push!(body.args, :(encodefield($(fieldtype(T, j)), @inbounds(nodes[$j]), e, getfield(x, $j))))
     end
+    push!(body.args, :(return nothing))
+    return body
+end
+
+function fieldsoftype(@nospecialize(T), @nospecialize(FT))
+    fields = Int[]
+    for i in 1:fieldcount(T)
+        fieldtype(T, i) === FT && push!(fields, i)
+    end
+    return fields
+end
+
+function typedfieldcode(fields::Vector{Int}, lo::Int, hi::Int)
+    lo == hi && return :(getfield(x, $(fields[lo])))
+    mid = (lo + hi) >>> 1
+    return Expr(:if, :(j <= $(fields[mid])), typedfieldcode(fields, lo, mid), typedfieldcode(fields, mid + 1, hi))
+end
+
+# The fields of a `fast` record: each leaf field's plan is a constant, as for a schema known when compiling.
+@generated function fastfields(node::RecordWriteNode{T}, e::Encoder, x::T) where {T}
+    return fastwritecode(T)
 end
 
 # Straight-line when the fields are `T`'s in order, otherwise by position.
 @generated function slowfields(node::RecordWriteNode{T}, e::Encoder, x::T) where {T}
-    straight = [:(encodenode($(fieldtype(T, j)), @inbounds(nodes[$j]), e, getfield(x, $j))) for j in 1:fieldcount(T)]
-    return quote
-        $(Expr(:meta, :noinline))
-        node.aligned || return fieldsbyposition(node, e, x)
-        nodes = node.nodes
-        $(straight...)
-        return nothing
-    end
+    return slowwritecode(T)
 end
 
 # Each schema field through a branch on its Julia field's type and a call.
@@ -483,14 +489,9 @@ end
 
 # Field `j` of `x`, one of its fields of type `FT`, through a binary decision over those fields.
 @generated function typedfield(x::T, j::Int, ::Type{FT}) where {T,FT}
-    fields = [i for i in 1:fieldcount(T) if fieldtype(T, i) === FT]
-    function stepto(lo, hi)
-        lo == hi && return :(getfield(x, $(fields[lo])))
-        mid = (lo + hi) >>> 1
-        return Expr(:if, :(j <= $(fields[mid])), stepto(lo, mid), stepto(mid + 1, hi))
-    end
+    fields = fieldsoftype(T, FT)
     isempty(fields) && return :(throw(ArgumentError("internal error: no field $j of that type")))
-    return Expr(:block, Expr(:meta, :inline), stepto(1, length(fields)))
+    return Expr(:block, Expr(:meta, :inline), typedfieldcode(fields, 1, length(fields)))
 end
 
 @noinline function encodefield(::Type{T}, @nospecialize(node::WriteNode), e::Encoder, x) where {T}

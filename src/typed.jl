@@ -71,7 +71,8 @@ mutable struct RecordNode{T} <: TypedNode{T}
     const slots::Vector{Int}
     const filled::Vector{Bool}
     const defaults::Vector{Any}
-    aligned::Bool                              # step `k` fills field `k` for every field, and there are no others
+    fast::Bool                                 # step `k` fills field `k` for every field, there are no others, and
+                                               # each field of a `naturalplan` type reads through that plan
 end
 
 # ---- construction -----------------------------------------------------------------------------------
@@ -318,6 +319,31 @@ const LEAF_PLAN_VALUES = (
     (DecimalPlan, Decimal), (DecimalPlan, WideDecimal), (UUIDStringPlan, UUID), (UUIDFixedPlan, UUID), (DurationPlan, Duration),
 )
 
+# The leaf plan types without data, which a record decodes or encodes inline from the plan's type alone.
+const SINGLETON_LEAF_PLANS = (LongPlan, StringPlan, DoublePlan, IntPlan, BoolPlan, FloatPlan, BytesPlan, NullPlan,
+    DatePlan, TimeMillisPlan, TimeMicrosPlan, TimestampPlan{Millisecond}, TimestampPlan{Microsecond},
+    TimestampPlan{Nanosecond}, LocalTimestampPlan{Millisecond}, LocalTimestampPlan{Microsecond},
+    LocalTimestampPlan{Nanosecond}, UUIDStringPlan, UUIDFixedPlan, DurationPlan)
+
+# The position of a plan's type in `SINGLETON_LEAF_PLANS`, or 0.
+Base.@nospecializeinfer function plancode(@nospecialize(p::Plan))
+    for (i, P) in enumerate(SINGLETON_LEAF_PLANS)
+        p isa P && return UInt8(i)
+    end
+    return 0x00
+end
+
+# The widest record with a straight-line path through its fields; wider ones make a call per field.
+const TYPED_RECORD_FIELDS = 32
+
+# The plan a value of type `T` reads through inline: the first without data whose generic value is a `T`.
+function naturalplan(@nospecialize(T))
+    for (P, V) in LEAF_PLAN_VALUES
+        V === T && P in SINGLETON_LEAF_PLANS && return P
+    end
+    return nothing
+end
+
 # The reader leaf types a promotion produces (`promotedvalue`).
 const PROMOTION_TARGETS = (Int64, Float32, Float64, Time, String, UUID, Vector{UInt8}, Decimal, WideDecimal,
                            Timestamp{Millisecond}, Timestamp{Microsecond}, Timestamp{Nanosecond},
@@ -432,38 +458,112 @@ end
 # decided before any field node is built, since field nodes can refer back to `node`.
 Base.@nospecializeinfer function recordnode!(node::RecordNode{T}, s::RecordSchema, @nospecialize(p::Plan), memo::TypedMemo) where {T}
     fieldof = recordfieldpositions(s, T)
-    steps = p isa ResolvedRecordPlan ? p.steps : Pair{Int,Plan}[Pair{Int,Plan}(i, f) for (i, f) in enumerate((p::RecordPlan).fields)]
-    for (slot, _) in steps
-        k = slot == 0 ? 0 : fieldof[slot]
-        k == 0 || (node.filled[k] = true)
-    end
-    covered = copy(node.filled)
-    if p isa ResolvedRecordPlan
-        for (slot, dp) in p.defaults
-            k = fieldof[slot]
-            k == 0 && continue
-            v = typeddefault(fieldtype(T, k), dp)
-            v === nothing && return false
-            node.defaults[k] = something(v)
-            covered[k] = true
-        end
-    end
-    implicitdefaults!(node.defaults, T, covered) || return false
+    steps = recordsteps(p)
+    unfilled = fillfields!(node.filled, node.defaults, T, fieldof, steps, p)
+    unfilled == -1 && return false
+    unfilled > 0 && throw(ConversionError(
+        "target type $(typestring(T)) has field $(fieldname(T, unfilled)) with no field in the reader record and no default"))
     for (slot, sp) in steps
         k = slot == 0 ? 0 : fieldof[slot]
         push!(node.plans, sp)
         push!(node.slots, k)
         push!(node.nodes, k == 0 ? nothing : fieldnode(T, k, NodeSite(s.fields[slot].schema, sp, memo)))
     end
-    node.aligned = node.slots == 1:fieldcount(T)
+    node.fast = fastrecord(naturalcodes(T), node.slots, node.nodes)
     return true
+end
+
+# The writer-ordered steps of a record's plan: each reader slot (0 = skip) and its plan.
+Base.@nospecializeinfer function recordsteps(@nospecialize(p::Plan))
+    p isa ResolvedRecordPlan && return p.steps
+    fields = (p::RecordPlan).fields
+    steps = Vector{Pair{Int,Plan}}(undef, length(fields))
+    for i in eachindex(fields)
+        steps[i] = Pair{Int,Plan}(i, fields[i])
+    end
+    return steps
+end
+
+# Mark the target fields the steps fill and take the rest from the reader's defaults, or `missing` or `nothing`
+# when the field type allows it. Returns 0, -1 when the record must take the semantic route (a default it
+# cannot hold directly, or StructUtils defaults for an unfilled field), or a field that nothing fills.
+Base.@nospecializeinfer function fillfields!(filled::Vector{Bool}, defaults::Vector{Any}, @nospecialize(T::Type),
+                                             fieldof::Vector{Int}, steps::Vector{Pair{Int,Plan}}, @nospecialize(p::Plan))
+    for (slot, _) in steps
+        k = slot == 0 ? 0 : fieldof[slot]
+        k == 0 || (filled[k] = true)
+    end
+    covered = copy(filled)
+    if p isa ResolvedRecordPlan
+        for (slot, dp) in p.defaults
+            k = fieldof[slot]
+            k == 0 && continue
+            v = typeddefault(fieldtype(T, k), dp)
+            v === nothing && return -1
+            defaults[k] = something(v)
+            covered[k] = true
+        end
+    end
+    all(covered) && return 0
+    customfielddefaults(T) && return -1
+    for k in 1:fieldcount(T)
+        covered[k] && continue
+        ft = fieldtype(T, k)
+        (Missing <: ft || Nothing <: ft) || return k
+        defaults[k] = Missing <: ft ? missing : nothing
+    end
+    return 0
+end
+
+function naturalcodesof(@nospecialize(T))
+    codes = UInt8[]
+    for k in 1:fieldcount(T)
+        P = naturalplan(fieldtype(T, k))
+        i = 0
+        for (j, S) in enumerate(SINGLETON_LEAF_PLANS)
+            S === P && (i = j)
+        end
+        push!(codes, UInt8(i))
+    end
+    return Tuple(codes)
+end
+
+# Each field's `naturalplan` as its `plancode` (0 for a type without one), known when the method compiles.
+@generated function naturalcodes(::Type{T}) where {T}
+    return naturalcodesof(T)
+end
+
+# Whether a record's steps run straight down its fields, each `natural` field reading through its plan.
+function fastrecord(codes::NTuple{N,UInt8}, slots::Vector{Int}, nodes::Vector{Union{Nothing,TypedNode}}) where {N}
+    (N <= TYPED_RECORD_FIELDS && slots == 1:N) || return false
+    for k in 1:N
+        codes[k] == 0x00 && continue
+        child = nodes[k]
+        (child isa LeafNode && plancode(child.plan) == codes[k]) || return false
+    end
+    return true
+end
+
+# The distinct field types of `T`, and the position among them of each field's type: generated code branches
+# on a field's type rather than on the field, so it stays small for a record of many fields of few types.
+function fieldtypegroups(@nospecialize(T))
+    types = Any[]
+    index = Int[]
+    for i in 1:fieldcount(T)
+        ft = fieldtype(T, i)
+        t = findfirst(x -> x === ft, types)
+        t === nothing && (push!(types, ft); t = length(types))
+        push!(index, t)
+    end
+    return types, index
 end
 
 # The node decoding into target field `k`, built for the field's constant type.
 @generated function fieldnode(::Type{T}, k::Int, site::NodeSite) where {T}
-    body = Expr(:block)
-    for j in 1:fieldcount(T)
-        push!(body.args, :(k == $j && return buildnode($(fieldtype(T, j)), site.schema, site.plan, site.memo)))
+    types, index = fieldtypegroups(T)
+    body = Expr(:block, :(t = $(Tuple(index))[k]))
+    for (t, FT) in enumerate(types)
+        push!(body.args, :(t == $t && return buildnode($FT, site.schema, site.plan, site.memo)))
     end
     push!(body.args, :(throw(ArgumentError("internal error: no field $k in the target"))))
     return body
@@ -482,21 +582,6 @@ Base.@nospecializeinfer function typeddefault(@nospecialize(T::Type), dp::Defaul
         e isa Union{MethodError,ConversionError} || rethrow()
         return nothing
     end
-end
-
-# Fill each target field nothing else covers with `missing` or `nothing`; `false` sends a type with
-# StructUtils defaults to the semantic route.
-function implicitdefaults!(defaults::Vector{Any}, ::Type{T}, covered::Vector{Bool}) where {T}
-    all(covered) && return true
-    customfielddefaults(T) && return false
-    for k in 1:fieldcount(T)
-        covered[k] && continue
-        ft = fieldtype(T, k)
-        (Missing <: ft || Nothing <: ft) || throw(ConversionError(
-            "target type $(typestring(T)) has field $(fieldname(T, k)) with no field in the reader record and no default"))
-        defaults[k] = Missing <: ft ? missing : nothing
-    end
-    return true
 end
 
 # ---- decoding ---------------------------------------------------------------------------------------
@@ -651,34 +736,79 @@ function recordvalue(node::RecordNode{T}, d::Decoder) where {T}
     return v
 end
 
-# The record built from its fields: straight-line in field order when the wire steps align with the target's
-# fields, otherwise through the wire steps (a binary decision on each step's target field), skipping and
-# defaulting as the node says.
-@generated function recordfields(node::RecordNode{T}, d::Decoder) where {T}
+# The code of the record functions below is built by these functions, which take the type unspecialized, so
+# they compile once with the package rather than once per record type.
+function fieldlocals(n::Int)
+    names = Vector{Symbol}(undef, n)
+    for k in 1:n
+        names[k] = Symbol(:f, k)
+    end
+    return names
+end
+
+function recordconstruction(@nospecialize(T), names::Vector{Symbol})
+    return T <: NamedTuple ? :($T(($(names...),))) : :($T($(names...)))
+end
+
+function fastfieldscode(@nospecialize(T))
     n = fieldcount(T)
-    names = [Symbol(:f, k) for k in 1:n]
-    types = [fieldtype(T, k) for k in 1:n]
-    assign(k, j) = :($(names[k]) = decodenode($(types[k]), childnode(node.nodes, $j), d))
-    function stepto(lo, hi)
-        lo == hi && return assign(lo, :j)
-        mid = (lo + hi) >>> 1
-        return Expr(:if, :(slot <= $mid), stepto(lo, mid), stepto(mid + 1, hi))
-    end
-    step = n == 0 ? :(skip(node.plans[j], d)) : :(slot == 0 ? skip(node.plans[j], d) : $(stepto(1, n)))
-    construct = T <: NamedTuple ? :($T(($(names...),))) : :($T($(names...)))
-    return quote
-        $([:(local $(names[k])::$(types[k])) for k in 1:n]...)
-        if node.aligned
-            $([assign(k, k) for k in 1:n]...)
+    n <= TYPED_RECORD_FIELDS || return :(steppedfields(node, d))
+    names = fieldlocals(n)
+    body = Expr(:block, :(node.fast || return steppedfields(node, d)))
+    for k in 1:n
+        FT = fieldtype(T, k)
+        P = naturalplan(FT)
+        if P === nothing
+            push!(body.args, :($(names[k]) = decodefield($FT, childnode(node.nodes, $k), d)))
         else
-            for j in eachindex(node.slots)
-                slot = node.slots[j]
-                $step
-            end
-            $([:(node.filled[$k] || ($(names[k]) = freshvalue(node.defaults[$k]::$(types[k])))) for k in 1:n]...)
+            push!(body.args, :(countvalue!(d)), :($(names[k]) = decodeleaf($P(), d)))
         end
-        return $construct
     end
+    push!(body.args, :(return $(recordconstruction(T, names))))
+    return body
+end
+
+# A binary decision on the wire step's target field `slot`.
+function stepcode(@nospecialize(T), names::Vector{Symbol}, lo::Int, hi::Int)
+    lo == hi && return :($(names[lo]) = decodefield($(fieldtype(T, lo)), childnode(node.nodes, j), d))
+    mid = (lo + hi) >>> 1
+    return Expr(:if, :(slot <= $mid), stepcode(T, names, lo, mid), stepcode(T, names, mid + 1, hi))
+end
+
+function steppedfieldscode(@nospecialize(T))
+    n = fieldcount(T)
+    names = fieldlocals(n)
+    body = Expr(:block)
+    for k in 1:n
+        push!(body.args, :(local $(names[k])::$(fieldtype(T, k))))
+    end
+    step = n == 0 ? :(skip(node.plans[j], d)) : :(slot == 0 ? skip(node.plans[j], d) : $(stepcode(T, names, 1, n)))
+    push!(body.args, :(for j in eachindex(node.slots)
+        slot = node.slots[j]
+        $step
+    end))
+    for k in 1:n
+        push!(body.args, :(node.filled[$k] || ($(names[k]) = freshvalue(node.defaults[$k]::$(fieldtype(T, k))))))
+    end
+    push!(body.args, :(return $(recordconstruction(T, names))))
+    return body
+end
+
+# The record built from its fields, straight down them when the node is `fast`: a field of a `naturalplan` type
+# decodes inline with no node involved.
+@generated function recordfields(node::RecordNode{T}, d::Decoder) where {T}
+    return fastfieldscode(T)
+end
+
+# The record built through its wire steps, skipping and defaulting as the node says.
+@noinline @generated function steppedfields(node::RecordNode{T}, d::Decoder) where {T}
+    return steppedfieldscode(T)
+end
+
+# One field through a call per field type, which every record with a field of that type shares: a record's own
+# code stays small, and the common field types compile with the package.
+@noinline function decodefield(::Type{T}, @nospecialize(node::TypedNode), d::Decoder) where {T}
+    return decodenode(T, node, d)
 end
 
 # A record step's node. The `nothing` check narrows the element to `TypedNode`; asserting that abstract

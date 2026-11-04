@@ -48,10 +48,37 @@ const PRECOMPILED_FIELDS = (Int64(1), Int32(1), 1.0, 1.0f0, true, "a", :a, UInt8
         end
         foreach(identity, Rows(tobuffer(prows; schema=s), typeof(prows[1])))
         foreach(identity, Rows(tobuffer(prows; schema=s), PrecompiledRow))
+        fieldtypes_, fieldvalues = Any[], Any[]
         for x in PRECOMPILED_FIELDS
             fs = schema(typeof(x))
             DatumReader(fs, typeof(x))(encode(fs, x))
-            x isa Vector && !(x isa Vector{UInt8}) && (es = schema(eltype(x)); DatumReader(es, eltype(x))(encode(es, first(x))))
+            push!(fieldtypes_, typeof(x))
+            push!(fieldvalues, x)
+            if x isa Vector && !(x isa Vector{UInt8})
+                es = schema(eltype(x))
+                DatumReader(es, eltype(x))(encode(es, first(x)))
+                push!(fieldtypes_, eltype(x))
+                push!(fieldvalues, first(x))
+            end
+        end
+        # A record of them: each field type's shared decoding and encoding compiles here.
+        R = NamedTuple{Tuple(Symbol(:f, i) for i in eachindex(fieldtypes_)),Tuple{fieldtypes_...}}
+        rs = schema(R)
+        row = R(Tuple(fieldvalues))
+        DatumReader(rs, R)(DatumWriter(rs, R)(row))
+        # File paths, memory-mapped and streamed.
+        mktempdir() do dir
+            path = joinpath(dir, "workload.avro")
+            write(path, prows; schema=s)
+            write(path, prows; schema=s, codec=:zstandard)
+            Tables.columntable(Table(path))
+            for row in Rows(path)
+                row isa Record
+            end
+            foreach(identity, Rows(path, typeof(prows[1])))
+            foreach(identity, Rows(path, PrecompiledRow; mmap=false))
+            write(path, (id=[Int64(1)], name=["a"]))
+            write(path, [PrecompiledRow(1, "a", 1.0, true)])
         end
         Tables.columntable(Table(tobuffer(prows; schema=s); select=(:id,)))
         Tables.columntable(Table(tobuffer(prows)))           # the schema derived from the rows
