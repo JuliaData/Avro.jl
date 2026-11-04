@@ -21,5 +21,31 @@
   columns.
 * **Column access beats row access** for bulk work: `Avro.Table` decodes straight into typed columns.
 * Typed decoding into concrete structs avoids the generic model's boxing for isbits fields.
-* **`juliac --trim=safe`** builds are not supported: readers and writers dispatch on schema-driven plans
-  at run time, which a trimmed executable cannot resolve.
+* **Typed readers and writers compile once per Julia type**, not per schema, so reading files of many
+  schemas into one type, or writing one type under many schemas, reuses the same code.
+
+## Trimmed programs
+
+Programs compiled with `juliac --trim=safe` read and write Avro through the types they name:
+
+* **Reading**: `Avro.Rows(src, T)`, `Avro.DatumReader(schema, T)`, `Avro.decode(schema, bytes, T)` and
+  `Avro.SingleObjectReader(store, T)`, where `T` is a `NamedTuple` or a plain struct whose fields Avro
+  decodes directly (see [Typed decoding](encoding.md#Typed-decoding)).
+* **Writing**: `Avro.write(dst, rows)` for vectors of `NamedTuple`s or structs and for `NamedTuple`s of
+  vectors, `Avro.Writer`, `Avro.DatumWriter(schema, T)` and `Avro.encode(schema, x)`.
+* **Sources and codecs**: paths (memory-mapped or `mmap=false`), byte vectors, `IOBuffer`s and streams; the
+  null, deflate, snappy and zstandard codecs, compressed on several tasks when the program runs threads.
+
+Keyword arguments need concrete types, so pass a parsed schema with its type asserted:
+`schema=Avro.parseschema(json)::Avro.RecordSchema`.
+
+The rest needs the full Julia runtime: the generic value model (`Avro.Table(src)`, `Avro.Rows(src)` without
+a type, `Avro.Record` or `Any` fields), schema resolution against a reader schema, conversions through
+StructUtils hooks, values encoded by their run-time type, and the bzip2 and xz codecs. The verifier rejects
+a program that calls the first two; a typed read or write that reaches a conversion or a run-time-typed
+value raises an `ArgumentError` saying so. A program that must read files of varying shape reads them into a
+type it declares.
+
+On Julia 1.13 and earlier, a bug in how `--trim` prunes the image (JuliaLang/julia#63664) can crash a
+trimmed program before `main` runs, inside its first dynamic call. Whether it does depends on everything the
+program compiles, not on Avro; Julia 1.14 fixes it. Avro's CI builds and runs a trimmed program on both.

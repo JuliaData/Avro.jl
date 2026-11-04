@@ -33,8 +33,8 @@ logical type is preserved as an unknown annotation and is deferred.
   may be strings; a table column the schema lacks is an error rather than a silent drop.
 - `Avro.SingleObjectReader` and `Avro.SingleObjectWriter`: prepared single-object codecs for message streams.
 - `references=` on `Avro.parseschema`, for named types shared across schema files.
-- With Arrow.jl 3 loaded, nested `Avro.Record` columns write as Arrow struct columns typed by their schema, with
-  their decimals as Arrow decimals; `Avro.Duration` values write as Arrow intervals.
+- With Arrow.jl 3 loaded (ArrowTypes 2.4), nested `Avro.Record` columns write as Arrow struct columns typed by
+  their schema, with their decimals as Arrow decimals; `Avro.Duration` values write as Arrow intervals.
 - With TimeZones.jl loaded, `ZonedDateTime` reads and writes as an instant.
 - Projection pushdown: `select=` on `Avro.Table` and `Avro.Rows` skips unselected fields and derives
   an effective schema that `Avro.write` round-trips.
@@ -55,9 +55,13 @@ logical type is preserved as an unknown annotation and is deferred.
 - Legacy support for files written by Avro.jl ≤ 1.1.2: `legacy=:avrojl1` (padded null-codec blocks,
   the `zstd` codec name, unnamed fixed schemas, native-endian fixed-16 decimals).
 - Prepared codecs: `Avro.DatumReader(schema[, T])` and `Avro.DatumWriter(schema[, T])` reuse plans
-  across calls; writers return a fresh byte vector or append to an `IO`. Typed targets compile once per
-  Julia type, whatever the schema, and every typed API takes the type positionally
+  across calls; writers return a fresh byte vector or append to an `IO`. Typed reading and writing compile
+  once per Julia type, whatever the schema, and every typed API takes the type positionally
   (`Avro.decode(schema, bytes, T)`, `Avro.Rows(src, T)`, `Avro.decodesingle(src, store, T)`).
+- Programs compiled with `juliac --trim=safe` read and write through the typed APIs with default options:
+  typed rows and structs, column tables, prepared readers and writers, and the null, deflate, snappy and
+  zstandard codecs. Julia 1.13 and earlier can crash such a program at startup (JuliaLang/julia#63664);
+  Julia 1.14 fixes it.
 - Exact timestamps: `timestamp-*` values are `Durations.ZonedTimestamp{P,:UTC}` and `local-timestamp-*`
   values are `Durations.Timestamp{P}` (the `Dates.Timestamp` of Julia 1.14), so microsecond and
   nanosecond precision survives decoding and Arrow.jl writes them as native timestamp columns.

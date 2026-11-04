@@ -18,11 +18,12 @@ call; use prepared objects for repeated work.
 dr = Avro.DatumReader(s)               # generic decoding
 drT = Avro.DatumReader(s, T)           # typed decoding into T
 dw = Avro.DatumWriter(s)               # accepts any encodable value
-dwT = Avro.DatumWriter(s, T)           # fixes the input type and reuses its prepared plan
+dwT = Avro.DatumWriter(s, T)           # takes values of exactly type T
 bytes = dwT(value)                     # returns a new owned byte vector
 dwT(io, value)                         # appends to an existing output stream
 ```
 
+A typed reader or writer compiles its decoding or encoding once per Julia type, whatever the schema.
 `DatumReader` objects are safe to share across tasks because each call owns its decoder state.
 `DatumWriter` retains reusable encoder state and is single-owner; do not call the same writer
 concurrently. Schemas and plans are immutable and shareable.
