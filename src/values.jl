@@ -98,8 +98,20 @@ end
 function datetimeticks(::Type{P}, dt::DateTime) where {P}
     delta, o1 = Base.Checked.sub_with_overflow(Dates.value(dt), UNIX_EPOCH_MS)
     ticks, o2 = Base.Checked.mul_with_overflow(delta, Int64(tickscale(P)))
-    (o1 || o2) && throw(ConversionError("DateTime $dt does not fit a timestamp in $(nameof(P))s"))
+    (o1 || o2) && datetimerangeerror(dt, String(nameof(P)))
     return ticks
+end
+
+# Printing a `DateTime` runs `Dates.format`, which programs compiled by `juliac --trim` leave out; their message
+# gives its `Dates.value` instead.
+@noinline function datetimerangeerror(dt::DateTime, unit::String)
+    shown = try
+        runtimecall(string, dt)::String
+    catch err
+        notcompiled(err, string) || rethrow()
+        string("with Dates.value ", Dates.value(dt))
+    end
+    throw(ConversionError(string("DateTime ", shown, " does not fit a timestamp in ", unit, "s")))
 end
 
 # `DateTime(x)` with an out-of-range value raising `ConversionError` (it floors sub-millisecond units).
