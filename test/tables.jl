@@ -1,5 +1,16 @@
 import DataAPI
 
+# A column table with a name that is neither a Symbol nor a string.
+struct TablesIntName
+    a::Vector{Int64}
+end
+Tables.istable(::Type{TablesIntName}) = true
+Tables.columnaccess(::Type{TablesIntName}) = true
+Tables.columns(t::TablesIntName) = t
+Tables.columnnames(::TablesIntName) = Any[:a, 1]
+Tables.getcolumn(t::TablesIntName, ::Symbol) = t.a
+Tables.getcolumn(t::TablesIntName, ::Int) = t.a
+
 @testset "Tables integration" begin
     P = Avro.parseschema
     rows = [(a=Int64(i), b="r$i", c=i % 3 == 0 ? missing : i / 2, e=isodd(i) ? "X" : "Y") for i in 1:250]
@@ -288,6 +299,10 @@ import DataAPI
         byname = Tables.columntable(Avro.Table(Avro.tobuffer(cols; schema=reordered)))  # matched by name
         @test keys(byname) == (:s, :id, :x) && all(isequal(byname[k], cols[k]) for k in keys(cols))
         @test_throws ArgumentError Avro.tobuffer((a=[1, 2], b=[1]))
+        repeated = Tables.table(Int64[1 2; 3 4]; header=[:a, :a])           # the first column of a repeated name
+        along = Avro.parseschema("""{"type":"record","name":"A","fields":[{"name":"a","type":"long"}]}""")
+        @test Avro.Table(Avro.tobuffer(repeated; schema=along)).a == [1, 3]
+        @test_throws "columns [Symbol(\"1\")] that record A lacks" Avro.tobuffer(TablesIntName([1, 2]); schema=along)
     end
 
     @testset "wide and reordered column tables write the same bytes as their rows" begin

@@ -1231,16 +1231,17 @@ function pushcolumns!(w::Writer, cols)
     names = Tables.columnnames(cols)
     (isempty(names) || !coversfields(s, names)) && return false
     cols isa NamedTuple && fieldcount(typeof(cols)) <= TYPED_ROW_COLUMNS && return pushcolumntable!(w, cols)
-    length(names) > TYPED_ROW_COLUMNS && return pushcolumncells!(w, cols, names)
     symbols = Tuple(Symbol(n) for n in names)
+    (length(names) > TYPED_ROW_COLUMNS || !allunique(symbols)) && return pushcolumncells!(w, cols, names)   # cells take the first of repeated names
     return pushcolumntable!(w, NamedTuple{symbols}(Tuple(Tables.getcolumn(cols, n) for n in names)))
 end
 
-# Whether the names include a column for every field of `s` (by name, as rows are matched).
+# Whether the names are all strings or symbols and include a column for every field of `s` (by name, as rows are
+# matched); other names take the row path, which reports them.
 function coversfields(s::RecordSchema, names)
     covered = falses(length(s.fields))
     for n in names
-        (n isa Union{Symbol,AbstractString}) || continue
+        n isa Union{Symbol,AbstractString} || return false
         i = recordfieldindex(s, n)
         i == 0 || (covered[i] = true)
     end
