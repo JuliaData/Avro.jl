@@ -103,9 +103,6 @@ function decode(@nospecialize(writer::Schema), bytes::AbstractVector{UInt8}, pos
     return DatumReader(writer, T; kw...)(bytes, pos)
 end
 
-# The datum type parameter of a `DatumWriter` built without one.
-struct UnfixedDatumWriter end
-
 """
     Avro.DatumWriter(schema; limits=Limits())
     Avro.DatumWriter(schema, T; limits=Limits())
@@ -113,29 +110,31 @@ struct UnfixedDatumWriter end
 A prepared encoder that retains its plan and a reusable buffer, so it is single-owner:
 `writer(x) -> Vector{UInt8}` returns a fresh owned buffer; `writer(io, x)` writes to `io` without
 creating a result vector per call; `writer(e::Avro.Encoder, x)` appends to a caller's encoder. The typed
-form fixes the datum type `T`, which is the fastest path when `T` is a NamedTuple or struct whose fields
-align with the record schema. Reused buffers may still grow when a larger value is written.
+form takes datums of exactly type `T` (`T = Any` is the untyped form). Either form compiles its encoding
+once per datum type, and encodes NamedTuples, structs, vectors and dictionaries of the types Avro encodes
+directly through their types; other values encode by their run-time types. Reused buffers may still grow
+when a larger value is written.
 """
-mutable struct DatumWriter{P<:Plan,T,FP}
+mutable struct DatumWriter{T}
     const schema::Schema
-    const plan::P
+    const plan::Plan
+    const nodes::WriteNodes
     const encoder::Encoder
-    const fixedplans::FP          # the typed form's aligned plans (`nothing` when untyped or not aligned)
 end
 
-function Base.show(io::IO, w::DatumWriter{P,T}) where {P,T}
-    return print(io, "Avro.DatumWriter(", schemalabel(w.schema), T === UnfixedDatumWriter ? "" : ", $T", ")")
+function Base.show(io::IO, w::DatumWriter{T}) where {T}
+    return print(io, "Avro.DatumWriter(", schemalabel(w.schema), T === Any ? "" : ", $T", ")")
 end
 
-function DatumWriter(schema::Schema; limits::Limits=Limits())
+function DatumWriter(@nospecialize(schema::Schema); limits::Limits=Limits())
+    return DatumWriter(schema, Any; limits=limits)
+end
+
+function DatumWriter(@nospecialize(schema::Schema), ::Type{T}; limits::Limits=Limits()) where {T}
     plan = writeplan(schema)
-    return DatumWriter{typeof(plan),UnfixedDatumWriter,Nothing}(schema, plan, Encoder(limits), nothing)
-end
-
-function DatumWriter(schema::Schema, ::Type{T}; limits::Limits=Limits()) where {T}
-    plan = writeplan(schema)
-    fixed = alignedplans(plan, T)
-    return DatumWriter{typeof(plan),T,typeof(fixed)}(schema, plan, Encoder(limits), fixed)
+    nodes = WriteNodes(schema, plan)
+    T === Any || writenode!(nodes, T)
+    return DatumWriter{T}(schema, plan, nodes, Encoder(limits))
 end
 
 function (w::DatumWriter)(x)
@@ -153,44 +152,27 @@ function (w::DatumWriter)(io::IO, x)
     e = w.encoder
     try
         writeprepared!(w, e, x)
-        Base.write(io, view(e.buf, 1:e.pos))
+        streamcall(Base.write, io, view(e.buf, 1:e.pos))
     finally
         reset!(e)
     end
     return nothing
 end
 
+# Appends from depth zero; a failure leaves the caller's encoder as it was.
 function (w::DatumWriter)(e::Encoder, x)
-    return appenddatum!(() -> writeprepared!(w, e, x), e)
-end
-
-function writeprepared!(w::DatumWriter{P,T,FP}, e::Encoder, x) where {P,T,FP}
-    T === UnfixedDatumWriter || typeof(x) === T ||
-        throw(EncodeError(string("prepared writer expects a datum of exact type ", T), "\$", w.schema))
-    FP === Nothing && return encodedatum!(w.plan, e, x, w.schema)
-    try
-        encodealignedfast!(w.fixedplans, e, x)
-    catch err
-        err isa EncodeError && replayaligned!(w.plan, Encoder(e.limits), x, w.schema::RecordSchema)
-        rethrow()
-    end
+    writeprepared!(w, e, x)
     return nothing
 end
 
-# Encode one datum onto a caller's encoder from depth zero; a failure truncates what it wrote.
-function appenddatum!(f::F, e::Encoder) where {F}
-    start, depth, values = e.pos, e.depth, e.values
-    e.depth = 0
-    try
-        f()
-    catch
-        e.pos = start
-        e.values = values
-        rethrow()
-    finally
-        e.depth = depth
-    end
+function writeprepared!(w::DatumWriter{T}, e::Encoder, x::X) where {T,X}
+    T === Any || X === T || preparedtypeerror(w)
+    encodetyped!(X, writenode!(w.nodes, X), e, x, w.plan, w.schema)
     return nothing
+end
+
+@noinline function preparedtypeerror(w::DatumWriter{T}) where {T}
+    throw(EncodeError(string("prepared writer expects a datum of exact type ", typestring(T)), "\$", w.schema))
 end
 
 """
@@ -199,9 +181,9 @@ end
 
 One-shot encoding (builds a plan per call; use `DatumWriter` for repeated use).
 """
-function encode(schema::Schema, x; limits::Limits=Limits())
+function encode(@nospecialize(schema::Schema), x; limits::Limits=Limits())
     e = Encoder(limits)
-    encodedatum!(writeplan(schema), e, x, schema)
+    encodeonce!(e, schema, x)
     return take!(e)
 end
 
@@ -216,14 +198,20 @@ end
 One-shot encoding that appends one datum to the caller's stream or encoder; a failed append leaves the
 encoder's bytes as they were. Use `DatumWriter` for repeated work.
 """
-function encode!(io::IO, schema::Schema, x; limits::Limits=Limits())
+function encode!(io::IO, @nospecialize(schema::Schema), x; limits::Limits=Limits())
     e = Encoder(limits)
-    encodedatum!(writeplan(schema), e, x, schema)
-    Base.write(io, view(e.buf, 1:e.pos))
+    encodeonce!(e, schema, x)
+    streamcall(Base.write, io, view(e.buf, 1:e.pos))
     return nothing
 end
 
-function encode!(e::Encoder, schema::Schema, x)
+function encode!(e::Encoder, @nospecialize(schema::Schema), x)
+    encodeonce!(e, schema, x)
+    return nothing
+end
+
+function encodeonce!(e::Encoder, @nospecialize(schema::Schema), x::T) where {T}
     plan = writeplan(schema)
-    return appenddatum!(() -> encodedatum!(plan, e, x, schema), e)
+    encodetyped!(T, writenode(T, schema, plan), e, x, plan, schema)
+    return nothing
 end

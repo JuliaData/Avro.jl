@@ -1,6 +1,7 @@
-# Write plans: one node per schema node. Values are taken from generic values, NamedTuples, StructUtils
-# structs, Tables rows, dictionaries and iterables; each value is checked against its schema node, and
-# a union's branch is chosen from the value.
+# Write plans: one node per schema node. The generic route encodes values by their run-time types: generic
+# values, NamedTuples, StructUtils structs, Tables rows, dictionaries and iterables; each value is checked
+# against its schema node, and a union's branch is chosen from the value. Typed write nodes (typedwrite.jl)
+# encode through the same per-plan `encodevalue` methods.
 
 struct WArray <: Plan
     schema::ArraySchema
@@ -11,27 +12,21 @@ struct WMap <: Plan
     values::Plan
 end
 
-# `Q` is the concrete plan of a nullable union's value branch (`Nothing` for other unions), so that
-# branch encodes without dynamic dispatch; `reprtypes` holds each branch's `juliatype` for exact matches.
-struct WUnion{Q} <: Plan
+# `nullable` is the position of the null branch of a two-branch nullable union (0 otherwise); `reprtypes`
+# holds each branch's `juliatype` for exact matches.
+struct WUnion <: Plan
     schema::UnionSchema
     branches::Vector{Plan}
     nullable::Int
     reprtypes::Vector{Any}
 end
 
-function WUnion(schema::UnionSchema, branches::Vector{Plan}, nullable::Int, reprtypes::Vector{Any})
-    Q = nullable == 0 ? Nothing : typeof(branches[3 - nullable])
-    return WUnion{Q}(schema, branches, nullable, reprtypes)
-end
-
-# How one Julia record type maps onto a record plan: the field of `type` for each schema field, the field
-# plans as a tuple when the type's fields align 1:1 with the record's (1 to 32 fields), and whether the type
-# overrides `propertynames` (a DataFrame row, say), whose properties rather than its fields are the record's.
+# How one Julia record type maps onto a record plan: the field of `type` for each schema field, and whether
+# the type overrides `propertynames` (a DataFrame row, say), whose properties rather than its fields are the
+# record's.
 struct RecordLayout
     type::Any
     positions::Vector{Int}
-    plans::Any
     properties::Bool
 end
 
@@ -47,11 +42,11 @@ end
 
 # One plan node per schema node, memoised by node id; a record is memoised before its fields are built
 # so recursive schemas terminate.
-function writeplan(s::Schema)
+function writeplan(@nospecialize(s::Schema))
     return writeplan(s, Vector{Union{Nothing,Plan}}(nothing, graphinfo(s).nodes))
 end
 
-function writeplan(s::Schema, memo::Vector{Union{Nothing,Plan}})
+function writeplan(@nospecialize(s::Schema), memo::Vector{Union{Nothing,Plan}})
     id = Int(nodeid(s)) + 1
     p = memo[id]
     p === nothing || return p
@@ -60,24 +55,20 @@ function writeplan(s::Schema, memo::Vector{Union{Nothing,Plan}})
     return p
 end
 
-function buildwriteplan(s::Schema, memo)
-    return buildreadplan(s, memo, :standard)    # the leaves are shared with reading
-end
-
-function buildwriteplan(s::ArraySchema, memo)
-    return WArray(s, writeplan(s.items, memo))
-end
-
-function buildwriteplan(s::MapSchema, memo)
-    return WMap(s, writeplan(s.values, memo))
-end
-
-function buildwriteplan(s::UnionSchema, memo)
-    branches = Plan[writeplan(b, memo) for b in s.branches]
-    return WUnion(s, branches, nullablebranch(s), Any[juliatype(b) for b in s.branches])
-end
-
-function buildwriteplan(s::RecordSchema, memo)
+# The composites have write plans of their own; the leaves are shared with reading.
+function buildwriteplan(@nospecialize(s::Schema), memo::Vector{Union{Nothing,Plan}})
+    s isa ArraySchema && return WArray(s, writeplan(s.items, memo))
+    s isa MapSchema && return WMap(s, writeplan(s.values, memo))
+    if s isa UnionSchema
+        branches = Plan[]
+        reprtypes = Any[]
+        for b in s.branches
+            push!(branches, writeplan(b, memo))
+            push!(reprtypes, juliatype(b))
+        end
+        return WUnion(s, branches, nullablebranch(s), reprtypes)
+    end
+    s isa RecordSchema || return buildreadplan(s, memo, :standard)
     p = WRecord(s, Plan[])
     memo[Int(nodeid(s)) + 1] = p
     for f in s.fields
@@ -88,7 +79,9 @@ end
 
 # ---- value paths and errors -----------------------------------------------------------------------------
 
-function encodeerror(msg::AbstractString, x)
+# Out of line and without constant propagation, so that a message built from constants stays a call
+# `juliac --trim` resolves.
+@noinline Base.@constprop :none function encodeerror(msg::AbstractString, x)
     throw(EncodeError(string(msg, " (got ", nameof(typeof(x)), ")"), "", nothing))
 end
 
@@ -134,12 +127,13 @@ end
 
 # ---- scalars ---------------------------------------------------------------------------------------------
 
-function encodevalue(p::Plan, e::Encoder, x)
+# Inlined, so that a typed leaf's chain over the plan types raises its error without a method per plan.
+@inline function encodevalue(p::Plan, e::Encoder, x)
     return encodeerror(expected(p), x)
 end
 
 # What a leaf plan accepts, for the error on any other value.
-function expected(p::Plan)
+function expected(@nospecialize(p::Plan))
     p isa NullPlan && return "expected null (missing or nothing)"
     p isa BoolPlan && return "expected a Bool"
     p isa Union{IntPlan,LongPlan} && return "expected an integer"
@@ -147,16 +141,32 @@ function expected(p::Plan)
     p isa DoublePlan && return "expected a Float64"
     p isa BytesPlan && return "expected bytes (an AbstractVector{UInt8})"
     p isa StringPlan && return "expected a string"
-    p isa FixedPlan && return "expected $(p.schema.size) fixed bytes"
-    p isa EnumPlan && return "expected an enum symbol of $(fullname(p.schema))"
+    p isa FixedPlan && return expectedfixed(p.schema.size)
+    p isa EnumPlan && return expectedenum(fullname(p.schema))
     p isa DatePlan && return "expected a Date"
     p isa Union{TimeMillisPlan,TimeMicrosPlan} && return "expected a Time"
-    p isa TimestampPlan && return "expected an instant (Avro.Timestamp{$(nameof(typeof(p).parameters[1]))}, any Durations.ZonedTimestamp) or a DateTime"
-    p isa LocalTimestampPlan && return "expected a local time (Avro.LocalTimestamp{$(nameof(typeof(p).parameters[1]))}) or a DateTime"
-    p isa DecimalPlan && return "expected an Avro.Decimal/WideDecimal with scale $(p.scale)"
+    p isa TimestampPlan{Millisecond} && return "expected an instant (Avro.Timestamp{Millisecond}, any Durations.ZonedTimestamp) or a DateTime"
+    p isa TimestampPlan{Microsecond} && return "expected an instant (Avro.Timestamp{Microsecond}, any Durations.ZonedTimestamp) or a DateTime"
+    p isa TimestampPlan{Nanosecond} && return "expected an instant (Avro.Timestamp{Nanosecond}, any Durations.ZonedTimestamp) or a DateTime"
+    p isa LocalTimestampPlan{Millisecond} && return "expected a local time (Avro.LocalTimestamp{Millisecond}) or a DateTime"
+    p isa LocalTimestampPlan{Microsecond} && return "expected a local time (Avro.LocalTimestamp{Microsecond}) or a DateTime"
+    p isa LocalTimestampPlan{Nanosecond} && return "expected a local time (Avro.LocalTimestamp{Nanosecond}) or a DateTime"
+    p isa DecimalPlan && return expecteddecimal(p.scale)
     p isa Union{UUIDStringPlan,UUIDFixedPlan} && return "expected a UUID"
     p isa DurationPlan && return "expected an Avro.Duration"
     return "unexpected value"
+end
+
+@noinline Base.@constprop :none function expectedfixed(size::Int)
+    return string("expected ", size, " fixed bytes")
+end
+
+@noinline Base.@constprop :none function expectedenum(name::String)
+    return string("expected an enum symbol of ", name)
+end
+
+@noinline Base.@constprop :none function expecteddecimal(scale::Int)
+    return string("expected an Avro.Decimal/WideDecimal with scale ", scale)
 end
 
 function encodevalue(::NullPlan, e::Encoder, x::Union{Missing,Nothing})
@@ -589,19 +599,13 @@ end
 
 # ---- unions ----------------------------------------------------------------------------------------------
 
-function encodevalue(p::WUnion{Q}, e::Encoder, x) where {Q}
+function encodevalue(p::WUnion, e::Encoder, x)
     i = selectbranch(p, x)
     writelong!(e, Int64(i) - 1)
     value = x isa UnionValue ? x.value : x
     previous = e.expected
     e.expected = p.schema.branches[i]
-    # A nullable union's value branch, with a value narrowed out of its `Union{Missing,T}` field type,
-    # makes the call static and unboxed.
-    if Q !== Nothing && i != p.nullable && !(value isa Union{Missing,Nothing})
-        encode(p.branches[i]::Q, e, value)
-    else
-        encode(p.branches[i], e, value)
-    end
+    encode(p.branches[i], e, value)
     e.expected = previous
     return nothing
 end
@@ -847,8 +851,6 @@ function encoderecord(p::WRecord, e::Encoder, x::T) where {T}
     (x isa NamedTuple || (isstructtype(T) && !(x isa AbstractArray) && !(x isa AbstractString))) || encodeerror("expected a record value for $(fullname(p.schema))", x)
     layout = recordlayout(p, T)
     layout.properties && return encoderow(p, e, x)
-    plans = layout.plans
-    plans === nothing || return encfields(e, plans, fieldtuple(x), p.schema.fields, 1)
     positions = layout.positions
     for (i, f) in enumerate(p.fields)
         j = positions[i]
@@ -863,10 +865,7 @@ function recordlayout(p::WRecord, ::Type{T}) where {T}
     cached = @atomic p.layout
     cached !== nothing && cached.type === T && return cached
     properties = usesproperties(T)
-    positions = properties ? Int[] : recordfieldpositions(p.schema, T)
-    n = length(positions)
-    aligned = 0 < n <= 32 && fieldcount(T) == n && all(i -> positions[i] == i, 1:n)
-    layout = RecordLayout(T, positions, aligned ? Tuple(p.fields) : nothing, properties)
+    layout = RecordLayout(T, properties ? Int[] : recordfieldpositions(p.schema, T), properties)
     @atomic p.layout = layout
     return layout
 end
@@ -957,138 +956,4 @@ function alignednames(p::WRecord, names)
         same || return false
     end
     return true
-end
-
-# ---- the aligned fast path -------------------------------------------------------------------------------
-#
-# Rows are most often NamedTuples or structs whose fields align 1:1 with the record. Their field plans as a
-# concrete tuple run the same per-plan `encode` methods monomorphized through tuple recursion: identical
-# bytes and validation without per-field dynamic dispatch or boxing.
-
-function isrecordtype(::Type{T}) where {T}
-    return T <: NamedTuple || (isstructtype(T) && !(T <: NOT_RECORDLIKE) && !(T <: Union{Tables.AbstractRow,TableRow}))
-end
-
-# The record's field plans as a tuple when `T` is a NamedTuple or struct aligned with the record;
-# `nothing` otherwise.
-function alignedplans(p::Plan, ::Type{T}) where {T}
-    (p isa WRecord && isconcretetype(T) && isrecordtype(T)) || return nothing
-    return recordlayout(p, T).plans
-end
-
-function fieldtuple(x::NamedTuple)
-    return values(x)
-end
-
-@generated function fieldtuple(x::T) where {T}
-    return Expr(:tuple, (:(getfield(x, $i)) for i in 1:fieldcount(T))...)
-end
-
-@inline function encfields(e::Encoder, ::Tuple{}, ::Tuple{}, fields, i::Int)
-    return nothing
-end
-
-@inline function encfields(e::Encoder, plans::Tuple, vals::Tuple, fields, i::Int)
-    field = fields[i]
-    encodeframed(first(plans), e, first(vals), field.schema, ENCODE_PATH_FIELD, field.name)
-    return encfields(e, Base.tail(plans), Base.tail(vals), fields, i + 1)
-end
-
-@inline function encfieldsfast(e::Encoder, ::Tuple{}, ::Tuple{})
-    return nothing
-end
-
-@inline function encfieldsfast(e::Encoder, plans::Tuple, vals::Tuple)
-    encode(first(plans), e, first(vals))
-    return encfieldsfast(e, Base.tail(plans), Base.tail(vals))
-end
-
-# One aligned row without path frames; callers replay a failure through `replayaligned!` for its path.
-function encodealignedfast!(plans::Tuple, e::Encoder, x)
-    countvalue!(e)
-    enter!(e)
-    encfieldsfast(e, plans, fieldtuple(x))
-    leave!(e)
-    return nothing
-end
-
-# ---- the field-cell path ---------------------------------------------------------------------------------
-#
-# Column tables wider than 32 columns or in another field order, and strided vectors of NamedTuples in
-# another field order, write each row through one cell per schema field: the field's plan and its source.
-# A cell vector and a `CellRow` cursor take the place of the plan tuple and row in `encodealignedfast!` and
-# `pushaligneddatum!`; each cell is one dynamic call to the same per-plan `encode` methods, so validation
-# and bytes are identical, without building a boxed `Record` per row.
-
-abstract type WriteCell end
-
-struct ColumnCell{P<:Plan,C<:AbstractVector} <: WriteCell
-    plan::P
-    column::C
-end
-
-struct RowCell{P<:Plan,T,R<:AbstractVector} <: WriteCell
-    plan::P
-    rows::R
-    field::Int
-end
-
-function RowCell(plan::P, rows::R, field::Int) where {P<:Plan,R<:AbstractVector}
-    return RowCell{P,fieldtype(eltype(R), field),R}(plan, rows, field)
-end
-
-# The current source row; a mutable cursor, so the dynamic per-cell call does not box the row index.
-mutable struct CellRow
-    i::Int
-end
-
-function cellvalue(c::ColumnCell, row::CellRow)
-    return c.column[firstindex(c.column) + row.i - 1]
-end
-
-function cellvalue(c::RowCell{P,T}, row::CellRow) where {P,T}
-    value = c.rows[firstindex(c.rows) + row.i - 1]
-    return typedrowfield(value, c.field, T)
-end
-
-# Literal field positions let Julia read an inline heterogeneous row without boxing the row or scalar.
-# Specialization follows the caller's NamedTuple type and field types, never schema names or positions.
-@inline @generated function typedrowfield(row::R, field::Int, ::Type{T}) where {R<:NamedTuple,T}
-    body = :(throw(BoundsError(row, field)))
-    for i in reverse(1:fieldcount(R))
-        fieldtype(R, i) === T || continue
-        body = :(field == $i ? getfield(row, $i) : $body)
-    end
-    return body
-end
-
-function encodecell!(c::Union{ColumnCell,RowCell}, e::Encoder, row::CellRow)
-    encode(c.plan, e, cellvalue(c, row))
-    return nothing
-end
-
-function encodealignedfast!(cells::Vector{WriteCell}, e::Encoder, row::CellRow)
-    countvalue!(e)
-    enter!(e)
-    for c in cells
-        encodecell!(c, e, row)
-    end
-    leave!(e)
-    return nothing
-end
-
-function cellrecord(cells::Vector{WriteCell}, row::CellRow, schema::RecordSchema)
-    return Record(schema, Any[cellvalue(c, row) for c in cells], Val(:unchecked))
-end
-
-# The failure of an aligned row raised again with its value path: the fast path carries none, so the
-# row is encoded once more with path frames into `scratch`.
-@noinline function replayaligned!(plan::Plan, scratch::Encoder, x, schema::RecordSchema)
-    reset!(scratch)
-    try
-        encodedatum!(plan, scratch, x, schema)
-    finally
-        reset!(scratch)
-    end
-    return nothing
 end

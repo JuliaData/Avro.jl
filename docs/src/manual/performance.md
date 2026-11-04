@@ -7,10 +7,11 @@
 * **Prepared beats one-shot**: `DatumReader`/`DatumWriter` skip per-call plan construction. For repeated
   writes, reuse a typed `DatumWriter(schema, T)` and an output `IO`; calling `writer(row)` returns a new
   owned byte vector each time, `writer(io, row)` appends without allocating one.
-* **Writers fast-path aligned rows** automatically: NamedTuples and structs whose fields match the record
-  schema in order (up to 32 fields) encode monomorphized. Other column tables and strided vectors of concrete
-  `NamedTuple` rows write through typed field cells; wide and reordered rows never build a generic
-  record per row.
+* **Writers encode through the datum's type**: NamedTuples, structs, vectors, dictionaries and nullable
+  values of the types Avro encodes directly compile their encoding once per Julia type, in any field order,
+  whatever the schema. Column tables of up to 32 columns write as `NamedTuple` rows of their element types;
+  wider ones compile once per column type. `Any` and other abstract types, `Avro.Record` and other generic
+  values, and unions of several types encode by each value's run-time type.
 * **Message streams**: a `SingleObjectReader` looks up and verifies each schema fingerprint once, where
   `decodesingle` repeats that work per message.
 * **Projection**: `select=` skips what you don't read, jumping sized array and map blocks by their

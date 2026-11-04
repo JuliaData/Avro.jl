@@ -539,6 +539,7 @@ mutable struct Writer
     const temppath::Union{Nothing,String}
     const schema::Schema
     const plan::Plan
+    const nodes::WriteNodes                 # the datums' write nodes, by datum type
     const wcodec::WriterCodec
     const syncmarker::NTuple{16,UInt8}
     const limits::Limits
@@ -549,7 +550,7 @@ mutable struct Writer
     const fsync::Bool
     const ownsink::Bool
     const encoder::Encoder
-    const datumencoder::Encoder             # scratch: a datum moving to the next block, diagnostic replays
+    const datumencoder::Encoder             # scratch: a datum moving to the next block
     const appendstart::Int                  # the file's length before an append; -1 otherwise
     appendlength::Int                       # the file's length with every block this writer has emitted
     pendingcount::Int
@@ -680,7 +681,8 @@ function Writer(dst::Union{AbstractString,IO}, @nospecialize(schema::Schema); co
         sink, temppath, ownsink = openwritersink(path === nothing ? dst : path, atomic)
     end
     workers = wcodec.name === :null ? 1 : min(Int(ntasks), Threads.nthreads())
-    w = Writer(sink, path, atomic ? temppath : nothing, schema, writeplan(schema), wcodec, syncmarker, limits,
+    plan = writeplan(schema)
+    w = Writer(sink, path, atomic ? temppath : nothing, schema, plan, WriteNodes(schema, plan), wcodec, syncmarker, limits,
                min(Int(block_bytes), limits.max_bytes), workers, Base.Semaphore(workers), Task[], fsync, ownsink,
                Encoder(limits), Encoder(limits), appendstart, appendstart, 0, false, nothing, 0, 0)
     try
@@ -772,40 +774,15 @@ function Base.push!(w::Writer, datum)
     end
 end
 
-function pushdatum!(w::Writer, datum)
-    plans = alignedplans(w.plan, typeof(datum))
-    plans === nothing && return pushgenericdatum!(w, datum)
-    return pushaligneddatum!(w, datum, plans)
+function pushdatum!(w::Writer, datum::T) where {T}
+    return pushdatum!(w, T, writenode!(w.nodes, T), datum)
 end
 
-"Encode one datum in place at the end of the current block; a failed datum leaves no bytes behind."
-function pushgenericdatum!(w::Writer, datum)
+"Encode one datum in place at the end of the current block through `node`; a failed datum leaves no bytes behind."
+@inline function pushdatum!(w::Writer, ::Type{T}, @nospecialize(node::WriteNode), datum) where {T}
     e = w.encoder
-    start = e.pos
-    values = e.values
-    try
-        encodedatum!(w.plan, e, datum, w.schema)
-    catch
-        e.pos = start
-        e.values = values
-        rethrow()
-    end
-    return commitdatum!(w, start, values)
-end
-
-"One aligned row (a NamedTuple or struct with its plan tuple, or a `CellRow` with its field cells) through the fast path."
-@inline function pushaligneddatum!(w::Writer, datum, plans)
-    e = w.encoder
-    start = e.pos
-    values = e.values
-    try
-        encodealignedfast!(plans, e, datum)
-    catch err
-        e.pos = start
-        e.values = values
-        err isa EncodeError && replayaligned!(w.plan, w.datumencoder, datum isa CellRow ? cellrecord(plans, datum, w.schema::RecordSchema) : datum, w.schema::RecordSchema)
-        rethrow()
-    end
+    start, values = e.pos, e.values
+    @inline encodetyped!(T, node, e, datum, w.plan, w.schema)
     return commitdatum!(w, start, values)
 end
 
@@ -1034,15 +1011,27 @@ function write(dst::Union{AbstractString,IO}, table; schema::Union{Nothing,Schem
         return dst
     end
     partitions = table isa Rows ? RowsPartitions(table) : Tables.partitions(table)    # `Rows` re-encodes one block at a time
+    R = typedrows(table)
+    if R !== nothing && partitions isa Tuple{Any}               # typed rows: the schema derives from their type
+        if s === nothing
+            s = tableschema(R, something(name, "Record"), something(namespace, ""))
+        else
+            checkcolumns(fieldnames(R), s)
+        end
+        Writer(dst, s; limits=limits, append=append, metadata=entries, kw...) do w
+            pushpartition!(w, table, Tables.rows(table))
+        end
+        return dst
+    end
     if !(table isa Rows || Tables.istable(table)) && partitions isa Tuple{Any}
         isdatumcollection(table) ||
             throw(ArgumentError("`Avro.write(dst, x)` writes Tables.jl sources and vectors or iterators of datums, not $(typeof(table)); use `Avro.encode!` to write one datum"))
         datums = table isa AbstractVector && isconcretetype(eltype(table)) ? table : [x for x in table]
         Tables.istable(datums) && return write(dst, datums; schema=s, name=name, namespace=namespace, metadata=metadata, append=append, limits=limits, kw...)
-        T = eltype(datums)
-        s === nothing && (s = Avro.schema(T; name=name, namespace=namespace))
+        s === nothing && (s = Avro.schema(eltype(datums); name=name, namespace=namespace))
+        # `eltype(datums)` rather than a local: a closure holds a type it captures as a `DataType`, which dispatches at run time
         Writer(dst, s; limits=limits, append=append, metadata=entries, kw...) do w
-            pushrowsof!(w, i -> datums[firstindex(datums) + i - 1], T, length(datums))
+            pushrowsof!(w, i -> datums[firstindex(datums) + i - 1], eltype(datums), length(datums))
         end
         return dst
     end
@@ -1079,19 +1068,78 @@ function isdatumcollection(x)
 end
 
 # A table column the record has no field for would silently vanish.
-function checkcolumns(@nospecialize(names), s::Schema)
+function checkcolumns(names, @nospecialize(s::Schema))
     s isa RecordSchema || return nothing
     extra = Symbol[]
     for n in names
         haskey(s.fieldindex, Symbol(n)) || push!(extra, Symbol(n))
     end
-    isempty(extra) || throw(ArgumentError("the source has columns $extra that record $(fullname(s)) lacks; select the columns to write first"))
+    isempty(extra) || extracolumnserror(extra, s)
     return nothing
+end
+
+# Printing the column names needs the run-time `show` of symbols, which programs compiled by `juliac --trim`
+# leave out; their message omits the names.
+@noinline function extracolumnserror(extra::Vector{Symbol}, s::RecordSchema)
+    tail = string(" that record ", fullname(s), " lacks; select the columns to write first")
+    msg = try
+        runtimecall(string, "the source has columns ", extra, tail)::String
+    catch err
+        notcompiled(err, string) || rethrow()
+        string("the source has columns", tail)
+    end
+    throw(ArgumentError(msg))
 end
 
 # A column type that says nothing about how to derive a schema: `Any`, `Real` and the like.
 function isopentype(@nospecialize(T))
     return any(m -> isabstracttype(m) && !(m <: Union{AbstractString,AbstractVector,AbstractDict}), Base.uniontypes(T))
+end
+
+# The `NamedTuple` row type of a vector of one concrete `NamedTuple` type, or of a `NamedTuple` of vectors, of at
+# most `TYPED_ROW_COLUMNS` columns, none of an open type (`isopentype`); `nothing` for other sources. A constant
+# where the source's type is.
+function typedrows(x)
+    R = x isa AbstractVector ? eltype(x) : x isa NamedTuple && vectorcolumns(x) ? columnrowtype(typeof(x)) : nothing
+    (R isa DataType && R <: NamedTuple && isconcretetype(R)) || return nothing
+    return fieldcount(R) <= TYPED_ROW_COLUMNS && !opencolumns(R) ? R : nothing
+end
+
+@generated function opencolumns(::Type{R}) where {R<:NamedTuple}
+    return any(isopentype, fieldtypes(R))
+end
+
+# The record schema `Avro.schema(::Tables.Schema)` derives from the columns of `R`, derived from the field types
+# known when compiling.
+function tableschema(::Type{R}, name::AbstractString, namespace::AbstractString) where {R<:NamedTuple}
+    ctx = DeriveContext(1)
+    full = FullName(checkderivedname(name, "name", "pass a valid `name=`"), checkderivednamespace(namespace))
+    rec = RecordSchema(full, String[], String[], nothing, false, Props(), NodeMeta())
+    registerderived!(ctx, rec, Tables.Schema)
+    column! = function (col::Symbol, ::Type{CT}) where {CT}
+        fn = checkderivedname(col, "column name", "rename the column")
+        fs = try
+            derive(ctx, CT, nothing, full.namespace)
+        catch err
+            err isa ArgumentError || rethrow()
+            msg = err.msg                                      # declared `AbstractString`; Avro's are `String`s
+            throw(ArgumentError(columnerror(String(col), typedescriptionof(CT), msg isa String ? msg : "no conventional Avro schema")))
+        end
+        push!(rec.fields, Field(fn, fs, nothing, nodefault, :ascending, String[], Props()))
+        return nothing
+    end
+    foreachfield(column!, R)
+    indexfields!(rec, (i, msg, key) -> throw(ArgumentError(msg)))
+    return finalizepublic!(rec)
+end
+
+# `typedescription(T)`, computed when the method compiles.
+@generated function typedescriptionof(::Type{T}) where {T}
+    return typedescription(T)
+end
+
+@noinline Base.@constprop :none function columnerror(column::String, type::String, msg::String)
+    return string("column ", column, " of type ", type, ": ", msg)
 end
 
 # The partition, its rows and the `Tables.Schema` a record schema derives from. Rows reporting no schema
@@ -1121,27 +1169,19 @@ end
 end
 
 """
-Push one partition. A column table whose columns match the record schema's fields in order (up to the
-aligned-row width) is pushed as typed `NamedTuple` rows, which take the writer's aligned fast path, as
-is an aligned vector of one concrete `NamedTuple` type. Other column tables and strided NamedTuple
-vectors with every field present use per-field cells; other sources are pushed row by row.
+Push one partition: a vector of one concrete `NamedTuple` type through the row type's write node, a column
+table with a vector column for every field of the record schema through its columns' element types, and
+other sources row by row.
 """
 function pushpartition!(w::Writer, part, rows)
     if part isa Table && isempty(Tables.columnnames(part))      # no column carries a zero-column table's row count
         foreach(_ -> push!(w, (;)), 1:length(part))
         return w
     end
-    rows isa AbstractVector && isconcretetype(eltype(rows)) && eltype(rows) <: NamedTuple &&
-        return pushnamedtuples!(w, rows)
-    if Tables.columnaccess(typeof(part))
-        cols = Tables.columns(part)
-        names = Tables.columnnames(cols)
-        if alignedcolumns(w.schema, names)
-            symbols = Tuple(Symbol(n) for n in names)
-            return pushcolumns!(w, NamedTuple{symbols}(Tuple(Tables.getcolumn(cols, i) for i in eachindex(symbols))))
-        end
-        pushcells!(w, cols) && return w
+    if rows isa AbstractVector && isconcretetype(eltype(rows)) && eltype(rows) <: NamedTuple
+        return pushrowsof!(w, i -> @inbounds(rows[firstindex(rows) + i - 1]), eltype(rows), length(rows))
     end
+    Tables.columnaccess(typeof(part)) && pushcolumns!(w, Tables.columns(part)) && return w
     known = Tables.schema(rows) !== nothing
     for row in rows
         known || checkcolumns(row isa AbstractDict ? keys(row) : Tables.columnnames(row), w.schema)
@@ -1150,106 +1190,158 @@ function pushpartition!(w::Writer, part, rows)
     return w
 end
 
-function alignedcolumns(s::Schema, names)
+# The widest column table written as `NamedTuple` rows, whose code compiles once per table type; wider
+# tables compile once per column type instead and write each row through one run-time call per cell.
+const TYPED_ROW_COLUMNS = 32
+
+"""
+Push every row of the column table `cols`. Returns `false`, having pushed nothing, when the record schema
+has a field without a column or a column is not a vector (the row path then applies).
+"""
+function pushcolumns!(w::Writer, cols)
+    s = w.schema
     s isa RecordSchema || return false
-    0 < length(names) == length(s.fields) <= 32 || return false
-    for (i, n) in enumerate(names)
-        (n isa Union{Symbol,AbstractString} && String(n) == s.fields[i].name) || return false
+    names = Tables.columnnames(cols)
+    (isempty(names) || !coversfields(s, names)) && return false
+    cols isa NamedTuple && fieldcount(typeof(cols)) <= TYPED_ROW_COLUMNS && return pushcolumntable!(w, cols)
+    length(names) > TYPED_ROW_COLUMNS && return pushcolumncells!(w, cols, names)
+    symbols = Tuple(Symbol(n) for n in names)
+    return pushcolumntable!(w, NamedTuple{symbols}(Tuple(Tables.getcolumn(cols, n) for n in names)))
+end
+
+# Whether the names include a column for every field of `s` (by name, as rows are matched).
+function coversfields(s::RecordSchema, names)
+    covered = falses(length(s.fields))
+    for n in names
+        (n isa Union{Symbol,AbstractString}) || continue
+        i = recordfieldindex(s, n)
+        i == 0 || (covered[i] = true)
     end
+    return all(covered)
+end
+
+function pushcolumntable!(w::Writer, cols::NamedTuple)
+    vectorcolumns(cols) || return false
+    R = columnrowtype(typeof(cols))
+    n = length(first(cols))
+    samelengths(cols, n) || throw(ArgumentError("table columns have different lengths"))
+    pushrowsof!(w, i -> columnrow(cols, i), R, n)
     return true
 end
 
-function pushcolumns!(w::Writer, cols::NamedTuple{K}) where {K}
-    return pushcolumns!(w, cols, NamedTuple{K,Tuple{map(eltype, values(cols))...}})
+# The row type of a NamedTuple of columns: their names, and their element types as field types.
+@generated function columnrowtype(::Type{C}) where {C<:NamedTuple}
+    return NamedTuple{fieldnames(C),Tuple{(eltype(fieldtype(C, j)) for j in 1:fieldcount(C))...}}
 end
 
-function pushcolumns!(w::Writer, cols::NamedTuple, ::Type{R}) where {R<:NamedTuple}
-    n = length(first(cols))
-    for c in cols
-        length(c) == n || throw(ArgumentError("table columns have different lengths"))
+@generated function vectorcolumns(cols::C) where {C<:NamedTuple}
+    return all(j -> fieldtype(C, j) <: AbstractVector, 1:fieldcount(C))
+end
+
+@generated function samelengths(cols::C, n::Int) where {C<:NamedTuple}
+    return Expr(:block, (:(length(getfield(cols, $j)) == n || return false) for j in 1:fieldcount(C))..., true)
+end
+
+# Row `i` of the columns, a `columnrowtype`.
+@generated function columnrow(cols::C, i::Int) where {C<:NamedTuple}
+    values = (:(getfield(cols, $j)[firstindex(getfield(cols, $j)) + i - 1]) for j in 1:fieldcount(C))
+    return :($(columnrowtype(C))(($(values...),)))
+end
+
+# A column of a wide table and the write node of its element type.
+struct ColumnCell{C<:AbstractVector}
+    column::C
+    node::WriteNode
+end
+
+# The row being written; a mutable cursor, so the run-time call per cell does not box the row index.
+mutable struct CellRow
+    i::Int
+end
+
+function cellvalue(c::ColumnCell, row::CellRow)
+    return c.column[firstindex(c.column) + row.i - 1]
+end
+
+@noinline function encodecell(c::ColumnCell{C}, e::Encoder, row::CellRow) where {C}
+    encodenode(eltype(C), c.node, e, cellvalue(c, row))
+    return nothing
+end
+
+function pushcolumncells!(w::Writer, cols, names)
+    s = w.schema::RecordSchema
+    p = w.plan::WRecord
+    positions = zeros(Int, length(s.fields))
+    for (j, name) in enumerate(names)
+        name isa Union{Symbol,AbstractString} || continue
+        i = recordfieldindex(s, name)
+        i == 0 || positions[i] != 0 || (positions[i] = j)
     end
-    return pushrowsof!(w, i -> R(ntuple(j -> cols[j][firstindex(cols[j]) + i - 1],
-                                       Val(fieldcount(R)))), R, n)
-end
-
-"""
-Push every row of the column table `cols` through one cell per schema field. Returns `false`, having
-pushed nothing, when a field has no vector column (the row path then applies).
-"""
-function pushcells!(w::Writer, cols)
-    p = w.plan
-    (p isa WRecord && !isempty(p.fields)) || return false
-    positions = recordrowpositions(p, cols)
-    any(==(0), positions) && return false
-    n = length(Tables.getcolumn(cols, positions[1]))
-    cells = Vector{WriteCell}(undef, length(positions))
+    cells = Vector{ColumnCell}(undef, length(positions))
+    n = -1
     for (k, j) in enumerate(positions)
         column = Tables.getcolumn(cols, j)
         column isa AbstractVector || return false
+        n < 0 && (n = length(column))
         length(column) == n || throw(ArgumentError("table columns have different lengths"))
-        cells[k] = ColumnCell(p.fields[k], column)
+        cells[k] = columncell(column, s.fields[k].schema, p.fields[k])
     end
-    pushcellrows!(w, cells, n)
-    return true
-end
-
-function pushcellrows!(w::Writer, cells::Vector{WriteCell}, n::Int)
     checkwritable(w)
     row = CellRow(0)
     try
         for i in 1:n
             row.i = i
-            pushaligneddatum!(w, row, cells)
+            pushcellrow!(w, cells, row)
         end
     catch e
         poison!(w, e)
         rethrow()
     end
-    return w
-end
-
-function pushnamedtuples!(w::Writer, rows::AbstractVector{R}) where {R<:NamedTuple}
-    isempty(rows) && return w
-    if !alignedcolumns(w.schema, fieldnames(R)) && pushrowcells!(w, rows)
-        return w
-    end
-    return pushrowsof!(w, i -> @inbounds(rows[firstindex(rows) + i - 1]), R, length(rows))
-end
-
-"Use typed field views over the original rows without materializing columns or boxing whole rows."
-function pushrowcells!(w::Writer, rows::AbstractVector{R}) where {R<:NamedTuple}
-    # Custom vectors may compute or consume a row on access; only strided storage permits field views.
-    rows isa StridedVector{R} || return false
-    p = w.plan
-    (p isa WRecord && !isempty(p.fields)) || return false
-    positions = recordfieldpositions(p.schema, R)
-    any(==(0), positions) && return false
-    cells = Vector{WriteCell}(undef, length(positions))
-    for (k, j) in enumerate(positions)
-        cells[k] = RowCell(p.fields[k], rows, j)
-    end
-    pushcellrows!(w, cells, length(rows))
     return true
 end
 
-"Push `row(i)` for `i` in `1:n`; aligned rows skip the dynamic plan lookup."
+function columncell(column::C, @nospecialize(schema::Schema), @nospecialize(plan::Plan)) where {C<:AbstractVector}
+    return ColumnCell{C}(column, writenode(eltype(C), schema, plan))
+end
+
+# One row of cells as a record datum, as `pushdatum!` writes one: the failure of a row raises again with its
+# value path from the generic route, given the row's values as a `Record`.
+function pushcellrow!(w::Writer, cells::Vector{ColumnCell}, row::CellRow)
+    e = w.encoder
+    start, values = e.pos, e.values
+    try
+        countvalue!(e)
+        enter!(e)
+        for c in cells
+            encodecell(c, e, row)
+        end
+        leave!(e)
+    catch err
+        e.pos, e.values, e.depth, e.expected = start, values, 0, nothing
+        empty!(e.path)
+        err isa EncodeError &&
+            replaydatum(w.plan, w.limits, Record(w.schema::RecordSchema, Any[cellvalue(c, row) for c in cells], Val(:unchecked)), w.schema)
+        rethrow()
+    end
+    return commitdatum!(w, start, values)
+end
+
+"Push `row(i)` for `i` in `1:n` through the write node of their type `R` (rows of an abstract `R`, by their own types)."
 function pushrowsof!(w::Writer, row::F, ::Type{R}, n::Int) where {F,R}
-    plans = alignedplans(w.plan, R)
-    if plans === nothing
+    if !isconcretetype(R)
         for i in 1:n
             push!(w, row(i))
         end
         return w
     end
-    return pushalignedrows!(w, row, plans, n)
-end
-
-"Specialised on the plans so no row is boxed."
-function pushalignedrows!(w::Writer, row::F, plans::P, n::Int) where {F,P<:Tuple}
     checkwritable(w)
     try
+        node = writenode!(w.nodes, R)
+        e = w.encoder
         for i in 1:n
-            pushaligneddatum!(w, row(i), plans)
+            start, values = e.pos, e.values
+            @inline encodetyped!(R, node, e, row(i), w.plan, w.schema)
+            commitdatum!(w, start, values)
         end
     catch e
         poison!(w, e)
