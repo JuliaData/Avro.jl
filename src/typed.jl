@@ -606,10 +606,8 @@ function nodevalue(::Type{T}, @nospecialize(node::TypedNode), d::Decoder) where 
     end
     if T isa Union
         N, X = splitoptional(T)
-        if X !== nothing
-            node isa NullableNode{T,X} && return nullablevalue(node, d)
-            node isa LeafNode{N} && return leafvalue(node, d)
-        end
+        X === nothing || (node isa NullableNode{T,X} && return nullablevalue(node, d))
+        N !== Union{} && node isa LeafNode{N} && return leafvalue(node, d)       # a `null` schema
         node isa UnionNode{T} && return unionvalue(node, d)
         node isa SemanticNode{T} && return semanticnodevalue(node, d)::T
         X === nothing && nodeerror()

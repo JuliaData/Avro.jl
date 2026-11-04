@@ -442,6 +442,8 @@ end
         @test plan(LL, ll) isa Avro.RecordNode
         @test Avro.decode(P("[\"int\",\"string\"]"), UInt8[0x00, 0x00], Union{Int32,String}) === Int32(0)
         @test Avro.decode(P("[\"null\",\"int\"]"), UInt8[0x00], Union{Missing,Int32}) === missing
+        @test Avro.decode(P("\"null\""), UInt8[], Union{Missing,Nothing,Int64}) === missing     # several non-null members
+        @test Avro.decode(P("\"null\""), UInt8[], Union{Missing,Int32,String}) === missing
         tree = P("{\"type\":\"record\",\"name\":\"Node\",\"fields\":[{\"name\":\"name\",\"type\":\"string\"},{\"name\":\"children\",\"type\":{\"type\":\"array\",\"items\":\"Node\"}}]}")
         n = Node("r", [Node("a", Node[]), Node("b", [Node("c", Node[])])])
         @test Avro.decode(tree, Avro.encode(tree, n), Node) == n
