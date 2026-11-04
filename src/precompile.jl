@@ -66,19 +66,26 @@ const PRECOMPILED_FIELDS = (Int64(1), Int32(1), 1.0, 1.0f0, true, "a", :a, UInt8
         rs = schema(R)
         row = R(Tuple(fieldvalues))
         DatumReader(rs, R)(DatumWriter(rs, R)(row))
-        # File paths, memory-mapped and streamed.
-        mktempdir() do dir
-            path = joinpath(dir, "workload.avro")
-            write(path, prows; schema=s)
-            write(path, prows; schema=s, codec=:zstandard)
-            Tables.columntable(Table(path))
-            for row in Rows(path)
-                row isa Record
+        # File paths, memory-mapped and streamed, where a temporary directory is usable. Every reader closes
+        # before its file is removed, which Windows requires of a mapped file.
+        try
+            mktempdir() do dir
+                path = joinpath(dir, "rows.avro")
+                write(path, prows; schema=s)
+                write(joinpath(dir, "rows-zstandard.avro"), prows; schema=s, codec=:zstandard)
+                Tables.columntable(Table(path))
+                Rows(path) do rows
+                    for row in rows
+                        row isa Record
+                    end
+                end
+                Rows(rows -> foreach(identity, rows), path, typeof(prows[1]))
+                Rows(rows -> foreach(identity, rows), path, PrecompiledRow; mmap=false)
+                write(joinpath(dir, "columns.avro"), (id=[Int64(1)], name=["a"]))
+                write(joinpath(dir, "structs.avro"), [PrecompiledRow(1, "a", 1.0, true)])
             end
-            foreach(identity, Rows(path, typeof(prows[1])))
-            foreach(identity, Rows(path, PrecompiledRow; mmap=false))
-            write(path, (id=[Int64(1)], name=["a"]))
-            write(path, [PrecompiledRow(1, "a", 1.0, true)])
+        catch err
+            err isa Base.IOError || rethrow()
         end
         Tables.columntable(Table(tobuffer(prows; schema=s); select=(:id,)))
         Tables.columntable(Table(tobuffer(prows)))           # the schema derived from the rows
