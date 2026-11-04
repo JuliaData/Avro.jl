@@ -589,7 +589,7 @@ end
     end
     @testset "sources: path, mmap=false stream, IO, bytes" begin
         if isfile("/proc/self/maps")                     # Linux lists the process's mapped files
-            mapped(path) = occursin(realpath(path), read("/proc/self/maps", String))
+            mapped(path) = any(l -> endswith(l, realpath(path)), eachline("/proc/self/maps"))   # procfs reports size 0, so `read` stops early
             mapfile = joinpath(mktempdir(), "mapped.avro")
             Avro.write(mapfile, [(x=Int64(1),)])
             r = Avro.Reader(mapfile)
