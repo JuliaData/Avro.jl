@@ -168,6 +168,25 @@ jobs:
       - name: Read 1 files with 1.10
         run: |
           julia --project=. test/crossversion/read.jl /tmp/from1
+  trim:
+    # Informational on the Julia prerelease; on 1.13 the harness reports a crash from JuliaLang/julia#63664 as broken.
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
+    name: juliac --trim=safe - Julia ${{ matrix.version }} - ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.version == 'pre' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ['1', 'pre']
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: ${{ matrix.version }}
+      - uses: julia-actions/cache@v2
+      - name: Build and run the trimmed workload
+        run: julia --color=yes --startup-file=no test/trim_compile_tests.jl
   docs:
     if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
     name: Documentation

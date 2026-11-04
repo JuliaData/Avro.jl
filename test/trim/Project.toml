@@ -1,0 +1,9 @@
+[deps]
+Avro = "65fc3dcb-49af-4f0c-a340-607eef534a14"
+JuliaC = "acedd4c2-ced6-4a15-accc-2607eb759ba2"
+
+[sources]
+Avro = {path = "../.."}
+
+[compat]
+JuliaC = "=0.3.12"
