@@ -1,7 +1,9 @@
 # Parallel container decode for `Avro.Table` over byte and mapped sources: block headers are pre-scanned
 # into a block table, the final columns are preallocated at the claimed row count, and every block
 # decodes directly at its row offset. Workers take block indices in order; the lowest failing index's
-# error is the one raised, so results, acceptance and errors are identical at every `ntasks`.
+# error is the one raised, so results, acceptance and errors are identical at every `ntasks`. Workers stop
+# taking blocks once what they decompressed exceeds what the whole file may inflate to, so a read never
+# decompresses more than that bound plus one block per worker.
 
 "One pre-scanned block: payload location, framing, and its prefix-sum row offset."
 struct BlockEntry
@@ -50,16 +52,18 @@ function prescanblocks(r::Reader)
     return PrescanResult(entries, rows, pending)
 end
 
-"The lowest block index that failed so far (`typemax(Int)` while none has)."
-mutable struct FailBox
-    @atomic index::Int
+"What the workers of one parallel decode share."
+mutable struct WorkerState
+    @atomic taken::Int       # the last block index handed out
+    @atomic failed::Int      # the lowest block index that failed so far (`typemax(Int)` while none has)
+    @atomic inflated::Int    # the read's decompressed bytes so far
 end
 
-function recordfailure!(fail::FailBox, index::Int)
+function recordfailure!(state::WorkerState, index::Int)
     while true
-        cur = @atomic fail.index
+        cur = @atomic state.failed
         index >= cur && return nothing
-        (@atomicreplace fail.index cur => index).success && return nothing
+        (@atomicreplace state.failed cur => index).success && return nothing
     end
 end
 
@@ -101,7 +105,8 @@ end
 """
 Charge blocks `1:upto` to the read's inflation budget in file order, stopping at the first block that was not
 decompressed. Workers decode blocks in any order, so the budget is charged afterwards, in order, which keeps
-the outcome independent of `ntasks`.
+the outcome independent of `ntasks`. When the workers stopped on the whole-file bound, the blocks they took
+are a prefix of the file, and the charge fails within it unless one of its blocks failed first.
 """
 function inflateinorder!(r::Reader, entries::Vector{BlockEntry}, sizes::Vector{Int}, upto::Int)
     for i in 1:min(upto, length(entries))
@@ -121,19 +126,26 @@ function decodeentry!(r::Reader, plan, cols::Vector{ColumnBuilder}, cells::Vecto
     return decoderows!(plan, cells, d, e.count)
 end
 
-function decodeworker!(ch::Channel{Int}, r::Reader, plan, projection::Union{Nothing,Projection},
-                       finals::Vector{AbstractVector}, entries::Vector{BlockEntry}, fail::FailBox,
-                       errors::Vector{Union{Nothing,Exception}}, sizes::Vector{Int})
+# Every block a worker takes, it decompresses and decodes, so the blocks handed out stay a decoded prefix.
+# Past `cap`, the most the whole file may inflate to, no further block is handed out.
+function decodeworker!(state::WorkerState, r::Reader, plan, projection::Union{Nothing,Projection},
+                       finals::Vector{AbstractVector}, entries::Vector{BlockEntry},
+                       errors::Vector{Union{Nothing,Exception}}, sizes::Vector{Int}, cap::Int)
     cols = directbuilders(plan, projection, finals)           # builders are per worker
     cells = rowcells(plan, cols)
-    for i in ch
-        (@atomic fail.index) < i && break                      # a lower block already failed; every later index is higher
+    n = length(entries)
+    while true
+        i = @atomic state.taken += 1
+        i > n && break
+        (@atomic state.failed) < i && break                    # a lower block already failed; every later index is higher
         try
             e = entries[i]
-            decodeentry!(r, plan, cols, cells, e, blockdecoder(r, e, sizes))
+            d = blockdecoder(r, e, sizes)
+            (@atomic state.inflated += sizes[i]) > cap && (@atomic state.taken = n)
+            decodeentry!(r, plan, cols, cells, e, d)
         catch err
             errors[i] = err
-            recordfailure!(fail, i)
+            recordfailure!(state, i)
             break
         end
     end
@@ -142,23 +154,27 @@ end
 
 function decodeparallel!(r::Reader, plan, projection::Union{Nothing,Projection}, finals::Vector{AbstractVector},
                          entries::Vector{BlockEntry}, nworkers::Int, sizes::Vector{Int})
-    fail = FailBox(typemax(Int))
+    state = WorkerState(0, typemax(Int), r.decompressed)
     errors = Vector{Union{Nothing,Exception}}(nothing, length(entries))
-    ch = Channel{Int}(length(entries))
-    for i in eachindex(entries)
-        put!(ch, i)
+    compressed = r.compressed
+    for e in entries
+        compressed = satadd(compressed, e.size)
     end
-    close(ch)
-    workers = Task[errormonitor(Threads.@spawn decodeworker!(ch, r, plan, projection, finals, entries, fail, errors, sizes))
+    cap = inflationcap(r.limits, compressed)
+    workers = Task[errormonitor(Threads.@spawn decodeworker!(state, r, plan, projection, finals, entries, errors, sizes, cap))
                    for _ in 1:nworkers]
     try
-        foreach(wait, workers)
+        for t in workers
+            wait(t)
+        end
     catch
-        recordfailure!(fail, 0)                                # interrupted: no worker may outlive the source
-        foreach(t -> (istaskdone(t) || try wait(t) catch end), workers)
+        recordfailure!(state, 0)                               # interrupted: no worker may outlive the source
+        for t in workers
+            istaskdone(t) || try wait(t) catch end
+        end
         rethrow()
     end
-    index = @atomic fail.index
+    index = @atomic state.failed
     inflateinorder!(r, entries, sizes, index)
     index <= length(entries) && throw(errors[index]::Exception)
     return nothing

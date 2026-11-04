@@ -242,6 +242,14 @@ end
         @test_throws Avro.LimitError Avro.Table(file; mmap=false, limits=tight)
         @test_throws Avro.LimitError collect(Avro.Rows(file; limits=tight))
         @test any(issue -> occursin("max_inflation", issue), Avro.inspect(file; limits=tight).issues)
+        # parallel workers stop near the whole file's bound rather than decompressing every block first
+        bomb = take!(Avro.tobuffer((x=fill(zeros(UInt8, 1 << 20), 200),); codec=:zstandard))
+        small = Avro.Limits(max_bytes=2 << 20, max_inflation=2)
+        bombread() = try; Avro.Table(bomb; ntasks=4, limits=small); nothing; catch e; e; end
+        bombread()
+        work = @timed bombread()
+        @test work.value isa Avro.LimitError && work.value.limit === :max_inflation
+        @test work.bytes < 100 << 20                                  # over 400 MiB when every block decompresses
         # the writer refuses to emit what its own limits could not read back
         writeerr = try; Avro.tobuffer(zeros_; schema=s, codec=:deflate, limits=tight); nothing; catch e; e; end
         @test writeerr isa Avro.LimitError && writeerr.limit === :max_inflation
