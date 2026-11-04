@@ -1333,7 +1333,7 @@ function pushcolumncells!(w::Writer, cols, names)
     for (k, j) in enumerate(positions)
         column = Tables.getcolumn(cols, j)
         column isa AbstractVector || return false
-        n < 0 && (n = length(column))
+        n < 0 && (n = length(column)::Int)        # a column of an abstract type would leave the row loop's bound boxed
         length(column) == n || throw(ArgumentError("table columns have different lengths"))
         cells[k] = columncell(column, s.fields[k].schema, p.fields[k])
     end
