@@ -1116,13 +1116,13 @@ function isopentype(@nospecialize(T))
     return any(m -> isabstracttype(m) && !(m <: Union{AbstractString,AbstractVector,AbstractDict}), Base.uniontypes(T))
 end
 
-# The `NamedTuple` row type of a vector of one concrete `NamedTuple` type, or of a `NamedTuple` of vectors, of at
-# most `TYPED_ROW_COLUMNS` columns, none of an open type (`isopentype`); `nothing` for other sources. A constant
-# where the source's type is.
+# The `NamedTuple` row type of a vector of one concrete `NamedTuple` type, or of a `NamedTuple` of vectors, none of
+# whose columns is of an open type (`isopentype`); `nothing` for other sources. A constant where the source's type
+# is.
 function typedrows(x)
     R = x isa AbstractVector ? eltype(x) : x isa NamedTuple && vectorcolumns(x) ? columnrowtype(typeof(x)) : nothing
     (R isa DataType && R <: NamedTuple && isconcretetype(R)) || return nothing
-    return fieldcount(R) <= TYPED_ROW_COLUMNS && !opencolumns(R) ? R : nothing
+    return opencolumns(R) ? nothing : R
 end
 
 function anyopencolumn(@nospecialize(R))
