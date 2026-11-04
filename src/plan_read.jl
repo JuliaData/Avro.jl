@@ -79,7 +79,7 @@ end
 
 # The generic read plan of a schema, memoised per node id so recursive records share one `RecordPlan`.
 # `mode`: `:little` reads legacy little-endian decimals; `:framing` reads every logical type as its
-# underlying encoding, so only the framing of a datum is checked (`Avro.inspect`).
+# underlying encoding into `Any` containers, so only the framing of a datum is checked (`Avro.inspect`).
 function readplan(@nospecialize(s::Schema); mode::Symbol=:standard)
     return readplan(s, Vector{Union{Nothing,Plan}}(nothing, graphinfo(s).nodes), mode)
 end
@@ -133,9 +133,9 @@ function buildreadplan(@nospecialize(s::Schema), memo::Vector{Union{Nothing,Plan
     elseif s isa EnumSchema
         return EnumPlan(s)
     elseif s isa ArraySchema
-        return ArrayPlan(readplan(s.items, memo, mode), elementtype(s.items), minsize(s.items))
+        return ArrayPlan(readplan(s.items, memo, mode), mode === :framing ? Any : elementtype(s.items), minsize(s.items))
     elseif s isa MapSchema
-        return MapPlan(readplan(s.values, memo, mode), elementtype(s.values), minsize(s.values))
+        return MapPlan(readplan(s.values, memo, mode), mode === :framing ? Any : elementtype(s.values), minsize(s.values))
     elseif s isa UnionSchema
         return UnionPlan(Plan[readplan(b, memo, mode) for b in s.branches], nullablebranch(s))
     end

@@ -1529,5 +1529,8 @@ end
         close(Avro.Writer(decimalio, shareddecimal))
         decimalreport = Avro.inspect(take!(decimalio))
         @test count(issue -> occursin("misframed", issue), decimalreport.issues) == 1
+        logicalrows = [(d=[Dates.Date(2020, 1, 1)], u=Dict("a" => UUID(UInt128(1))), t=[Dates.Time(1)])]
+        logicalreport = Avro.inspect(take!(Avro.tobuffer(logicalrows)))    # containers of logical values walk as their encodings
+        @test isempty(logicalreport.issues) && logicalreport.datums == 1
     end
 end
