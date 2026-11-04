@@ -26,13 +26,15 @@
 
 ## Trimmed programs
 
-Programs compiled with `juliac --trim=safe` read and write Avro through the types they name:
+Programs compiled with `juliac --trim=safe` on Julia 1.13 or later read and write Avro through the types they
+name:
 
 * **Reading**: `Avro.Rows(src, T)`, `Avro.DatumReader(schema, T)`, `Avro.decode(schema, bytes, T)` and
   `Avro.SingleObjectReader(store, T)`, where `T` is a `NamedTuple` or a plain struct whose fields Avro
   decodes directly (see [Typed decoding](encoding.md#Typed-decoding)).
-* **Writing**: `Avro.write(dst, rows)` for vectors of `NamedTuple`s or structs and for `NamedTuple`s of
-  vectors, `Avro.Writer`, `Avro.DatumWriter(schema, T)` and `Avro.encode(schema, x)`.
+* **Writing**: `Avro.write(dst, rows)` for vectors of `NamedTuple`s or structs and for `NamedTuple`s of up to
+  32 vectors (wider ones write through a run-time call per cell, so write their rows instead), `Avro.Writer`,
+  `Avro.DatumWriter(schema, T)` and `Avro.encode(schema, x)`.
 * **Sources and codecs**: paths (memory-mapped or `mmap=false`), byte vectors, `IOBuffer`s and streams; the
   null, deflate, snappy and zstandard codecs, compressed on several tasks when the program runs threads.
 
