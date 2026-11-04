@@ -19,5 +19,9 @@ are calibrated for an Apple M3 Max and compare against Avro.jl 1.1.2 measured th
 | `Avro.parseschema` of the interop schema | ≤ 100 µs |
 | package load / time to first table | ≤ 0.5 s / ≤ 1.5 s |
 
-A run on that host on 2026-11-01 (Julia 1.12.6, with other work running) wrote the 1 M rows in 0.058 s,
-16× faster than 1.1.2, and read them into a table in 0.083 s, 61× faster.
+A run on that host on 2026-11-04 (Julia 1.12.6, with other work running) wrote the 1 M rows in 0.059 s,
+16× faster than 1.1.2, and read them into a table in 0.033 s, about 150× faster.
+
+The default test suite checks what does not depend on the host (`test/gates.jl`): parsing the interop schema
+takes at most 1,000 allocations, a prepared typed decode at most 1, and after a warm-up, decoding random schemas
+creates no new method instances.
