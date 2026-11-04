@@ -346,7 +346,7 @@ function isbytetuple(::Type{T}, n::Int) where {T}
 end
 
 function buildarraynode(::Type{T}, s::ArraySchema, p::ArrayPlan, memo::TypedMemo) where {T}
-    T <: Vector || return SemanticNode{T}(p, s)
+    (isconcretetype(T) && T <: Vector) || return SemanticNode{T}(p, s)
     items = buildnode(eltype(T), s.items, p.items, memo)
     items isa SemanticNode && return SemanticNode{T}(p, s)
     return ArrayNode{T,eltype(T)}(items, p.minsize)
@@ -428,15 +428,13 @@ function resolvednullable(::Type{T}, ::Type{X}, s::UnionSchema, p::UnionResolveP
     return NullableNode{T,X}(copy(p.branches), inner)
 end
 
-# Fill `node` for record `s` and its plan; `false` when the record must take the semantic route.
+# Fill `node` for record `s` and its plan; `false` when the record must take the semantic route. That is
+# decided before any field node is built, since field nodes can refer back to `node`.
 Base.@nospecializeinfer function recordnode!(node::RecordNode{T}, s::RecordSchema, @nospecialize(p::Plan), memo::TypedMemo) where {T}
     fieldof = recordfieldpositions(s, T)
     steps = p isa ResolvedRecordPlan ? p.steps : Pair{Int,Plan}[Pair{Int,Plan}(i, f) for (i, f) in enumerate((p::RecordPlan).fields)]
-    for (slot, sp) in steps
+    for (slot, _) in steps
         k = slot == 0 ? 0 : fieldof[slot]
-        push!(node.plans, sp)
-        push!(node.slots, k)
-        push!(node.nodes, k == 0 ? nothing : fieldnode(T, k, NodeSite(s.fields[slot].schema, sp, memo)))
         k == 0 || (node.filled[k] = true)
     end
     covered = copy(node.filled)
@@ -451,6 +449,12 @@ Base.@nospecializeinfer function recordnode!(node::RecordNode{T}, s::RecordSchem
         end
     end
     implicitdefaults!(node.defaults, T, covered) || return false
+    for (slot, sp) in steps
+        k = slot == 0 ? 0 : fieldof[slot]
+        push!(node.plans, sp)
+        push!(node.slots, k)
+        push!(node.nodes, k == 0 ? nothing : fieldnode(T, k, NodeSite(s.fields[slot].schema, sp, memo)))
+    end
     node.aligned = node.slots == 1:fieldcount(T)
     return true
 end

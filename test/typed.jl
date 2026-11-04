@@ -192,6 +192,24 @@ function StructUtils.fieldtags(::Avro.AvroStyle, ::Type{OversizedTypedFieldName}
     return (x=(name=OVERSIZED_TYPED_FIELD_NAME,),)
 end
 
+struct AnyTags
+    tags::Vector
+end
+
+struct RecInner{O}
+    back::Union{Nothing,O}
+end
+struct RecOuter                                         # its defaults send it to the semantic route
+    x::Int64
+    inner::RecInner{RecOuter}
+    extra::Union{Nothing,String}
+end
+StructUtils.fielddefaults(::Avro.AvroStyle, ::Type{RecOuter}) = (extra="dflt",)
+struct RecPair
+    a::RecOuter
+    b::RecInner{RecOuter}
+end
+
 @testset "Typed decoding" begin
     using .TypedTestTypes: Plain, Mut, Empty, MutEmpty, Bits, Guarded, Colour, red, green, blue, EnumFallback, TransactionFail, TransactionGood, Tagged, WithDefault, NoDefault, Optional, LL, Node, Shape, Circle, Lifted, Wrapper, HasWrapper, CheckedSet, SymField, Nested
     P = Avro.parseschema
@@ -440,6 +458,22 @@ end
         @test Avro.decode(arr, Avro.encode(arr, [1, missing]), Vector{Union{Nothing,Int}}) == [1, nothing]
         @test isequal(Avro.decode(arr, Avro.encode(arr, [1, missing]), Vector{Any}), [Int32(1), missing])
         @test isequal(Avro.decode(arr, Avro.encode(arr, [1, missing]), Vector{Union{Missing,Int}}), [1, missing])
+        # a record on the semantic route leaves no half-built node behind for the nodes that refer back to it
+        w = P("""{"type":"record","name":"W","fields":[
+            {"name":"a","type":{"type":"record","name":"Outer","fields":[{"name":"x","type":"long"},
+                {"name":"inner","type":{"type":"record","name":"Inner","fields":[{"name":"back","type":["null","Outer"]}]}}]}},
+            {"name":"b","type":"Inner"}]}""")
+        pair = Avro.decode(w, Avro.encode(w, (a=(x=1, inner=(back=nothing,)), b=(back=(x=2, inner=(back=nothing,)),))), RecPair)
+        @test pair == RecPair(RecOuter(1, RecInner{RecOuter}(nothing), "dflt"), RecInner{RecOuter}(RecOuter(2, RecInner{RecOuter}(nothing), "dflt")))
+    end
+
+    @testset "abstract vector targets convert on the semantic route" begin
+        tags = P("""{"type":"record","name":"AnyTags","fields":[{"name":"tags","type":{"type":"array","items":"string"}}]}""")
+        @test Avro.decode(tags, Avro.encode(tags, (tags=["a"],)), AnyTags).tags == Any["a"]
+        nested = P("""{"type":"array","items":{"type":"array","items":"string"}}""")
+        @test Avro.decode(nested, Avro.encode(nested, [["a"]]), Vector{Vector}) == [Any["a"]]
+        m = P("""{"type":"map","values":{"type":"array","items":"string"}}""")
+        @test Avro.decode(m, Avro.encode(m, Dict("k" => ["a"])), Dict{String,Vector}) == Dict("k" => Any["a"])
     end
 
     @testset "semantic route and custom hooks" begin
