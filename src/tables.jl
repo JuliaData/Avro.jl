@@ -516,7 +516,7 @@ function Base.iterate(it::RowsPartitions, yielded::Bool=false)
     else
         count, bytes = blk
     end
-    reset!(rows.decoder, bytes, 1)
+    blockcap!(reset!(rows.decoder, bytes, 1))
     cols = columnbuilders(rows.plan, rows.select, min(count, length(bytes)))    # a block's count is a claim, so columns grow
     decoderows!(rows.plan, rowcells(rows.plan, cols), rows.decoder, count)
     consumedrows!(rows, count)

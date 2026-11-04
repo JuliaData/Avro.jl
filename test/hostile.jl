@@ -221,6 +221,7 @@ end
         @test all(e -> e isa Avro.LimitError && e.limit === :max_values_per_byte, errs)
         @test sprint(showerror, errs[1]) == sprint(showerror, errs[2])
         @test_throws Avro.LimitError collect(Avro.Rows(hostile))
+        @test_throws Avro.LimitError collect(Tables.partitions(Avro.Rows(hostile)))
         # the writer splits zero-byte datums into blocks a default reader accepts
         many = Avro.tobuffer([(n=missing,) for _ in 1:2_000]; schema=nullrecord)
         bytes = take!(copy(many))
