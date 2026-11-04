@@ -272,8 +272,8 @@ Base.@nospecializeinfer function isdirect(@nospecialize(node::TypedNode), seen::
     push!(seen, node)
     node isa ArrayNode && return isdirect(node.items, seen)
     node isa MapNode && return isdirect(node.values, seen)
-    node isa UnionNode && return all(c -> isdirect(c, seen), node.branches)
-    children = node isa RecordNode ? node.nodes : node isa NullableNode ? node.branches : nothing
+    children = node isa RecordNode ? node.nodes : node isa NullableNode ? node.branches :
+               node isa UnionNode ? node.branches : nothing
     children === nothing && return true
     for c in children
         c === nothing || isdirect(c, seen) || return false

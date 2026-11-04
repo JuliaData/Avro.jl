@@ -46,8 +46,15 @@ function refersto(x::Schema, root::RecordSchema, seen::BitVector)
     id = Int(nodeid(x)) + 1
     seen[id] && return false
     seen[id] = true
-    x isa RecordSchema && return any(f -> refersto(f.schema, root, seen), x.fields)
-    x isa UnionSchema && return any(b -> refersto(b, root, seen), x.branches)
+    if x isa RecordSchema
+        for f in x.fields
+            refersto(f.schema, root, seen) && return true
+        end
+    elseif x isa UnionSchema
+        for b in x.branches
+            refersto(b, root, seen) && return true
+        end
+    end
     x isa ArraySchema && return refersto(x.items, root, seen)
     x isa MapSchema && return refersto(x.values, root, seen)
     return false
@@ -481,7 +488,7 @@ end
 
 # Whether the schema alone fixes the types of a column's values, rather than each value choosing its own.
 function typesfixed(@nospecialize(T))
-    T isa Union && return all(typesfixed, Base.uniontypes(T))
+    T isa Union && return typesfixed(T.a) && typesfixed(T.b)
     (T === Any || T === Record) && return false
     return T <: Vector ? typesfixed(eltype(T)) : T <: Dict ? typesfixed(valtype(T)) : true
 end
@@ -490,7 +497,10 @@ end
 # whose types vary by value could differ from block to block, so such rows stay one partition.
 function Tables.partitions(rows::Rows)
     rows.mode === :generic || throw(ArgumentError("only the generic record mode has Tables partitions"))
-    return all(f -> typesfixed(juliatype(f.schema)), rowschema(rows).fields) ? RowsPartitions(rows) : (rows,)
+    for f in rowschema(rows).fields
+        typesfixed(juliatype(f.schema)) || return (rows,)
+    end
+    return RowsPartitions(rows)
 end
 
 function Base.IteratorSize(::Type{RowsPartitions})

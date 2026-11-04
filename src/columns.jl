@@ -74,7 +74,11 @@ end
 # The decode cells of a record plan's builders: each run of two or more consecutive `SkipColumn`s fused
 # into a `SkipRun` (`cols` itself when there is none).
 function fuseskips(cols::Vector{ColumnBuilder})
-    any(i -> cols[i] isa SkipColumn && cols[i + 1] isa SkipColumn, 1:length(cols) - 1) || return cols
+    adjacent = false
+    for i in 1:length(cols) - 1
+        adjacent |= cols[i] isa SkipColumn && cols[i + 1] isa SkipColumn
+    end
+    adjacent || return cols
     cells = ColumnBuilder[]
     i = 1
     while i <= length(cols)
