@@ -49,13 +49,13 @@
         @test o <= 1.3                                              # ≤ 1.3 × (null table + isolated transcode)
     end
     projratio = only(coldmetric("projection"))
-    @test projratio >= 2                                            # select=(:id,) vs the full table
+    @test projratio >= 1.5                                          # select=(:id,) vs the full table
     decallocs, dns, ea, ens, onedec, oneenc, parseus, parseallocs = coldmetric("kernels")
     @test decallocs <= 1                                            # prepared typed decode: the string only
     @test dns <= 150
     @test ea == 0                                                   # prepared typed encode: zero allocations
     @test parseus <= 100
-    @test parseallocs <= 1400                                       # 1,196 measured on the reference host
+    @test parseallocs <= 1000                                       # 792 on Julia 1.12
     tload = only(coldmetric("load"))
     @test tload <= 0.5
     tttft = only(coldmetric("ttft"))

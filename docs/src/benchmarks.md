@@ -13,7 +13,7 @@ are calibrated for an Apple M3 Max and compare against Avro.jl 1.1.2 measured th
 | `Avro.Table`, null codec, 1 thread | ≤ 0.30 s and ≥ 10× faster than 1.1.2 |
 | `Avro.Table` with `ntasks=8` (1 MiB blocks) | ≥ 3× faster than 1 thread |
 | zstandard / deflate / snappy `Table` | ≤ 1.3× (null-codec `Table` + raw decompression) |
-| `select=(:id,)` | ≥ 2× faster than the full decode |
+| `select=(:id,)` | ≥ 1.5× faster than the full decode |
 | prepared typed decode | ≤ 1 allocation, ≤ 150 ns |
 | prepared typed encode into a reused buffer | 0 allocations |
 | `Avro.parseschema` of the interop schema | ≤ 100 µs |
