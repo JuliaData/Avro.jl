@@ -240,6 +240,30 @@
         @test Avro.fullname(Avro.schema(immediatevalue)) == "b.Good"
         @test immediatevalue["x"] == UInt8[0x6f, 0x6b]
     end
+    @testset "a writer union resolved into a reader leaf decodes its written branch" begin
+        wa = P("""{"type":"array","items":["null","string"]}""")
+        ra = P("""{"type":"array","items":"string"}""")
+        @test Avro.decode(wa, Avro.encode(wa, ["a", "b"]); reader_schema=ra) == ["a", "b"]
+        @test_throws Avro.ResolutionError Avro.decode(wa, Avro.encode(wa, ["a", missing]); reader_schema=ra)
+        wm = P("""{"type":"map","values":["int","long"]}""")
+        rm_ = P("""{"type":"map","values":"long"}""")
+        @test Avro.decode(wm, Avro.encode(wm, Dict("k" => Int32(5))); reader_schema=rm_) == Dict("k" => 5)
+        wr = P("""{"type":"record","name":"R","fields":[{"name":"name","type":["null","string"]},
+                  {"name":"tags","type":{"type":"array","items":["null","string"]}}]}""")
+        rr = P("""{"type":"record","name":"R","fields":[{"name":"name","type":"string"},
+                  {"name":"tags","type":{"type":"array","items":"string"}}]}""")
+        rows = [(name="x", tags=["t1"]), (name="y", tags=String[])]
+        file = take!(Avro.tobuffer(rows; schema=wr))
+        NT = NamedTuple{(:name, :tags),Tuple{String,Vector{String}}}
+        @test Avro.Table(file; reader_schema=rr).tags == [["t1"], String[]]
+        @test [r.tags for r in Avro.Rows(file; reader_schema=rr)] == [["t1"], String[]]
+        @test collect(Avro.Rows(file, NT; reader_schema=rr)) == rows
+        @test Avro.decode(wr, Avro.encode(wr, rows[1]), NT; reader_schema=rr) == rows[1]
+        n = P("""["null","string"]""")
+        @test Avro.decode(n, Avro.encode(n, "z"), String; reader_schema=P("\"string\"")) == "z"
+        @test_throws Avro.ResolutionError Avro.decode(n, Avro.encode(n, missing), String; reader_schema=P("\"string\""))
+    end
+
     @testset "first union matches across prepared, typed and container readers" begin
         writer = P("\"int\"")
         reader = P("[\"long\",\"int\"]")

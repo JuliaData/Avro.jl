@@ -547,13 +547,23 @@ function leaftarget(@nospecialize(T))
     return T === Nothing || T === Float16 || T === Char || T === DateTime
 end
 
+# The writer branch a union resolved into a reader leaf holds next, counted as a value like `decode` counts it.
+function writtenbranch(p::UnionResolvePlan, d::Decoder)
+    b = p.branches[readindex(d, unionsize(p, d))]
+    countvalue!(d)
+    b isa UnresolvableBranch && throw(ResolutionError(b.msg, b.writerpath, b.readerpath))
+    return b
+end
+
 @noinline function nodeerror()
     throw(ArgumentError("internal error: a typed node does not decode its target type"))
 end
 
-# The leaf node's plan decoded into `T`, through the plans whose generic value is a `T` or converts to one.
+# The leaf node's plan decoded into `T`, through the plans whose generic value is a `T` or converts to one; a
+# writer union resolved into the leaf decodes its written branch.
 @generated function leafvalue(node::LeafNode{T}, d::Decoder) where {T}
     body = Expr(:block, Expr(:meta, :inline), :(p = node.plan))
+    push!(body.args, :(p isa UnionResolvePlan && (p = writtenbranch(p, d))))
     for (P, V) in LEAF_PLAN_VALUES
         if V === T
             push!(body.args, :(p isa $P && return decodeleaf(p::$P, d)::$T))
