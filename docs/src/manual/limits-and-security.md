@@ -53,7 +53,8 @@ in parallel into preallocated columns when the file's block headers claim no mor
 arrive, so a tiny file cannot make the reader allocate gigabytes before its first block is verified.
 
 `Avro.Table` output is proportional to the file it reads: at most `max_bytes + max_inflation × the file's
-compressed bytes` decompress, and each decompressed byte decodes to a bounded number of values. Decoded values
+compressed bytes` decompress (plus the block each decoding task has in hand when the budget runs out), and
+each decompressed byte decodes to a bounded number of values. Decoded values
 still take more memory than their encoded bytes (a one-byte `long` becomes an 8-byte `Int64`, a nested record a
 heap object), so a hostile kilobyte can still expand to many megabytes. For input from an untrusted source,
 stream with `Avro.Rows`, which holds one block at a time, and lower `max_bytes` and `max_inflation`.
@@ -85,7 +86,7 @@ encode); time values are never silently truncated on encode (Java truncates).
 
 ## Concurrency and ownership
 
-`DatumReader`, `SingleObjectReader`, schemas, plans and `Limits` are safe to share across tasks. `DatumWriter` retains reusable mutable state and is single-owner, as is `SingleObjectWriter`. `Reader`/`Rows`/`Writer` are also single-operation objects.
+`DatumReader`, `SingleObjectReader`, schemas, plans and `Limits` are safe to share across tasks. `DatumWriter` retains reusable mutable state and is single-owner, as is `SingleObjectWriter`. `Reader`/`Rows`/`Writer` are also single-operation objects: close a `Reader` or `Rows` only after the reads that use it finish, since closing one releases its memory-mapped file at once.
 Parallel decoding never changes results or acceptance: a failing file fails with the same error at the
 same block at every `ntasks`. Truncating a memory-mapped file during a read is undefined at the OS
 level — use `mmap=false` for files that may change.
