@@ -254,6 +254,15 @@ end
         # the writer refuses to emit what its own limits could not read back
         writeerr = try; Avro.tobuffer(zeros_; schema=s, codec=:deflate, limits=tight); nothing; catch e; e; end
         @test writeerr isa Avro.LimitError && writeerr.limit === :max_inflation
+        # an append counts the blocks already in the file once its own cannot keep within the budget alone
+        mktempdir() do dir
+            path = joinpath(dir, "appended.avro")
+            Avro.write(path, zeros_[1:900_000]; schema=s, codec=:deflate, limits=tight)
+            @test_throws Avro.LimitError Avro.write(path, zeros_[1:900_000]; append=true, limits=tight)
+            @test length(Avro.Table(path; limits=tight)) == 900_000          # the refused append left the file as it was
+            Avro.write(path, zeros_[1:1_000]; append=true, limits=tight)
+            @test length(Avro.Table(path; limits=tight)) == 901_000
+        end
         @test_throws ArgumentError Avro.Limits(max_inflation=0)
     end
 
