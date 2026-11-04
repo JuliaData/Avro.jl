@@ -119,3 +119,10 @@ function satadd(a::Int, b::Int)
     (a == INFINITE || b == INFINITE || a > INFINITE - b) && return INFINITE
     return a + b
 end
+
+"Multiply two non-negative sizes and saturate at the largest representable Int."
+function satmul(a::Int, b::Int)
+    a >= 0 && b >= 0 || throw(ArgumentError("saturating sizes must be non-negative"))
+    (a == 0 || b <= INFINITE ÷ a) || return INFINITE
+    return a * b
+end

@@ -827,7 +827,7 @@ function writeblock!(w::Writer, count::Int, compressed::Vector{UInt8}, rawlength
     # Appended blocks within `max_inflation` of their own bytes keep the file readable whatever it held before;
     # the first that are not count the file's blocks so far, read once.
     unscanned = w.unscanned
-    if unscanned !== nothing && w.decompressed > inflationcap(w.limits, w.compressed) - w.limits.max_bytes
+    if unscanned !== nothing && w.decompressed > satmul(w.limits.max_inflation, w.compressed)
         filecompressed, filedecompressed = filetotals(w, unscanned)
         w.compressed = satadd(filecompressed, length(compressed))
         w.decompressed = satadd(filedecompressed, rawlength)
