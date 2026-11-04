@@ -1217,8 +1217,9 @@ function pushpartition!(w::Writer, part, rows)
     return w
 end
 
-# The widest column table written as `NamedTuple` rows, whose code compiles once per table type; wider
-# tables compile once per column type instead and write each row through one run-time call per cell.
+# The widest column table, other than a `NamedTuple` of vectors, written as `NamedTuple` rows: those rows'
+# code compiles once per table type, so wider tables compile once per column type instead and write each row
+# through one run-time call per cell.
 const TYPED_ROW_COLUMNS = 32
 
 """
@@ -1230,9 +1231,10 @@ function pushcolumns!(w::Writer, cols)
     s isa RecordSchema || return false
     names = Tables.columnnames(cols)
     (isempty(names) || !coversfields(s, names)) && return false
-    cols isa NamedTuple && fieldcount(typeof(cols)) <= TYPED_ROW_COLUMNS && return pushcolumntable!(w, cols)
+    cols isa NamedTuple && return pushcolumntable!(w, cols)
     symbols = Tuple(Symbol(n) for n in names)
-    (length(names) > TYPED_ROW_COLUMNS || !allunique(symbols)) && return pushcolumncells!(w, cols, names)   # cells take the first of repeated names
+    # Cells take the first column of a repeated name, as rows do.
+    (length(names) > TYPED_ROW_COLUMNS || !allunique(symbols)) && return pushcolumncells!(w, cols, names)
     return pushcolumntable!(w, NamedTuple{symbols}(Tuple(Tables.getcolumn(cols, n) for n in names)))
 end
 

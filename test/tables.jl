@@ -323,8 +323,9 @@ Tables.getcolumn(t::TablesIntName, ::Int) = t.a
             end
             return take!(io)
         end
-        for schema in (ws, rs)
-            bytes = take!(Avro.tobuffer(cols; schema=schema, sync=sync, block_bytes=4096))
+        # A NamedTuple of vectors writes through its row type; another wide table, through one cell per column.
+        for src in (cols, Tables.dictcolumntable(cols)), schema in (ws, rs)
+            bytes = take!(Avro.tobuffer(src; schema=schema, sync=sync, block_bytes=4096))
             @test bytes == rowwise(schema, cols)
             back = Tables.columntable(Avro.Table(bytes))
             @test all(isequal(back[k], cols[k]) for k in keys(cols))
@@ -336,15 +337,19 @@ Tables.getcolumn(t::TablesIntName, ::Int) = t.a
         catch err
             err
         end
-        cellerror = failure(() -> Avro.tobuffer(bad; schema=ws))
         rowerror = failure(() -> rowwise(ws, bad))
-        @test cellerror isa Avro.EncodeError && cellerror.path == "\$.c2"
-        @test rowerror isa Avro.EncodeError && cellerror.msg == rowerror.msg && cellerror.path == rowerror.path
+        @test rowerror isa Avro.EncodeError && rowerror.path == "\$.c2"
+        for src in (bad, Tables.dictcolumntable(bad))
+            err = failure(() -> Avro.tobuffer(src; schema=ws))
+            @test err isa Avro.EncodeError && err.msg == rowerror.msg && err.path == rowerror.path
+        end
         # rows cost no allocations per cell (no boxed Record per row)
         floats(rows) = NamedTuple{Tuple(Symbol("f", k) for k in 1:50)}(Tuple(collect(1.0:rows) for _ in 1:50))
         f2, f4 = floats(2000), floats(4000)
-        Avro.tobuffer(f2)
-        @test @allocations(Avro.tobuffer(f4)) - @allocations(Avro.tobuffer(f2)) < 1_000
+        for (a, b) in ((f2, f4), (Tables.dictcolumntable(f2), Tables.dictcolumntable(f4)))
+            Avro.tobuffer(a)
+            @test @allocations(Avro.tobuffer(b)) - @allocations(Avro.tobuffer(a)) < 1_000
+        end
     end
 
     @testset "zero rows, zero columns, empty records" begin

@@ -22,6 +22,7 @@ struct Tree                                     # refers to itself through a uni
 end
 
 const Wide = NamedTuple{Tuple(Symbol(:c, i) for i in 1:40),NTuple{40,Int64}}
+const WideColumns = NamedTuple{fieldnames(Wide),NTuple{40,Vector{Int64}}}
 
 # The encoding of the `Tree` value `main` builds. Julia 1.14.0-alpha2's `--trim` leaves a call in the write-node
 # builder of a type that refers to itself unresolved, so there the program reads these bytes without writing them.
@@ -82,6 +83,8 @@ function (@main)(args::Vector{String})::Cint
         file = joinpath(dir, "wide.avro")
         Avro.write(file, wide)
         sum(r -> r.c40, Avro.Rows(file, Wide)) == 600 || return Cint(9)
+        Avro.write(file, WideColumns(ntuple(j -> Int64[i * j for i in 1:5], Val(40))))
+        sum(r -> r.c40, Avro.Rows(file, Wide)) == 600 || return Cint(10)
         println(Core.stdout, "ok")
         return Cint(0)
     finally
