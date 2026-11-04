@@ -558,7 +558,7 @@ mutable struct Writer
     poison::Union{Nothing,Exception}
     compressed::Int                         # payload bytes of the blocks this writer emitted
     decompressed::Int                       # their encoded bytes before compression
-    unscanned::Bool                         # an append whose counts leave out the blocks the file held before it
+    unscanned::Union{Nothing,String}        # the file of an append whose counts leave out the blocks it held before
 end
 
 "The writer's 16-byte sync marker: validated caller bytes, or fresh `RandomDevice` bytes."
@@ -685,7 +685,7 @@ function Writer(dst::Union{AbstractString,IO}, @nospecialize(schema::Schema); co
     plan = writeplan(schema)
     w = Writer(sink, path, atomic ? temppath : nothing, schema, plan, WriteNodes(schema, plan), wcodec, syncmarker, limits,
                min(Int(block_bytes), limits.max_bytes), workers, Base.Semaphore(workers), Task[], fsync, ownsink,
-               Encoder(limits), Encoder(limits), appendstart, appendstart, 0, false, nothing, 0, 0, appendstart >= 0)
+               Encoder(limits), Encoder(limits), appendstart, appendstart, 0, false, nothing, 0, 0, appendstart >= 0 ? path : nothing)
     try
         entries === nothing || writecontainerheader!(sink, entries, syncmarker)
     catch e
@@ -826,11 +826,12 @@ function writeblock!(w::Writer, count::Int, compressed::Vector{UInt8}, rawlength
     w.decompressed = satadd(w.decompressed, rawlength)
     # Appended blocks within `max_inflation` of their own bytes keep the file readable whatever it held before;
     # the first that are not count the file's blocks so far, read once.
-    if w.unscanned && w.decompressed > inflationcap(w.limits, w.compressed) - w.limits.max_bytes
-        filecompressed, filedecompressed = filetotals(w)
+    unscanned = w.unscanned
+    if unscanned !== nothing && w.decompressed > inflationcap(w.limits, w.compressed) - w.limits.max_bytes
+        filecompressed, filedecompressed = filetotals(w, unscanned)
         w.compressed = satadd(filecompressed, length(compressed))
         w.decompressed = satadd(filedecompressed, rawlength)
-        w.unscanned = false
+        w.unscanned = nothing
     end
     cap = inflationcap(w.limits, w.compressed)
     w.decompressed <= cap || throw(LimitError(:max_inflation, w.decompressed, cap))
@@ -844,10 +845,10 @@ function writeblock!(w::Writer, count::Int, compressed::Vector{UInt8}, rawlength
     return nothing
 end
 
-"The payload and decompressed bytes of every block in the file an appending writer has written so far."
-function filetotals(w::Writer)
+"The payload and decompressed bytes of every block in the file at `path` an appending writer has written so far."
+function filetotals(w::Writer, path::String)
     streamcall(flush, w.sink)
-    return Reader(w.path::String; mmap=false, limits=w.limits, allow_invalid_names=true, allow_invalid_defaults=true) do r
+    return Reader(path; mmap=false, limits=w.limits, allow_invalid_names=true, allow_invalid_defaults=true) do r
         while nextblock!(r) !== nothing
         end
         return (r.compressed, r.decompressed)
