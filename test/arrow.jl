@@ -65,6 +65,12 @@ end
         t = Avro.Table(Avro.tobuffer([(price=Avro.Decimal(Int128(12345), 2),)]; schema=price))
         q = arrowtable((price=DataDecimals.Decimal{9,2}.(t.price),))
         @test eltype(q.price) === DataDecimals.Decimal{9,2,Int128} && q.price == [DataDecimals.Decimal{9,2,Int128}("123.45")]
+        # a wide decimal column has no schema to give its precision, so it writes as Arrow's widest decimal at its scale
+        wide = P("""{"type":"record","name":"W","fields":[{"name":"w","type":["null",{"type":"bytes","logicalType":"decimal","precision":40,"scale":3}]}]}""")
+        w = arrowtable(Avro.Table(Avro.tobuffer([(w=Avro.WideDecimal(big(10)^38 + 7, 3),), (w=missing,)]; schema=wide)))
+        D = DataDecimals.Decimal{76,3,DataDecimals.Int256}
+        @test eltype(w.w) === Union{Missing,D}
+        @test isequal(collect(w.w), [D(DataDecimals.DecimalValue{DataDecimals.Int256}(big(10)^38 + 7, 3)), missing])
     end
 
     @testset "nested records take their schema's struct type" begin
@@ -157,7 +163,7 @@ end
         end
         decimal(p) = """{"type":"bytes","logicalType":"decimal","precision":$p,"scale":0}"""
         @test writeerror("""{"type":"record","name":"V","fields":[{"name":"d","type":$(decimal(80))}]}""", [(c=(d=Avro.WideDecimal(big(1), 0),),)]) isa ArgumentError
-        @test writeerror(decimal(40), [(c=Avro.WideDecimal(big(1), 0),)]) isa ArgumentError
+        @test writeerror(decimal(80), [(c=Avro.WideDecimal(big(10)^78, 0),)]) isa ArgumentError
         @test writeerror("""{"type":"fixed","name":"D","size":12,"logicalType":"duration"}""", [(c=Avro.Duration(typemax(UInt32), UInt32(0), UInt32(0)),)]) isa ArgumentError
         recursive = writeerror("""{"type":"record","name":"L","fields":[{"name":"n","type":["null","L"]}]}""", [(c=(n=(n=missing,),),)])
         @test recursive isa ArgumentError && occursin("recursive record L", sprint(showerror, recursive))

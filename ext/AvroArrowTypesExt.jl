@@ -1,7 +1,8 @@
 # An `Avro.Record` holds its field values untyped, so Arrow.jl cannot type a struct column from them. This extension
 # lowers each record to a `NamedTuple` whose field types come from the record's schema, so a struct column has one
 # Arrow type in every row whatever values the rows hold, and a decimal inside it has the schema's precision and
-# scale. `Avro.Duration` lowers to the `Durations.Duration` that Arrow.jl writes as a month-day-nanosecond interval.
+# scale. `Avro.Duration` lowers to the `Durations.Duration` that Arrow.jl writes as a month-day-nanosecond interval,
+# and an `Avro.WideDecimal` outside a record to Arrow's widest decimal.
 module AvroArrowTypesExt
 
 using Avro: Avro
@@ -32,6 +33,21 @@ end
 
 function ArrowTypes.toarrow(x::Avro.Duration)
     return Durations.Duration(x)
+end
+
+# Outside a record a wide decimal has no schema to give its precision, so it writes as Arrow's widest decimal (76
+# digits) at its own scale. That storage type depends on the scale, so it is declared abstract and Arrow.jl takes a
+# column's type from its values, writing values of several scales at the largest.
+function ArrowTypes.ArrowType(::Type{Avro.WideDecimal})
+    return DataDecimals.AbstractDecimal
+end
+
+function ArrowTypes.toarrow(x::Avro.WideDecimal)
+    return DataDecimals.Decimal{76,x.scale,DataDecimals.Int256}(DataDecimals.DecimalValue{DataDecimals.Int256}(x.unscaled, x.scale))
+end
+
+function ArrowTypes.default(::Type{Avro.WideDecimal})
+    return Avro.WideDecimal(big(0), 0)
 end
 
 # The Julia type Arrow.jl stores a value of schema `s` as, inside a record. Union branches that Arrow stores
