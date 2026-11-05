@@ -257,6 +257,7 @@ mutable struct Reader
     failed::Bool                # set while reading a block's framing; left set by an error, since the position is then unknown
     compressed::Int             # payload bytes of the blocks read so far
     decompressed::Int           # their decompressed bytes
+    const scratch::Base.RefValue{Vector{UInt8}}   # the decompressed block being read, reused by the next
 end
 
 "Close a reader's source. Explicit close reports the source failure; `suppress=true` swallows it."
@@ -276,7 +277,7 @@ function Reader(src; limits::Limits=Limits(), legacy::Union{Nothing,Symbol}=noth
     r = try
         h = readheader(source, limits; legacy=legacy, allow_invalid_names=allow_invalid_names, allow_invalid_defaults=allow_invalid_defaults)
         Reader(source, h.schema, readplan(h.schema; mode=legacy === :avrojl1 ? :little : :standard), readercodec(h.codecname, legacy), h.metadata, h.sync,
-               limits, legacy, 0, false, false, false, 0, 0)
+               limits, legacy, 0, false, false, false, 0, 0, Ref(UInt8[]))
     catch
         closereaderresources(source; suppress=true)
         rethrow()
@@ -345,36 +346,47 @@ function schema(r::Reader)
 end
 
 # Avro.jl ≤ 1.1.2 sized null-codec blocks with a cushion, so a legacy block may carry bytes after its
-# declared datums: walk them to find where they end, warn once and drop the padding.
-function exactblock(r::Reader, bytes::Vector{UInt8}, count::Int, index::Int)
-    r.legacy === :avrojl1 || return bytes
-    d = blockcap!(Decoder(bytes, r.limits))
+# declared datums: walk them to find where they end, warn once and leave the padding out of the block's decoder.
+function exactblock!(r::Reader, d::Decoder, count::Int, index::Int)
+    r.legacy === :avrojl1 || return d
+    start, stop = d.pos, d.stop
     for _ in 1:count
         skip(r.plan, d)
     end
-    d.pos == length(bytes) + 1 && return bytes
-    r.codecname === :null ||
-        throw(DataError("block $index declares $count datums but they consume $(d.pos - 1) of $(length(bytes)) bytes", d.pos))
-    r.warned ||
-        (@warn "accepting trailing bytes after $count datums in a null-codec block (legacy=:avrojl1; Avro.jl ≤ 1.1.2 sizing cushion)" source = 1; r.warned = true)
-    return resize!(bytes, d.pos - 1)
+    if d.pos != stop + 1
+        r.codecname === :null ||
+            throw(DataError("block $index declares $count datums but they consume $(d.pos - start) of $(stop - start + 1) bytes", d.pos - start + 1))
+        r.warned ||
+            (@warn "accepting trailing bytes after $count datums in a null-codec block (legacy=:avrojl1; Avro.jl ≤ 1.1.2 sizing cushion)" source = 1; r.warned = true)
+        stop = d.pos - 1
+    end
+    return blockcap!(reset!(d, d.buf, start, stop))
 end
 
 "Read the next block as `(count, bytes)` with the owned decompressed bytes; `nothing` at a clean end of the file."
 function nextblock!(r::Reader)
+    d = Decoder(UInt8[], r.limits)
+    count = nextblock!(r, d)
+    count === nothing && return nothing
+    return (count, d.buf[d.pos:d.stop])
+end
+
+"Load the next block into `d` (see `blockbody!`) and return its datum count; `nothing` at a clean end of the file."
+function nextblock!(r::Reader, d::Decoder{Vector{UInt8}})
     checkopen(r)
     source = r.source::BlockSource
     sourceeof(source) && return nothing
     r.failed = true
     count, size = blockframe!(r, source)
-    return blockbody!(r, source, count, size)
+    return blockbody!(r, source, count, size, d)
 end
 
 """
 The first block that holds file row `firstrow` or a later one, after passing over the blocks before it without
-decompressing them: the datums passed over, and the block as `nextblock!` reads it (`nothing` at a clean end).
+decompressing them: the datums passed over, and the block's count with the block loaded into `d` as `nextblock!` loads
+it (`nothing` at a clean end).
 """
-function nextblockfrom!(r::Reader, firstrow::Int)
+function nextblockfrom!(r::Reader, d::Decoder{Vector{UInt8}}, firstrow::Int)
     skipped = 0
     while true
         checkopen(r)
@@ -382,7 +394,7 @@ function nextblockfrom!(r::Reader, firstrow::Int)
         sourceeof(source) && return (skipped, nothing)
         r.failed = true
         count, size = blockframe!(r, source)
-        satadd(skipped, count) < firstrow || return (skipped, blockbody!(r, source, count, size))
+        satadd(skipped, count) < firstrow || return (skipped, blockbody!(r, source, count, size, d))
         sourcepayload(source, size)
         checksync(source, r.sync, r.blockindex)
         r.failed = false
@@ -401,16 +413,25 @@ function blockframe!(r::Reader, source::BlockSource)
     return (Int(count), Int(size))
 end
 
-# The block whose frame was just read, as `(count, bytes)`.
-function blockbody!(r::Reader, source::BlockSource, count::Int, size::Int)
+# Load the block whose frame was just read into `d` and return its count. An uncompressed block is decoded where it
+# is, in the source's memory or its own streamed payload, and any other from the reader's buffer, which the next
+# block reuses: decoded values never alias their input.
+function blockbody!(r::Reader, source::BlockSource, count::Int, size::Int, d::Decoder{Vector{UInt8}})
+    start = source isa BytesSource ? source.pos : 1
     payload = sourcepayload(source, size)
     checksync(source, r.sync, r.blockindex)
     r.failed = false                                   # a bad payload below leaves the next block readable
-    decoded = decompressblock(r.codecname, payload, r.limits)
-    inflate!(r, size, length(decoded))
-    bytes = exactblock(r, decoded, count, r.blockindex)
-    count == 0 && !isempty(bytes) && throw(DataError("a zero-count block has a non-empty payload", 1))
-    return (count, bytes)
+    if r.codecname === :null
+        inflate!(r, size, size)
+        reset!(d, source isa BytesSource ? source.buf : payload::Vector{UInt8}, start, start + size - 1)
+    else
+        n = decompressblock!(r.scratch, r.codecname, payload, r.limits)
+        inflate!(r, size, n)
+        reset!(d, r.scratch[], 1, n)
+    end
+    exactblock!(r, blockcap!(d), count, r.blockindex)
+    count == 0 && remaining(d) != 0 && throw(DataError("a zero-count block has a non-empty payload", 1))
+    return count
 end
 
 "Charge one block to the read's inflation budget (`max_inflation`)."
@@ -485,11 +506,9 @@ function nextdatum!(decodeone::F, it) where {F}
     checkopen(it.reader)
     d = it.decoder
     while it.remaining == 0
-        blk = nextblock!(it.reader)
-        blk === nothing && return nothing
-        it.remaining = blk[1]
-        blockcap!(reset!(d, blk[2], 1))
-        it.remaining == 0 && checkconsumed(d)
+        count = nextblock!(it.reader, d)
+        count === nothing && return nothing
+        it.remaining = count
     end
     left = it.remaining - 1
     it.remaining = 0
@@ -880,7 +899,8 @@ end
 function filetotals(w::Writer, path::String)
     streamcall(flush, w.sink)
     return Reader(path; mmap=false, limits=w.limits, allow_invalid_names=true, allow_invalid_defaults=true) do r
-        while nextblock!(r) !== nothing
+        d = Decoder(UInt8[], r.limits)
+        while nextblock!(r, d) !== nothing
         end
         return (r.compressed, r.decompressed)
     end

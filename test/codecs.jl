@@ -136,4 +136,31 @@ import CodecZstd, CodecZlib, TranscodingStreams, Zlib_jll
             @test_throws Avro.LimitError codecdec(name, nb; limits=Avro.Limits(max_bytes=1 << 20))
         end
     end
+    @testset "blocks that grow and shrink read alike through every read path" begin
+        schema = Avro.parseschema("""{"type":"record","name":"R","fields":[{"name":"i","type":"long"},{"name":"s","type":"string"}]}""")
+        T = @NamedTuple{i::Int64, s::String}
+        rows = [T((i, string(i, ":", repeat(Char('a' + i % 26), isodd(i ÷ 20) ? 1500 + 7i : i % 5)))) for i in 1:199]
+        for codec in (:null, :deflate, :snappy, :zstandard, :bzip2, :xz)
+            io = IOBuffer()
+            w = Avro.Writer(io, schema; codec=codec)
+            for r in rows
+                push!(w, r)
+                r.i % 20 == 19 && flush(w)                 # blocks of 20 rows, alternately about 30 KB and 100 bytes
+            end
+            close(w)
+            bytes = take!(io)
+            blocks = collect(Avro.eachblock(Avro.Reader(bytes)))
+            @test minimum(length.(last.(blocks))) < 200 && maximum(length.(last.(blocks))) > 20_000
+            @test [(i=r.i, s=r.s) for r in Avro.Rows(bytes)] == rows
+            @test collect(Avro.Rows(bytes, T)) == rows
+            for t in (Avro.Table(bytes; ntasks=1), Avro.Table(bytes; ntasks=4), Avro.Table(IOBuffer(bytes)), Avro.Table(bytes, T))
+                @test t.i == 1:199 && t.s == last.(rows)
+            end
+            @test Avro.Table(bytes; offset=123, limit=60).s == last.(rows[124:183])
+            r = Avro.Reader(bytes)                         # every block `eachblock` yielded still holds its own bytes
+            got = [Avro.decode(r.plan, d) for (n, b) in blocks for d in (Avro.Decoder(b),) for _ in 1:n]
+            @test [(i=g.i, s=g.s) for g in got] == rows
+            close(r)
+        end
+    end
 end

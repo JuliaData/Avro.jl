@@ -111,18 +111,20 @@ end
 
 """
 A decoder over one pre-scanned block, the `i`th the read decodes, its decompressed size recorded in `sizes[i]`: an
-uncompressed block in a `Vector` is read in place, since decoded values never alias their input.
+uncompressed block is read in place and any other decompressed into `scratch[]`, since decoded values never alias
+their input.
 """
-function blockdecoder(r::Reader, e::BlockEntry, sizes::Vector{Int}, i::Int)
+function blockdecoder(r::Reader, e::BlockEntry, sizes::Vector{Int}, i::Int, scratch::Base.RefValue{Vector{UInt8}})
     src = r.source::BytesSource
     stop = e.offset + e.size - 1
-    if r.codecname === :null && r.legacy === nothing && src.buf isa Vector{UInt8}
+    if r.codecname === :null
         sizes[i] = e.size
-        return blockcap!(Decoder(src.buf, r.limits; pos=e.offset, stop=stop))
+        d = Decoder(src.buf, r.limits; pos=e.offset, stop=stop)
+    else
+        sizes[i] = decompressblock!(scratch, r.codecname, view(src.buf, e.offset:stop), r.limits)
+        d = Decoder(scratch[], r.limits; stop=sizes[i])
     end
-    decoded = decompressblock(r.codecname, view(src.buf, e.offset:stop), r.limits)
-    sizes[i] = length(decoded)
-    return blockcap!(Decoder(exactblock(r, decoded, e.count, e.index), r.limits))
+    return exactblock!(r, blockcap!(d), e.count, e.index)
 end
 
 """
@@ -203,6 +205,7 @@ end
 
 @noinline function (w::BlockWorker)()
     blocks = workerblocks(w.blocks)
+    scratch = Ref(UInt8[])
     n = length(w.entries)
     while true
         i = @atomic w.state.taken += 1
@@ -210,7 +213,7 @@ end
         (@atomic w.state.failed) < i && break                  # a lower block already failed; every later index is higher
         try
             e = w.entries[i]
-            d = blockdecoder(w.r, e, w.sizes, i)
+            d = blockdecoder(w.r, e, w.sizes, i, scratch)
             (@atomic w.state.inflated += w.sizes[i]) > w.cap && (@atomic w.state.taken = n)
             decodeblock!(blocks, e, d)
         catch err
@@ -261,7 +264,7 @@ function decodeblocks!(r::Reader, blocks, pre::PrescanResult, ntasks::Int)
         decodeparallel!(r, blocks, entries, nworkers, sizes)
     else
         for (i, e) in enumerate(entries)
-            d = blockdecoder(r, e, sizes, i)
+            d = blockdecoder(r, e, sizes, i, r.scratch)
             inflate!(r, e.size, sizes[i])
             decodeblock!(blocks, e, d)
         end

@@ -528,14 +528,12 @@ function decodestreamed!(r::Reader, plan, projection::Union{Nothing,Projection},
     cols = columnbuilders(plan, projection, 0)
     cells = rowcells(plan, cols)
     nrows = 0
-    base, blk = firstblock!(r, firstrow, lastrow)
-    while blk !== nothing
-        count, bytes = blk
-        blockcap!(reset!(d, bytes, 1))
+    base, count = firstblock!(r, d, firstrow, lastrow)
+    while count !== nothing
         decoderows!(plan, cells, d, count)
         nrows = satadd(nrows, count)
         satadd(base, nrows) < lastrow || break
-        blk = nextblock!(r)
+        count = nextblock!(r, d)
     end
     return (finishedcolumns(cols, projection), nrows, base)
 end
@@ -544,27 +542,25 @@ end
 function decodestreamed!(r::Reader, b::TypedBlocks{T}, firstrow::Int=1, lastrow::Int=typemax(Int)) where {T}
     d = Decoder(UInt8[], r.limits)
     nrows = 0
-    base, blk = firstblock!(r, firstrow, lastrow)
-    while blk !== nothing
-        count, bytes = blk
-        blockcap!(reset!(d, bytes, 1))
+    base, count = firstblock!(r, d, firstrow, lastrow)
+    while count !== nothing
         for _ in 1:count
             pushrow!(b.columns, decodenode(T, b.node, d))
         end
         checkconsumed(d)
         nrows = satadd(nrows, count)
         satadd(base, nrows) < lastrow || break
-        blk = nextblock!(r)
+        count = nextblock!(r, d)
     end
     return (nrows, base)
 end
 
-# The file rows before the first block a streamed read of rows `firstrow:lastrow` decodes, and that block; no block
-# for an empty range.
-function firstblock!(r::Reader, firstrow::Int, lastrow::Int)
+# The file rows before the first block a streamed read of rows `firstrow:lastrow` decodes, and that block's count with
+# the block loaded into `d`; no block for an empty range.
+function firstblock!(r::Reader, d::Decoder{Vector{UInt8}}, firstrow::Int, lastrow::Int)
     lastrow < firstrow && return (0, nothing)
-    firstrow == 1 && return (0, nextblock!(r))
-    return nextblockfrom!(r, firstrow)
+    firstrow == 1 && return (0, nextblock!(r, d))
+    return nextblockfrom!(r, d, firstrow)
 end
 
 # ---- Avro.Rows --------------------------------------------------------------------------------------
@@ -822,18 +818,17 @@ function Base.iterate(it::RowsPartitions, yielded::Bool=false)
     rows.remaining == 0 || throw(ArgumentError("Tables.partitions cannot start mid-block; iterate one interface only"))
     r = rows.reader
     out = rows.outschema::RecordSchema
-    blk = nextblock!(r)
-    while blk !== nothing && first(blk) == 0
-        blk = nextblock!(r)
+    d = rows.decoder
+    count = nextblock!(r, d)
+    while count == 0
+        count = nextblock!(r, d)
     end
-    if blk === nothing                              # an empty source is one empty partition, so a sink sees its columns
+    if count === nothing                            # an empty source is one empty partition, so a sink sees its columns
         yielded && return nothing
-        count, bytes = 0, UInt8[]
-    else
-        count, bytes = blk
+        count = 0
+        blockcap!(reset!(d, UInt8[], 1))
     end
-    blockcap!(reset!(rows.decoder, bytes, 1))
-    cols = columnbuilders(rows.plan, rows.select, min(count, length(bytes)))    # a block's count is a claim, so columns grow
+    cols = columnbuilders(rows.plan, rows.select, min(count, remaining(d)))    # a block's count is a claim, so columns grow
     decoderows!(rows.plan, rowcells(rows.plan, cols), rows.decoder, count)
     consumedrows!(rows, count)
     t = Table{Record}(out, r.schema, finishedcolumns(cols, rows.select), count, r.metadata, r.codecname, r.sync)

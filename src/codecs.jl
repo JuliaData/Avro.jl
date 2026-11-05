@@ -60,14 +60,16 @@ function growbuffer(out::Vector{UInt8}, len::Int, cap::Int)
 end
 
 """
-Decompress `input` with a TranscodingStreams `codec` into at most `maxbytes` bytes. When a member ends
-before the input does, the codec restarts on the remaining bytes if `multimember`; otherwise they are
-ignored.
+Decompress `input` with a TranscodingStreams `codec` into `scratch[]`, which grows to at most `maxbytes` bytes, and
+return the decompressed length. When a member ends before the input does, the codec restarts on the remaining
+bytes if `multimember`; otherwise they are ignored.
 """
-function transcodemembers(name::Symbol, codec::TranscodingStreams.Codec, input::AbstractVector{UInt8}, maxbytes::Int;
-                          multimember::Bool=true)
+function transcodemembers!(scratch::Base.RefValue{Vector{UInt8}}, name::Symbol, codec::TranscodingStreams.Codec,
+                           input::AbstractVector{UInt8}, maxbytes::Int; multimember::Bool=true)
     n = length(input)
-    out = Vector{UInt8}(undef, min(max(4 * n, 4096), maxbytes))
+    out = scratch[]
+    start = min(max(4 * n, 4096), maxbytes)
+    start <= length(out) <= maxbytes || (out = Vector{UInt8}(undef, start))
     probe = UInt8[0x00]                           # once `out` is full at `maxbytes`, any byte landing here is one too many
     outlen = 0
     inpos = 1
@@ -87,7 +89,10 @@ function transcodemembers(name::Symbol, codec::TranscodingStreams.Codec, input::
             outlen += Δout
             status === :error && throw(CodecError(name, :decompress, codecmessage(err)))
             if status === :end
-                (inpos > n || !multimember) && return resize!(out, outlen)
+                if inpos > n || !multimember
+                    scratch[] = out
+                    return outlen
+                end
                 TranscodingStreams.startproc(codec, :read, err) === :ok || throw(CodecError(name, :decompress, codecmessage(err)))
             elseif Δin == 0 && Δout == 0
                 throw(CodecError(name, :decompress, inpos > n ? "truncated $name data" : "$name codec made no progress"))
@@ -98,27 +103,50 @@ function transcodemembers(name::Symbol, codec::TranscodingStreams.Codec, input::
     end
 end
 
-"""
-The owned decompressed bytes of one block payload. Every codec but null raises `LimitError(:max_bytes)`
-rather than produce more than `limits.max_bytes` bytes; a null payload is returned as is (copied unless a
-`Vector{UInt8}`).
-"""
+"`transcodemembers!` into a new vector of exactly the decompressed bytes."
+function transcodemembers(name::Symbol, codec::TranscodingStreams.Codec, input::AbstractVector{UInt8}, maxbytes::Int;
+                          multimember::Bool=true)
+    scratch = Ref(UInt8[])
+    n = transcodemembers!(scratch, name, codec, input, maxbytes; multimember=multimember)
+    return resize!(scratch[], n)
+end
+
+"The owned decompressed bytes of one block payload (`decompressblock!`); a null payload in a `Vector{UInt8}` is returned as is."
 function decompressblock(name::Symbol, payload::AbstractVector{UInt8}, limits::Limits)
-    name === :null && return payload isa Vector{UInt8} ? payload : Vector{UInt8}(payload)
+    name === :null && payload isa Vector{UInt8} && return payload
+    scratch = Ref(UInt8[])
+    n = decompressblock!(scratch, name, payload, limits)
+    return resize!(scratch[], n)
+end
+
+"""
+Decompress one block payload into `scratch[]`, which is replaced by a larger vector when it is too small, and return
+the decompressed length: the block is `scratch[][1:n]`. Every codec but null raises `LimitError(:max_bytes)` rather
+than produce more than `limits.max_bytes` bytes; a null payload is copied.
+"""
+function decompressblock!(scratch::Base.RefValue{Vector{UInt8}}, name::Symbol, payload::AbstractVector{UInt8}, limits::Limits)
+    if name === :null
+        n = length(payload)
+        length(scratch[]) < n && (scratch[] = Vector{UInt8}(undef, n))
+        copyto!(scratch[], 1, payload, 1, n)
+        return n
+    end
     # Bytes after the final deflate block are ignored, as Java and Python readers do: the Apache
     # Python writer and fastavro 1.13.1 and earlier leave 3 bytes of the zlib checksum there.
-    name === :deflate && return transcodemembers(:deflate, DeflateDecompressor(), payload, limits.max_bytes; multimember=false)
+    name === :deflate && return transcodemembers!(scratch, :deflate, DeflateDecompressor(), payload, limits.max_bytes; multimember=false)
     # libzstd consumes a skippable frame itself and ends it as an empty member.
-    name === :zstandard && return transcodemembers(:zstandard, ZstdDecompressor(), payload, limits.max_bytes)
-    name === :snappy && return snappydecompress(payload, limits)
-    return runtimecall(extensiondecompress, name, payload, limits)::Vector{UInt8}
+    name === :zstandard && return transcodemembers!(scratch, :zstandard, ZstdDecompressor(), payload, limits.max_bytes)
+    name === :snappy && return snappydecompress!(scratch, payload, limits)
+    out = runtimecall(extensiondecompress, name, payload, limits)::Vector{UInt8}
+    scratch[] = out
+    return length(out)
 end
 
 function extensiondecompress(name::Symbol, payload::AbstractVector{UInt8}, limits::Limits)
     return EXTENSION_CODECS[name].decompress(payload, limits)::Vector{UInt8}
 end
 
-function snappydecompress(payload::AbstractVector{UInt8}, limits::Limits)
+function snappydecompress!(scratch::Base.RefValue{Vector{UInt8}}, payload::AbstractVector{UInt8}, limits::Limits)
     n = length(payload)
     n >= 4 || throw(CodecError(:snappy, :decompress, "snappy block shorter than its 4-byte CRC"))
     result = Ref{Csize_t}(0)
@@ -126,14 +154,15 @@ function snappydecompress(payload::AbstractVector{UInt8}, limits::Limits)
     st == Snappy.LibSnappy.SNAPPY_OK || throw(CodecError(:snappy, :decompress, "invalid snappy data (status $st)"))
     m = Int(result[])
     m <= limits.max_bytes || throw(LimitError(:max_bytes, m, limits.max_bytes))
-    out = Vector{UInt8}(undef, m)
+    length(scratch[]) < m && (scratch[] = Vector{UInt8}(undef, m))
+    out = scratch[]
     len = Ref{Csize_t}(m)
     st = GC.@preserve payload out Snappy.LibSnappy.snappy_uncompress(pointer(payload), n - 4, pointer(out), len)
     (st == Snappy.LibSnappy.SNAPPY_OK && len[] == m) ||
         throw(CodecError(:snappy, :decompress, "snappy decompression failed (status $st)"))
     stored = UInt32(payload[n - 3]) << 24 | UInt32(payload[n - 2]) << 16 | UInt32(payload[n - 1]) << 8 | UInt32(payload[n])
-    crc32(out) == stored || throw(CodecError(:snappy, :decompress, "snappy CRC mismatch"))
-    return out
+    crc32(out, m) == stored || throw(CodecError(:snappy, :decompress, "snappy CRC mismatch"))
+    return m
 end
 
 # ---- compression ------------------------------------------------------------------------------------
@@ -210,8 +239,8 @@ end
 
 # ---- CRC32 (IEEE, reflected; snappy's checksum of the uncompressed data), through zlib ---------------
 
-function crc32(data::Vector{UInt8})
-    isempty(data) && return UInt32(0)
+function crc32(data::Vector{UInt8}, n::Int=length(data))
+    n == 0 && return UInt32(0)
     return GC.@preserve data UInt32(ccall((:crc32_z, CodecZlib.libz), Culong, (Culong, Ptr{UInt8}, Csize_t),
-                                          0, pointer(data), length(data)) & 0xffffffff)
+                                          0, pointer(data), n) & 0xffffffff)
 end
