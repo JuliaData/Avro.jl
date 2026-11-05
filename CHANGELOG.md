@@ -74,7 +74,9 @@ logical type is preserved as an unknown annotation and is deferred.
 
 ### Changed (breaking)
 
-- Customisation moved from StructTypes to StructUtils; `JSON3`/`SentinelArrays` dependencies dropped.
+- Customisation moved from StructTypes to StructUtils; `JSON3`/`SentinelArrays` dependencies dropped. The deflate
+  codec runs on libdeflate (`libdeflate_jll`) rather than CodecZlib, so files it writes differ byte for byte from
+  zlib's at the same level.
 - Generic decoding returns the closed value model: enums as `Avro.EnumValue` (a string), fixed as
   `Avro.Fixed` (a byte vector), nested records as `Avro.Record`, maps as `Dict{String,V}`, `["null", T]` unions as
   `Union{Missing,T}`, other unions as the bare value of the written branch (`Avro.UnionValue` only

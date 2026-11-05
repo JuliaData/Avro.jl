@@ -1,9 +1,9 @@
 # Block compression. Decompression stops at `Limits.max_bytes`; zstandard frames (skippable ones
 # included) and bzip2/xz streams are decoded to the end of the payload, deflate ignores bytes after its
-# final block, and snappy carries the big-endian CRC32 of the uncompressed data.
+# final block, and snappy carries the big-endian CRC32 of the uncompressed data. Deflate and CRC32 run on
+# libdeflate.
 
-import CodecZlib
-using CodecZlib: DeflateCompressor, DeflateDecompressor
+using libdeflate_jll: libdeflate
 using CodecZstd: ZstdCompressor, ZstdDecompressor
 import Snappy
 import TranscodingStreams
@@ -131,15 +131,45 @@ function decompressblock!(scratch::Base.RefValue{Vector{UInt8}}, name::Symbol, p
         copyto!(scratch[], 1, payload, 1, n)
         return n
     end
-    # Bytes after the final deflate block are ignored, as Java and Python readers do: the Apache
-    # Python writer and fastavro 1.13.1 and earlier leave 3 bytes of the zlib checksum there.
-    name === :deflate && return transcodemembers!(scratch, :deflate, DeflateDecompressor(), payload, limits.max_bytes; multimember=false)
+    name === :deflate && return inflateblock!(scratch, payload, limits.max_bytes)
     # libzstd consumes a skippable frame itself and ends it as an empty member.
     name === :zstandard && return transcodemembers!(scratch, :zstandard, ZstdDecompressor(), payload, limits.max_bytes)
     name === :snappy && return snappydecompress!(scratch, payload, limits)
     out = runtimecall(extensiondecompress, name, payload, limits)::Vector{UInt8}
     scratch[] = out
     return length(out)
+end
+
+const LIBDEFLATE_SUCCESS = Cint(0)
+const LIBDEFLATE_INSUFFICIENT_SPACE = Cint(3)
+
+# A raw DEFLATE payload inflated into `scratch[]` in one call, which is retried in a buffer twice the size, up to
+# `maxbytes`, while the output does not fit. libdeflate stops at the final block, so bytes after it are ignored, as
+# Java and Python readers ignore them: the Apache Python writer and fastavro 1.13.1 and earlier leave 3 bytes of
+# the zlib checksum there.
+function inflateblock!(scratch::Base.RefValue{Vector{UInt8}}, payload::AbstractVector{UInt8}, maxbytes::Int)
+    out = scratch[]
+    start = min(max(4 * length(payload), 4096), maxbytes)
+    start <= length(out) <= maxbytes || (out = Vector{UInt8}(undef, start))
+    d = ccall((:libdeflate_alloc_decompressor, libdeflate), Ptr{Cvoid}, ())
+    d == C_NULL && throw(OutOfMemoryError())
+    try
+        while true
+            used, n = Ref{Csize_t}(0), Ref{Csize_t}(0)
+            st = GC.@preserve payload out ccall((:libdeflate_deflate_decompress_ex, libdeflate), Cint,
+                (Ptr{Cvoid}, Ptr{UInt8}, Csize_t, Ptr{UInt8}, Csize_t, Ref{Csize_t}, Ref{Csize_t}),
+                d, pointer(payload), length(payload), pointer(out), length(out), used, n)
+            if st == LIBDEFLATE_SUCCESS
+                scratch[] = out
+                return Int(n[])
+            end
+            st == LIBDEFLATE_INSUFFICIENT_SPACE || throw(CodecError(:deflate, :decompress, "invalid deflate data"))
+            length(out) < maxbytes || throw(LimitError(:max_bytes, maxbytes + 1, maxbytes))
+            out = Vector{UInt8}(undef, min(2 * length(out), maxbytes))
+        end
+    finally
+        ccall((:libdeflate_free_decompressor, libdeflate), Cvoid, (Ptr{Cvoid},), d)
+    end
 end
 
 function extensiondecompress(name::Symbol, payload::AbstractVector{UInt8}, limits::Limits)
@@ -204,13 +234,29 @@ end
 function compressblock(w::WriterCodec, bytes::Vector{UInt8})
     w.name === :null && return bytes
     w.name === :snappy && return snappycompress(bytes)
-    w.name === :deflate && return transcodeblock(DeflateCompressor(level=w.level), bytes)
+    w.name === :deflate && return deflateblock(bytes, w.level)
     w.name === :zstandard && return transcodeblock(ZstdCompressor(level=w.level), bytes)
     return runtimecall(extensioncompress, w, bytes)::Vector{UInt8}
 end
 
 function extensioncompress(w::WriterCodec, bytes::Vector{UInt8})
     return transcodeblock(w.factory(), bytes)
+end
+
+"Raw-DEFLATE-compress one block at `level` (0–9)."
+function deflateblock(bytes::Vector{UInt8}, level::Int)
+    c = ccall((:libdeflate_alloc_compressor, libdeflate), Ptr{Cvoid}, (Cint,), level)
+    c == C_NULL && throw(OutOfMemoryError())
+    try
+        bound = Int(ccall((:libdeflate_deflate_compress_bound, libdeflate), Csize_t, (Ptr{Cvoid}, Csize_t), c, length(bytes)))
+        out = Vector{UInt8}(undef, bound)
+        n = GC.@preserve bytes out ccall((:libdeflate_deflate_compress, libdeflate), Csize_t,
+            (Ptr{Cvoid}, Ptr{UInt8}, Csize_t, Ptr{UInt8}, Csize_t), c, pointer(bytes), length(bytes), pointer(out), bound)
+        n == 0 && throw(CodecError(:deflate, :compress, "deflate compression failed"))
+        return resize!(out, Int(n))
+    finally
+        ccall((:libdeflate_free_compressor, libdeflate), Cvoid, (Ptr{Cvoid},), c)
+    end
 end
 
 function transcodeblock(codec::TranscodingStreams.Codec, bytes::Vector{UInt8})
@@ -237,10 +283,8 @@ function snappycompress(bytes::Vector{UInt8})
     return resize!(out, m + 4)
 end
 
-# ---- CRC32 (IEEE, reflected; snappy's checksum of the uncompressed data), through zlib ---------------
+# ---- CRC32 (IEEE, reflected; snappy's checksum of the uncompressed data), through libdeflate ---------
 
 function crc32(data::Vector{UInt8}, n::Int=length(data))
-    n == 0 && return UInt32(0)
-    return GC.@preserve data UInt32(ccall((:crc32_z, CodecZlib.libz), Culong, (Culong, Ptr{UInt8}, Csize_t),
-                                          0, pointer(data), n) & 0xffffffff)
+    return GC.@preserve data ccall((:libdeflate_crc32, libdeflate), UInt32, (UInt32, Ptr{UInt8}, Csize_t), 0, pointer(data), n)
 end
