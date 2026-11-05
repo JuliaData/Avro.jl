@@ -218,8 +218,36 @@ function readstring(d::Decoder)
     return s
 end
 
+# Strict UTF-8 validity of `buf[from:to]`: all-ASCII bytes, the common case, are checked a word at a time, and
+# anything else goes to Base, which rejects overlongs, surrogates and code points above U+10FFFF.
+function validutf8(buf::Vector{UInt8}, from::Int, to::Int)
+    ascii = GC.@preserve buf asciibytes(pointer(buf, from), to - from + 1, length(buf) - from + 1)
+    return ascii || isvalid(String, view(buf, from:to))
+end
+
 function validutf8(buf::AbstractVector{UInt8}, from::Int, to::Int)
     return isvalid(String, view(buf, from:to))
+end
+
+# Whether the `n` bytes at `p` are all ASCII, read a word at a time with the last word overlapping the one before
+# it. `room` bytes from `p` are readable, so fewer than eight are read as one masked word when `room >= 8`.
+@inline function asciibytes(p::Ptr{UInt8}, n::Int, room::Int)
+    acc = UInt64(0)
+    if n >= 8
+        i = 0
+        while i < n - 8
+            acc |= unsafe_load(Ptr{UInt64}(p + i))
+            i += 8
+        end
+        acc |= unsafe_load(Ptr{UInt64}(p + n - 8))
+    elseif room >= 8
+        acc = ltoh(unsafe_load(Ptr{UInt64}(p))) & (typemax(UInt64) >> (8 * (8 - n)))
+    else
+        for i in 0:n - 1
+            acc |= unsafe_load(p + i)
+        end
+    end
+    return acc & 0x8080808080808080 == 0
 end
 
 "The `n` bytes at `p` as a new `String` (one copy; a pointer path for contiguous memory)."

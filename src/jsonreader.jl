@@ -22,8 +22,13 @@ function isstrictutf8(bytes::AbstractVector{UInt8})
     return isvalid(String, bytes)
 end
 
+function isstrictutf8(bytes::Vector{UInt8})
+    return validutf8(bytes, 1, length(bytes))
+end
+
 function isstrictutf8(s::String)
-    return isvalid(s)
+    n = sizeof(s)
+    return (GC.@preserve s asciibytes(pointer(s), n, n)) || isvalid(s)
 end
 
 # A `DataString` checks its bytes where they are: a long one's in its buffer, a short one's in its payload.
@@ -31,7 +36,7 @@ function isstrictutf8(s::DataString)
     n = ncodeunits(s)
     if n > DataStrings.INLINE_MAX
         pos = DataStrings.payloadpos(s.p)
-        return isvalid(String, view(s.data, pos:pos + n - 1))
+        return validutf8(s.data, pos, pos + n - 1)
     end
     ((s.p.a >> 32) | s.p.b) & 0x8080808080808080 == 0 && return true      # ASCII, zero padding included
     return isvalid(String, codeunits(s))

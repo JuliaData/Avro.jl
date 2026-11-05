@@ -97,6 +97,29 @@ end
         @test dec("\"string\"", enc("\"string\"", :sym)) == "sym" && dec("\"string\"", enc("\"string\"", 'c')) == "c"
     end
 
+    @testset "a string decodes and encodes exactly when its bytes are UTF-8" begin
+        # ASCII strings of every length to 30 with a valid or invalid sequence at each position, decoded both at the
+        # end of the input and followed by another field.
+        pair = "{\"type\":\"record\",\"name\":\"P\",\"fields\":[{\"name\":\"s\",\"type\":\"string\"},{\"name\":\"n\",\"type\":\"long\"}]}"
+        inserts = (UInt8[0x7f], UInt8[0x80], UInt8[0xff], UInt8[0xc3], UInt8[0xc3, 0xa9], UInt8[0xc0, 0xaf],
+                   UInt8[0xed, 0xa0, 0x80], UInt8[0xf0, 0x9f, 0x98, 0x80], UInt8[0xf4, 0x90, 0x80, 0x80])
+        for n in 0:30, at in 1:n + 1, ins in inserts
+            bytes = vcat(fill(UInt8('a'), at - 1), ins, fill(UInt8('b'), max(0, n - at + 1 - length(ins))))
+            valid = isvalid(String, bytes)
+            alone = vcat(UInt8(2 * length(bytes)), bytes)
+            if valid
+                @test dec("\"string\"", alone) == String(copy(bytes))
+                r = dec(pair, vcat(alone, 0x02))
+                @test r.s == String(copy(bytes)) && r.n == 1
+                @test enc("\"string\"", String(copy(bytes))) == alone
+            else
+                @test_throws Avro.DataError dec("\"string\"", alone)
+                @test_throws Avro.DataError dec(pair, vcat(alone, 0x02))
+                @test_throws Avro.EncodeError enc("\"string\"", String(copy(bytes)))
+            end
+        end
+    end
+
     @testset "fixed, enum, unions, branch recovery" begin
         f = "{\"type\":\"fixed\",\"name\":\"F\",\"size\":2}"
         @test hex(enc(f, UInt8[1, 2])) == "0102" && hex(enc(f, (0x01, 0x02))) == "0102"
