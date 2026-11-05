@@ -26,13 +26,13 @@
     cols = decodeall(50)
     @test cols[1] == 1:50 && cols[1] isa Vector{Int64}
     @test cols[2] == [i / 2 for i in 1:50] && cols[2] isa Vector{Float64}
-    @test cols[3] == ["n$i" for i in 1:50] && cols[3] isa Vector{String}
+    @test cols[3] == ["n$i" for i in 1:50] && cols[3] isa Avro.DataStrings.StringVector{Avro.DataString}
     @test isequal(cols[4], [i % 3 == 0 ? missing : isodd(i) for i in 1:50]) && cols[4] isa Vector{Union{Missing,Bool}}
     @test cols[5] == [["t$i"] for i in 1:50] && cols[5] isa Vector{Vector{String}}
     @test cols[6][7] == Dict("k" => Int32[7])
     @test cols[6] isa Vector{Dict{String,Any}}                              # one level of typed nesting: Dict{String,Any} for nested arrays
     @test cols[7] == [Avro.EnumValue(s.fields[7].schema, isodd(i) ? 1 : 2) for i in 1:50] && cols[7] isa Vector{Avro.EnumValue}
-    @test all(eltype(c) in Avro.valuetypes() for c in cols)
+    @test all(eltype(c) in Avro.valuetypes() || eltype(c) === Avro.DataString for c in cols)
     # projection: unselected fields are skipped, growth beyond the capacity hint, exact trimming
     cols2 = decodeall(50; selected=[1, 3], capacity=4)
     @test cols2[1] == 1:50 && cols2[3] == ["n$i" for i in 1:50] && cols2[2] === nothing && cols2[4] === nothing
@@ -81,13 +81,17 @@
     kernel(ncols, nd, 100)
     @test @allocated(kernel(ncols, nd, 100)) == 0
     @test isequal(ncols[1].data, [r.a for r in nrows]) && isequal(ncols[2].data, [r.b for r in nrows])
-    # a string column allocates exactly one String per cell
+    # a string column allocates nothing for a short string, and for long ones only a buffer as one fills
     ss = P("{\"type\":\"record\",\"name\":\"S\",\"fields\":[{\"name\":\"s\",\"type\":\"string\"}]}")
     sb = reduce(vcat, [Avro.encode(ss, (s="row$i",)) for i in 1:200])
     scols = Avro.columnbuilders(Avro.readplan(ss), nothing, 200)
     sd = Avro.Decoder(sb)
     kernel(scols, sd, 200)
-    a100 = @allocations(kernel(scols, sd, 100))
-    a200 = @allocations(kernel(scols, sd, 200))
-    @test a200 - a100 == 100 && a100 <= 101                                 # one String per cell (at most one per call besides)
+    @test @allocations(kernel(scols, sd, 200)) == @allocations(kernel(scols, sd, 100)) <= 1
+    lb = reduce(vcat, [Avro.encode(ss, (s="a longer row, number $i",)) for i in 1:200])
+    lcols = Avro.columnbuilders(Avro.readplan(ss), nothing, 200)
+    ld = Avro.Decoder(lb)
+    kernel(lcols, ld, 200)
+    @test @allocations(kernel(lcols, ld, 200)) < 10
+    @test Avro.finishcolumn!(lcols[1]) == ["a longer row, number $i" for i in 1:200]
 end

@@ -7,7 +7,8 @@ integration. The API is fully qualified: nothing is exported.
 """
 module Avro
 
-import DataDecimals, Durations
+import DataDecimals, DataStrings, Durations
+using DataStrings: DataString, StringPayload, StringVector
 
 using Dates
 using UUIDs

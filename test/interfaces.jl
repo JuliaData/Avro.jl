@@ -512,7 +512,7 @@ Avro.lookup(c::LyingStore, ::UInt64) = c.schema
         @test DataAPI.metadata(df, "k") == "v"
         @test Avro.Table(Avro.tobuffer(df; schema=s)).e == ["A", "B"]
         derived = Avro.Table(Avro.tobuffer(df))
-        @test derived.e == ["A", "B"] && derived.u == [1, "x"] && eltype(derived.e) === String && eltype(derived.f) === Vector{UInt8}
+        @test derived.e == ["A", "B"] && derived.u == [1, "x"] && eltype(derived.e) === Avro.DataString && eltype(derived.f) === Vector{UInt8}
         io = IOBuffer()
         CSV.write(io, (id=t.id, e=t.e))
         @test String(take!(io)) == "id,e\n1,A\n2,B\n"

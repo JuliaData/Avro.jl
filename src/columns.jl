@@ -1,9 +1,48 @@
 # Column builders: a record's fields decoded straight into typed column vectors. Builders live in a
 # schema-independent `Vector{ColumnBuilder}` driven by one loop that decodes each cell through a closed chain
 # over the common column kinds (and a function barrier for the rest); every column's element type is a member
-# of the closed value set (`valuetypes()`), so untrusted schemas never create new method instances.
+# of the closed value set (`valuetypes()`), or `DataString` for a string column, so untrusted schemas never
+# create new method instances.
 
 abstract type ColumnBuilder end
+
+# The element type of a generic table's column for field schema `s`. A string column is a
+# `DataStrings.StringVector`, so it holds `DataString`s.
+function columntype(@nospecialize(s::Schema))
+    T = juliatype(s)
+    T === String && return DataString
+    T === Union{Missing,String} && return Union{Missing,DataString}
+    return T
+end
+
+# A string column while it decodes: a payload per row, and the buffers that the payloads of strings longer than
+# `DataStrings.INLINE_MAX` bytes point into. Builders add buffers under the lock.
+struct StringStore{E}
+    payloads::Vector{StringPayload}
+    buffers::Vector{Vector{UInt8}}
+    lock::ReentrantLock
+end
+
+# Where a final column of element type `E` decodes: a `Vector{E}`, or a `StringStore` for a string column.
+function finalstorage(@nospecialize(E::Type), n::Int)
+    (E === DataString || E === Union{Missing,DataString}) || return Vector{E}(undef, n)
+    return StringStore{E}(Vector{StringPayload}(undef, n), Vector{UInt8}[], ReentrantLock())
+end
+
+# The bytes per row that `finalstorage` allocates before decoding (a long string's bytes come as it decodes).
+function storagesize(@nospecialize(E::Type))
+    (E === DataString || E === Union{Missing,DataString}) && return sizeof(StringPayload)
+    return Base.elsize(Vector{E})
+end
+
+# A store's first `n` rows as the finished column.
+function stringvector(store::StringStore{E}, n::Int) where {E}
+    return StringVector{E}(resize!(store.payloads, n), store.buffers, Val(:trusted))
+end
+
+function finishedstorage(@nospecialize(x))
+    return x isa StringStore ? stringvector(x, length(x.payloads)) : x::AbstractVector
+end
 
 struct Projection
     indices::Vector{Int}       # source field positions in caller order
@@ -26,7 +65,29 @@ mutable struct PlanColumn{E} <: ColumnBuilder
     len::Int
 end
 
-const TypedColumn = Union{NodeColumn,PlanColumn}
+# A string field. A `string` or a nullable union of one reads in place: a short string's payload holds its bytes,
+# and a long one's bytes are copied into this builder's buffer, which the store gained when the builder started
+# it. Other plans decode the value and append it.
+mutable struct StringColumn{E} <: ColumnBuilder
+    const plan::Union{Nothing,Plan}
+    const inplace::Bool
+    const nullable::Int                  # the null branch of an in-place nullable union, or 0
+    const store::StringStore{E}
+    buffer::Vector{UInt8}                # `store.buffers[bufidx + 1]`, holding `length(buffer)` bytes
+    bufidx::Int                          # -1 until the first long string
+    capacity::Int                        # the bytes `buffer` holds before a long string starts another
+    len::Int
+    last::String                         # the last value appended, and its payload, which a repeat reuses
+    lastpayload::StringPayload
+end
+
+const TypedColumn = Union{NodeColumn,PlanColumn,StringColumn}
+
+# A long string that does not fit a builder's buffer starts another, so no buffer grows by copying. Buffers
+# start small, for small tables, and double up to `STRING_BUFFER_BYTES`. An Arrow view payload addresses
+# its buffer with 32-bit offsets, so one string longer than that is an `ArgumentError`.
+const STRING_BUFFER_START = 4 * KiB
+const STRING_BUFFER_BYTES = 1 * MiB
 
 # A field that is not kept: skipped (and checked) by its plan.
 struct SkipColumn <: ColumnBuilder
@@ -123,17 +184,17 @@ end
 function columnbuilders(@nospecialize(p::Plan), projection::Union{Nothing,Projection}, capacity::Int)
     capacity >= 0 || throw(ArgumentError("capacity must be non-negative"))
     fields = p.schema.fields
-    return directbuilders(p, projection, AbstractVector[Vector{juliatype(fields[i].schema)}(undef, capacity)
-                                                        for i in keptslots(projection, length(fields))])
+    return directbuilders(p, projection, Any[finalstorage(columntype(fields[i].schema), capacity)
+                                             for i in keptslots(projection, length(fields))])
 end
 
 function keptslots(projection::Union{Nothing,Projection}, n::Int)
     return projection === nothing ? (1:n) : projection.indices
 end
 
-# Builders that decode blocks straight into final columns: `finals[k]` is projected column `k`, and each
-# block's rows land after the row its builders' `len` is set to.
-function directbuilders(@nospecialize(p::Plan), projection::Union{Nothing,Projection}, finals::Vector{AbstractVector})
+# Builders that decode blocks straight into final columns: `finals[k]` is projected column `k`'s storage
+# (`finalstorage`), and each block's rows land after the row its builders' `len` is set to.
+function directbuilders(@nospecialize(p::Plan), projection::Union{Nothing,Projection}, finals::Vector{Any})
     plans = slotplans(p)
     fields = p.schema.fields
     cols = Vector{ColumnBuilder}(undef, length(plans))
@@ -153,6 +214,12 @@ function typedcolumn(data::Vector{E}, @nospecialize(plan::Union{Nothing,Plan})) 
     node = plan === nothing ? nothing : columnnode(E, plan)
     node === nothing && return PlanColumn{E}(plan, data, 0)
     return NodeColumn{E,typeof(node)}(node, data, 0)
+end
+
+function typedcolumn(store::StringStore{E}, @nospecialize(plan::Union{Nothing,Plan})) where {E}
+    nullable = plan isa UnionPlan && plan.nullable != 0 && plan.branches[3 - plan.nullable] isa StringPlan ? plan.nullable : 0
+    return StringColumn{E}(plan, plan isa StringPlan || nullable != 0, nullable, store, UInt8[], -1, 0, 0, "",
+                           DataStrings.inline_payload(UInt8[], 1, 0))
 end
 
 # The typed node of a column of a plain leaf, an array or map of one, or a nullable union whose other branch
@@ -193,9 +260,9 @@ end
 # One cell through a closed chain over the common column kinds; the others dispatch at run time.
 function anycell!(@nospecialize(c::ColumnBuilder), d::Decoder)
     c isa LeafColumn{Int64} && return decodecell!(c, d)
-    c isa LeafColumn{String} && return decodecell!(c, d)
+    c isa StringColumn{DataString} && return decodecell!(c, d)
     c isa LeafColumn{Float64} && return decodecell!(c, d)
-    c isa NullableColumn{String} && return decodecell!(c, d)
+    c isa StringColumn{Union{Missing,DataString}} && return decodecell!(c, d)
     c isa NullableColumn{Int64} && return decodecell!(c, d)
     c isa NullableColumn{Float64} && return decodecell!(c, d)
     c isa LeafColumn{Int32} && return decodecell!(c, d)
@@ -234,6 +301,67 @@ end
 
 function decodecell!(c::PlanColumn, d::Decoder)
     return appendcell!(c, decode(c.plan::Plan, d))
+end
+
+# Counted as `decode` counts a string and a nullable union of one.
+function decodecell!(c::StringColumn, d::Decoder)
+    c.inplace || return appendcell!(c, decode(c.plan::Plan, d))
+    countvalue!(d)
+    if c.nullable != 0
+        branch = readindex(d, 2)
+        countvalue!(d)
+        branch == c.nullable && return appendpayload!(c, DataStrings.PAYLOAD_MISSING)
+    end
+    n = readlen(d)
+    p = d.pos
+    validutf8(d.buf, p, p + n - 1) || dataerror(d, "invalid UTF-8 in string")
+    d.pos = p + n
+    return appendpayload!(c, stringpayload!(c, d.buf, p, n))
+end
+
+# The payload of the `n` bytes at `p` of `src`: inline when they are short, else copied into the builder's buffer.
+function stringpayload!(c::StringColumn, src::AbstractVector{UInt8}, p::Int, n::Int)
+    n <= DataStrings.INLINE_MAX && return DataStrings.inline_payload(src, p, n)
+    buf = c.buffer
+    off = length(buf)
+    if n > c.capacity - off
+        capacity = max(n, clamp(2 * c.capacity, STRING_BUFFER_START, STRING_BUFFER_BYTES))
+        buf = sizehint!(UInt8[], capacity)
+        store = c.store
+        c.bufidx = @lock store.lock (push!(store.buffers, buf); length(store.buffers) - 1)
+        c.buffer = buf
+        c.capacity = capacity
+        off = 0
+    end
+    resize!(buf, off + n)                                  # within the capacity, so the bytes stay put
+    copyto!(buf, off + 1, src, p, n)
+    return DataStrings.view_payload(buf, off + 1, n, c.bufidx, off)
+end
+
+function appendpayload!(c::StringColumn, payload::StringPayload)
+    n = c.len + 1
+    payloads = c.store.payloads
+    n > length(payloads) && resize!(payloads, max(2 * length(payloads), 4))
+    @inbounds payloads[n] = payload
+    c.len = n
+    return nothing
+end
+
+# A value the row plan fills or a generic decode produced: `missing` or a `String`. A reader default fills every row
+# with one value, which is stored once.
+function appendcell!(c::StringColumn, v)
+    v === missing && return appendpayload!(c, DataStrings.PAYLOAD_MISSING)
+    s = v::String
+    if s != c.last
+        bytes = codeunits(s)
+        c.lastpayload = stringpayload!(c, bytes, 1, length(bytes))
+        c.last = s
+    end
+    return appendpayload!(c, c.lastpayload)
+end
+
+function finishcolumn!(c::StringColumn)
+    return stringvector(c.store, c.len)
 end
 
 function decodecell!(c::SkipColumn, d::Decoder)

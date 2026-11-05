@@ -366,20 +366,51 @@ function nextblock!(r::Reader)
     source = r.source::BlockSource
     sourceeof(source) && return nothing
     r.failed = true
+    count, size = blockframe!(r, source)
+    return blockbody!(r, source, count, size)
+end
+
+"""
+The first block that holds file row `firstrow` or a later one, after passing over the blocks before it without
+decompressing them: the datums passed over, and the block as `nextblock!` reads it (`nothing` at a clean end).
+"""
+function nextblockfrom!(r::Reader, firstrow::Int)
+    skipped = 0
+    while true
+        checkopen(r)
+        source = r.source::BlockSource
+        sourceeof(source) && return (skipped, nothing)
+        r.failed = true
+        count, size = blockframe!(r, source)
+        satadd(skipped, count) < firstrow || return (skipped, blockbody!(r, source, count, size))
+        sourcepayload(source, size)
+        checksync(source, r.sync, r.blockindex)
+        r.failed = false
+        skipped += count
+    end
+end
+
+# The next block's datum count and payload size.
+function blockframe!(r::Reader, source::BlockSource)
     count = sourcevarint(source)
     count >= 0 || throw(DataError("negative block count $count", position(source)))
     size = sourcevarint(source)
     size >= 0 || throw(DataError("negative block size $size", position(source)))
     size <= r.limits.max_bytes || throw(LimitError(:max_bytes, size, r.limits.max_bytes))
     r.blockindex += 1
-    payload = sourcepayload(source, Int(size))
+    return (Int(count), Int(size))
+end
+
+# The block whose frame was just read, as `(count, bytes)`.
+function blockbody!(r::Reader, source::BlockSource, count::Int, size::Int)
+    payload = sourcepayload(source, size)
     checksync(source, r.sync, r.blockindex)
     r.failed = false                                   # a bad payload below leaves the next block readable
     decoded = decompressblock(r.codecname, payload, r.limits)
-    inflate!(r, Int(size), length(decoded))
-    bytes = exactblock(r, decoded, Int(count), r.blockindex)
+    inflate!(r, size, length(decoded))
+    bytes = exactblock(r, decoded, count, r.blockindex)
     count == 0 && !isempty(bytes) && throw(DataError("a zero-count block has a non-empty payload", 1))
-    return (Int(count), bytes)
+    return (count, bytes)
 end
 
 "Charge one block to the read's inflation budget (`max_inflation`)."
@@ -877,16 +908,6 @@ end
     return job
 end
 
-# `Threads.@spawn` would wrap `job` in a closure that the call edge cannot reach.
-function spawncompression(job::CompressJob)
-    TRIM_CALL_EDGE[] && job()
-    task = Task(job)
-    task.sticky = false
-    Threads._spawn_set_thrpool(task, :default)
-    schedule(task)
-    return task
-end
-
 "Wait for the oldest in-flight block and write it; a failed compression raises here."
 function writeoldest!(w::Writer)
     job = fetch(first(w.inflight))::CompressJob
@@ -928,7 +949,7 @@ function flushblock!(w::Writer)
         else
             length(w.inflight) >= 2 * w.workers && writeoldest!(w)
             job = CompressJob(w.wcodec, w.permits, w.pendingcount, length(raw), raw, nothing)
-            push!(w.inflight, spawncompression(job))
+            push!(w.inflight, spawntask(job))
         end
     catch e
         poison!(w, e)

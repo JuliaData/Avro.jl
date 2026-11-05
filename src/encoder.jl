@@ -135,6 +135,30 @@ function writestring!(e::Encoder, s::AbstractString)
     return nothing
 end
 
+# A `DataString` (from a string column `Avro.Table` read) copies a long string from its buffer in one move, and
+# stores a short one's 12 inline payload bytes in two words; the bytes past its length are written over next.
+function writestring!(e::Encoder, s::DataString)
+    n = ncodeunits(s)
+    writelong!(e, Int64(n))
+    p = s.p
+    if n > DataStrings.INLINE_MAX
+        ensureroom!(e, n)
+        data = s.data
+        buf = e.buf
+        GC.@preserve data buf unsafe_copyto!(pointer(buf, e.pos + 1), pointer(data, DataStrings.payloadpos(p)), n)
+    else
+        ensureroom!(e, DataStrings.INLINE_MAX)
+        buf = e.buf
+        GC.@preserve buf begin
+            q = pointer(buf, e.pos + 1)
+            unsafe_store!(Ptr{UInt32}(q), htol((p.a >> 32) % UInt32))
+            unsafe_store!(Ptr{UInt64}(q + 4), htol(p.b))
+        end
+    end
+    e.pos += n
+    return nothing
+end
+
 function writechar!(e::Encoder, char::Char)
     n = ncodeunits(char)
     writelong!(e, Int64(n))

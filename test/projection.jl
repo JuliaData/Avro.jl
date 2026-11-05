@@ -319,6 +319,8 @@ import Logging
                 fullct = Tables.columntable(full)
                 fullsch = Tables.schema(full)
                 for sel in corpusselections(names)
+                    # rows hold the generic values; a table holds string columns as `DataString`s
+                    expectedrowtypes = Type[Avro.juliatype(Avro.schema(full).fields[findfirst(==(nm), names)].schema) for nm in sel]
                     expectedtypes = Type[fullsch.types[findfirst(==(nm), collect(fullsch.names))] for nm in sel]
                     rowresult = quietly(data) do
                         rl = Avro.Rows(data; select=Tuple(sel), opts...)
@@ -330,7 +332,7 @@ import Logging
                     end
                     rowschema, rows = rowresult
                     @test collect(rowschema.names) == sel
-                    @test collect(rowschema.types) == expectedtypes
+                    @test collect(rowschema.types) == expectedrowtypes
                     @test length(rows) == length(full)
                     for (k, nm) in enumerate(sel)
                         @test isequal([Tables.getcolumn(r, k) for r in rows], collect(fullct[nm]))

@@ -25,7 +25,12 @@ logical type is preserved as an unknown annotation and is deferred.
 - The JSON encoding (`Avro.tojson`/`Avro.fromjson`).
 - `Avro.Table`: a column table with DataAPI metadata, direct column access through `table.name`,
   `table[:name]` and `table[index]`, and a stored `Tables.Schema` (names and eltypes never become type
-  parameters); `Tables.rowtable` builds typed rows from it on request.
+  parameters); `Tables.rowtable` builds typed rows from it on request. String columns are
+  `DataStrings.StringVector`s of `DataString`s, which hold short strings in place and long ones in shared buffers.
+- `Avro.Table(src, T)`: a typed column table, one `Vector{fieldtype(T, i)}` per field of `T`, decoded in parallel
+  and compiled by `juliac --trim=safe`.
+- Scans: `filter=`, `limit=` and `offset=` on `Avro.Table`, or a `Tables.Scan` as `scan=`, decode only the columns
+  and blocks a scan needs and return what `Tables.scan` would.
 - `Avro.Rows`: bounded-memory streaming of `Avro.Record`s (Tables.jl rows), typed values
   (`Avro.Rows(src, T)`), or plain values, with per-block `Tables.partitions`.
 - `Avro.write` takes generators and vectors of structs or plain values as well as Tables.jl sources;
@@ -34,7 +39,8 @@ logical type is preserved as an unknown annotation and is deferred.
 - `Avro.SingleObjectReader` and `Avro.SingleObjectWriter`: prepared single-object codecs for message streams.
 - `references=` on `Avro.parseschema`, for named types shared across schema files.
 - With Arrow.jl 3 loaded (ArrowTypes 2.4), nested `Avro.Record` columns write as Arrow struct columns typed by
-  their schema, with their decimals as Arrow decimals; `Avro.Duration` values write as Arrow intervals.
+  their schema, with their decimals as Arrow decimals; `Avro.Duration` values write as Arrow intervals, and
+  `Avro.WideDecimal` columns as 76-digit Arrow decimals.
 - With TimeZones.jl loaded, `ZonedDateTime` reads and writes as an instant.
 - Projection pushdown: `select=` on `Avro.Table` and `Avro.Rows` skips unselected fields and derives
   an effective schema that `Avro.write` round-trips.

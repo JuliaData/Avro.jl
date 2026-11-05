@@ -29,6 +29,17 @@ end
 # Never true and not foldable. `juliac --trim` compiles a task body or finalizer only through a static call to it.
 const TRIM_CALL_EDGE = Ref(false)
 
+# Run `job()` on a thread of the default pool. `Threads.@spawn` would wrap `job` in a closure that the call edge
+# cannot reach. `job`'s call method must be `@noinline`, so that the task runs its compiled method.
+function spawntask(job::F) where {F}
+    TRIM_CALL_EDGE[] && job()
+    task = Task(job)
+    task.sticky = false
+    Threads._spawn_set_thrpool(task, :default)
+    schedule(task)
+    return task
+end
+
 # Run `f(x)` when `x` is collected. `Base.finalizer` takes its function `@nospecialize`, which `juliac --trim`
 # cannot resolve, so this registers it with the runtime directly. `f` must be `@noinline`: the runtime calls
 # its compiled method, which an inlined call edge would not leave behind.

@@ -1445,18 +1445,19 @@ function deepcopyschema(@nospecialize(s::Schema), memo::IdDict{Schema,Schema})
 end
 
 """
-    projectrecord(s, positions) -> RecordSchema
+    projectrecord(s, positions, names; aliases=true) -> RecordSchema
 
-The record `s` reduced to the fields at `positions`, in that order: a copy of its graph in which every
-reference to `s` resolves to the new root. `s` was validated when it was built, so the copy skips the
-constructors' rules and keeps repaired names and defaults.
+The record `s` reduced to the fields at `positions`, in that order and named `names` (with their aliases unless
+`aliases=false`): a copy of its graph in which every reference to `s` resolves to the new root. `s` was validated
+when it was built, so the copy skips the constructors' rules and keeps repaired names and defaults.
 """
-function projectrecord(s::RecordSchema, positions::Vector{Int})
+function projectrecord(s::RecordSchema, positions::Vector{Int}, names::Vector{String}=String[s.fields[i].name for i in positions];
+                       aliases::Bool=true)
     rec = RecordSchema(s.name, s.aliases, s.rawaliases, s.doc, s.iserror, s.props, NodeMeta())
     memo = IdDict{Schema,Schema}(s => rec)
-    for i in positions
+    for (i, name) in zip(positions, names)
         f = s.fields[i]
-        push!(rec.fields, Field(f.name, deepcopyschema(f.schema, memo), f.doc, f.default, f.order, f.aliases, f.props))
+        push!(rec.fields, Field(name, deepcopyschema(f.schema, memo), f.doc, f.default, f.order, aliases ? f.aliases : String[], f.props))
     end
     indexfields!(rec, (i, msg, key) -> throw(ArgumentError(msg)))
     metas = NodeMeta[]

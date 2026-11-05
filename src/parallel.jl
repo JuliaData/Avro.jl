@@ -2,7 +2,7 @@
 # into a block table, the final columns are preallocated at the claimed row count, and every block
 # decodes directly at its row offset. Workers take block indices in order; the lowest failing index's
 # error is the one raised, so results, acceptance and errors are identical at every `ntasks`. Workers stop
-# taking blocks once what they decompressed exceeds what the whole file may inflate to, so a read never
+# taking blocks once what they decompressed exceeds what the blocks being read may inflate to, so a read never
 # decompresses more than that bound plus one block per worker.
 
 "One pre-scanned block: payload location, framing, and its prefix-sum row offset."
@@ -20,8 +20,11 @@ struct PrescanResult
     pending::Union{Nothing,Exception}   # a header fault met while scanning; raised after the complete blocks decode
 end
 
-"Walk the block headers without decompressing (a bad header becomes the pending failure)."
-function prescanblocks(r::Reader)
+"""
+Walk the block headers without decompressing, up to the block that holds file row `lastrow` (a bad header becomes
+the pending failure).
+"""
+function prescanblocks(r::Reader, lastrow::Int=typemax(Int))
     src = r.source::BytesSource
     entries = BlockEntry[]
     rows = 0
@@ -43,6 +46,7 @@ function prescanblocks(r::Reader)
                 throw(DataError("cumulative block row count exceeds the platform Int range", src.pos))
             push!(entries, BlockEntry(length(entries) + 1, off, Int(size), blockrows, rows + 1))
             rows += blockrows
+            lastrow < typemax(Int) && rows >= lastrow && break
         end
     catch e
         (e isa DataError || e isa LimitError) || rethrow()
@@ -50,6 +54,25 @@ function prescanblocks(r::Reader)
     end
     src.pos = startpos
     return PrescanResult(entries, rows, pending)
+end
+
+"""
+The pre-scanned blocks that hold file rows `firstrow:lastrow`, with row offsets from the first of them, and the file
+rows before that block. A header fault is met only by a window that reaches past the complete blocks.
+"""
+function windowblocks(pre::PrescanResult, firstrow::Int, lastrow::Int)
+    pending = lastrow > pre.totalrows ? pre.pending : nothing
+    firstrow == 1 && lastrow >= pre.totalrows && return (PrescanResult(pre.entries, pre.totalrows, pending), 0)
+    entries = BlockEntry[]
+    base = pre.totalrows
+    for e in pre.entries
+        e.rowstart + e.count - 1 < firstrow && continue
+        e.rowstart > lastrow && break
+        isempty(entries) && (base = e.rowstart - 1)
+        push!(entries, BlockEntry(e.index, e.offset, e.size, e.count, e.rowstart - base))
+    end
+    rows = isempty(entries) ? 0 : entries[end].rowstart + entries[end].count - 1
+    return (PrescanResult(entries, rows, pending), base)
 end
 
 "What the workers of one parallel decode share."
@@ -87,18 +110,18 @@ function decoderows!(plan, cells::Vector{ColumnBuilder}, d::Decoder, count::Int)
 end
 
 """
-A decoder over one pre-scanned block, its decompressed size recorded in `sizes`: an uncompressed block in a
-`Vector` is read in place, since decoded values never alias their input.
+A decoder over one pre-scanned block, the `i`th the read decodes, its decompressed size recorded in `sizes[i]`: an
+uncompressed block in a `Vector` is read in place, since decoded values never alias their input.
 """
-function blockdecoder(r::Reader, e::BlockEntry, sizes::Vector{Int})
+function blockdecoder(r::Reader, e::BlockEntry, sizes::Vector{Int}, i::Int)
     src = r.source::BytesSource
     stop = e.offset + e.size - 1
     if r.codecname === :null && r.legacy === nothing && src.buf isa Vector{UInt8}
-        sizes[e.index] = e.size
+        sizes[i] = e.size
         return blockcap!(Decoder(src.buf, r.limits; pos=e.offset, stop=stop))
     end
     decoded = decompressblock(r.codecname, view(src.buf, e.offset:stop), r.limits)
-    sizes[e.index] = length(decoded)
+    sizes[i] = length(decoded)
     return blockcap!(Decoder(exactblock(r, decoded, e.count, e.index), r.limits))
 end
 
@@ -116,44 +139,90 @@ function inflateinorder!(r::Reader, entries::Vector{BlockEntry}, sizes::Vector{I
     return nothing
 end
 
-"Decode one pre-scanned block from its decoder `d` straight into the finals at its row offset."
-function decodeentry!(r::Reader, plan, cols::Vector{ColumnBuilder}, cells::Vector{ColumnBuilder}, e::BlockEntry,
-                      d::Decoder)
-    e.count == 0 && return checkconsumed(d)
-    for c in cols
-        c isa TypedColumn && (c.len = e.rowstart - 1)
-    end
-    return decoderows!(plan, cells, d, e.count)
+# A generic table's block decoder: builders over the final columns. Each worker decodes with its own builders.
+struct BuilderBlocks{P}
+    plan::P
+    projection::Union{Nothing,Projection}
+    finals::Vector{Any}                      # each column's `finalstorage`
+    cols::Vector{ColumnBuilder}
+    cells::Vector{ColumnBuilder}
 end
 
-# Every block a worker takes, it decompresses and decodes, so the blocks handed out stay a decoded prefix.
-# Past `cap`, the most the whole file may inflate to, no further block is handed out.
-function decodeworker!(state::WorkerState, r::Reader, plan, projection::Union{Nothing,Projection},
-                       finals::Vector{AbstractVector}, entries::Vector{BlockEntry},
-                       errors::Vector{Union{Nothing,Exception}}, sizes::Vector{Int}, cap::Int)
-    cols = directbuilders(plan, projection, finals)           # builders are per worker
-    cells = rowcells(plan, cols)
-    n = length(entries)
+function BuilderBlocks(plan, projection::Union{Nothing,Projection}, finals::Vector{Any})
+    cols = directbuilders(plan, projection, finals)
+    return BuilderBlocks(plan, projection, finals, cols, rowcells(plan, cols))
+end
+
+# The block decoder a worker uses, given the one the read was set up with.
+function workerblocks(b::BuilderBlocks)
+    return BuilderBlocks(b.plan, b.projection, b.finals)
+end
+
+"Decode one pre-scanned block from its decoder `d` straight into the final columns at its row offset."
+function decodeblock!(b::BuilderBlocks, e::BlockEntry, d::Decoder)
+    e.count == 0 && return checkconsumed(d)
+    for c in b.cols
+        c isa TypedColumn && (c.len = e.rowstart - 1)
+    end
+    return decoderows!(b.plan, b.cells, d, e.count)
+end
+
+# A typed table's block decoder, which workers share: each row decodes into `T` and its fields go to the columns.
+struct TypedBlocks{T,C<:Tuple}
+    node::TypedNode
+    columns::C
+end
+
+function TypedBlocks{T}(node::TypedNode, columns::C) where {T,C<:Tuple}
+    return TypedBlocks{T,C}(node, columns)
+end
+
+function workerblocks(b::TypedBlocks)
+    return b
+end
+
+function decodeblock!(b::TypedBlocks{T}, e::BlockEntry, d::Decoder) where {T}
+    for row in e.rowstart:(e.rowstart + e.count - 1)
+        setrow!(b.columns, row, decodenode(T, b.node, d))
+    end
+    return checkconsumed(d)
+end
+
+# One worker of a parallel decode, decoding with its `workerblocks` of `blocks`. Every block it takes, it
+# decompresses and decodes, so the blocks handed out stay a decoded prefix. Past `cap`, the most the blocks being
+# read may inflate to, no further block is handed out.
+struct BlockWorker{B}
+    state::WorkerState
+    r::Reader
+    entries::Vector{BlockEntry}
+    errors::Vector{Union{Nothing,Exception}}
+    sizes::Vector{Int}
+    cap::Int
+    blocks::B
+end
+
+@noinline function (w::BlockWorker)()
+    blocks = workerblocks(w.blocks)
+    n = length(w.entries)
     while true
-        i = @atomic state.taken += 1
+        i = @atomic w.state.taken += 1
         i > n && break
-        (@atomic state.failed) < i && break                    # a lower block already failed; every later index is higher
+        (@atomic w.state.failed) < i && break                  # a lower block already failed; every later index is higher
         try
-            e = entries[i]
-            d = blockdecoder(r, e, sizes)
-            (@atomic state.inflated += sizes[i]) > cap && (@atomic state.taken = n)
-            decodeentry!(r, plan, cols, cells, e, d)
+            e = w.entries[i]
+            d = blockdecoder(w.r, e, w.sizes, i)
+            (@atomic w.state.inflated += w.sizes[i]) > w.cap && (@atomic w.state.taken = n)
+            decodeblock!(blocks, e, d)
         catch err
-            errors[i] = err
-            recordfailure!(state, i)
+            w.errors[i] = err::Exception
+            recordfailure!(w.state, i)
             break
         end
     end
     return nothing
 end
 
-function decodeparallel!(r::Reader, plan, projection::Union{Nothing,Projection}, finals::Vector{AbstractVector},
-                         entries::Vector{BlockEntry}, nworkers::Int, sizes::Vector{Int})
+function decodeparallel!(r::Reader, blocks, entries::Vector{BlockEntry}, nworkers::Int, sizes::Vector{Int})
     state = WorkerState(0, typemax(Int), r.decompressed)
     errors = Vector{Union{Nothing,Exception}}(nothing, length(entries))
     compressed = r.compressed
@@ -161,8 +230,8 @@ function decodeparallel!(r::Reader, plan, projection::Union{Nothing,Projection},
         compressed = satadd(compressed, e.size)
     end
     cap = inflationcap(r.limits, compressed)
-    workers = Task[errormonitor(Threads.@spawn decodeworker!(state, r, plan, projection, finals, entries, errors, sizes, cap))
-                   for _ in 1:nworkers]
+    worker = BlockWorker(state, r, entries, errors, sizes, cap, blocks)
+    workers = Task[spawntask(worker) for _ in 1:nworkers]
     try
         for t in workers
             wait(t)
@@ -181,23 +250,20 @@ function decodeparallel!(r::Reader, plan, projection::Union{Nothing,Projection},
 end
 
 """
-Decode a pre-scanned byte source into the preallocated finals, in parallel when `ntasks` and the thread
-count allow (legacy tolerance mutates reader state, so it decodes sequentially).
+Decode a pre-scanned byte source into preallocated final columns with the block decoder `blocks`, in parallel
+when `ntasks` and the thread count allow (legacy tolerance mutates reader state, so it decodes sequentially).
 """
-function decodeblocks!(r::Reader, plan, projection::Union{Nothing,Projection}, finals::Vector{AbstractVector},
-                       pre::PrescanResult, ntasks::Int)
+function decodeblocks!(r::Reader, blocks, pre::PrescanResult, ntasks::Int)
     entries = pre.entries
     sizes = fill(-1, length(entries))
     nworkers = min(ntasks, Threads.nthreads(), length(entries))
     if nworkers > 1 && r.legacy === nothing
-        decodeparallel!(r, plan, projection, finals, entries, nworkers, sizes)
+        decodeparallel!(r, blocks, entries, nworkers, sizes)
     else
-        cols = directbuilders(plan, projection, finals)
-        cells = rowcells(plan, cols)
-        for e in entries
-            d = blockdecoder(r, e, sizes)
-            inflate!(r, e.size, sizes[e.index])
-            decodeentry!(r, plan, cols, cells, e, d)
+        for (i, e) in enumerate(entries)
+            d = blockdecoder(r, e, sizes, i)
+            inflate!(r, e.size, sizes[i])
+            decodeblock!(blocks, e, d)
         end
     end
     pre.pending === nothing || throw(pre.pending)

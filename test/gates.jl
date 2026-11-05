@@ -57,7 +57,7 @@ end
             cols = Avro.columnbuilders(plan, nothing, 1)
             Avro.decoderow!(cols, d)
             col = Avro.finishcolumn!(cols[1])
-            @test eltype(col) === T && length(col) == 1
+            @test eltype(col) === Avro.columntype(s) && length(col) == 1           # T, or DataString for a string column
             Avro.fromjson(s, Avro.tojson(s, v))
         end
         warmed += 1

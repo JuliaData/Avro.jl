@@ -1,6 +1,6 @@
 # Precompile workload: schema parse/print/canonical/fingerprint, prepared and one-shot
-# encode/decode, container round trips over the built-in codecs, Table (with a projection), Rows,
-# single-object, and the JSON encoding.
+# encode/decode, container round trips over the built-in codecs, Table (with a projection, a row limit, and
+# typed), Rows, single-object, and the JSON encoding.
 
 using PrecompileTools: @setup_workload, @compile_workload
 
@@ -88,6 +88,8 @@ const PRECOMPILED_FIELDS = (Int64(1), Int32(1), 1.0, 1.0f0, true, "a", :a, UInt8
             err isa Base.IOError || rethrow()
         end
         Tables.columntable(Table(tobuffer(prows; schema=s); select=(:id,)))
+        Table(tobuffer(prows; schema=s); limit=1)
+        Table(tobuffer(prows; schema=s), PrecompiledRow)
         Tables.columntable(Table(tobuffer(prows)))           # the schema derived from the rows
         schema(typeof(prows[1]))
     end

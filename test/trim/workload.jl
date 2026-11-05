@@ -62,6 +62,12 @@ function (@main)(args::Vector{String})::Cint
             n += row.id + length(row.tags)
         end
         n == 5250 || return Cint(3)
+        blocked = joinpath(dir, "readings-blocked.avro")         # many blocks, so two threads decode them in parallel
+        Avro.write(blocked, readings; block_bytes=512)
+        table = Avro.Table(blocked, Reading)
+        (length(table) == 1000 && sum(table.time) == 500500 && count(ismissing, table.temp) == 500) || return Cint(11)
+        tags = Avro.Table(file, @NamedTuple{tags::Vector{String}, id::Int64})
+        (sum(tags.id) == 5050 && all(t -> t == ["a", "b"], tags.tags)) || return Cint(12)
         columns = (id=collect(Int64, 1:10), name=["n$i" for i in 1:10])
         Avro.write(joinpath(dir, "columns.avro"), columns)
         bytes = Avro.DatumWriter(s, Row)(rows[2])

@@ -28,7 +28,7 @@ Tables.getcolumn(t::TablesIntName, ::Int) = t.a
         ts = Tables.schema(t)
         @test ts isa Tables.Schema{nothing,nothing}                            # stored: nothing in type parameters
         @test collect(ts.names) == [:a, :b, :c, :e]
-        @test collect(ts.types) == [Int64, String, Union{Missing,Float64}, Avro.EnumValue]
+        @test collect(ts.types) == [Int64, Avro.DataString, Union{Missing,Float64}, Avro.EnumValue]
         @test Tables.getcolumn(t, 1) == 1:250 && Tables.getcolumn(t, :a) isa Vector{Int64}
         @test Tables.getcolumn(t, :b) == ["r$i" for i in 1:250]
         @test t.a === t[:a] === t[1] === Tables.getcolumn(t, :a)
@@ -404,5 +404,147 @@ Tables.getcolumn(t::TablesIntName, ::Int) = t.a
         @test Base.IteratorSize(typeof(rc)) === Base.SizeUnknown()
         @test_throws Avro.DataError collect(rc)
         close(rc)
+    end
+
+    @testset "typed tables" begin
+        bytes = take!(buf())
+        g = Avro.Table(bytes)
+        R = @NamedTuple{c::Union{Missing,Float64}, a::Int64, e::String}
+        for src in (bytes, IOBuffer(bytes)), nt in (1, 4)
+            t = Avro.Table(src isa IOBuffer ? IOBuffer(bytes) : src, R; ntasks=nt)
+            @test t isa Avro.Table{R,Tuple{Vector{Union{Missing,Float64}},Vector{Int64},Vector{String}}}
+            @test Tables.columnnames(t) == (:c, :a, :e) && length(t) == 250
+            @test isequal(t.c, g.c) && t.a == g.a && t.e == g.e
+            @test Tables.schema(t) == Tables.Schema((:c, :a, :e), (Union{Missing,Float64}, Int64, String))
+        end
+        column(t) = t.a
+        @test (@inferred column(Avro.Table(bytes, R))) isa Vector{Int64}
+        @test Avro.metadata(Avro.Table(bytes, R))["k"] == Vector{UInt8}("v")
+        # an evolved file reads as `Avro.Rows(src, T)` reads it
+        widened = P("{\"type\":\"record\",\"name\":\"T\",\"namespace\":\"t\",\"fields\":[{\"name\":\"a\",\"type\":\"long\"},{\"name\":\"z\",\"type\":\"long\",\"default\":7}]}")
+        @test Avro.Table(bytes, @NamedTuple{z::Int64, a::Int64}; reader_schema=widened).z == fill(7, 250)
+        # bounded rows, from bytes and from a stream
+        for src in (bytes, IOBuffer(bytes))
+            b = Avro.Table(src isa IOBuffer ? IOBuffer(bytes) : src, R; offset=120, limit=17)
+            @test b.a == 121:137 && length(b) == 17
+        end
+        @test length(Avro.Table(bytes, R; offset=300)) == 0 && length(Avro.Table(bytes, R; limit=0)) == 0
+        @test_throws ArgumentError Avro.Table(bytes, R; limit=-1)
+        @test_throws ArgumentError Avro.Table(bytes, Int)
+        @test_throws ArgumentError Avro.Table(bytes, NamedTuple)
+        # written back, its schema derives from its columns
+        back = Avro.Table(Avro.tobuffer(Avro.Table(bytes, R)))
+        @test Tables.columnnames(back) == [:c, :a, :e] && back.a == g.a && back.e == g.e
+    end
+
+    @testset "string columns" begin
+        long(i) = "row $i " * "x"^(i % 40)
+        strs = [(s=long(i), short="s$(i % 9)", n=isodd(i) ? missing : long(i)) for i in 1:60_000]
+        ss = P("{\"type\":\"record\",\"name\":\"S\",\"fields\":[{\"name\":\"s\",\"type\":\"string\"},{\"name\":\"short\",\"type\":\"string\"},{\"name\":\"n\",\"type\":[\"null\",\"string\"]}]}")
+        bytes = take!(Avro.tobuffer(strs; schema=ss, block_bytes=4096))
+        for src in (bytes, IOBuffer(bytes)), nt in (1, 4)                   # more than a megabyte of long strings
+            t = Avro.Table(src isa IOBuffer ? IOBuffer(bytes) : src; ntasks=nt)
+            @test t.s isa Avro.DataStrings.StringVector{Avro.DataString}
+            @test t.n isa Avro.DataStrings.StringVector{Union{Missing,Avro.DataString}}
+            @test t.s == [r.s for r in strs] && t.short == [r.short for r in strs] && isequal(t.n, [r.n for r in strs])
+            @test length(t.s.buffers) > 2
+        end
+        @test collect(Tables.schema(Avro.Table(bytes)).types) == [Avro.DataString, Avro.DataString, Union{Missing,Avro.DataString}]
+        @test collect(Tables.schema(Avro.Rows(bytes)).types) == [String, String, Union{Missing,String}]   # rows hold Strings
+        @test first(Avro.Rows(bytes)).s isa String
+        rewritten = take!(Avro.tobuffer(Avro.Table(bytes)))
+        @test Avro.Table(rewritten).s == [r.s for r in strs]
+        parts = collect(Tables.partitions(Avro.Rows(bytes)))
+        @test length(parts) > 1 && reduce(vcat, [collect(p.s) for p in parts]) == [r.s for r in strs]
+        # a reader default fills a string column
+        extra = P("{\"type\":\"record\",\"name\":\"S\",\"fields\":[{\"name\":\"s\",\"type\":\"string\"},{\"name\":\"d\",\"type\":\"string\",\"default\":\"a default longer than twelve bytes\"}]}")
+        defaulted = Avro.Table(bytes; reader_schema=extra).d
+        @test defaulted == fill("a default longer than twelve bytes", length(strs))
+        @test sum(length, defaulted.buffers) < 1000                       # stored once per decoding task, not per row
+        bad = copy(bytes)
+        bad[findfirst(==(UInt8('x')), bad)] = 0xff
+        @test_throws Avro.DataError Avro.Table(bad)
+    end
+
+    @testset "scans equal Tables.scan over the whole table" begin
+        bytes = take!(Avro.tobuffer(rows; schema=s, block_bytes=256))
+        whole = Avro.Table(bytes)
+        col = Tables.col
+        scans = [Tables.Scan(limit=10), Tables.Scan(offset=245), Tables.Scan(offset=100, limit=77), Tables.Scan(offset=900),
+                 Tables.Scan(limit=0), Tables.Scan(select=(:c, :a), limit=5, offset=3), Tables.Scan(filter=col(:a) > 200),
+                 Tables.Scan(select=(:b,), filter=col(:c) > 50.0, limit=7, offset=2), Tables.Scan(select=(:a => :key, :b), filter=Tables.isnull(col(:c))),
+                 Tables.Scan(select=(:a, :a => :a2), limit=3), Tables.Scan(select=Tables.Not(:b), offset=249), Tables.Scan(select=(), limit=10),
+                 Tables.Scan(filter=Tables.colcmp(==, col(:e), "X") & (col(:a) < 30))]
+        for sc in scans, src in (bytes, IOBuffer(bytes)), nt in (1, 4)
+            want = Tables.scan(whole, sc)
+            t = Avro.Table(src isa IOBuffer ? IOBuffer(bytes) : src; scan=sc, ntasks=nt)
+            @test collect(Tables.columnnames(t)) == collect(Tables.columnnames(want))
+            @test length(t) == Tables.rowcount(Tables.columns(want))
+            for nm in Tables.columnnames(want)
+                @test isequal(collect(Tables.getcolumn(t, nm)), collect(Tables.getcolumn(want, nm)))
+            end
+        end
+        @test Avro.Table(bytes; limit=3).a == [1, 2, 3]
+        @test Avro.Table(bytes; select=:b, offset=248).b == ["r249", "r250"]
+        @test Avro.Table(bytes; filter=Tables.colcmp(==, col(:e), "Y"), limit=2).a == [2, 4]
+        @test [f.name for f in Avro.schema(Avro.Table(bytes; scan=Tables.Scan(select=(:a => :key,)))).fields] == ["key"]
+        @test_throws ArgumentError Avro.Table(bytes; scan=Tables.Scan(), limit=1)
+        @test_throws ArgumentError Avro.Table(bytes; scan=Tables.Scan(select=(:a => Float64,)))
+        @test_throws ArgumentError Avro.Table(bytes; scan=Tables.Scan(select=(:a => Symbol("not a name"),)))
+        @test_throws Avro.SchemaError Avro.Table(bytes; select=:nope, limit=1)
+        @test Avro.Table(bytes; offset=typemax(Int)).a == Int64[] && Avro.Table(bytes; limit=typemax(UInt64)).a == 1:250
+        @test_throws ArgumentError Avro.Table(bytes, @NamedTuple{a::Int64}; select=:a)
+        # a repeated or renamed field leaves its aliases out, so they cannot collide
+        aliased = P("{\"type\":\"record\",\"name\":\"A\",\"fields\":[{\"name\":\"a\",\"type\":\"long\",\"aliases\":[\"olda\"]},{\"name\":\"b\",\"type\":\"long\"}]}")
+        ab = take!(Avro.tobuffer([(a=i, b=10i) for i in 1:5]; schema=aliased))
+        for sc in (Tables.Scan(select=(:a, :a => :a2)), Tables.Scan(select=(:a, :b => :olda)))
+            @test Tables.columntable(Avro.Table(ab; scan=sc)) == Tables.columntable(Tables.scan(Avro.Table(ab), sc))
+        end
+        @test Avro.schema(Avro.Table(ab; select=:a)).fields[1].aliases == ["olda"]
+        # a record that refers back to itself keeps every field once, under its own name
+        node = P("{\"type\":\"record\",\"name\":\"N\",\"fields\":[{\"name\":\"a\",\"type\":\"long\"},{\"name\":\"b\",\"type\":\"long\"},{\"name\":\"n\",\"type\":[\"null\",\"N\"]}]}")
+        nb = take!(Avro.tobuffer([(a=1, b=2, n=(a=3, b=4, n=missing))]; schema=node))
+        for sel in ((:a, :a => :a2, :n), (:a => :x, :b, :n), (:a => :b, :b => :a, :n), (:a, :n))
+            @test_throws ArgumentError Avro.Table(nb; scan=Tables.Scan(select=sel))
+        end
+        @test Tables.columnnames(Avro.Table(nb; scan=Tables.Scan(select=(:n, :b, :a)))) == [:n, :b, :a]
+        # a field name holding a NUL byte, read under allow_invalid_names, selects as itself
+        zs = P("{\"type\":\"record\",\"name\":\"Z\",\"fields\":[{\"name\":\"axxxxxxb\",\"type\":\"long\"},{\"name\":\"c\",\"type\":\"long\"}]}")
+        zb = take!(Avro.tobuffer([(axxxxxxb=1, c=2)]; schema=zs))
+        zb[findfirst(codeunits("axxxxxxb"), zb)] = codeunits("a\\u0000b")
+        nul = first(Tables.columnnames(Avro.Table(zb; allow_invalid_names=true)))
+        @test Avro.Table(zb; allow_invalid_names=true, select=nul)[1] == [1]
+        # a zero-column table still has rows for Tables.jl
+        @test Tables.rowcount(Avro.Table(bytes; select=())) == 250
+        @test Tables.rowcount(Tables.scan(Avro.Table(bytes; select=()), Tables.Scan(limit=3))) == 3
+    end
+
+    @testset "scans hold only the rows they keep, and meet only the blocks they read" begin
+        many = [(id=Int64(i), s="a string longer than twelve bytes, row $i") for i in 1:20_000]
+        ms = P("{\"type\":\"record\",\"name\":\"M\",\"fields\":[{\"name\":\"id\",\"type\":\"long\"},{\"name\":\"s\",\"type\":\"string\"}]}")
+        data = take!(Avro.tobuffer(many; schema=ms, block_bytes=1 << 20))
+        whole = Base.summarysize(Avro.Table(data))
+        @test Base.summarysize(Avro.Table(data; filter=Tables.colcmp(==, Tables.col(:id), 7))) < whole ÷ 100
+        @test Base.summarysize(Avro.Table(data; limit=10)) < whole ÷ 100
+        # damage blocks the scan does not read: a snappy checksum in the first block, the sync marker after the last
+        sn = take!(Avro.tobuffer(many; schema=ms, codec=:snappy, block_bytes=4096))
+        entries = Avro.prescanblocks(Avro.Reader(sn)).entries
+        first1, last1 = entries[1], entries[end]
+        sn[first1.offset + first1.size - 1] ⊻= 0xff
+        sn[last1.offset + last1.size] ⊻= 0xff
+        skip, stop = first1.count + 3, last1.rowstart - 10
+        for src in (() -> sn, () -> IOBuffer(sn)), (label, read) in (("generic", s -> Avro.Table(s; offset=skip, limit=5).id),
+                                                                      ("typed", s -> Avro.Table(s, @NamedTuple{id::Int64}; offset=skip, limit=5).id))
+            @test read(src()) == skip + 1:skip + 5
+        end
+        @test Avro.Table(sn; offset=skip, limit=stop - skip).id == skip + 1:stop
+        @test Avro.Table(IOBuffer(sn); offset=skip, limit=stop - skip).id == skip + 1:stop
+        @test_throws Avro.CodecError Avro.Table(sn)
+        @test_throws Avro.CodecError Avro.Table(IOBuffer(sn))
+        for src in (sn, IOBuffer(sn))                                 # limit=0 reads nothing
+            @test length(Avro.Table(src; limit=0)) == 0
+            src isa IOBuffer && seekstart(src)
+            @test length(Avro.Table(src, @NamedTuple{id::Int64}; limit=0)) == 0
+        end
     end
 end

@@ -26,6 +26,17 @@ function isstrictutf8(s::String)
     return isvalid(s)
 end
 
+# A `DataString` checks its bytes where they are: a long one's in its buffer, a short one's in its payload.
+function isstrictutf8(s::DataString)
+    n = ncodeunits(s)
+    if n > DataStrings.INLINE_MAX
+        pos = DataStrings.payloadpos(s.p)
+        return isvalid(String, view(s.data, pos:pos + n - 1))
+    end
+    ((s.p.a >> 32) | s.p.b) & 0x8080808080808080 == 0 && return true      # ASCII, zero padding included
+    return isvalid(String, codeunits(s))
+end
+
 const HEX_DIGITS = codeunits("0123456789abcdef")
 
 "Write one JSON `\\uXXXX` escape without allocating a temporary hexadecimal string."

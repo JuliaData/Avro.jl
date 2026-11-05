@@ -57,8 +57,10 @@ value = Avro.decode(s, bytes)
   `null`, `deflate`, `snappy`, `zstandard` codecs built in and `bzip2`/`xz` as package extensions;
   atomic file replacement on write; `append=true` to add to a file; `Avro.inspect` for diagnosing files.
 * **Tables.jl**: `Avro.Table` is a column table (with DataAPI metadata); `Avro.Rows` streams `Avro.Record`s, which are Tables.jl rows; `select=` is projection
-  pushdown that skips unselected fields; typed decoding into your own structs via StructUtils. Access
-  columns as `table.name` or `table[:name]`.
+  pushdown that skips unselected fields, and `filter=`, `limit=`, `offset=` or a whole `Tables.Scan` decode only
+  what the scan keeps; typed decoding into your own structs via StructUtils. Access columns as `table.name` or
+  `table[:name]`. `Avro.Table(src, T)` reads typed columns, one per field of `T`, and string columns are compact
+  `DataStrings.StringVector`s.
 * **Natural values**: maps are `Dict`s, nullable unions are `Union{Missing,T}`, other unions decode to
   the bare branch value, enum values are strings, fixed values are byte vectors, and timestamps are exact
   Durations.jl date-times (`Durations.ZonedTimestamp{P,:UTC}` for instants, `Durations.Timestamp{P}` for
