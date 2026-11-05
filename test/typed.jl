@@ -185,6 +185,16 @@ function StructUtils.lift(::Avro.AvroStyle, ::Type{BadSemanticHook}, x)
     throw(SEMANTIC_HOOK_SENTINEL)
 end
 
+# A hook small enough to inline, which leaves no method of its own in the backtrace.
+struct NegativeValue <: Exception
+    value::Int64
+end
+struct CheckedValue
+    value::Int64
+end
+StructUtils.structlike(::Avro.AvroStyle, ::Type{CheckedValue}) = false
+StructUtils.lift(::Avro.AvroStyle, ::Type{CheckedValue}, x) = x < 0 ? throw(NegativeValue(x)) : (CheckedValue(x), nothing)
+
 const OVERSIZED_TYPED_FIELD_SOURCE = "x" * repeat("n", 1024)
 const OVERSIZED_TYPED_FIELD_NAME = SubString(OVERSIZED_TYPED_FIELD_SOURCE, 2)
 
@@ -525,6 +535,12 @@ end
             err
         end
         @test nested_hook_error === SEMANTIC_HOOK_SENTINEL
+        longschema = P("\"long\"")
+        @test Avro.decode(longschema, Avro.encode(longschema, 5), CheckedValue) == CheckedValue(5)
+        @test_throws NegativeValue(-5) Avro.decode(longschema, Avro.encode(longschema, -5), CheckedValue)
+        # a conversion failure says what Base raised
+        @test_throws r"to Set\{Int8\}: \"InexactError: trunc\(Int8, 300\)\"" Avro.decode(P("{\"type\":\"array\",\"items\":\"long\"}"),
+                                                                                    Avro.encode(P("{\"type\":\"array\",\"items\":\"long\"}"), [300]), Set{Int8})
 
         # hook answers are cached per world: a hook defined after a first decode is still honored
         late = P("{\"type\":\"record\",\"name\":\"LateHooked\",\"fields\":[{\"name\":\"a\",\"type\":\"long\"}]}")

@@ -890,27 +890,35 @@ end
 # ---- semantic route ----------------------------------------------------------------------------------
 
 # Convert a generic value to `T` through `StructUtils.make` under `AvroStyle`. A failure converting file
-# content is a `ConversionError`, whatever Base raised; errors raised by caller-defined hooks propagate.
+# content is a `ConversionError` quoting the first line of what Base raised; errors raised by caller-defined
+# hooks propagate.
 function semanticvalue(::Type{T}, v, schema::Schema) where {T}
     try
         return StructUtils.make(T, v, AvroStyle())
     catch e
         e isa Union{AvroError,InterruptException,OutOfMemoryError,StackOverflowError} && rethrow()
         structutilshookexception(catch_backtrace()) && rethrow()
-        throw(ConversionError("cannot convert the decoded value to $T; StructUtils raised $(typeof(e))"))
+        cause = first(split(sprint(showerror, e), '\n'; limit=2))
+        throw(ConversionError("cannot convert the decoded value to $T: $(quoted(cause))"))
     end
 end
 
-# Whether a caught conversion error passed through a caller-defined StructUtils make/lift method.
+# Whether a caught conversion error passed through a caller-defined StructUtils `make` or `lift` method. A frame
+# inlined into its caller carries no method, so it counts when the methods of its name in its file are all the
+# caller's. A method a StructUtils macro generates for a caller carries StructUtils' file, which is library code.
 function structutilshookexception(backtrace)
     for frame in stacktrace(backtrace)
+        frame.func in (:make, :lift) || continue
         method = frame.linfo
         while method isa Union{Core.CodeInstance,Core.MethodInstance}
             method = method.def
         end
-        method isa Method || continue
-        method.module in HOOK_MODULES && continue
-        method.name in (:make, :lift) && return true
+        if method isa Method
+            method.module in HOOK_MODULES || return true
+        else
+            infile = [m for m in methods(frame.func === :make ? StructUtils.make : StructUtils.lift) if m.file === frame.file]
+            !isempty(infile) && all(m -> !(m.module in HOOK_MODULES), infile) && return true
+        end
     end
     return false
 end
