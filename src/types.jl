@@ -69,7 +69,7 @@ end
 The enum symbol emitted for the `Base.Enum` instance `x` (overridable; default `string(x)`).
 """
 function avrosymbol(::Type{E}, x::E) where {E<:Base.Enum}
-    return string(x)
+    return String(Symbol(x))                  # `string(x)`, without printing through a buffer
 end
 
 "A bounded spelling of a type for error messages: long parameter lists keep 100 characters plus a digest."
