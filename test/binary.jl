@@ -98,12 +98,12 @@ end
     end
 
     @testset "a string decodes and encodes exactly when its bytes are UTF-8" begin
-        # ASCII strings of every length to 30 with a valid or invalid sequence at each position, decoded both at the
+        # ASCII strings of every length to 40 with a valid or invalid sequence at each position, decoded both at the
         # end of the input and followed by another field.
         pair = "{\"type\":\"record\",\"name\":\"P\",\"fields\":[{\"name\":\"s\",\"type\":\"string\"},{\"name\":\"n\",\"type\":\"long\"}]}"
         inserts = (UInt8[0x7f], UInt8[0x80], UInt8[0xff], UInt8[0xc3], UInt8[0xc3, 0xa9], UInt8[0xc0, 0xaf],
                    UInt8[0xed, 0xa0, 0x80], UInt8[0xf0, 0x9f, 0x98, 0x80], UInt8[0xf4, 0x90, 0x80, 0x80])
-        for n in 0:30, at in 1:n + 1, ins in inserts
+        for n in 0:40, at in 1:n + 1, ins in inserts
             bytes = vcat(fill(UInt8('a'), at - 1), ins, fill(UInt8('b'), max(0, n - at + 1 - length(ins))))
             valid = isvalid(String, bytes)
             alone = vcat(UInt8(2 * length(bytes)), bytes)
