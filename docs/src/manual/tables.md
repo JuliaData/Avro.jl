@@ -38,6 +38,10 @@ sum(t.id)                                     # t.id is a Vector{Int64}
 
 `limit=` and `offset=` bound its rows, as for a generic table.
 
+A `String` field's column is a `Vector{String}`, one heap object per value, and the garbage collector traces every
+one of them. On string-heavy files a generic table, whose string columns share a few buffers, is faster: a
+typed table of 2M rows of ten strings took about twice as long to read.
+
 ## `Avro.Rows`
 
 [`Avro.Rows`](@ref) streams with bounded memory, one decompressed block at a time. Three modes:

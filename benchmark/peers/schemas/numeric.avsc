@@ -1,0 +1,4 @@
+{"type":"record","name":"Numeric","namespace":"peerbench","fields":[
+ {"name":"a","type":"long"},{"name":"b","type":"long"},{"name":"c","type":"long"},{"name":"d","type":"long"},
+ {"name":"x","type":"double"},{"name":"y","type":"double"},
+ {"name":"n","type":"int"},{"name":"flag","type":"boolean"}]}

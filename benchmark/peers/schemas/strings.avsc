@@ -1,0 +1,4 @@
+{"type":"record","name":"Strings","namespace":"peerbench","fields":[
+ {"name":"s0","type":"string"},{"name":"s1","type":"string"},{"name":"s2","type":"string"},{"name":"s3","type":"string"},
+ {"name":"s4","type":"string"},{"name":"s5","type":"string"},{"name":"s6","type":"string"},{"name":"s7","type":"string"},
+ {"name":"s8","type":"string"},{"name":"s9","type":"string"}]}

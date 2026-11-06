@@ -1,0 +1,11 @@
+{"type":"record","name":"Event","namespace":"peerbench","fields":[
+ {"name":"id","type":"long"},
+ {"name":"ts","type":{"type":"long","logicalType":"timestamp-micros"}},
+ {"name":"name","type":"string"},
+ {"name":"user","type":["null","string"]},
+ {"name":"value","type":"double"},
+ {"name":"count","type":"int"},
+ {"name":"kind","type":{"type":"enum","name":"Kind","symbols":["CLICK","VIEW","PURCHASE","SIGNUP","LOGOUT"]}},
+ {"name":"parent","type":["null","long"]},
+ {"name":"ok","type":"boolean"},
+ {"name":"tag","type":"bytes"}]}

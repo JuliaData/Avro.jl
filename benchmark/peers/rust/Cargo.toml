@@ -1,0 +1,15 @@
+[package]
+name = "peerbench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+apache-avro = { version = "=0.22.0", features = ["snappy", "zstandard"] }
+arrow-avro = "=60.1.0"
+arrow-array = "=60.1.0"
+arrow-schema = "=60.1.0"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1

@@ -25,3 +25,25 @@ A run on that host on 2026-11-04 (Julia 1.12.6, with other work running) wrote t
 The default test suite checks what does not depend on the host (`test/gates.jl`): parsing the interop schema
 takes at most 1,000 allocations, a prepared typed decode at most 1, and after a warm-up, decoding random schemas
 creates no new method instances.
+
+## Against other Avro libraries
+
+`benchmark/peers` measures Avro.jl against fastavro, Apache Avro Java, apache-avro and arrow-avro (Rust) and
+hamba/avro (Go) on four files of 200 to 470 MB: fixed-width numbers, short strings, an event log and nested data.
+Every reader must report the same checksums, another library reads back every written file, and the sides run in
+fresh processes in rotating order. Its README has the method, every table and the analysis behind each gap.
+
+On the same host (Julia 1.12.6, 3 runs per side, other work keeping the load average at 20 to 65), the fastest
+single-threaded Avro.jl reader, typed rows, against the fastest other library:
+
+| file | null | deflate | zstandard | snappy |
+|---|---|---|---|---|
+| numeric, 10M rows | 1.96× arrow-avro | 1.50× arrow-avro | 1.66× arrow-avro | 2.45× Java |
+| event log, 4M rows | 1.10× arrow-avro | 1.55× arrow-avro | 1.03× arrow-avro | 1.36× Java |
+| strings, 2M rows | 0.72× Java | 1.17× arrow-avro | 0.91× arrow-avro | 0.74× Java |
+| nested, 3M rows | 0.48× arrow-avro | 0.78× arrow-avro | 0.62× arrow-avro | 1.05× Java |
+
+Above 1, Avro.jl is faster. With 14 threads, `Avro.Table` reads the numeric, strings and event-log files faster
+than any single-threaded reader with every codec. Deflate writes are 1.43× to 1.91× the fastest other writer on
+one thread, and with more threads Avro.jl compresses several blocks at once. Uncompressed writes are level with
+arrow-avro on numbers and 0.40× to 0.65× the fastest other writer on strings, the event log and nested data.
