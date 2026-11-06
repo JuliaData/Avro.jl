@@ -1,0 +1,1 @@
+{"name":"example.avro.Bar","type":"record","fields":[{"name":"title","type":"string"},{"name":"created_at","type":["null","long"]}]}

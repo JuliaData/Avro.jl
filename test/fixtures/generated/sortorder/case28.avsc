@@ -1,0 +1,1 @@
+{"type": "record", "name": "R2", "fields": [{"name": "a", "type": "int", "order": "ignore"}, {"name": "b", "type": "string"}]}

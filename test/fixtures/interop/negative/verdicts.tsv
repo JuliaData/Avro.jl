@@ -1,0 +1,16 @@
+# category	case	julia	java	fastavro	note
+schema	truncated_json	reject	reject	reject	incomplete JSON object
+schema	duplicate_field	reject	reject	accept	fastavro does not enforce unique record field names
+schema	invalid_name	reject	reject	accept	fastavro does not enforce the Avro name grammar
+schema	unknown_type	reject	reject	reject	unknown schema kind
+datum	negative_length	reject	reject	reject	negative string byte length
+datum	truncated_payload	reject	reject	reject	declared string payload is incomplete
+datum	overlong_length	reject	reject	reject	multi-byte length exceeds the available payload
+json	bare_word	reject	reject	reject	not JSON
+json	wrong_type	reject	reject	reject	JSON object for a string schema
+json	trailing	reject	reject	reject	trailing non-whitespace after one JSON value
+block	truncated_sync	reject	accept	reject	Java stops after the declared datum count without a complete final sync
+block	invalid_boolean	reject	accept	accept	both oracles treat any nonzero boolean byte as true
+block	bad_magic	reject	reject	accept	fastavro does not validate the first OCF magic byte
+block	bad_sync	reject	reject	reject	final sync marker differs
+block	valid	accept	accept	accept	control case

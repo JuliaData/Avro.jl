@@ -1,0 +1,1 @@
+{"name":"org.apache.avro.TestMessage","type":"record","fields":[{"name":"id","type":"long"},{"name":"name","type":"string"},{"name":"tags","type":{"type":"array","items":"string"}}]}

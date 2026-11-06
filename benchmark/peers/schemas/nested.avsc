@@ -1,0 +1,6 @@
+{"type":"record","name":"Nested","namespace":"peerbench","fields":[
+ {"name":"id","type":"long"},
+ {"name":"items","type":{"type":"array","items":"long"}},
+ {"name":"attrs","type":{"type":"map","values":"long"}},
+ {"name":"point","type":{"type":"record","name":"Point","fields":[
+   {"name":"label","type":"string"},{"name":"w","type":"double"}]}}]}

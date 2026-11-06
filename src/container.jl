@@ -1,0 +1,1609 @@
+# Object container files: a block reader over memory-mapped, byte and streamed sources, a writer with
+# atomic publication and failure poisoning, `Avro.write`/`Avro.tobuffer` over Tables.jl sources, and
+# the permissive `Avro.inspect` diagnostic.
+
+import Mmap
+
+const MAGIC = (UInt8('O'), UInt8('b'), UInt8('j'), 0x01)
+
+# ---- sources ----------------------------------------------------------------------------------------
+
+mutable struct BytesSource
+    const buf::Vector{UInt8}
+    pos::Int
+    const stop::Int
+    const mapped::Bool       # `buf` is this source's own memory map
+end
+
+function BytesSource(buf::Vector{UInt8}, pos::Int, stop::Int=length(buf))
+    return BytesSource(buf, pos, stop, false)
+end
+
+mutable struct StreamSource
+    const io::IO
+    const owned::Bool
+    pos::Int
+end
+
+function StreamSource(io::IO, owned::Bool)
+    return StreamSource(io, owned, 1)
+end
+
+const BlockSource = Union{BytesSource,StreamSource}
+
+function sourceeof(s::BytesSource)
+    return s.pos > s.stop
+end
+
+function sourceeof(s::StreamSource)
+    return streamcall(eof, s.io)::Bool
+end
+
+function sourcebyte(s::BytesSource)
+    s.pos <= s.stop || throw(DataError("truncated file", s.pos))
+    b = s.buf[s.pos]
+    s.pos += 1
+    return b
+end
+
+function sourcebyte(s::StreamSource)
+    sourceeof(s) && throw(DataError("truncated file", s.pos))
+    byte = streamcall(Base.read, s.io, UInt8)::UInt8
+    s.pos += 1
+    return byte
+end
+
+"A zig-zag varint long read byte-wise from the source (the container's counts and sizes)."
+function sourcevarint(s::BlockSource)
+    v = UInt64(0)
+    shift = 0
+    while true
+        b = sourcebyte(s)
+        shift == 63 && (b & 0xfe) != 0 && throw(DataError("varint overflows 64 bits", position(s)))
+        v |= UInt64(b & 0x7f) << shift
+        (b & 0x80) == 0 && break
+        shift += 7
+        shift > 63 && throw(DataError("varint longer than 10 bytes", position(s)))
+    end
+    return reinterpret(Int64, (v >> 1) ⊻ (~(v & 1) + 1))
+end
+
+function Base.position(s::BytesSource)
+    return s.pos
+end
+
+function Base.position(s::StreamSource)
+    return s.pos
+end
+
+"Exactly `n` payload bytes: a view for byte sources, an owned buffer for streams."
+function sourcepayload(s::BytesSource, n::Int)
+    n <= s.stop - s.pos + 1 || throw(DataError("truncated file", s.pos))
+    out = view(s.buf, s.pos:s.pos + n - 1)
+    s.pos += n
+    return out
+end
+
+function sourcepayload(s::StreamSource, n::Int)
+    out = Vector{UInt8}(undef, n)
+    consumed = streamcall(readbytes!, s.io, out, n)::Int
+    s.pos += consumed
+    consumed == n || throw(DataError("truncated file", s.pos))
+    return out
+end
+
+"Exactly `n` payload bytes as a caller-owned vector."
+function ownedpayload(s::BlockSource, n::Int)
+    payload = sourcepayload(s, n)
+    return payload isa Vector{UInt8} ? payload : Vector{UInt8}(payload)
+end
+
+function checksync(s::BlockSource, sync::NTuple{16,UInt8}, blockindex::Int)
+    for i in 1:16
+        sourcebyte(s) == sync[i] || throw(DataError("sync marker mismatch after block $blockindex", position(s)))
+    end
+    return nothing
+end
+
+# Decoded values never alias a source's bytes, so a map is released now rather than at some later collection:
+# maps are a scarce OS resource, and on Windows one blocks replacing or truncating its file.
+function closesource(s::BytesSource)
+    s.mapped && finalize(mappedmemory(s.buf))
+    return nothing
+end
+
+# The object `Mmap.mmap` attaches its unmapping finalizer to: on Julia 1.11+ the array's `Memory`.
+@static if isdefined(Base, :Memory)
+    mappedmemory(map::Vector{UInt8}) = map.ref.mem
+else
+    mappedmemory(map::Vector{UInt8}) = map
+end
+
+function closesource(s::StreamSource)
+    s.owned && streamcall(close, s.io)
+    return nothing
+end
+
+function opensource(src::Vector{UInt8}; mmap::Bool=true)
+    return BytesSource(src, 1)
+end
+
+function opensource(src::AbstractVector{UInt8}; mmap::Bool=true)
+    return BytesSource(copyto!(Vector{UInt8}(undef, length(src)), src), 1)
+end
+
+function opensource(src::IOBuffer; mmap::Bool=true)
+    return BytesSource(bytevector(src.data), iobufferstart(src), src.size)
+end
+
+function bytevector(v::Vector{UInt8})
+    return v
+end
+
+@static if isdefined(Base, :Memory)
+    function bytevector(m::Memory{UInt8})               # an IOBuffer's storage on Julia 1.11+, shared
+        return Base.wrap(Array, m, length(m))
+    end
+end
+
+# On Julia 1.11+ an IOBuffer over a Vector with a memory offset starts after index 1 of `data`.
+function iobufferstart(src::IOBuffer)
+    return max(1, src.ptr - position(src))
+end
+
+function opensource(src::IO; mmap::Bool=true)
+    return StreamSource(src, false)
+end
+
+function opensource(src::AbstractString; mmap::Bool=true)
+    mmap || return StreamSource(open(src, "r"), true)
+    map = open(io -> Mmap.mmap(io, Vector{UInt8}), src, "r")
+    return BytesSource(map, 1, length(map), true)
+end
+
+# ---- header -----------------------------------------------------------------------------------------
+
+"One metadata entry: an owned UTF-8 key and value, with the running byte total kept under `max_bytes`."
+function readmetadataentry(s::BlockSource, limits::Limits, total::Int)
+    klen = sourcevarint(s)
+    klen >= 0 || throw(DataError("negative metadata key length $klen", position(s)))
+    klen <= limits.max_bytes || throw(LimitError(:max_bytes, klen, limits.max_bytes))
+    kbytes = ownedpayload(s, Int(klen))
+    isstrictutf8(kbytes) || throw(DataError("metadata key is not valid UTF-8", position(s)))
+    vlen = sourcevarint(s)
+    vlen >= 0 || throw(DataError("negative metadata value length $vlen", position(s)))
+    vlen <= limits.max_bytes || throw(LimitError(:max_bytes, vlen, limits.max_bytes))
+    total = checked_add(checked_add(total, Int(klen)), Int(vlen))
+    total <= limits.max_bytes || throw(LimitError(:max_bytes, total, limits.max_bytes))
+    return (String(kbytes), ownedpayload(s, Int(vlen)), total)
+end
+
+"The header's metadata map (duplicate keys rejected; sized blocks must be consumed exactly)."
+function readmetadata(s::BlockSource, limits::Limits)
+    metadata = Dict{String,Vector{UInt8}}()
+    total = 0
+    while true
+        count = sourcevarint(s)
+        count == 0 && break
+        size = -1
+        if count < 0
+            count == typemin(Int64) && throw(DataError("metadata block count typemin(Int64)", position(s)))
+            count = -count
+            size = sourcevarint(s)
+            size >= 0 || throw(DataError("negative metadata block size $size", position(s)))
+            size <= limits.max_bytes || throw(LimitError(:max_bytes, size, limits.max_bytes))
+        end
+        blockstart = position(s)
+        for _ in 1:count
+            key, value, total = readmetadataentry(s, limits, total)
+            haskey(metadata, key) && throw(DataError("duplicate metadata key \"$(diagnostictext(key))\"", position(s)))
+            metadata[key] = value
+        end
+        if size >= 0
+            consumed = position(s) - blockstart
+            consumed == size || throw(DataError("metadata block declares $size bytes but its entries consume $consumed", position(s)))
+        end
+    end
+    return metadata
+end
+
+"The `avro.codec` name of a parsed header (\"null\" when the entry is absent)."
+function headercodecname(metadata::Dict{String,Vector{UInt8}}, s::BlockSource)
+    codecbytes = get(metadata, "avro.codec", nothing)
+    codecbytes === nothing && return "null"
+    isstrictutf8(codecbytes) || throw(DataError("avro.codec is not valid UTF-8", position(s)))
+    return String(copy(codecbytes))
+end
+
+"The parsed container header: metadata, schema, codec name and sync marker."
+function readheader(s::BlockSource, limits::Limits; legacy, allow_invalid_names::Bool, allow_invalid_defaults::Bool)
+    for m in MAGIC
+        (sourceeof(s) || sourcebyte(s) != m) && throw(DataError("not an Avro object container file (bad magic)", position(s)))
+    end
+    metadata = readmetadata(s, limits)
+    sync = ntuple(_ -> sourcebyte(s), Val(16))
+    schemabytes = get(metadata, "avro.schema", nothing)
+    schemabytes === nothing && throw(DataError("the container has no avro.schema", position(s)))
+    schema = parseschemaimpl(schemabytes, legacy === :avrojl1; allow_invalid_names=allow_invalid_names,
+                             allow_invalid_defaults=allow_invalid_defaults, limits=limits)
+    return (metadata=metadata, schema=schema, codecname=headercodecname(metadata, s), sync=sync)
+end
+
+# ---- Reader -----------------------------------------------------------------------------------------
+
+"""
+    Avro.Reader(src; limits=Limits(), legacy=nothing, allow_invalid_names=false, allow_invalid_defaults=false,
+                mmap=true)
+
+A block-level container reader over a file path (memory-mapped by default; `mmap=false` streams), a byte
+vector (caller-owned), an `IOBuffer` (its written bytes) or a streaming `IO`. `eachblock(r)` yields
+`(count, bytes)` with the owned decompressed block; `eachdatum(r)` yields the schema's generic values;
+`close(r)` is idempotent (the do-block form closes on exit; a finalizer closes a path-owned source as a
+fallback). `legacy=:avrojl1` tolerates the Avro.jl ≤ 1.1.2 container defects (padded null-codec blocks, the
+`zstd` codec name, unnamed fixed schemas) and reads its little-endian decimals.
+"""
+mutable struct Reader
+    source::Union{Nothing,BlockSource}
+    const schema::Schema
+    const plan::Plan
+    const codecname::Symbol
+    const metadata::Dict{String,Vector{UInt8}}
+    const sync::NTuple{16,UInt8}
+    const limits::Limits
+    const legacy::Union{Nothing,Symbol}
+    blockindex::Int
+    closed::Bool
+    warned::Bool
+    failed::Bool                # set while reading a block's framing; left set by an error, since the position is then unknown
+    compressed::Int             # payload bytes of the blocks read so far
+    decompressed::Int           # their decompressed bytes
+    const scratch::Base.RefValue{Vector{UInt8}}   # the decompressed block being read, reused by the next
+end
+
+"Close a reader's source. Explicit close reports the source failure; `suppress=true` swallows it."
+function closereaderresources(source; suppress::Bool=false)
+    try
+        source === nothing || closesource(source)
+    catch err
+        suppress || rethrow()
+    end
+    return nothing
+end
+
+function Reader(src; limits::Limits=Limits(), legacy::Union{Nothing,Symbol}=nothing,
+                allow_invalid_names::Bool=false, allow_invalid_defaults::Bool=false, mmap::Bool=true)
+    legacy in (nothing, :avrojl1) || throw(ArgumentError("legacy must be nothing or :avrojl1"))
+    source = opensource(src; mmap=mmap)
+    r = try
+        h = readheader(source, limits; legacy=legacy, allow_invalid_names=allow_invalid_names, allow_invalid_defaults=allow_invalid_defaults)
+        Reader(source, h.schema, readplan(h.schema; mode=legacy === :avrojl1 ? :little : :standard), readercodec(h.codecname, legacy), h.metadata, h.sync,
+               limits, legacy, 0, false, false, false, 0, 0, Ref(UInt8[]))
+    catch
+        closereaderresources(source; suppress=true)
+        rethrow()
+    end
+    return addfinalizer(closeunclosed!, r)
+end
+
+# The finalizer of a reader nobody closed.
+@noinline function closeunclosed!(r::Reader)
+    r.closed && return nothing
+    source = r.source
+    r.source = nothing
+    r.closed = true
+    return closereaderresources(source; suppress=true)
+end
+
+function Base.show(io::IO, r::Reader)
+    return print(io, "Avro.Reader(", schemalabel(r.schema), ", codec=", r.codecname, r.source === nothing ? ", closed)" : ")")
+end
+
+function Reader(f::Function, src; kw...)
+    r = Reader(src; kw...)
+    try
+        return f(r)
+    finally
+        close(r)
+    end
+end
+
+function Base.close(r::Reader)
+    r.closed && return nothing
+    source = r.source
+    r.source = nothing
+    r.closed = true
+    return closereaderresources(source)
+end
+
+function checkopen(r::Reader)
+    r.closed && throw(ArgumentError("the reader is closed"))
+    r.failed && throw(ArgumentError("an earlier error ended this stream"))
+    return nothing
+end
+
+"""
+    Avro.metadata(r) -> Dict{String,Vector{UInt8}}; Avro.codec(r) -> Symbol; Avro.sync(r) -> NTuple{16,UInt8}
+    Avro.writerschema(r) -> Schema; Avro.schema(r) -> Schema
+"""
+function metadata(r::Reader)
+    return r.metadata
+end
+
+function codec(r::Reader)
+    return r.codecname
+end
+
+function sync(r::Reader)
+    return r.sync
+end
+
+function writerschema(r::Reader)
+    return r.schema
+end
+
+function schema(r::Reader)
+    return r.schema
+end
+
+# Avro.jl ≤ 1.1.2 sized null-codec blocks with a cushion, so a legacy block may carry bytes after its
+# declared datums: walk them to find where they end, warn once and leave the padding out of the block's decoder.
+function exactblock!(r::Reader, d::Decoder, count::Int, index::Int)
+    r.legacy === :avrojl1 || return d
+    start, stop = d.pos, d.stop
+    for _ in 1:count
+        skip(r.plan, d)
+    end
+    if d.pos != stop + 1
+        r.codecname === :null ||
+            throw(DataError("block $index declares $count datums but they consume $(d.pos - start) of $(stop - start + 1) bytes", d.pos - start + 1))
+        r.warned ||
+            (@warn "accepting trailing bytes after $count datums in a null-codec block (legacy=:avrojl1; Avro.jl ≤ 1.1.2 sizing cushion)" source = 1; r.warned = true)
+        stop = d.pos - 1
+    end
+    return blockcap!(reset!(d, d.buf, start, stop))
+end
+
+"Read the next block as `(count, bytes)` with the owned decompressed bytes; `nothing` at a clean end of the file."
+function nextblock!(r::Reader)
+    d = Decoder(UInt8[], r.limits)
+    count = nextblock!(r, d)
+    count === nothing && return nothing
+    return (count, d.buf[d.pos:d.stop])
+end
+
+"Load the next block into `d` (see `blockbody!`) and return its datum count; `nothing` at a clean end of the file."
+function nextblock!(r::Reader, d::Decoder{Vector{UInt8}})
+    checkopen(r)
+    source = r.source::BlockSource
+    sourceeof(source) && return nothing
+    r.failed = true
+    count, size = blockframe!(r, source)
+    return blockbody!(r, source, count, size, d)
+end
+
+"""
+The first block that holds file row `firstrow` or a later one, after passing over the blocks before it without
+decompressing them: the datums passed over, and the block's count with the block loaded into `d` as `nextblock!` loads
+it (`nothing` at a clean end).
+"""
+function nextblockfrom!(r::Reader, d::Decoder{Vector{UInt8}}, firstrow::Int)
+    skipped = 0
+    while true
+        checkopen(r)
+        source = r.source::BlockSource
+        sourceeof(source) && return (skipped, nothing)
+        r.failed = true
+        count, size = blockframe!(r, source)
+        satadd(skipped, count) < firstrow || return (skipped, blockbody!(r, source, count, size, d))
+        sourcepayload(source, size)
+        checksync(source, r.sync, r.blockindex)
+        r.failed = false
+        skipped += count
+    end
+end
+
+# The next block's datum count and payload size.
+function blockframe!(r::Reader, source::BlockSource)
+    count = sourcevarint(source)
+    count >= 0 || throw(DataError("negative block count $count", position(source)))
+    size = sourcevarint(source)
+    size >= 0 || throw(DataError("negative block size $size", position(source)))
+    size <= r.limits.max_bytes || throw(LimitError(:max_bytes, size, r.limits.max_bytes))
+    r.blockindex += 1
+    return (Int(count), Int(size))
+end
+
+# Load the block whose frame was just read into `d` and return its count. An uncompressed block is decoded where it
+# is, in the source's memory or its own streamed payload, and any other from the reader's buffer, which the next
+# block reuses: decoded values never alias their input.
+function blockbody!(r::Reader, source::BlockSource, count::Int, size::Int, d::Decoder{Vector{UInt8}})
+    start = source isa BytesSource ? source.pos : 1
+    payload = sourcepayload(source, size)
+    checksync(source, r.sync, r.blockindex)
+    r.failed = false                                   # a bad payload below leaves the next block readable
+    if r.codecname === :null
+        inflate!(r, size, size)
+        reset!(d, source isa BytesSource ? source.buf : payload::Vector{UInt8}, start, start + size - 1)
+    else
+        n = decompressblock!(r.scratch, r.codecname, payload, r.limits)
+        inflate!(r, size, n)
+        reset!(d, r.scratch[], 1, n)
+    end
+    exactblock!(r, blockcap!(d), count, r.blockindex)
+    count == 0 && remaining(d) != 0 && throw(DataError("a zero-count block has a non-empty payload", 1))
+    return count
+end
+
+"Charge one block to the read's inflation budget (`max_inflation`)."
+function inflate!(r::Reader, compressed::Int, decompressed::Int)
+    r.compressed = satadd(r.compressed, compressed)
+    r.decompressed = satadd(r.decompressed, decompressed)
+    cap = inflationcap(r.limits, r.compressed)
+    r.decompressed <= cap || throw(LimitError(:max_inflation, r.decompressed, cap))
+    return nothing
+end
+
+function checkconsumed(d::Decoder)
+    d.pos == d.stop + 1 || throw(DataError("block datums did not consume the block exactly", d.pos))
+    return nothing
+end
+
+struct EachBlock
+    reader::Reader
+end
+
+"""
+    Avro.eachblock(r::Reader)
+
+Iterate `(count, bytes)` pairs, `bytes` being the owned decompressed block.
+"""
+function eachblock(r::Reader)
+    return EachBlock(r)
+end
+
+function Base.IteratorSize(::Type{EachBlock})
+    return Base.SizeUnknown()
+end
+
+function Base.eltype(::Type{EachBlock})
+    return Tuple{Int,Vector{UInt8}}
+end
+
+function Base.iterate(it::EachBlock, ::Nothing=nothing)
+    block = nextblock!(it.reader)
+    block === nothing && return nothing
+    return (block, nothing)
+end
+
+mutable struct EachDatum
+    const reader::Reader
+    const decoder::Decoder{Vector{UInt8}}
+    remaining::Int
+end
+
+"""
+    Avro.eachdatum(r::Reader)
+
+Iterate the file's datums as the schema's generic values (any root schema).
+"""
+function eachdatum(r::Reader)
+    return EachDatum(r, Decoder(UInt8[], r.limits), 0)
+end
+
+function Base.IteratorSize(::Type{EachDatum})
+    return Base.SizeUnknown()
+end
+
+function Base.iterate(it::EachDatum, ::Nothing=nothing)
+    v = nextdatum!(d -> decode(it.reader.plan, d), it)
+    return v === nothing ? nothing : (something(v), nothing)
+end
+
+# The next datum of a datum cursor (`EachDatum`, `Rows`: a `reader`, its block `decoder`, and the datums
+# `remaining` in the current block) decoded by `decodeone`, or `nothing` at a clean end. A datum that
+# fails takes the rest of its block with it, so iterating again continues with the next block.
+function nextdatum!(decodeone::F, it) where {F}
+    checkopen(it.reader)
+    d = it.decoder
+    while it.remaining == 0
+        count = nextblock!(it.reader, d)
+        count === nothing && return nothing
+        it.remaining = count
+    end
+    left = it.remaining - 1
+    it.remaining = 0
+    v = decodeone(d)
+    left == 0 && checkconsumed(d)
+    it.remaining = left
+    return Some(v)
+end
+
+# ---- Writer -----------------------------------------------------------------------------------------
+
+function writevarint(@nospecialize(io::IO), n::Integer)
+    v = (reinterpret(UInt64, Int64(n)) << 1) ⊻ reinterpret(UInt64, Int64(n) >> 63)
+    while true
+        b = UInt8(v & 0x7f)
+        v >>= 7
+        if v == 0
+            sinkwrite(io, b)
+            break
+        end
+        sinkwrite(io, b | 0x80)
+    end
+    return nothing
+end
+
+function sinkwrite(@nospecialize(io::IO), x)
+    streamcall(Base.write, io, x)
+    return nothing
+end
+
+"""
+    varintlength(n) -> Int
+
+The number of bytes of the zig-zag varint encoding of the non-negative integer `n`.
+"""
+function varintlength(n::Integer)
+    v = UInt64(n) << 1
+    len = 1
+    while v >= 0x80
+        v >>= 7
+        len += 1
+    end
+    return len
+end
+
+"""
+    Avro.Writer(dst, schema; codec=nothing, level=nothing, metadata=Dict(), sync=nothing, block_bytes=64*1024,
+                ntasks=Threads.nthreads(), atomic=true, append=false, fsync=false, allow_invalid_names=false,
+                allow_invalid_defaults=false, limits=Limits())
+
+A container writer to a path (atomic by default: a sibling temp file renamed into place on `close`) or a
+caller-owned `IO` (flushed, never closed). The path's parent directory, including parent symbolic links,
+is resolved when the writer opens. Changing the working directory later does not redirect its output.
+`codec` is `:null` (uncompressed, what `nothing` means for a new file), `:deflate` (`level` 0–9, default 6),
+`:snappy`, `:zstandard` (`level` 1–22, default 3), or `:bzip2`/`:xz` once `CodecBzip2`/`CodecXz` is loaded.
+Datums are encoded into the current block, which is emitted at `block_bytes`, before a datum would push
+it past `max_bytes` or its value cap, or on `flush`/`close`; a datum that exceeds either bound on its own
+is a `LimitError`. With a compressing codec and more than one thread, up to `ntasks` emitted blocks compress
+at once on other tasks while the caller encodes the next block. At most `2 × ntasks` blocks wait to be
+written, and `ntasks=1` compresses on the caller's task. The caller's task writes every block in order, so
+the file is the same at every `ntasks`. The first failure poisons the writer, including a rejected datum
+from `push!`. A failed compression raises from the `push!`, `flush` or `close` that writes its block.
+`WriterClosedError` carries the original cause. With `atomic=true`, the temp file is removed and the
+destination is untouched; `atomic=false` and caller-owned streams can retain partial output.
+`close(w; abort=true)` waits for the compression tasks, then discards the buffered block and every block not
+yet written. The do-block form closes on success and aborts on error; a finalizer aborts an unclosed writer
+without closing caller-owned I/O.
+
+`append=true` adds blocks to the existing file at path `dst` in place, keeping its codec (`codec` must be
+`nothing` or match it), metadata and sync marker (a missing or empty file is created as usual). `schema` must equal the file's schema and the file must
+end at a block boundary. Aborting removes the blocks this writer added, unless the file has since grown past
+them; a writer dropped without closing leaves the blocks it flushed. Readers see each block once it is flushed.
+A crash can leave a torn last block, which the next append or read reports.
+"""
+mutable struct Writer
+    const sink::IO
+    const path::Union{Nothing,String}
+    const temppath::Union{Nothing,String}
+    const schema::Schema
+    const plan::Plan
+    const nodes::WriteNodes                 # the datums' write nodes, by datum type
+    const wcodec::WriterCodec
+    const syncmarker::NTuple{16,UInt8}
+    const limits::Limits
+    const blockbytes::Int
+    const workers::Int                      # blocks compressing at once on other tasks; 1 compresses on the caller's task
+    const permits::Base.Semaphore           # caps the compressing tasks at `workers`
+    const inflight::Vector{Task}            # compression tasks, oldest block first
+    const fsync::Bool
+    const ownsink::Bool
+    const encoder::Encoder
+    const datumencoder::Encoder             # scratch: a datum moving to the next block
+    const appendstart::Int                  # the file's length before an append; -1 otherwise
+    appendlength::Int                       # the file's length with every block this writer has emitted
+    pendingcount::Int
+    closed::Bool
+    poison::Union{Nothing,Exception}
+    compressed::Int                         # payload bytes of the blocks this writer emitted
+    decompressed::Int                       # their encoded bytes before compression
+    unscanned::Union{Nothing,String}        # the file of an append whose counts leave out the blocks it held before
+end
+
+"The writer's 16-byte sync marker: validated caller bytes, or fresh `RandomDevice` bytes."
+function writersyncmarker(sync)
+    sync === nothing && return ntuple(_ -> rand(RandomDevice(), UInt8), Val(16))
+    (sync isa AbstractVector{UInt8} && length(sync) == 16) || throw(ArgumentError("sync must be exactly 16 bytes"))
+    return ntuple(i -> sync[i], Val(16))
+end
+
+"The header entries: the schema JSON, the codec name and the validated user metadata."
+function writerheaderentries(@nospecialize(schema::Schema), codec::Symbol, metadata, limits::Limits)
+    schemajson = json(schema)
+    parsejson(Vector{UInt8}(codeunits(schemajson)); limits=limits, errfn=(msg, pos) -> throw(ArgumentError(msg)))   # readable under these limits
+    codecname = String(codec)
+    entries = Tuple{String,Vector{UInt8}}[("avro.schema", Vector{UInt8}(codeunits(schemajson))),
+                                          ("avro.codec", Vector{UInt8}(codeunits(codecname)))]
+    total = checked_add(checked_add(11, sizeof(schemajson)), checked_add(10, sizeof(codecname)))
+    total <= limits.max_bytes || throw(LimitError(:max_bytes, total, limits.max_bytes))
+    for (k, v) in metadata
+        k isa AbstractString && v isa Union{AbstractString,AbstractVector{UInt8}} || throw(ArgumentError("metadata must map strings to strings or byte vectors"))
+        startswith(k, "avro.") && throw(ArgumentError("metadata keys in the avro.* namespace are reserved; avro.schema and avro.codec come from the constructor"))
+        isstrictutf8(k) || throw(ArgumentError("metadata keys must be valid UTF-8"))
+        value = v isa AbstractString ? Vector{UInt8}(codeunits(v)) : Vector{UInt8}(v)
+        total = checked_add(total, checked_add(sizeof(k), length(value)))
+        total <= limits.max_bytes || throw(LimitError(:max_bytes, total, limits.max_bytes))
+        push!(entries, (String(k), value))
+    end
+    return entries
+end
+
+"Write the container magic, the metadata block and the sync marker to the sink."
+function writecontainerheader!(sink, entries, syncmarker)
+    for m in MAGIC
+        sinkwrite(sink, m)
+    end
+    writevarint(sink, length(entries))
+    for (k, v) in entries
+        writevarint(sink, sizeof(k))
+        sinkwrite(sink, codeunits(k))
+        writevarint(sink, length(v))
+        sinkwrite(sink, v)
+    end
+    sinkwrite(sink, 0x00)
+    for b in syncmarker
+        sinkwrite(sink, b)
+    end
+    return nothing
+end
+
+"The mode of a published file: the replaced file's mode, else the mode `open` gives a new file."
+function publishmode(path::String)
+    isfile(path) && return filemode(path) & 0o777
+    Sys.iswindows() && return 0o666
+    # Let file creation apply the umask without changing process-wide permissions while other tasks run.
+    return mktempdir(dirname(path)) do dir
+        open(joinpath(dir, "mode"), "w") do io
+            return filemode(stat(io)) & 0o777
+        end
+    end
+end
+
+# The file a path names: its directory resolved now, and a symbolic link followed so that atomic replacement
+# updates the file it points to.
+function writerpath(dst::AbstractString)
+    path = joinpath(realpath(joinpath(dirname(dst), ".")), basename(dst))
+    return islink(path) && ispath(path) ? realpath(path) : path
+end
+
+"The writer's destination: `(sink, temppath, ownsink)`, a temp file first when writing atomically."
+function openwritersink(dst::Union{AbstractString,IO}, atomic::Bool)
+    path = dst isa AbstractString ? String(dst) : nothing
+    path === nothing && return (dst, nothing, false)
+    if atomic
+        t, tio = mktemp(dirname(abspath(path)))
+        return (tio, t, true)
+    end
+    return (open(path, "w"), nothing, true)
+end
+
+# The codec and sync marker of the container being appended to, after checking the writer's arguments
+# against its header and that the file ends at a block boundary.
+function appendheader(path::String, @nospecialize(schema::Schema), codec, metadata, sync, limits::Limits, allow_invalid_names::Bool,
+                      allow_invalid_defaults::Bool)
+    (isempty(metadata) && sync === nothing) || throw(ArgumentError("append=true keeps the file's metadata and sync marker"))
+    codecname, syncmarker = Reader(path; mmap=false, limits=limits, allow_invalid_names=allow_invalid_names,
+                                   allow_invalid_defaults=allow_invalid_defaults) do r
+        schemaequal(r.schema, schema) ||
+            throw(ArgumentError("the schema differs from that of $path; append with the file's schema"))
+        codec === nothing || codec === r.codecname ||
+            throw(ArgumentError("$path uses the $(r.codecname) codec; append=true cannot write $codec blocks into it"))
+        return (r.codecname, r.sync)
+    end
+    tail = open(io -> (seek(io, filesize(path) - 16); Base.read(io, 16)), path)
+    tail == UInt8[syncmarker...] || throw(DataError("$path does not end at a block boundary; its last block is torn", filesize(path) + 1))
+    return (codecname, syncmarker)
+end
+
+function Writer(dst::Union{AbstractString,IO}, @nospecialize(schema::Schema); codec::Union{Nothing,Symbol}=nothing, level=nothing,
+                metadata=Dict{String,Vector{UInt8}}(), sync=nothing, block_bytes::Integer=64 * 1024,
+                ntasks::Integer=Threads.nthreads(), atomic::Bool=true, append::Bool=false, fsync::Bool=false,
+                allow_invalid_names::Bool=false, allow_invalid_defaults::Bool=false, limits::Limits=Limits())
+    block_bytes > 0 || throw(ArgumentError("block_bytes must be positive, got $block_bytes"))
+    1 <= ntasks <= typemax(Int) || throw(ArgumentError("ntasks must be in 1:$(typemax(Int)), got $ntasks"))
+    gi = graphinfo(schema)
+    gi.repaired_names && !allow_invalid_names && throw(ArgumentError("the schema contains invalid names; pass allow_invalid_names=true to write it"))
+    gi.repaired_defaults && !allow_invalid_defaults && throw(ArgumentError("the schema contains invalid defaults; pass allow_invalid_defaults=true to write it"))
+    metadata isa AbstractDict || throw(ArgumentError("metadata must map strings to strings or byte vectors"))
+    append && dst isa IO && throw(ArgumentError("append=true needs a file path"))
+    path = dst isa AbstractString ? writerpath(dst) : nothing
+    if path !== nothing && append && isfile(path) && filesize(path) > 0
+        codecname, syncmarker = appendheader(path, schema, codec, metadata, sync, limits, allow_invalid_names, allow_invalid_defaults)
+        wcodec = writercodec(codecname, level)
+        entries = nothing
+        appendstart = filesize(path)
+        sink, temppath, ownsink = (open(path, "a"), nothing, true)
+    else
+        syncmarker = writersyncmarker(sync)
+        wcodec = writercodec(something(codec, :null), level)
+        entries = writerheaderentries(schema, something(codec, :null), metadata, limits)
+        appendstart = -1
+        sink, temppath, ownsink = openwritersink(path === nothing ? dst : path, atomic)
+    end
+    workers = wcodec.name === :null ? 1 : min(Int(ntasks), Threads.nthreads())
+    plan = writeplan(schema)
+    w = Writer(sink, path, atomic ? temppath : nothing, schema, plan, WriteNodes(schema, plan), wcodec, syncmarker, limits,
+               min(Int(block_bytes), limits.max_bytes), workers, Base.Semaphore(workers), Task[], fsync, ownsink,
+               Encoder(limits), Encoder(limits), appendstart, appendstart, 0, false, nothing, 0, 0, appendstart >= 0 ? path : nothing)
+    try
+        entries === nothing || writecontainerheader!(sink, entries, syncmarker)
+    catch e
+        poison!(w, e)
+        abortcleanup(w; suppress=true)
+        rethrow()
+    end
+    return addfinalizer(abandonunclosed!, w)
+end
+
+# The finalizer of a writer nobody closed: its temp file goes, and the blocks of an unclosed append stay, as a
+# crash would leave them.
+@noinline function abandonunclosed!(w::Writer)
+    w.closed && return nothing
+    w.closed = true
+    return cleanupwritersink(w.sink, w.temppath, w.ownsink, true)
+end
+
+function Base.show(io::IO, w::Writer)
+    return print(io, "Avro.Writer(", schemalabel(w.schema), ", codec=", w.wcodec.name, w.closed ? ", closed)" : ")")
+end
+
+function Writer(f::Function, dst, @nospecialize(schema::Schema); kw...)
+    w = Writer(dst, schema; kw...)
+    try
+        result = f(w)
+        close(w)
+        return result
+    catch err
+        try
+            close(w; abort=true)
+        catch cleanup
+            throw(CompositeException(Any[err, cleanup]))
+        end
+        rethrow()
+    end
+end
+
+function poison!(w::Writer, e::Exception)
+    return (w.poison === nothing && (w.poison = e); nothing)
+end
+
+function checkwritable(w::Writer)
+    w.closed && throw(WriterClosedError(w.poison))
+    w.poison === nothing || throw(WriterClosedError(w.poison))
+    return nothing
+end
+
+function cleanupwritersink(@nospecialize(sink::IO), temppath::Union{Nothing,String}, ownsink::Bool, suppress::Bool=false)
+    failure = nothing
+    try
+        ownsink && streamcall(close, sink)
+    catch err
+        failure = err
+    end
+    try
+        temppath !== nothing && rm(temppath; force=true)
+    catch err
+        failure === nothing && (failure = err)
+    end
+    suppress || failure === nothing || throw(failure)
+    return nothing
+end
+
+# An aborted append removes its own blocks, unless the file has since grown past them: what follows them is
+# another writer's.
+function abortcleanup(w::Writer; suppress::Bool=false)
+    discardinflight!(w)
+    if w.appendstart >= 0
+        try
+            streamcall(flush, w.sink)
+            filesize(w.path) <= w.appendlength && streamcall(Base.truncate, w.sink, w.appendstart)
+        catch
+            suppress || rethrow()
+        end
+    end
+    return cleanupwritersink(w.sink, w.temppath, w.ownsink, suppress)
+end
+
+function Base.push!(w::Writer, datum)
+    checkwritable(w)
+    try
+        return pushdatum!(w, datum)
+    catch e
+        poison!(w, e)
+        rethrow()
+    end
+end
+
+function pushdatum!(w::Writer, datum::T) where {T}
+    return pushdatum!(w, T, writenode!(w.nodes, T), datum)
+end
+
+"Encode one datum in place at the end of the current block through `node`; a failed datum leaves no bytes behind."
+@inline function pushdatum!(w::Writer, ::Type{T}, @nospecialize(node::WriteNode), datum) where {T}
+    e = w.encoder
+    start, values = e.pos, e.values
+    @inline encodetyped!(T, node, e, datum, w.plan, w.schema)
+    return commitdatum!(w, start, values)
+end
+
+"Whether a block of `bytes` bytes holding `values` values exceeds what a reader with these limits accepts."
+function blockexceeds(limits::Limits, bytes::Int, values::Int)
+    return bytes > limits.max_bytes || values > blockvaluecap(limits, bytes)
+end
+
+"Account the datum encoded since `start`: move it to the next block when it overflows this one, then flush at `block_bytes`."
+function commitdatum!(w::Writer, start::Int, values::Int)
+    e = w.encoder
+    if w.pendingcount > 0 && blockexceeds(w.limits, e.pos, e.values)
+        datumbytes = e.pos - start
+        datumvalues = e.values - values
+        scratch = w.datumencoder
+        writeraw!(scratch, e.buf, start + 1, datumbytes)
+        e.pos = start
+        e.values = values
+        try
+            flushblock!(w)
+            writeraw!(e, scratch.buf, 1, datumbytes)
+        finally
+            reset!(scratch)
+        end
+        e.values = datumvalues
+    end
+    if blockexceeds(w.limits, e.pos, e.values)
+        e.pos > w.limits.max_bytes && throw(LimitError(:max_bytes, e.pos, w.limits.max_bytes))
+        throw(LimitError(:max_values_per_byte, e.values, blockvaluecap(w.limits, e.pos)))
+    end
+    w.pendingcount += 1
+    e.pos >= w.blockbytes && flushblock!(w)
+    return w
+end
+
+"Write one compressed block to the sink and count it toward the file's length and a reader's inflation budget."
+function writeblock!(w::Writer, count::Int, compressed::Vector{UInt8}, rawlength::Int)
+    length(compressed) <= w.limits.max_bytes || throw(LimitError(:max_bytes, length(compressed), w.limits.max_bytes))
+    w.compressed = satadd(w.compressed, length(compressed))
+    w.decompressed = satadd(w.decompressed, rawlength)
+    # Appended blocks within `max_inflation` of their own bytes keep the file readable whatever it held before;
+    # the first that are not count the file's blocks so far, read once.
+    unscanned = w.unscanned
+    if unscanned !== nothing && w.decompressed > satmul(w.limits.max_inflation, w.compressed)
+        filecompressed, filedecompressed = filetotals(w, unscanned)
+        w.compressed = satadd(filecompressed, length(compressed))
+        w.decompressed = satadd(filedecompressed, rawlength)
+        w.unscanned = nothing
+    end
+    cap = inflationcap(w.limits, w.compressed)
+    w.decompressed <= cap || throw(LimitError(:max_inflation, w.decompressed, cap))
+    w.appendlength += varintlength(count) + varintlength(length(compressed)) + length(compressed) + 16
+    writevarint(w.sink, count)
+    writevarint(w.sink, length(compressed))
+    sinkwrite(w.sink, compressed)
+    for b in w.syncmarker
+        sinkwrite(w.sink, b)
+    end
+    return nothing
+end
+
+"The payload and decompressed bytes of every block in the file at `path` an appending writer has written so far."
+function filetotals(w::Writer, path::String)
+    streamcall(flush, w.sink)
+    return Reader(path; mmap=false, limits=w.limits, allow_invalid_names=true, allow_invalid_defaults=true) do r
+        d = Decoder(UInt8[], r.limits)
+        while nextblock!(r, d) !== nothing
+        end
+        return (r.compressed, r.decompressed)
+    end
+end
+
+"The compression of one emitted block, run as a task body; the finished job is the task's result."
+mutable struct CompressJob
+    const codec::WriterCodec
+    const permits::Base.Semaphore
+    const count::Int
+    const rawlength::Int
+    bytes::Vector{UInt8}                    # the encoded block, then its compressed payload
+    error::Union{Nothing,Exception}
+end
+
+@noinline function (job::CompressJob)()
+    Base.acquire(job.permits)
+    try
+        job.bytes = compressblock(job.codec, job.bytes)
+    catch e
+        job.error = e::Exception
+    finally
+        Base.release(job.permits)
+    end
+    return job
+end
+
+"Wait for the oldest in-flight block and write it; a failed compression raises here."
+function writeoldest!(w::Writer)
+    job = fetch(first(w.inflight))::CompressJob
+    popfirst!(w.inflight)                    # after the wait, so an interrupted wait leaves the task for an abort
+    err = job.error
+    err === nothing || throw(err)
+    return writeblock!(w, job.count, job.bytes, job.rawlength)
+end
+
+function drainblocks!(w::Writer)
+    while !isempty(w.inflight)
+        writeoldest!(w)
+    end
+    return nothing
+end
+
+# Waits out every compression task, even through an interrupt, so none outlives the sink; their blocks are dropped.
+function discardinflight!(w::Writer)
+    for task in w.inflight
+        try
+            wait(task)
+        catch
+        end
+    end
+    empty!(w.inflight)
+    return nothing
+end
+
+"""
+End the current block by compressing and writing it, or by handing it to a compression task after writing
+the oldest block when `2 × workers` are in flight.
+"""
+function flushblock!(w::Writer)
+    w.pendingcount == 0 && return nothing
+    try
+        raw = take!(w.encoder)
+        if w.workers == 1
+            writeblock!(w, w.pendingcount, compressblock(w.wcodec, raw), length(raw))
+        else
+            length(w.inflight) >= 2 * w.workers && writeoldest!(w)
+            job = CompressJob(w.wcodec, w.permits, w.pendingcount, length(raw), raw, nothing)
+            push!(w.inflight, spawntask(job))
+        end
+    catch e
+        poison!(w, e)
+        rethrow()
+    end
+    w.pendingcount = 0
+    return nothing
+end
+
+function Base.flush(w::Writer)
+    checkwritable(w)
+    flushblock!(w)
+    try
+        drainblocks!(w)
+        streamcall(flush, w.sink)
+    catch e
+        poison!(w, e)
+        rethrow()
+    end
+    return nothing
+end
+
+function syncfile(@nospecialize(io::IO))
+    streamcall(flush, io)
+    io isa IOStream || return nothing
+    @static if Sys.iswindows()
+        result = ccall(:_commit, Cint, (Cint,), fd(io))
+    else
+        result = ccall(:fsync, Cint, (Cint,), fd(io))
+    end
+    Base.systemerror("syncing Avro output", result != 0)
+    return nothing
+end
+
+function Base.close(w::Writer; abort::Bool=false)
+    w.closed && return nothing
+    if abort || w.poison !== nothing
+        w.closed = true
+        abortcleanup(w)
+        return nothing
+    end
+    try
+        flushblock!(w)
+        drainblocks!(w)
+        w.fsync ? syncfile(w.sink) : streamcall(flush, w.sink)
+        if w.path !== nothing
+            w.ownsink && streamcall(close, w.sink)
+            if w.temppath !== nothing
+                chmod(w.temppath, publishmode(w.path))          # mktemp creates owner-only files
+                Base.Filesystem.rename(w.temppath, w.path)
+            end
+        end
+        w.closed = true
+    catch e
+        poison!(w, e)
+        w.closed = true
+        try
+            abortcleanup(w)
+        catch cleanup
+            throw(CompositeException(Any[e, cleanup]))
+        end
+        rethrow()
+    end
+    return nothing
+end
+
+# ---- Avro.write / tobuffer --------------------------------------------------------------------------
+
+"""
+    Avro.write(dst, source; schema=nothing, codec=nothing, level=nothing, metadata=nothing, block_bytes=64*1024,
+               ntasks=Threads.nthreads(), name=nothing, namespace=nothing, append=false, sync=nothing, atomic=true,
+               fsync=false, allow_invalid_names=false, allow_invalid_defaults=false, limits=Limits()) -> dst
+
+Write a container file from a Tables.jl source (a `DataFrame`, a vector of `NamedTuple`s, a column table,
+`Avro.Table`, `Avro.Rows`) or a collection of datums (a vector or generator of structs or plain values;
+generators are collected first, so use `Avro.Writer` to stream). Schema precedence: an explicit `schema=`,
+the schema an Avro source retains, the schema of the file being appended to, else a conventional derivation:
+`Avro.schema(T; name, namespace)` for a collection of datums, and from the source's column types for a table
+(a record named `name`, default `"Record"`), narrowing abstract column types to the types of the values they
+hold. A table column the schema has no field for is an `ArgumentError`. `metadata` defaults to the user
+metadata an Avro source retains, so a rewrite keeps it. `Tables.partitions` become block boundaries (each
+non-empty partition ends a block). With a compressing codec, up to `ntasks` blocks compress at once on other
+tasks, and the file is the same at every `ntasks`. `append=true` adds blocks to the existing file at path
+`dst` (see `Avro.Writer`).
+"""
+function write(dst::Union{AbstractString,IO}, table; schema::Union{Nothing,Schema}=nothing,
+               name::Union{Nothing,AbstractString}=nothing, namespace::Union{Nothing,AbstractString}=nothing,
+               metadata=nothing, append::Bool=false, limits::Limits=Limits(), kw...)
+    s = something(schema, retainedschema(table), Some(nothing))
+    if s === nothing && append && dst isa AbstractString && isfile(dst) && filesize(dst) > 0
+        s = Reader(r -> r.schema, dst; mmap=false, limits=limits, allow_invalid_names=get(kw, :allow_invalid_names, false),
+                   allow_invalid_defaults=get(kw, :allow_invalid_defaults, false))
+    end
+    entries = something(metadata, append ? Dict{String,Vector{UInt8}}() : retainedmetadata(table))
+    newwriter(s) = Writer(dst, s; limits=limits, append=append, metadata=entries, kw...)
+    if table isa Rows && getfield(table, :mode) !== :generic      # typed and non-record rows write datum-wise
+        Writer(dst, s; limits=limits, append=append, metadata=entries, kw...) do w
+            foreach(v -> push!(w, v), table)
+        end
+        return dst
+    end
+    partitions = table isa Rows ? RowsPartitions(table) : Tables.partitions(table)    # `Rows` re-encodes one block at a time
+    R = typedrows(table)
+    if R !== nothing && partitions isa Tuple{Any}               # typed rows: the schema derives from their type
+        if s === nothing
+            s = tableschema(R, something(name, "Record"), something(namespace, ""))
+        else
+            checkcolumns(fieldnames(R), s)
+        end
+        Writer(dst, s; limits=limits, append=append, metadata=entries, kw...) do w
+            pushpartition!(w, table, Tables.rows(table))
+        end
+        return dst
+    end
+    if !(table isa Rows || Tables.istable(table)) && partitions isa Tuple{Any}
+        isdatumcollection(table) ||
+            throw(ArgumentError("`Avro.write(dst, x)` writes Tables.jl sources and vectors or iterators of datums, not $(typeof(table)); use `Avro.encode!` to write one datum"))
+        datums = table isa AbstractVector && isconcretetype(eltype(table)) ? table : [x for x in table]
+        Tables.istable(datums) && return write(dst, datums; schema=s, name=name, namespace=namespace, metadata=metadata, append=append, limits=limits, kw...)
+        s === nothing && (s = Avro.schema(eltype(datums); name=name, namespace=namespace))
+        # `eltype(datums)` rather than a local: a closure holds a type it captures as a `DataType`, which dispatches at run time
+        Writer(dst, s; limits=limits, append=append, metadata=entries, kw...) do w
+            pushrowsof!(w, i -> datums[firstindex(datums) + i - 1], eltype(datums), length(datums))
+        end
+        return dst
+    end
+    w = nothing
+    ok = false
+    try
+        for part in partitions
+            rows = Tables.rows(part)
+            if s === nothing
+                part, rows, ts = derivationschema(part, rows)
+                s = Avro.schema(ts; name=something(name, "Record"), namespace=something(namespace, ""))
+            end
+            ts = Tables.schema(rows)
+            ts === nothing || checkcolumns(ts.names, s)
+            w === nothing && (w = newwriter(s))
+            pushpartition!(w, part, rows)
+            flushblock!(w)
+        end
+        if w === nothing
+            s === nothing && throw(ArgumentError("an empty partitioned source reports no Tables.schema; pass `schema=`"))
+            w = newwriter(s)
+        end
+        ok = true
+    finally
+        w === nothing || (ok ? close(w) : close(w; abort=true))
+    end
+    return dst
+end
+
+# What `Avro.write` takes as a collection of datums: vectors other than a byte string, and lazy iterators.
+function isdatumcollection(x)
+    x isa AbstractVector{UInt8} && return false
+    return x isa Union{AbstractVector,Base.Generator,Channel} || parentmodule(typeof(x)) === Base.Iterators
+end
+
+# A table column the record has no field for would silently vanish.
+function checkcolumns(names, @nospecialize(s::Schema))
+    s isa RecordSchema || return nothing
+    extra = Symbol[]
+    for n in names
+        haskey(s.fieldindex, Symbol(n)) || push!(extra, Symbol(n))
+    end
+    isempty(extra) || extracolumnserror(extra, s)
+    return nothing
+end
+
+# Printing the column names needs the run-time `show` of symbols, which programs compiled by `juliac --trim`
+# leave out; their message omits the names.
+@noinline function extracolumnserror(extra::Vector{Symbol}, s::RecordSchema)
+    tail = string(" that record ", fullname(s), " lacks; select the columns to write first")
+    msg = try
+        runtimecall(string, "the source has columns ", extra, tail)::String
+    catch err
+        notcompiled(err, string) || rethrow()
+        string("the source has columns", tail)
+    end
+    throw(ArgumentError(msg))
+end
+
+# A column type that says nothing about how to derive a schema: `Any`, `Real` and the like.
+function isopentype(@nospecialize(T))
+    return any(m -> isabstracttype(m) && !(m <: Union{AbstractString,AbstractVector,AbstractDict}), Base.uniontypes(T))
+end
+
+# The `NamedTuple` row type of a vector of one concrete `NamedTuple` type, or of a `NamedTuple` of vectors, none of
+# whose columns is of an open type (`isopentype`); `nothing` for other sources. A constant where the source's type
+# is.
+function typedrows(x)
+    R = x isa AbstractVector ? eltype(x) : x isa NamedTuple && vectorcolumns(x) ? columnrowtype(typeof(x)) : nothing
+    (R isa DataType && R <: NamedTuple && isconcretetype(R)) || return nothing
+    return opencolumns(R) ? nothing : R
+end
+
+function anyopencolumn(@nospecialize(R))
+    for i in 1:fieldcount(R)
+        isopentype(fieldtype(R, i)) && return true
+    end
+    return false
+end
+
+@generated function opencolumns(::Type{R}) where {R<:NamedTuple}
+    return anyopencolumn(R)
+end
+
+# The record schema `Avro.schema(::Tables.Schema)` derives from the columns of `R`, derived from the field types
+# known when compiling.
+function tableschema(::Type{R}, name::AbstractString, namespace::AbstractString) where {R<:NamedTuple}
+    ctx = DeriveContext(1)
+    full = FullName(checkderivedname(name, "name", "pass a valid `name=`"), checkderivednamespace(namespace))
+    rec = RecordSchema(full, String[], String[], nothing, false, Props(), NodeMeta())
+    registerderived!(ctx, rec, Tables.Schema)
+    column! = function (col::Symbol, ::Type{CT}) where {CT}
+        fn = checkderivedname(col, "column name", "rename the column")
+        fs = try
+            derive(ctx, CT, nothing, full.namespace)
+        catch err
+            err isa ArgumentError || rethrow()
+            msg = err.msg                                      # declared `AbstractString`; Avro's are `String`s
+            throw(ArgumentError(columnerror(String(col), typedescriptionof(CT), msg isa String ? msg : "no conventional Avro schema")))
+        end
+        push!(rec.fields, Field(fn, fs, nothing, nodefault, :ascending, String[], Props()))
+        return nothing
+    end
+    foreachfield(column!, R)
+    indexfields!(rec, (i, msg, key) -> throw(ArgumentError(msg)))
+    return finalizepublic!(rec)
+end
+
+# `typedescription(T)`, computed when the method compiles.
+@generated function typedescriptionof(::Type{T}) where {T}
+    return typedescription(T)
+end
+
+@noinline Base.@constprop :none function columnerror(column::String, type::String, msg::String)
+    return string("column ", column, " of type ", type, ": ", msg)
+end
+
+# The partition, its rows and the `Tables.Schema` a record schema derives from. Rows reporting no schema
+# (differing types, a plain iterator) become a row table whose column types are the union of the types its
+# rows hold, and open column types likewise become the union of the types the column holds.
+function derivationschema(part, rows)
+    ts = Tables.schema(rows)
+    (ts === nothing || any(isopentype, ts.types)) || return (part, rows, ts)
+    return narrowedschema(part, rows, ts)
+end
+
+# Kept apart and unspecialized, so a source with concrete column types never compiles it.
+@noinline function narrowedschema(@nospecialize(part), @nospecialize(rows), @nospecialize(ts))
+    if ts === nothing || !Tables.columnaccess(typeof(part))
+        table = Tables.dictrowtable(rows)
+        ts = Tables.schema(table)
+        isempty(ts.names) && throw(ArgumentError("the source has no rows to derive its columns from; pass `schema=`"))
+        return (table, Tables.rows(table), ts)
+    end
+    columns = Tables.columns(part)
+    types = Type[]
+    for (name, T) in zip(ts.names, ts.types)
+        column = Tables.getcolumn(columns, name)
+        push!(types, isopentype(T) && !isempty(column) ? Union{unique(typeof.(column))...} : T)
+    end
+    return (part, rows, Tables.Schema(ts.names, types))
+end
+
+"""
+Push one partition: a vector of one concrete `NamedTuple` type through the row type's write node, a column
+table with a vector column for every field of the record schema through its columns' element types, and
+other sources row by row.
+"""
+function pushpartition!(w::Writer, part, rows)
+    if part isa Table && isempty(Tables.columnnames(part))      # no column carries a zero-column table's row count
+        foreach(_ -> push!(w, (;)), 1:length(part))
+        return w
+    end
+    if rows isa AbstractVector && isconcretetype(eltype(rows)) && eltype(rows) <: NamedTuple
+        return pushrowsof!(w, i -> @inbounds(rows[firstindex(rows) + i - 1]), eltype(rows), length(rows))
+    end
+    Tables.columnaccess(typeof(part)) && pushcolumns!(w, Tables.columns(part)) && return w
+    known = Tables.schema(rows) !== nothing
+    for row in rows
+        known || checkcolumns(row isa AbstractDict ? keys(row) : Tables.columnnames(row), w.schema)
+        push!(w, row isa Union{NamedTuple,Record,AbstractDict,Tables.AbstractRow} ? row : TableRow(row))
+    end
+    return w
+end
+
+# The widest column table, other than a `NamedTuple` of vectors, written as `NamedTuple` rows: those rows'
+# code compiles once per table type, so wider tables compile once per column type instead and write each row
+# through one run-time call per cell.
+const TYPED_ROW_COLUMNS = 32
+
+"""
+Push every row of the column table `cols`. Returns `false`, having pushed nothing, when the record schema
+has a field without a column or a column is not a vector (the row path then applies).
+"""
+function pushcolumns!(w::Writer, cols)
+    s = w.schema
+    s isa RecordSchema || return false
+    names = Tables.columnnames(cols)
+    (isempty(names) || !coversfields(s, names)) && return false
+    cols isa NamedTuple && return pushcolumntable!(w, cols)
+    symbols = Tuple(Symbol(n) for n in names)
+    # Cells take the first column of a repeated name, as rows do.
+    (length(names) > TYPED_ROW_COLUMNS || !allunique(symbols)) && return pushcolumncells!(w, cols, names)
+    return pushcolumntable!(w, NamedTuple{symbols}(Tuple(Tables.getcolumn(cols, n) for n in names)))
+end
+
+# Whether the names are all strings or symbols and include a column for every field of `s` (by name, as rows are
+# matched); other names take the row path, which reports them.
+function coversfields(s::RecordSchema, names)
+    covered = falses(length(s.fields))
+    for n in names
+        n isa Union{Symbol,AbstractString} || return false
+        i = recordfieldindex(s, n)
+        i == 0 || (covered[i] = true)
+    end
+    return all(covered)
+end
+
+function pushcolumntable!(w::Writer, cols::NamedTuple)
+    vectorcolumns(cols) || return false
+    R = columnrowtype(typeof(cols))
+    n = length(first(cols))
+    samelengths(cols, n) || throw(ArgumentError("table columns have different lengths"))
+    pushrowsof!(w, i -> columnrow(cols, i), R, n)
+    return true
+end
+
+function columnrowtypeof(@nospecialize(C))
+    types = Any[]
+    for j in 1:fieldcount(C)
+        push!(types, eltype(fieldtype(C, j)))
+    end
+    return NamedTuple{fieldnames(C),Tuple{types...}}
+end
+
+# The row type of a NamedTuple of columns: their names, and their element types as field types.
+@generated function columnrowtype(::Type{C}) where {C<:NamedTuple}
+    return columnrowtypeof(C)
+end
+
+function allvectorcolumns(@nospecialize(C))
+    for j in 1:fieldcount(C)
+        fieldtype(C, j) <: AbstractVector || return false
+    end
+    return true
+end
+
+@generated function vectorcolumns(cols::C) where {C<:NamedTuple}
+    return allvectorcolumns(C)
+end
+
+@generated function samelengths(cols::C, n::Int) where {C<:NamedTuple}
+    body = Expr(:block)
+    for j in 1:fieldcount(C)
+        push!(body.args, :(length(getfield(cols, $j)) == n || return false))
+    end
+    push!(body.args, true)
+    return body
+end
+
+# Row `i` of the columns, a `columnrowtype`.
+@generated function columnrow(cols::C, i::Int) where {C<:NamedTuple}
+    values = Any[]
+    for j in 1:fieldcount(C)
+        push!(values, :(getfield(cols, $j)[firstindex(getfield(cols, $j)) + i - 1]))
+    end
+    return :($(columnrowtypeof(C))(($(values...),)))
+end
+
+# A column of a wide table and the write node of its element type.
+struct ColumnCell{C<:AbstractVector}
+    column::C
+    node::WriteNode
+end
+
+# The row being written; a mutable cursor, so the run-time call per cell does not box the row index.
+mutable struct CellRow
+    i::Int
+end
+
+function cellvalue(c::ColumnCell, row::CellRow)
+    return c.column[firstindex(c.column) + row.i - 1]
+end
+
+@noinline function encodecell(c::ColumnCell{C}, e::Encoder, row::CellRow) where {C}
+    encodenode(eltype(C), c.node, e, cellvalue(c, row))
+    return nothing
+end
+
+function pushcolumncells!(w::Writer, cols, names)
+    s = w.schema::RecordSchema
+    p = w.plan::WRecord
+    positions = zeros(Int, length(s.fields))
+    for (j, name) in enumerate(names)
+        name isa Union{Symbol,AbstractString} || continue
+        i = recordfieldindex(s, name)
+        i == 0 || positions[i] != 0 || (positions[i] = j)
+    end
+    cells = Vector{ColumnCell}(undef, length(positions))
+    n = -1
+    for (k, j) in enumerate(positions)
+        column = Tables.getcolumn(cols, j)
+        column isa AbstractVector || return false
+        n < 0 && (n = length(column)::Int)        # a column of an abstract type would leave the row loop's bound boxed
+        length(column) == n || throw(ArgumentError("table columns have different lengths"))
+        cells[k] = columncell(column, s.fields[k].schema, p.fields[k])
+    end
+    checkwritable(w)
+    row = CellRow(0)
+    try
+        for i in 1:n
+            row.i = i
+            pushcellrow!(w, cells, row)
+        end
+    catch e
+        poison!(w, e)
+        rethrow()
+    end
+    return true
+end
+
+function columncell(column::C, @nospecialize(schema::Schema), @nospecialize(plan::Plan)) where {C<:AbstractVector}
+    return ColumnCell{C}(column, writenode(eltype(C), schema, plan))
+end
+
+# One row of cells as a record datum, as `pushdatum!` writes one: the failure of a row raises again with its
+# value path from the generic route, given the row's values as a `Record`.
+function pushcellrow!(w::Writer, cells::Vector{ColumnCell}, row::CellRow)
+    e = w.encoder
+    start, values = e.pos, e.values
+    try
+        countvalue!(e)
+        enter!(e)
+        for c in cells
+            encodecell(c, e, row)
+        end
+        leave!(e)
+    catch err
+        e.pos, e.values, e.depth, e.expected = start, values, 0, nothing
+        empty!(e.path)
+        err isa EncodeError &&
+            replaydatum(w.plan, w.limits, Record(w.schema::RecordSchema, Any[cellvalue(c, row) for c in cells], Val(:unchecked)), w.schema)
+        rethrow()
+    end
+    return commitdatum!(w, start, values)
+end
+
+"Push `row(i)` for `i` in `1:n` through the write node of their type `R` (rows of an abstract `R`, by their own types)."
+function pushrowsof!(w::Writer, row::F, ::Type{R}, n::Int) where {F,R}
+    if !isconcretetype(R)
+        for i in 1:n
+            push!(w, row(i))
+        end
+        return w
+    end
+    checkwritable(w)
+    try
+        node = writenode!(w.nodes, R)
+        e = w.encoder
+        for i in 1:n
+            start, values = e.pos, e.values
+            @inline encodetyped!(R, node, e, row(i), w.plan, w.schema)
+            commitdatum!(w, start, values)
+        end
+    catch e
+        poison!(w, e)
+        rethrow()
+    end
+    return w
+end
+
+"""
+    Avro.tobuffer(table; kw...) -> IOBuffer
+
+`Avro.write` into a fresh, rewound `IOBuffer`.
+"""
+function tobuffer(table; kw...)
+    io = IOBuffer()
+    write(io, table; kw...)
+    seekstart(io)
+    return io
+end
+
+# ---- inspect ----------------------------------------------------------------------------------------
+
+"""
+    Avro.InspectReport
+
+`Avro.inspect`'s diagnostic summary: the codec, permissively parsed schema, block/datum counts, and the
+issues found (legacy codec names, repaired names/defaults, structural problems).
+"""
+struct InspectReport
+    codec::Union{Nothing,String}
+    schema::Union{Nothing,Schema}
+    blocks::Int
+    datums::Int
+    compressedbytes::Int
+    issues::Vector{String}
+end
+
+const INSPECT_ISSUE_CAPACITY = 256
+
+"Append an issue; the last slot holds the omission marker once the report is full."
+function inspectissue!(issues::Vector{String}, issue::String)
+    n = length(issues)
+    n < INSPECT_ISSUE_CAPACITY - 1 && return (push!(issues, issue); nothing)
+    n == INSPECT_ISSUE_CAPACITY - 1 && push!(issues, "additional issues were omitted")
+    return nothing
+end
+
+function inspectissue!(issues::Vector{String}, error::AvroError)
+    return inspectissue!(issues, sprint(showerror, error))
+end
+
+function Base.show(io::IO, ::MIME"text/plain", r::InspectReport)
+    println(io, "Avro.InspectReport:")
+    println(io, "  codec:  ", something(r.codec, "?"))
+    println(io, "  schema: ", r.schema === nothing ? "?" : kind(r.schema))
+    println(io, "  blocks: ", r.blocks, " (", r.datums, " datums, ", r.compressedbytes, " compressed payload bytes)")
+    if isempty(r.issues)
+        print(io, "  no issues found")
+    else
+        print(io, "  issues:")
+        for issue in r.issues
+            print(io, "\n   - ", issue)
+        end
+    end
+    return nothing
+end
+
+"""
+    Avro.inspect(src; limits=Limits()) -> Avro.InspectReport
+
+A permissive diagnostic parse of a container source: never mutates it, tolerates repaired schemas and
+legacy codec names, and stops at (and reports) the first structural problem.
+"""
+function inspect(src; limits::Limits=Limits())
+    issues = String[]
+    codecname = nothing
+    schemaout = nothing
+    blocks = 0
+    datums = 0
+    cbytes = 0
+    compressed = 0
+    decompressed = 0
+    source = opensource(src)
+    try
+        h = readheader(source, limits; legacy=:avrojl1, allow_invalid_names=true, allow_invalid_defaults=true)
+        codecname = h.codecname
+        schemaout = h.schema
+        h.codecname == "zstd" &&
+            inspectissue!(issues, "codec \"zstd\" is Avro.jl ≤ 1.1.2's name for zstandard; read with legacy=:avrojl1")
+        cname = try
+            readercodec(h.codecname, :avrojl1)
+        catch e
+            e isa AvroError || rethrow()
+            e isa UnsupportedCodecError && e.package === nothing ?
+                inspectissue!(issues, string("unknown codec ", sprint(escapejson, h.codecname))) : inspectissue!(issues, e)
+            nothing
+        end
+        gi = graphinfo(h.schema)
+        gi.repaired_names &&
+            inspectissue!(issues, "the schema contains invalid names; read with allow_invalid_names=true")
+        gi.repaired_defaults &&
+            inspectissue!(issues, "the schema contains invalid defaults; read with allow_invalid_defaults=true")
+        inspectdecimalwarnings!(issues, h.schema)
+        if cname !== nothing
+            plan = readplan(h.schema; mode=:framing)
+            while !sourceeof(source)
+                count = sourcevarint(source)
+                count >= 0 || throw(DataError("negative block count $count", position(source)))
+                size = sourcevarint(source)
+                size >= 0 || throw(DataError("negative block size $size", position(source)))
+                size <= limits.max_bytes || throw(LimitError(:max_bytes, size, limits.max_bytes))
+                payload = sourcepayload(source, Int(size))
+                checksync(source, h.sync, blocks + 1)
+                decoded = decompressblock(cname, payload, limits)
+                compressed = satadd(compressed, Int(size))
+                decompressed = satadd(decompressed, length(decoded))
+                decompressed <= inflationcap(limits, compressed) ||
+                    throw(LimitError(:max_inflation, decompressed, inflationcap(limits, compressed)))
+                n = Int(count)
+                decoder = blockcap!(Decoder(decoded, limits))
+                for _ in 1:n
+                    decode(plan, decoder)
+                end
+                if decoder.pos != length(decoded) + 1
+                    cname === :null ||
+                        throw(DataError("block $(blocks + 1) declares $n datums but they consume $(decoder.pos - 1) of $(length(decoded)) bytes", decoder.pos))
+                    inspectissue!(issues, string("block ", blocks + 1, " has ", length(decoded) - decoder.pos + 1,
+                                                 " trailing payload bytes after ", n,
+                                                 " datums (Avro.jl ≤ 1.1.2 null-codec padding; read with legacy=:avrojl1)"))
+                end
+                blocks += 1
+                datums += n
+                cbytes += Int(size)
+            end
+        end
+    catch e
+        e isa AvroError || rethrow()
+        inspectissue!(issues, e)
+    finally
+        closesource(source)
+    end
+    return InspectReport(codecname, schemaout, blocks, datums, cbytes, issues)
+end
+
+function inspectdecimalwarnings!(issues::Vector{String}, s::Schema)
+    return inspectdecimalwarnings!(issues, s, falses(graphinfo(s).nodes))
+end
+
+function inspectdecimalwarnings!(issues::Vector{String}, s::Schema, seen::BitVector)
+    length(issues) == INSPECT_ISSUE_CAPACITY && return nothing
+    index = Int(nodeid(s)) + 1
+    seen[index] && return nothing
+    seen[index] = true
+    if s isa FixedSchema && s.logical isa DecimalLogical && s.size != 16
+        inspectissue!(issues, string("fixed decimal \"", fullname(s), "\" has size ", s.size,
+                                     ": Avro.jl ≤ 1.1.2 wrote 16 bytes regardless, so 1.x files with this schema are misframed"))
+    elseif s isa ArraySchema
+        inspectdecimalwarnings!(issues, s.items, seen)
+    elseif s isa MapSchema
+        inspectdecimalwarnings!(issues, s.values, seen)
+    elseif s isa UnionSchema
+        for branch in s.branches
+            inspectdecimalwarnings!(issues, branch, seen)
+        end
+    elseif s isa RecordSchema
+        for field in s.fields
+            inspectdecimalwarnings!(issues, field.schema, seen)
+        end
+    end
+    return nothing
+end

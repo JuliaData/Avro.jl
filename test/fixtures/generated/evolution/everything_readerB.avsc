@@ -1,0 +1,115 @@
+{
+ "type": "record",
+ "name": "Everything2",
+ "namespace": "avro.jl.test",
+ "aliases": [
+  "Everything"
+ ],
+ "fields": [
+  {
+   "name": "str",
+   "type": "string",
+   "aliases": [
+    "s"
+   ]
+  },
+  {
+   "name": "nested",
+   "type": {
+    "type": "record",
+    "name": "Inner2",
+    "aliases": [
+     "Inner"
+    ],
+    "fields": [
+     {
+      "name": "pt",
+      "type": {
+       "type": "record",
+       "name": "Pt",
+       "aliases": [
+        "Point"
+       ],
+       "fields": [
+        {
+         "name": "y",
+         "type": "double"
+        },
+        {
+         "name": "x",
+         "type": "double"
+        },
+        {
+         "name": "z",
+         "type": "double",
+         "default": 0.0
+        }
+       ]
+      },
+      "aliases": [
+       "p"
+      ]
+     },
+     {
+      "name": "tags",
+      "type": {
+       "type": "array",
+       "items": "string"
+      }
+     },
+     {
+      "name": "deep",
+      "type": [
+       "null",
+       "Inner2"
+      ],
+      "default": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "list",
+   "type": {
+    "type": "record",
+    "name": "LongList",
+    "fields": [
+     {
+      "name": "next",
+      "type": [
+       "null",
+       "LongList"
+      ],
+      "default": null
+     },
+     {
+      "name": "value",
+      "type": "long"
+     }
+    ]
+   }
+  },
+  {
+   "name": "arr_rec",
+   "type": {
+    "type": "array",
+    "items": "Pt"
+   }
+  },
+  {
+   "name": "e",
+   "type": {
+    "type": "enum",
+    "name": "Colour",
+    "aliases": [
+     "Color"
+    ],
+    "symbols": [
+     "RED",
+     "GREEN",
+     "BLUE"
+    ]
+   }
+  }
+ ]
+}

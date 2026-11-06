@@ -1,0 +1,1 @@
+{"name":"unionfields","type":"record","fields":[{"name":"data1","type":["string","int"]},{"name":"data2","type":[{"name":"inner","type":"record","fields":[{"name":"d1","type":["string","int","boolean","null"]}]},"null"]}]}

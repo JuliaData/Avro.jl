@@ -1,0 +1,1 @@
+{"name":"avro.jl.test.Bench","type":"record","fields":[{"name":"id","type":"long"},{"name":"x","type":"double"},{"name":"name","type":"string"},{"name":"flag","type":"boolean"}]}

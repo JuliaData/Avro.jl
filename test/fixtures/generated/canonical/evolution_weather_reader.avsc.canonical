@@ -1,0 +1,1 @@
+{"name":"test.Weather","type":"record","fields":[{"name":"temp","type":"long"},{"name":"humidity","type":["null","int"]},{"name":"site","type":"string"}]}

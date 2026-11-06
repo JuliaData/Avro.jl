@@ -1,0 +1,1 @@
+{"type": "enum", "name": "Color", "namespace": "avro.jl.test", "symbols": ["RED", "GREEN", "BLUE"]}

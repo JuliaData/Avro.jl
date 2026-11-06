@@ -1,0 +1,1 @@
+{"name":"org.apache.avro.FooBarSpecificRecord","type":"record","fields":[{"name":"id","type":"int"},{"name":"name","type":"string"},{"name":"nicknames","type":{"type":"array","items":"string"}},{"name":"relatedids","type":{"type":"array","items":"int"}},{"name":"typeEnum","type":["null",{"name":"org.apache.avro.TypeEnum","type":"enum","symbols":["a","b","c"]}]}]}
